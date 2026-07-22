@@ -1,0 +1,13 @@
+html,
+body,
+#__nuxt {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+}
+
+.app-shell {
+  background: rgb(var(--v-theme-background));
+}

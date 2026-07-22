@@ -1,0 +1,31 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Photo Curator",
+  "version": "0.1.0",
+  "identifier": "app.photocurator.desktop",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:3000",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../.output/public"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Photo Curator",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 1024,
+        "minHeight": 640,
+        "center": true,
+        "resizable": true
+      }
+    ],
+    "security": { "csp": null }
+  },
+  "bundle": {
+    "active": false,
+    "targets": ["nsis"]
+  }
+}

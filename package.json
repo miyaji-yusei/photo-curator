@@ -1,0 +1,34 @@
+{
+  "name": "photo-curator",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "packageManager": "pnpm@10.12.1",
+  "scripts": {
+    "dev": "nuxt dev",
+    "build": "nuxt generate",
+    "preview": "nuxt preview",
+    "postinstall": "nuxt prepare",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "test": "vitest run",
+    "typecheck": "nuxt typecheck"
+  },
+  "dependencies": {
+    "@mdi/font": "^7.4.47",
+    "@pinia/nuxt": "^0.11.0",
+    "@tauri-apps/api": "^2.8.0",
+    "nuxt": "^3.17.0",
+    "pinia": "^3.0.0",
+    "vue": "^3.5.0",
+    "vuetify": "^3.9.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.8.0",
+    "typescript": "^5.8.0",
+    "vite-plugin-vuetify": "^2.1.2",
+    "vitest": "^3.2.0",
+    "vue-tsc": "^3.3.7"
+  }
+}

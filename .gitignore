@@ -1,0 +1,22 @@
+# Nuxt
+.nuxt/
+.output/
+.data/
+.cache/
+dist/
+
+# Dependencies
+node_modules/
+
+# Tauri / Rust
+src-tauri/target/
+src-tauri/gen/
+
+# Local files
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+.idea/
+.vscode/
