@@ -20,3 +20,5 @@ src-tauri/gen/
 .DS_Store
 .idea/
 .vscode/
+
+.claude/tmp/

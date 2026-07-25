@@ -1,0 +1,5 @@
+label,photos,total_ms,walk_ms,scan_fingerprint_ms,scan_db_ms,exif_ms,metadata_db_ms,hash_fingerprint_ms,decode_hash_ms,hash_db_ms,groups_query_ms,groups_build_ms,exif_hits,mtime_fallbacks,burst_candidates,hash_cache_hits,groups,exif_success_pct,burst_candidate_pct,hash_cache_hit_pct,peak_rss_mb,candidate_window_ms,candidate_window_narrowed,weak_pairs_skipped,thumbnail_hits,thumbnail_generated,thumbnail_failures,thumbnail_cache_mb,decode_sources
+synth1000-cold,1000,273.0,1.7,46.9,95.3,111.1,17.8,0.0,0.0,0.0,0.1,0.0,0,1000,0,0,0,0.00,0.00,0.00,7.7,4000,false,999,0,0,0,0.00,{}
+synth1000-warm,1000,148.3,1.6,47.4,99.2,0.0,0.0,0.0,0.0,0.0,0.1,0.0,0,0,0,0,0,0.00,0.00,0.00,7.7,4000,false,999,0,0,0,0.00,{}
+synth5000-cold,5000,1378.3,7.8,231.2,477.3,540.7,120.7,0.0,0.0,0.0,0.7,0.0,0,5000,0,0,0,0.00,0.00,0.00,13.2,4000,false,4999,0,0,0,0.00,{}
+synth5000-warm,5000,768.7,7.5,231.1,529.4,0.0,0.0,0.0,0.0,0.0,0.6,0.0,0,0,0,0,0,0.00,0.00,0.00,13.2,4000,false,4999,0,0,0,0.00,{}

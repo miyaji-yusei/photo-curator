@@ -1,13 +1,184 @@
-html,
-body,
-#__nuxt {
-  min-height: 100%;
+html, body, #__nuxt { min-height: 100%; }
+body { margin: 0; }
+.app-shell { min-height: 100vh; background: rgb(var(--v-theme-background)); }
+.v-card-title { letter-spacing: -.01em; }
+.v-card-text { line-height: 1.65; }
+/* ボタンの間隔は各コンテナの gap / ga-* で付ける。ここで margin を足すと
+   二重になるため持たせない。 */
+.project-nav-item { min-height: 54px; }
+.photo-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 16px; }
+.photo-tile { aspect-ratio: 1; overflow: hidden; border-radius: 10px; background: #24272d; position: relative; }
+.photo-tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.photo-tile__caption { position: absolute; left: 0; right: 0; bottom: 0; padding: 22px 8px 7px; font-size: 12px; background: linear-gradient(transparent, rgba(0,0,0,.8)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.choice-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px; }
+.choice-card { cursor: pointer; border: 2px solid transparent; background: rgb(var(--v-theme-surface)) !important; color: rgb(var(--v-theme-on-surface)); transition: transform .12s, border-color .12s, box-shadow .12s; }
+.choice-card::before, .choice-card .v-card__overlay { opacity: 0 !important; }
+.choice-card:hover, .choice-card:focus-visible { transform: translateY(-2px); border-color: rgb(var(--v-theme-primary)); box-shadow: 0 10px 28px rgba(0, 0, 0, .24); outline: none; }
+.choice-card--disabled { cursor: not-allowed; opacity: .55; filter: saturate(.45); }
+.choice-card--disabled:hover { transform: none; border-color: transparent; box-shadow: none; }
+.choice-card.is-selected { border-color: rgb(var(--v-theme-primary)); box-shadow: 0 0 0 2px rgba(214,255,115,.18); }
+.settings-card { border: 1px solid rgba(255, 255, 255, .08); }
+.selection-slider { --v-slider-track-background: #6f7785; --v-slider-track-fill-background: rgb(var(--v-theme-primary)); --v-slider-thumb-color: rgb(var(--v-theme-primary)); padding: 8px 4px 2px; }
+.selection-slider .v-slider-track__background { opacity: 1 !important; background: #6f7785 !important; }
+.selection-slider .v-slider-track__fill { opacity: 1 !important; background: rgb(var(--v-theme-primary)) !important; }
+.selection-slider .v-slider-thumb__surface { background: rgb(var(--v-theme-primary)) !important; border: 2px solid #101114; opacity: 1 !important; }
+/* 列数は枚数に応じて JS が --tournament-columns で渡す。auto-fit に任せると
+   2枚のときに1枚が極端に大きくなったり、10枚で列が増えすぎたりして安定しない。
+   幅は余さず使い、高さは「1画面に1グループが収まる」ことを優先して決める。 */
+.tournament-grid {
+  display: grid;
+  grid-template-columns: repeat(var(--tournament-columns, 5), 1fr);
+  gap: 12px;
+  align-content: start;
+  justify-items: center;
+}
+.tournament-card {
+  /* overflow は Vuetify の .v-card が hidden にする。box-shadow は自分の
+     overflow では切られないので、下の「重なった紙」の表現には影響しない。 */
+  cursor: pointer; position: relative;
+  border: 3px solid transparent; background: #16181d;
+  width: 100%;
+  /* 列が広いとカードだけ極端な横長になり、contain の写真の左右が大きく余る。
+     写真の縦横比（3:2 前後）に合わせて幅の上限を高さから決める。 */
+  max-width: calc(1.6 * (100vh - 300px) / var(--tournament-rows, 2));
+}
+.tournament-card:hover { border-color: rgba(214,255,115,.65); }
+/* 複数枚選ぶと、どれを選んだか分からなくなる。枠だけでなく、明るさを落とした
+   背景・発光・チェックの3つで差を付ける。 */
+.tournament-card.is-selected {
+  border-color: rgb(var(--v-theme-primary));
+  box-shadow: 0 0 0 3px rgba(214,255,115,.35), 0 8px 24px rgba(0,0,0,.35);
+}
+.tournament-card:not(.is-selected) img { opacity: .82; transition: opacity .12s; }
+.tournament-card.is-selected img, .tournament-card:hover img { opacity: 1; }
+.tournament-card.is-confirmed { border-color: rgb(var(--v-theme-secondary)); }
+.tournament-card__number { position: absolute; top: 8px; left: 8px; z-index: 2; min-width: 26px; text-align: center; background: rgba(0,0,0,.72); border-radius: 999px; padding: 3px 7px; font-weight: 700; }
+/* 選択のクリックと切り分けるため、拡大とまとめは右上にまとめる。 */
+.tournament-card__tools { position: absolute; top: 6px; right: 6px; z-index: 2; display: flex; gap: 6px; }
+.tournament-card__check {
+  position: absolute; bottom: 8px; right: 8px; z-index: 2;
+  display: grid; place-items: center; width: 30px; height: 30px; border-radius: 999px;
+  background: rgb(var(--v-theme-primary)); color: #101114;
+}
+.tournament-card__confirmed {
+  position: absolute; bottom: 8px; left: 8px; z-index: 2;
+  background: rgb(var(--v-theme-secondary)); color: #101114;
+  border-radius: 999px; padding: 2px 10px; font-size: 12px; font-weight: 700;
 }
 
-body {
-  margin: 0;
+/* 拡大表示 */
+.zoom-overlay__inner { display: grid; place-items: center; gap: 10px; padding: 16px; }
+.zoom-overlay__inner img { max-width: 96vw; max-height: 88vh; object-fit: contain; display: block; }
+.zoom-overlay__caption { color: #cfd3da; }
+
+/* まとめの中身は選別画面と同じ .tournament-grid を使う。
+   全画面ダイアログの中なので、上の説明文ぶんだけ高さを譲る。 */
+.burst-review-grid .tournament-card img { height: calc((100vh - 340px) / var(--tournament-rows, 2)); }
+.burst-review-grid .tournament-card { max-width: calc(1.6 * (100vh - 340px) / var(--tournament-rows, 2)); }
+
+/* 写真の良し悪しを見るのに切り取ってはいけない。cover ではなく contain。
+   高さは行数で割って、グループ全体がスクロールなしで収まるようにする。 */
+.tournament-card img {
+  width: 100%;
+  height: calc((100vh - 300px) / var(--tournament-rows, 2));
+  min-height: 140px;
+  object-fit: contain;
+  display: block;
+  border-radius: 2px;
 }
 
-.app-shell {
-  background: rgb(var(--v-theme-background));
+/* まとめられた連写は「重なった写真の束」に見せる。
+   背景が黒に近いので、青みのある色や暗い影では沈んで見えない。
+   紙の縁を白で描くのが、暗い画面では最も強く出る。 */
+.tournament-card.is-burst {
+  background: #ffffff;
+  border-color: #ffffff;
+  /* 白い縁を2枚ぶん背後にずらして、束ねた紙の断面を作る。
+     -1px の暗い層は縁どうしの境目で、これが無いと1枚の白い塊に見える。 */
+  box-shadow:
+    6px 6px 0 -1px #101114, 6px 6px 0 0 rgba(255, 255, 255, .85),
+    12px 12px 0 -1px #101114, 12px 12px 0 0 rgba(255, 255, 255, .55);
+}
+/* 白い枠の内側に写真を置くので、写真自体は黒地のまま見せる。 */
+.tournament-card.is-burst img { background: #101114; }
+.tournament-card.is-burst.is-selected {
+  border-color: rgb(var(--v-theme-primary));
+  box-shadow:
+    6px 6px 0 -1px #101114, 6px 6px 0 0 rgba(255, 255, 255, .85),
+    12px 12px 0 -1px #101114, 12px 12px 0 0 rgba(255, 255, 255, .55),
+    0 0 0 4px rgba(214, 255, 115, .45);
+}
+/* 連写の表示は左下の1か所だけ。ここ自体がまとめを開くボタン。 */
+.tournament-card__stackmark {
+  position: absolute; left: 8px; bottom: 8px; z-index: 2;
+  display: inline-flex; align-items: center; gap: 3px;
+  background: #ffffff; color: #101114; border: none;
+  border-radius: 999px; padding: 3px 8px 3px 10px;
+  font-size: 12px; font-weight: 700; font-family: inherit;
+  cursor: pointer; transition: background .12s, transform .12s;
+}
+.tournament-card__stackmark:hover,
+.tournament-card__stackmark:focus-visible {
+  background: rgb(var(--v-theme-primary)); transform: translateY(-1px); outline: none;
+}
+
+/* 代表の1枚（まとめの中身を開いたとき）。 */
+.tournament-card.is-representative { border-color: rgb(var(--v-theme-secondary)); }
+.drop-placeholder { border: 2px dashed #4b5059; border-radius: 12px; color: #959ba7; }
+.v-card-actions { gap: 10px; }
+
+/* 2枚を見比べる画面。比較対象が少ないので画面いっぱいに大きく見せる。 */
+.compare-pair { display: grid; grid-template-columns: repeat(2, 1fr); gap: 24px; align-items: start; }
+.compare-pair__item { margin: 0; min-width: 0; }
+/* 構図の類似を判断させる画面なので、切り取ってはいけない。cover ではなく contain。 */
+.compare-pair img {
+  width: 100%; max-height: 62vh; height: auto; object-fit: contain; display: block;
+  background: #16181d; border-radius: 12px;
+}
+.compare-actions { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; }
+
+/* 選別結果の一覧。サムネイルを使うので原本のデコードは発生しない。 */
+.result-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 14px; }
+.result-tile { cursor: pointer; border: 2px solid transparent; border-radius: 10px; overflow: hidden; background: #16181d; }
+.result-tile:hover, .result-tile:focus-visible { border-color: rgb(var(--v-theme-primary)); outline: none; }
+.result-tile.is-confirmed { border-color: rgb(var(--v-theme-secondary)); }
+/* 落選は一覧の中で沈ませる。通過との差が一目で付く。 */
+.result-tile.is-eliminated img { opacity: .45; filter: saturate(.6); }
+.result-tile img { width: 100%; aspect-ratio: 3 / 2; object-fit: contain; display: block; }
+.result-tile__meta { display: flex; align-items: center; gap: 6px; padding: 6px 8px 0; min-height: 26px; }
+.result-tile__stars { display: inline-flex; }
+.result-tile__badge { margin-left: auto; background: rgb(var(--v-theme-secondary)); color: #101114; border-radius: 999px; padding: 1px 8px; font-size: 11px; font-weight: 700; }
+.result-tile__badge.is-out { background: #3a3f48; color: #cfd3da; }
+.result-tile__name { padding: 2px 8px 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---- レスポンシブ ---------------------------------------------------- */
+
+/* タブレット以下。2枚を縦に積み、1枚あたりの高さを抑えて両方を視野に収める。 */
+@media (max-width: 900px) {
+  .compare-pair { grid-template-columns: 1fr; gap: 16px; }
+  .compare-pair img { max-height: 34vh; }
+  .compare-actions .v-btn { flex: 1 1 auto; }
+  /* 列数と高さは実測から決まるので、ここでは触らない。 */
+  /* 列を最大3つに抑える。狭い幅で5列にすると1枚が小さくなりすぎる。 */
+  .tournament-grid { grid-template-columns: repeat(min(var(--tournament-columns, 3), 3), 1fr); gap: 10px; }
+  .tournament-card img { height: calc((100vh - 340px) / var(--tournament-rows, 2)); min-height: 120px; }
+  .photo-grid { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 12px; }
+}
+
+/* スマートフォン相当。余白を詰めて写真の面積を優先する。 */
+@media (max-width: 600px) {
+  .compare-pair img { max-height: 30vh; }
+  /* DOM 順のまま縦に積む。主操作の「まとめる」が最下部に来て親指が届く。 */
+  .compare-actions { flex-direction: column; }
+  .compare-actions .v-btn { width: 100%; }
+  .tournament-grid { grid-template-columns: repeat(min(var(--tournament-columns, 2), 2), 1fr); gap: 8px; }
+  .tournament-card img { height: auto; aspect-ratio: 4 / 3; min-height: 0; }
+  .photo-grid { grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap: 10px; }
+  .result-grid { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 10px; }
+  .photo-tile__caption { font-size: 11px; padding: 18px 6px 5px; }
+}
+
+/* 縦が短い画面では vh 基準の画像が潰れるので下限を切る。 */
+@media (max-height: 620px) {
+  .compare-pair img { max-height: 46vh; min-height: 180px; }
 }

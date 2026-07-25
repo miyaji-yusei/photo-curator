@@ -4,15 +4,40 @@ version = "0.1.0"
 description = "A human-centered desktop workflow for curating large photo collections"
 authors = []
 edition = "2021"
+# 計測ハーネス bench.rs を追加したことで bin ターゲットが2つになり、
+# `cargo run`（tauri dev が内部で呼ぶ）がどちらを起動するか決められなくなる。
+# required-features を付けていても曖昧さは解消しないため、既定を明示する。
+default-run = "photo-curator"
 
 [lib]
 name = "photo_curator_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# 計測ハーネス。既定ビルドには入らない。
+# `cargo run --features bench --bin bench -- <subcommand>`
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+required-features = ["bench"]
+
+[features]
+# 計測ハーネスの bin ターゲットを有効にするだけ。既定ビルドには入らない。
+bench = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+walkdir = "2"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+kamadak-exif = "0.6"
+uuid = { version = "1", features = ["v4"] }
+# dHash 用の 1/8 IDCT デコード。image 0.25 のバックエンド zune-jpeg は
+# scaled decode を提供しないため、EXIF サムネイルが無い JPEG の
+# フォールバック経路としてこちらを併用する。
+jpeg-decoder = "0.3"

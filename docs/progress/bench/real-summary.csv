@@ -1,0 +1,3 @@
+label,photos,total_ms,walk_ms,scan_fingerprint_ms,scan_db_ms,exif_ms,metadata_db_ms,hash_fingerprint_ms,decode_hash_ms,hash_db_ms,groups_query_ms,groups_build_ms,exif_hits,mtime_fallbacks,burst_candidates,hash_cache_hits,groups,exif_success_pct,burst_candidate_pct,hash_cache_hit_pct,peak_rss_mb,candidate_window_ms,candidate_window_narrowed,weak_pairs_skipped,thumbnail_hits,thumbnail_generated,thumbnail_failures,thumbnail_cache_mb,decode_sources
+real-cold,271,687.1,0.5,11.5,25.8,18.9,4.2,15.6,601.6,8.8,0.2,0.1,271,0,267,0,52,100.00,98.52,0.00,85.8,4000,false,0,0,267,0,1.78,"{""exif_thumbnail"": 260, ""jpeg_scaled"": 7}"
+real-warm,271,59.2,0.5,11.8,27.5,0.0,0.0,9.0,10.2,0.0,0.2,0.1,0,0,267,267,52,0.00,98.52,100.00,85.8,4000,false,0,267,0,0,1.78,{}

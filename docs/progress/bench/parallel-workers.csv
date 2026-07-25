@@ -1,0 +1,5 @@
+workers,total_ms,ms_per_photo,speedup_vs_1,completed,failed,timed_out,peak_working_set_mb
+1,640.5,2.364,1.000,271,0,0,6.4
+2,332.6,1.227,1.926,271,0,0,7.9
+3,241.8,0.892,2.649,271,0,0,9.8
+4,193.3,0.713,3.313,271,0,0,11.7

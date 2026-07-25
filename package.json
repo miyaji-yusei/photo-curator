@@ -11,6 +11,8 @@
     "postinstall": "nuxt prepare",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
+    "tauri:dev:release": "tauri dev --release",
+    "dev:app": "node scripts/tauri-dev.mjs",
     "tauri:build": "tauri build",
     "test": "vitest run",
     "typecheck": "nuxt typecheck"
@@ -19,6 +21,7 @@
     "@mdi/font": "^7.4.47",
     "@pinia/nuxt": "^0.11.0",
     "@tauri-apps/api": "^2.8.0",
+    "@tauri-apps/plugin-dialog": "^2.4.0",
     "nuxt": "^3.17.0",
     "pinia": "^3.0.0",
     "vue": "^3.5.0",
