@@ -6,7 +6,10 @@ body { margin: 0; }
 /* ボタンの間隔は各コンテナの gap / ga-* で付ける。ここで margin を足すと
    二重になるため持たせない。 */
 .project-nav-item { min-height: 54px; }
+/* 一覧の列数。既定は画面幅にまかせる auto-fill で、`is-fixed` が付いたときだけ
+   利用者の選んだ列数に固定する。固定側は @media で打ち消さない。 */
 .photo-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 16px; }
+.photo-grid.is-fixed, .result-grid.is-fixed { grid-template-columns: repeat(var(--grid-columns), minmax(0, 1fr)); }
 .photo-tile { aspect-ratio: 1; overflow: hidden; border-radius: 10px; background: #24272d; position: relative; }
 .photo-tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .photo-tile__caption { position: absolute; left: 0; right: 0; bottom: 0; padding: 22px 8px 7px; font-size: 12px; background: linear-gradient(transparent, rgba(0,0,0,.8)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -68,8 +71,13 @@ body { margin: 0; }
 
 /* 拡大表示 */
 .zoom-overlay__inner { display: grid; place-items: center; gap: 10px; padding: 16px; }
-.zoom-overlay__inner img { max-width: 96vw; max-height: 88vh; object-fit: contain; display: block; }
+/* 送りボタンは写真の左右に置く。写真の上に重ねると、閉じるつもりのクリックが
+   送りに化ける。ボタンぶんの幅を引いた残りが写真の最大幅。 */
+.zoom-overlay__stage { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 8px; }
+.zoom-overlay__stage img { max-width: min(96vw - 120px, 1600px); max-height: 88vh; object-fit: contain; display: block; margin: 0 auto; }
+.zoom-overlay__step { color: #cfd3da; }
 .zoom-overlay__caption { color: #cfd3da; }
+.zoom-overlay__position { background: rgba(255,255,255,.14); border-radius: 999px; padding: 2px 9px; margin-right: 6px; font-weight: 700; }
 
 /* まとめの中身は選別画面と同じ .tournament-grid を使う。
    全画面ダイアログの中なので、上の説明文ぶんだけ高さを譲る。 */
@@ -137,6 +145,27 @@ body { margin: 0; }
 }
 .compare-actions { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; }
 
+/* 星ごとの内訳。1行が1つの星で、そのまま選別や移動の入口になる。 */
+.rating-board { display: flex; flex-direction: column; gap: 8px; }
+.rating-row {
+  display: grid;
+  grid-template-columns: auto auto minmax(80px, 1fr) auto;
+  align-items: center; gap: 16px;
+  padding: 10px 16px; border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, .08); background: #16181d;
+  cursor: pointer; transition: border-color .12s, background .12s;
+}
+.rating-row:hover, .rating-row:focus-visible { border-color: rgba(214,255,115,.5); outline: none; }
+.rating-row.is-active { border-color: rgb(var(--v-theme-primary)); background: #1b1f18; }
+.rating-row__stars { display: inline-flex; }
+.rating-row__count { min-width: 84px; text-align: right; font-variant-numeric: tabular-nums; }
+.rating-row__actions { display: flex; align-items: center; gap: 4px; }
+
+/* 移動ダイアログのタイル。選ばれていないものは沈ませる。 */
+.result-tile.is-unpicked { opacity: .4; }
+.result-tile__pick { position: absolute; top: 6px; left: 6px; z-index: 2; }
+.result-tile { position: relative; }
+
 /* 選別結果の一覧。サムネイルを使うので原本のデコードは発生しない。 */
 .result-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 14px; }
 .result-tile { cursor: pointer; border: 2px solid transparent; border-radius: 10px; overflow: hidden; background: #16181d; }
@@ -162,7 +191,7 @@ body { margin: 0; }
   /* 列を最大3つに抑える。狭い幅で5列にすると1枚が小さくなりすぎる。 */
   .tournament-grid { grid-template-columns: repeat(min(var(--tournament-columns, 3), 3), 1fr); gap: 10px; }
   .tournament-card img { height: calc((100vh - 340px) / var(--tournament-rows, 2)); min-height: 120px; }
-  .photo-grid { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 12px; }
+  .photo-grid:not(.is-fixed) { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 12px; }
 }
 
 /* スマートフォン相当。余白を詰めて写真の面積を優先する。 */
@@ -173,8 +202,9 @@ body { margin: 0; }
   .compare-actions .v-btn { width: 100%; }
   .tournament-grid { grid-template-columns: repeat(min(var(--tournament-columns, 2), 2), 1fr); gap: 8px; }
   .tournament-card img { height: auto; aspect-ratio: 4 / 3; min-height: 0; }
-  .photo-grid { grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap: 10px; }
-  .result-grid { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 10px; }
+  .photo-grid:not(.is-fixed) { grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap: 10px; }
+  .result-grid:not(.is-fixed) { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 10px; }
+  .zoom-overlay__stage img { max-width: calc(96vw - 96px); }
   .photo-tile__caption { font-size: 11px; padding: 18px 6px 5px; }
 }
 

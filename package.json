@@ -7,6 +7,7 @@
   "scripts": {
     "dev": "nuxt dev",
     "build": "nuxt generate",
+    "build:pages": "node scripts/build-pages.mjs",
     "preview": "nuxt preview",
     "postinstall": "nuxt prepare",
     "tauri": "tauri",

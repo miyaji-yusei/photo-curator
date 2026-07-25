@@ -2248,6 +2248,124 @@ fn save_selection_results(
     Ok(())
 }
 
+/// 一時テーブルに入れる id の1回ぶん。SQLite の変数上限（既定 999）より十分小さく取る。
+const ID_BIND_CHUNK: usize = 500;
+
+/// ある星の写真をまとめて別の星へ移す本体。
+///
+/// `include_ids` が `Some` ならその id だけ、`None` なら `exclude_ids` を除いた
+/// **その星の全件**が対象。既定を「除外指定」にしてあるのは、5,000 枚に対して
+/// 「全選択」が既定の UI だから。全件の id を毎回 IPC で送らずに済む。
+///
+/// id は `IN (?, ?, …)` ではなく**一時テーブル経由**で渡す。
+/// 数千件を並べると SQLite の変数上限に当たるため。
+fn move_rating_in(
+    conn: &Connection,
+    project_id: &str,
+    from_rating: i64,
+    to_rating: i64,
+    include_ids: Option<Vec<String>>,
+    exclude_ids: &[String],
+) -> Result<i64, String> {
+    let valid = |rating: i64| (0..=MAX_RATING).contains(&rating);
+    if !valid(from_rating) || !valid(to_rating) {
+        return Err(format!(
+            "レートは 0〜{MAX_RATING} の範囲で指定してください。"
+        ));
+    }
+    // 同じ星への移動は操作として意味が無い。エラーにはせず、何もしない。
+    if from_rating == to_rating {
+        return Ok(0);
+    }
+
+    let transaction = conn
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+
+    // 対象 id の絞り込みは常に「その星・そのプロジェクト・欠損していない」が前提。
+    // 一時テーブルに他プロジェクトの id が混じっても、この条件で弾かれる。
+    let base = "project_id=?1 AND rating=?2 AND is_missing=0";
+    let updated = match include_ids {
+        Some(ids) if ids.is_empty() => 0,
+        Some(ids) => {
+            fill_id_table(&transaction, &ids)?;
+            transaction
+                .execute(
+                    &format!(
+                        "UPDATE photos SET rating=?3
+                         WHERE {base} AND id IN (SELECT id FROM _rating_move)"
+                    ),
+                    params![project_id, from_rating, to_rating],
+                )
+                .map_err(|error| error.to_string())?
+        }
+        None if exclude_ids.is_empty() => transaction
+            .execute(
+                &format!("UPDATE photos SET rating=?3 WHERE {base}"),
+                params![project_id, from_rating, to_rating],
+            )
+            .map_err(|error| error.to_string())?,
+        None => {
+            fill_id_table(&transaction, exclude_ids)?;
+            transaction
+                .execute(
+                    &format!(
+                        "UPDATE photos SET rating=?3
+                         WHERE {base} AND id NOT IN (SELECT id FROM _rating_move)"
+                    ),
+                    params![project_id, from_rating, to_rating],
+                )
+                .map_err(|error| error.to_string())?
+        }
+    };
+
+    // 一時テーブルは接続に紐づくので、次の呼び出しに残さない。
+    transaction
+        .execute("DROP TABLE IF EXISTS temp._rating_move", [])
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(updated as i64)
+}
+
+/// 対象 id を一時テーブルへ入れ直す。前回の中身は必ず捨てる。
+fn fill_id_table(conn: &Connection, ids: &[String]) -> Result<(), String> {
+    conn.execute("DROP TABLE IF EXISTS temp._rating_move", [])
+        .map_err(|error| error.to_string())?;
+    conn.execute("CREATE TEMP TABLE _rating_move (id TEXT PRIMARY KEY)", [])
+        .map_err(|error| error.to_string())?;
+    for chunk in ids.chunks(ID_BIND_CHUNK) {
+        let placeholders = vec!["(?)"; chunk.len()].join(",");
+        conn.execute(
+            &format!("INSERT OR IGNORE INTO _rating_move (id) VALUES {placeholders}"),
+            rusqlite::params_from_iter(chunk.iter()),
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+/// 選別結果の画面から、ある星の写真をまとめて別の星へ移す。
+/// 移した枚数を返す。
+#[tauri::command]
+fn move_rating(
+    app: AppHandle,
+    project_id: String,
+    from_rating: i64,
+    to_rating: i64,
+    include_ids: Option<Vec<String>>,
+    exclude_ids: Vec<String>,
+) -> Result<i64, String> {
+    let conn = connection(&app)?;
+    move_rating_in(
+        &conn,
+        &project_id,
+        from_rating,
+        to_rating,
+        include_ids,
+        &exclude_ids,
+    )
+}
+
 /// 星を全部 0 に戻す。解析結果（d_hash やサムネイル）には触れないので、
 /// やり直しても解析のやり直しにはならない。
 #[tauri::command]
@@ -2624,6 +2742,14 @@ fn get_photos_by_ids(
         .collect())
 }
 
+/// 選別の並び順。**ここが返す順序が、そのまま選別画面の並びになる。**
+///
+/// 似た構図は撮影時刻が近いので、撮影順に並べると「その中の1枚を選ぶ」比較が
+/// 同じ場面どうしになる。以前は `ORDER BY id`（= UUID なので実質ランダム）で、
+/// さらにフロント側でシャッフルしていた。
+/// 撮影日時の無い写真は末尾へ回し、その中はファイル順で安定させる。
+const SELECTION_SEED_ORDER: &str = " ORDER BY captured_at IS NULL, captured_at, relative_path";
+
 /// 選別に出す写真。`rating` を指定するとその星の写真だけを返す。
 /// 「★3 の 120 枚を選別する」という使い方をするので、対象は星で決まる。
 #[tauri::command]
@@ -2640,7 +2766,7 @@ fn get_selection_seed(
     };
     let mut statement = conn
         .prepare(&format!(
-            "SELECT id,rating FROM photos WHERE project_id=?1 AND is_missing=0{where_extra} ORDER BY id"
+            "SELECT id,rating FROM photos WHERE project_id=?1 AND is_missing=0{where_extra}{SELECTION_SEED_ORDER}"
         ))
         .map_err(|error| error.to_string())?;
     let rows = statement
@@ -3080,6 +3206,7 @@ pub fn run() {
             get_selection_seed,
             save_selection_results,
             reset_selection_results,
+            move_rating,
             get_selection_summary,
             export_by_rating,
             write_ratings_to_files,
@@ -5015,6 +5142,223 @@ mod tests {
         assert_eq!(ids(Some(5)), vec!["five"]);
         assert_eq!(ids(Some(0)), vec!["zero"]);
         assert_eq!(ids(None).len(), 4);
+
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    /// 選別の並びは撮影順。似た構図は撮影時刻が近いので、この並びのまま
+    /// グループに切ると「同じ場面から1枚選ぶ」比較になる。
+    /// 撮影日時の無い写真は末尾へ回し、その中はファイル順で安定させる。
+    #[test]
+    fn selection_seed_is_ordered_by_capture_time() {
+        let directory = test_directory("seed-order");
+        let conn = open_database(&directory.join("seed.sqlite3")).expect("open database");
+        conn.execute(
+            "INSERT INTO projects (id,name,folder_path,photo_count,status,created_at,updated_at)
+             VALUES ('p1','p1','C:/photos',5,'ready',1,1)",
+            [],
+        )
+        .expect("insert project");
+
+        // id 順・ファイル名順・挿入順のどれとも食い違う撮影順にする。
+        // どれか1つでも一致していると、間違った ORDER BY を素通りさせてしまう。
+        let insert = |id: &str, relative: &str, captured: Option<i64>| {
+            conn.execute(
+                "INSERT INTO photos (id,project_id,path,relative_path,name,captured_at,rating,is_missing)
+                 VALUES (?1,'p1',?2,?3,?3,?4,0,0)",
+                params![id, format!("C:/photos/{relative}"), relative, captured],
+            )
+            .expect("insert photo");
+        };
+        insert("id-a", "2-third.jpg", Some(300));
+        insert("id-y", "b-no-time.jpg", None);
+        insert("id-z", "3-first.jpg", Some(100));
+        insert("id-b", "c-no-time.jpg", None);
+        insert("id-m", "1-second.jpg", Some(200));
+
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT id FROM photos WHERE project_id=?1 AND is_missing=0{SELECTION_SEED_ORDER}"
+            ))
+            .expect("prepare");
+        let ids: Vec<String> = statement
+            .query_map(params!["p1"], |row| row.get(0))
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect");
+
+        assert_eq!(
+            ids,
+            vec!["id-z", "id-m", "id-a", "id-y", "id-b"],
+            "撮影順。日時の無い2枚は末尾で、その中はファイル順"
+        );
+
+        drop(statement);
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    // ---- レートの移動 ----------------------------------------------------
+
+    #[test]
+    fn moving_a_rating_only_touches_the_source_star() {
+        let directory = test_directory("move-rating");
+        let path = directory.join("move.sqlite3");
+        let conn = rated_fixture(&path);
+
+        // ★3 の 2 枚をまるごと ★5 へ。
+        let moved = move_rating_in(&conn, "p1", 3, 5, None, &[]).expect("move");
+        assert_eq!(moved, 2);
+
+        let count = |rating: i64| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM photos WHERE project_id='p1' AND rating=?1",
+                params![rating],
+                |row| row.get(0),
+            )
+            .expect("count")
+        };
+        assert_eq!(count(3), 0, "元の星は空になる");
+        assert_eq!(count(5), 3, "元から★5 の1枚に2枚が合流する");
+        assert_eq!(count(0), 1, "他の星は動かない");
+
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn excluded_photos_stay_where_they_are() {
+        let directory = test_directory("move-exclude");
+        let conn = rated_fixture(&directory.join("ex.sqlite3"));
+
+        let moved =
+            move_rating_in(&conn, "p1", 3, 1, None, &["three-b".to_string()]).expect("move");
+        assert_eq!(moved, 1);
+
+        let rating = |id: &str| -> i64 {
+            conn.query_row(
+                "SELECT rating FROM photos WHERE id=?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .expect("read rating")
+        };
+        assert_eq!(rating("three"), 1);
+        assert_eq!(rating("three-b"), 3, "除外した写真は元の星に残る");
+
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn include_ids_move_only_those_photos() {
+        let directory = test_directory("move-include");
+        let conn = rated_fixture(&directory.join("in.sqlite3"));
+
+        let include = Some(vec!["three-b".to_string()]);
+        let moved = move_rating_in(&conn, "p1", 3, 2, include, &[]).expect("move");
+        assert_eq!(moved, 1);
+
+        let rating = |id: &str| -> i64 {
+            conn.query_row(
+                "SELECT rating FROM photos WHERE id=?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .expect("read rating")
+        };
+        assert_eq!(rating("three-b"), 2);
+        assert_eq!(rating("three"), 3, "指定しなかった写真は動かない");
+
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn moving_never_leaves_the_project_or_the_source_star() {
+        let directory = test_directory("move-scope");
+        let conn = rated_fixture(&directory.join("scope.sqlite3"));
+        conn.execute(
+            "INSERT INTO projects (id,name,folder_path,photo_count,status,created_at,updated_at)
+             VALUES ('p2','p2','C:/other',1,'ready',1,1)",
+            [],
+        )
+        .expect("insert other project");
+        insert_rated_photo(&conn, "p2", "other-three", "other.jpg", 3);
+
+        // include_ids に他プロジェクトの写真を混ぜても動かない。
+        let include = Some(vec!["other-three".to_string(), "three".to_string()]);
+        let moved = move_rating_in(&conn, "p1", 3, 4, include, &[]).expect("move");
+        assert_eq!(moved, 1);
+
+        let rating = |id: &str| -> i64 {
+            conn.query_row(
+                "SELECT rating FROM photos WHERE id=?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .expect("read rating")
+        };
+        assert_eq!(rating("other-three"), 3, "別プロジェクトには触れない");
+        assert_eq!(rating("five"), 5, "元の星が違う写真も動かない");
+
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn moving_to_the_same_star_or_out_of_range_is_rejected() {
+        let directory = test_directory("move-guard");
+        let conn = rated_fixture(&directory.join("guard.sqlite3"));
+
+        assert_eq!(
+            move_rating_in(&conn, "p1", 3, 3, None, &[]).expect("same star"),
+            0,
+            "同じ星への移動は何もしない"
+        );
+        assert!(move_rating_in(&conn, "p1", 3, MAX_RATING + 1, None, &[]).is_err());
+        assert!(move_rating_in(&conn, "p1", -1, 3, None, &[]).is_err());
+
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    /// id を `IN (?, ?, …)` で渡すと SQLite の変数上限に当たる。
+    /// 一時テーブル経由にしてあることを、上限を超える件数で確かめる。
+    #[test]
+    fn moving_handles_more_ids_than_sqlite_allows_as_parameters() {
+        let directory = test_directory("move-many");
+        let conn = open_database(&directory.join("many.sqlite3")).expect("open database");
+        conn.execute(
+            "INSERT INTO projects (id,name,folder_path,photo_count,status,created_at,updated_at)
+             VALUES ('p1','p1','C:/photos',1500,'ready',1,1)",
+            [],
+        )
+        .expect("insert project");
+        for index in 0..1500 {
+            insert_rated_photo(
+                &conn,
+                "p1",
+                &format!("id-{index}"),
+                &format!("{index}.jpg"),
+                2,
+            );
+        }
+
+        // 1 枚だけ残して、残り 1,499 枚を明示指定で動かす。
+        let include: Vec<String> = (0..1499).map(|index| format!("id-{index}")).collect();
+        let moved = move_rating_in(&conn, "p1", 2, 4, Some(include), &[]).expect("move many");
+        assert_eq!(moved, 1499);
+
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM photos WHERE project_id='p1' AND rating=2",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(left, 1);
 
         drop(conn);
         fs::remove_dir_all(&directory).expect("remove test directory");

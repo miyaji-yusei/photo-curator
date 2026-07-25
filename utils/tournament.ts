@@ -127,12 +127,21 @@ export function setBurstRepresentative(session: SelectionSession, currentId: str
   return session
 }
 
+/**
+ * 候補を `groupSize` ずつ切ってラウンドを組む。
+ *
+ * **並べ替えはしない。** `candidates` は `get_selection_seed` が撮影順で返したもので、
+ * その順序自体が「似た構図を隣り合わせる」という意味を持っている。
+ * 以前はここで `seededShuffle` を掛けていたため、同じ場面の写真が別々のグループに
+ * ばらけて比較にならなかった。
+ *
+ * 2ラウンド目以降も順序は保たれる。`survivors` はグループ順に push され、
+ * `groups` は `candidates` 順に切られるため。
+ */
 export function prepareRound(session: SelectionSession) {
-  const shuffled = seededShuffle(session.candidates, session.seed ?? Date.now())
-  session.seed = shuffled.seed
   const multiPhotoGroups: string[][] = []
-  for (let index = 0; index < shuffled.items.length; index += session.settings.groupSize) {
-    const group = shuffled.items.slice(index, index + session.settings.groupSize)
+  for (let index = 0; index < session.candidates.length; index += session.settings.groupSize) {
+    const group = session.candidates.slice(index, index + session.settings.groupSize)
     if (group.length > 1) multiPhotoGroups.push(group)
     else session.survivors.push(...group)
   }
@@ -143,6 +152,23 @@ export function prepareRound(session: SelectionSession) {
   session.history = []
   session.stage = 'tournament'
   return session
+}
+
+/**
+ * グループを確定するときに通す写真を決める。
+ *
+ * 明示的に選んだ写真（`selectedInGroup`）に加え、そのグループで★5に
+ * **確定**した写真も必ず通す。確定は複数枚選択中にトグルで付けられるので、
+ * 選択とは別に拾わないと、確定した写真が「選択なしで次へ」で落ちてしまう。
+ */
+export function resolveChosen(
+  selectedInGroup: string[],
+  group: string[],
+  ratings: Record<string, number>,
+  maxRating: number
+): string[] {
+  const confirmed = group.filter(id => (ratings[id] ?? 0) >= maxRating)
+  return [...new Set([...selectedInGroup, ...confirmed])]
 }
 
 /**

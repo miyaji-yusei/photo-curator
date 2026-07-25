@@ -1,0 +1,65 @@
+# GitHub Pages へ配信する。
+#
+# 配信するのは静的ファイルだけで、サーバー側の処理は無い。写真も星も
+# 利用者の端末（IndexedDB）に留まり、ここには一切上がらない。
+#
+# 公開前に Settings → Pages の Source を "GitHub Actions" にしておくこと。
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  # 手動でも流せるようにしておく。
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 走っているデプロイを打ち消さない。並んだら順に流す。
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # packageManager フィールドから pnpm の版を読む。
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # 壊れたものを配信しないための関門。落ちたらデプロイまで進まない。
+      - run: pnpm typecheck
+      - run: pnpm test
+
+      # サブパス配信用に base URL を差し替えてビルドする。
+      - run: pnpm build:pages
+
+      # Actions 経由の配信では Jekyll は動かないが、将来ブランチ配信へ
+      # 切り替えても `_nuxt/` が無視されないように置いておく。
+      - run: touch .output/public/.nojekyll
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: .output/public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

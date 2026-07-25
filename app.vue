@@ -4,14 +4,27 @@ import type {
   SelectionResult, SelectionSession, SelectionSummary, TournamentSettings
 } from '~/types/photo'
 import { MAX_RATING } from '~/types/photo'
+import type { MoveSelection } from '~/utils/ratingMove'
+// `selectedCount` は選別画面側の computed と名前がぶつかるので別名にする。
+import {
+  createMoveSelection, isSelected as isMovePicked, selectedCount as countMoveSelection,
+  setSelectAll, toMoveArgs, toggleSelection
+} from '~/utils/ratingMove'
 import {
   collapseBursts,
   makeSession,
   prepareRound,
   regroupRemaining,
+  resolveChosen,
   setBurstRepresentative,
   undoLastStep
 } from '~/utils/tournament'
+import { clampGroupSize, groupSizeLimits } from '~/utils/groupSize'
+import type { ShortcutRow } from '~/utils/shareExport'
+import {
+  SHARE_FILE_LIMIT, buildShortcutPayload, downloadBlob, runShortcut, shareFiles, zipEntriesByRating
+} from '~/utils/shareExport'
+import { createStoredZip } from '~/utils/zip'
 import {
   DEFAULT_THRESHOLD_OPTIONS,
   MAX_HASH_DISTANCE,
@@ -44,7 +57,14 @@ const taskDialog = ref(false)
 const analysisProgress = ref<ProjectProgress | null>(null)
 const analysisFailures = ref(0)
 const pendingTournamentSettings = ref<TournamentSettings | null>(null)
-const settings = reactive<TournamentSettings>({ groupSize: 10, groupBursts: false })
+/**
+ * 1 グループの枚数の既定と上限。デスクトップは 10 枚、iPad などブラウザは
+ * 画面が狭く指で選ぶので既定 4 枚（2×2）・上限 9 枚（3×3）にする。
+ */
+const groupLimits = groupSizeLimits(desktop.isDesktop())
+const settings = reactive<TournamentSettings>({ groupSize: groupLimits.default, groupBursts: false })
+/** キーボードが無い環境ではショートカットの案内を出さない。 */
+const isTouchOnly = computed(() => !desktop.isDesktop())
 let stopProgressListener: (() => void) | undefined
 
 // 狭い画面ではドロワーを常設しない。
@@ -115,6 +135,26 @@ const hasSelectionData = computed(() => {
 })
 const ratingCount = (rating: number) => selectionSummary.value?.counts[rating] ?? 0
 
+// レートの移動
+const moveDialog = ref(false)
+const moveFrom = ref(0)
+const moveTo = ref(0)
+const moveBusy = ref(false)
+const movePhotos = ref<Photo[]>([])
+const moveTotal = ref(0)
+const moveOffset = ref(0)
+/** ダイアログ内に出すエラー。画面上部に出すとモーダルに隠れて気づけない。 */
+const moveError = ref('')
+/** 移動が終わったことを画面上部で知らせる。 */
+const moveReport = ref('')
+/**
+ * 既定は「全選択」。個別のチェックは**ここからの差分**だけを持つ。
+ * 5,000 枚の id を並べて持たないための形。詳細は `utils/ratingMove.ts`。
+ */
+const moveSelection = ref<MoveSelection>(createMoveSelection())
+const moveSelectedCount = computed(() => countMoveSelection(moveSelection.value, moveTotal.value))
+const isMoveSelected = (photoId: string) => isMovePicked(moveSelection.value, photoId)
+
 // 書き出し
 const exportDialog = ref(false)
 const exportMode = ref<'copy' | 'move'>('copy')
@@ -131,8 +171,36 @@ const metadataBusy = ref(false)
 const metadataAcknowledged = ref(false)
 const metadataResult = ref<ExportReport | null>(null)
 
+// ブラウザからライブラリへ渡す 3 つの出口（共有シート / ZIP / Shortcuts）。
+const shareDialog = ref(false)
+const shareRatings = ref<number[]>([MAX_RATING])
+const shareBusy = ref(false)
+const shareError = ref('')
+const shareMessage = ref('')
+/** 利用者が iPad に入れておくショートカットの名前。 */
+const shortcutName = ref('写真をお気に入りに')
+
 // 拡大表示・まとめの展開
 const zoomPhoto = ref<Photo | null>(null)
+/** 拡大中に ← → で辿れる一覧。開いた場所に並んでいた写真をそのまま入れる。 */
+const zoomList = ref<Photo[]>([])
+
+// 一覧の列数。`'auto'` は今までどおり画面幅にまかせる。
+// null ではなく文字列にしてあるのは、mandatory な v-btn-toggle が null を
+// 「未選択」と解釈して、勝手に先頭の 3 列へ寄せてしまうため。
+type GridDensity = 3 | 5 | 8 | 'auto'
+const densityOptions: { value: GridDensity, icon: string, label: string }[] = [
+  { value: 3, icon: 'mdi-view-grid-outline', label: '3列' },
+  { value: 5, icon: 'mdi-view-comfy-outline', label: '5列' },
+  { value: 8, icon: 'mdi-view-module-outline', label: '8列' },
+  { value: 'auto', icon: 'mdi-view-dashboard-variant-outline', label: '自動' }
+]
+const previewDensity = ref<GridDensity>('auto')
+const resultsDensity = ref<GridDensity>('auto')
+const moveDensity = ref<GridDensity>('auto')
+const gridClass = (density: GridDensity) => (density === 'auto' ? '' : 'is-fixed')
+const gridStyle = (density: GridDensity) =>
+  density === 'auto' ? undefined : { '--grid-columns': String(density) }
 const burstDialog = ref(false)
 const burstOwner = ref<Photo | null>(null)
 const burstPhotos = ref<Photo[]>([])
@@ -186,7 +254,8 @@ function statusLabel(project: Project) {
 }
 
 async function refreshProjects() {
-  if (desktop.isDesktop()) projects.value = await desktop.listProjects()
+  // デスクトップは PC の DB、ブラウザは端末内の DB。どちらも一覧を返す。
+  projects.value = await desktop.listProjects()
 }
 
 async function loadPreview(projectId: string) {
@@ -238,16 +307,56 @@ async function chooseFolder() {
   }
 }
 
+/**
+ * 写真ライブラリから取り込める環境か。ブラウザはフォルダを走査できないので、
+ * 代わりに写真ピッカーから受け取る。
+ */
+const canImportPhotos = computed(() => typeof desktop.importPhotos === 'function')
+const photoInput = ref<HTMLInputElement | null>(null)
+
+function openPhotoPicker() {
+  // 同じ写真を選び直せるよう、開く前に値を捨てる。
+  if (photoInput.value) photoInput.value.value = ''
+  photoInput.value?.click()
+}
+
+/** ピッカーで選ばれた写真を取り込み、そのまま解析まで進める。 */
+async function onPhotoPicked(event: Event) {
+  const input = event.target as HTMLInputElement
+  const files = Array.from(input.files ?? [])
+  if (!files.length || !activeProject.value || !desktop.importPhotos) return
+  taskWarning.value = null
+  taskProgress.value = {
+    projectId: activeProject.value.id, task: 'scan', phase: 'indexing',
+    processed: 0, total: files.length, message: '写真を読み込んでいます…', warning: null, failed: 0
+  }
+  taskDialog.value = true
+  try {
+    await desktop.importPhotos(activeProject.value.id, files)
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : '写真を取り込めませんでした。'
+  } finally {
+    taskDialog.value = false
+    await refreshProjects()
+    activeProject.value = projects.value.find(item => item.id === activeProject.value?.id) ?? activeProject.value
+    if (activeProject.value) await loadPreview(activeProject.value.id)
+  }
+}
+
 async function createProject() {
-  if (!folderPath.value) return
+  // ブラウザではフォルダを選べない。名前だけ決めて作り、続けて写真を選ばせる。
+  if (!canImportPhotos.value && !folderPath.value) return
   loading.value = true
   try {
-    const project = await desktop.createProject(projectName.value.trim() || fileName(folderPath.value), folderPath.value)
+    const fallbackName = folderPath.value ? fileName(folderPath.value) : '新しいプロジェクト'
+    const project = await desktop.createProject(projectName.value.trim() || fallbackName, folderPath.value)
     createDialog.value = false
     projectName.value = ''
     folderPath.value = ''
     await refreshProjects()
     await openProject(project)
+    // 作った直後に写真を選ばせる。空のプロジェクトだけ残しても何もできない。
+    if (canImportPhotos.value) openPhotoPicker()
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : 'プロジェクトを作成できませんでした。'
   } finally {
@@ -275,7 +384,7 @@ function enterMethod() {
 
 function openSettings() {
   const prior = session.value?.settings
-  settings.groupSize = prior?.groupSize ?? 10
+  settings.groupSize = clampGroupSize(prior?.groupSize ?? groupLimits.default, groupLimits)
   settings.groupBursts = prior?.groupBursts ?? false
   view.value = 'settings'
 }
@@ -477,8 +586,9 @@ async function toggleChoice(photoId: string) {
  */
 async function confirmChoices() {
   if (!session.value) return
-  const chosen = [...session.value.selectedInGroup]
   const group = [...currentGroup.value]
+  // 選択した写真に加え、このグループで★5に確定した写真も通す。
+  const chosen = resolveChosen(session.value.selectedInGroup, group, session.value.ratings, MAX_RATING)
   session.value.history.push({ groupIndex: session.value.groupIndex, chosen })
   for (const id of chosen) {
     session.value.survivors.push(id)
@@ -528,18 +638,47 @@ async function skipGroup() {
 /**
  * 迷う必要のない1枚を「確定」にする。最高レーティングを付けて通し、
  * 以降のラウンドでは判定に出さない。
+ *
+ * 複数枚選択中は**トグル**として振る舞う。★5 を付け外しするだけで
+ * 次の選別へは進まないので、同じグループの他の写真もそのまま選び続けられる。
+ * 決定（Enter）を押すまでグループは確定しない。
+ * 単数選択のときは、その1枚を確定して即座に次へ進む（従来どおり）。
  */
 async function confirmPhoto(photoId: string) {
   if (!session.value) return
-  // 星を一気に最大へ。★5 は以降どの星の選別にも出てこないので、
-  // 「確定」という別状態を持たなくてよい。
+  if (session.value.multiSelect) {
+    // ラウンド開始時、表示中の写真の星はすべて targetRating。だから確定を
+    // 外したら targetRating に戻す。★5 は以降どの星の選別にも出てこないので、
+    // 「確定」という別状態を持たずに星だけで表せる。
+    session.value.ratings[photoId] = isConfirmed(photoId)
+      ? session.value.targetRating
+      : MAX_RATING
+    await saveSession()
+    return
+  }
   session.value.ratings[photoId] = MAX_RATING
   session.value.selectedInGroup = [photoId]
   await confirmChoices()
 }
 
-function openZoom(photo: Photo | null) {
-  if (photo) zoomPhoto.value = photo
+/**
+ * 拡大表示を開く。`list` にその写真が並んでいた一覧を渡すと、
+ * 拡大したまま ← → で前後の写真へ移れる。
+ */
+function openZoom(photo: Photo | null, list: Photo[] = []) {
+  if (!photo) return
+  zoomPhoto.value = photo
+  zoomList.value = list.length ? [...list] : [photo]
+}
+
+const zoomIndex = computed(() =>
+  zoomPhoto.value ? zoomList.value.findIndex(item => item.id === zoomPhoto.value!.id) : -1
+)
+
+/** 拡大中に前後へ移る。行き先が無ければ**動かないだけ**で、拡大は閉じない。 */
+function stepZoom(step: number) {
+  const next = zoomList.value[zoomIndex.value + step]
+  if (next) zoomPhoto.value = next
 }
 
 /** まとめられた連写の中身を開く。代表の差し替えもここから。 */
@@ -591,7 +730,7 @@ async function applyGroupSize(size: number) {
 }
 
 function openNextRoundDialog(rating: number) {
-  nextRoundGroupSize.value = session.value?.settings.groupSize ?? 10
+  nextRoundGroupSize.value = clampGroupSize(session.value?.settings.groupSize ?? groupLimits.default, groupLimits)
   nextRoundRating.value = rating
   nextRoundDialog.value = true
 }
@@ -742,8 +881,213 @@ async function loadResultsPage(reset = false) {
   }
 }
 
+// ---- レートの移動 --------------------------------------------------------
+
+/**
+ * ある星の写真をまとめて別の星へ移す。
+ *
+ * 選択状態は id の集合ではなく **「全選択からの差分」** で持つ。
+ * 既定が全選択なので、id を並べる持ち方だと開いた瞬間に 5,000 件をフロントへ
+ * 載せることになる。差分なら、利用者が実際に触った枚数しか持たない。
+ * 「全解除」を押すと `moveSelectAll` が反転し、差分の意味も反転する。
+ */
+function openMoveDialog(rating: number) {
+  moveFrom.value = rating
+  // 移動先の初期値は、上限に居るときだけ1つ下。それ以外は1つ上。
+  moveTo.value = rating >= MAX_RATING ? rating - 1 : rating + 1
+  moveSelection.value = createMoveSelection()
+  movePhotos.value = []
+  moveOffset.value = 0
+  moveTotal.value = 0
+  moveError.value = ''
+  moveDialog.value = true
+  void loadMovePage(true)
+}
+
+async function loadMovePage(reset = false) {
+  if (!activeProject.value) return
+  moveBusy.value = true
+  try {
+    if (reset) {
+      moveOffset.value = 0
+      movePhotos.value = []
+    }
+    const page = await desktop.getProjectPhotoPage(
+      activeProject.value.id, moveOffset.value, 80, moveFrom.value, 'name'
+    )
+    movePhotos.value = [...movePhotos.value, ...page.photos]
+    moveTotal.value = page.total
+    moveOffset.value += page.photos.length
+  } catch (cause) {
+    moveError.value = cause instanceof Error ? cause.message : '写真を読み込めませんでした。'
+  } finally {
+    moveBusy.value = false
+  }
+}
+
+function toggleMoveSelection(photoId: string) {
+  moveSelection.value = toggleSelection(moveSelection.value, photoId)
+}
+
+/** 全選択・全解除は、差分の基準そのものを切り替える。 */
+function setMoveSelectAll(all: boolean) {
+  moveSelection.value = setSelectAll(all)
+}
+
+async function runMove() {
+  if (!activeProject.value || moveFrom.value === moveTo.value) return
+  moveBusy.value = true
+  moveError.value = ''
+  const { includeIds, excludeIds } = toMoveArgs(moveSelection.value)
+  try {
+    const moved = await desktop.moveRating(
+      activeProject.value.id, moveFrom.value, moveTo.value, includeIds, excludeIds
+    )
+    // 進行中のセッションが持つ星も合わせる。移した写真が分かるとき（明示指定）
+    // だけメモリ上を直し、それ以外は件数を読み直すことで整合を取る。
+    if (session.value && includeIds) {
+      for (const id of includeIds) session.value.ratings[id] = moveTo.value
+      await saveSession()
+    }
+    moveDialog.value = false
+    await loadSummary()
+    if (view.value === 'results') await loadResultsPage(true)
+    error.value = ''
+    moveReport.value = `${moved.toLocaleString()} 枚を ★${moveFrom.value} から ★${moveTo.value} へ移しました。`
+  } catch (cause) {
+    moveError.value = cause instanceof Error ? cause.message : 'レートを移動できませんでした。'
+  } finally {
+    moveBusy.value = false
+  }
+}
+
+// ---- ライブラリへの反映（ブラウザ） --------------------------------------
+
+/**
+ * 書き出しの対象を集める。
+ *
+ * **原本はこのセッションで取り込んだぶんしか手元に無い。** iOS には永続的な
+ * ファイルハンドルが無いため、リロードすると参照が切れる。書き出せる枚数と
+ * 全体の枚数を分けて返し、画面で差を伝える。
+ */
+async function collectShareCandidates() {
+  const project = activeProject.value
+  if (!project) return { rows: [], files: [], missing: 0 }
+  const rows: { name: string, rating: number, capturedAt: number | null, file: File }[] = []
+  let missing = 0
+  for (const rating of [...shareRatings.value].sort((left, right) => right - left)) {
+    let offset = 0
+    for (;;) {
+      const page = await desktop.getProjectPhotoPage(project.id, offset, 200, rating, 'name')
+      for (const photo of page.photos) {
+        const file = desktop.originalFile?.(photo.id) ?? null
+        if (file) rows.push({ name: photo.name, rating: photo.rating, capturedAt: photo.capturedAt, file })
+        else missing += 1
+      }
+      offset += page.photos.length
+      if (!page.photos.length || offset >= page.total) break
+    }
+  }
+  return { rows, files: rows.map(row => row.file), missing }
+}
+
+/** 選んだ写真を共有シートに渡す。写真アプリには重複として入る。 */
+async function shareSelectedPhotos() {
+  shareBusy.value = true
+  shareError.value = ''
+  shareMessage.value = ''
+  try {
+    const { files, missing } = await collectShareCandidates()
+    if (!files.length) {
+      shareError.value = missing
+        ? 'この端末に原本が残っていません。写真を選び直してから書き出してください。'
+        : '対象の写真がありません。'
+      return
+    }
+    if (files.length > SHARE_FILE_LIMIT) {
+      shareError.value = `一度に共有できるのは ${SHARE_FILE_LIMIT} 枚までです。ZIP で書き出してください。`
+      return
+    }
+    const outcome = await shareFiles(files, `★${shareRatings.value.join('・')} の写真`)
+    if (outcome === 'unsupported') shareError.value = 'この端末では共有シートを開けませんでした。ZIP で書き出してください。'
+    else if (outcome === 'shared') shareMessage.value = `${files.length} 枚を共有シートに渡しました。`
+  } catch (cause) {
+    shareError.value = cause instanceof Error ? cause.message : '共有できませんでした。'
+  } finally {
+    shareBusy.value = false
+  }
+}
+
+/** 星ごとのフォルダに分けた ZIP を書き出す。 */
+async function exportZipByRating() {
+  shareBusy.value = true
+  shareError.value = ''
+  shareMessage.value = ''
+  try {
+    const { rows, missing } = await collectShareCandidates()
+    if (!rows.length) {
+      shareError.value = missing
+        ? 'この端末に原本が残っていません。写真を選び直してから書き出してください。'
+        : '対象の写真がありません。'
+      return
+    }
+    const zip = await createStoredZip(zipEntriesByRating(rows.map(row => ({
+      name: row.name, rating: row.rating, blob: row.file, modifiedAt: row.file.lastModified
+    }))))
+    const stamp = new Date().toISOString().slice(0, 10)
+    downloadBlob(zip, `photo-curator-${stamp}.zip`)
+    shareMessage.value = `${rows.length} 枚を ZIP にしました${missing ? `（原本の無い ${missing} 枚は除いています）` : ''}。`
+  } catch (cause) {
+    shareError.value = cause instanceof Error ? cause.message : 'ZIP を作れませんでした。'
+  } finally {
+    shareBusy.value = false
+  }
+}
+
+/**
+ * 一覧をクリップボードに入れてショートカットを起動する。
+ * 写真アプリのお気に入り（♡）やアルバムに反映できる唯一の経路。
+ */
+async function runFavoriteShortcut() {
+  const project = activeProject.value
+  if (!project) return
+  shareBusy.value = true
+  shareError.value = ''
+  shareMessage.value = ''
+  try {
+    const rows: ShortcutRow[] = []
+    for (const rating of [...shareRatings.value].sort((left, right) => right - left)) {
+      let offset = 0
+      for (;;) {
+        const page = await desktop.getProjectPhotoPage(project.id, offset, 200, rating, 'name')
+        // 原本が無くてもファイル名は残っているので、こちらは全件渡せる。
+        for (const photo of page.photos) {
+          rows.push({ name: photo.name, rating: photo.rating, capturedAt: photo.capturedAt })
+        }
+        offset += page.photos.length
+        if (!page.photos.length || offset >= page.total) break
+      }
+    }
+    if (!rows.length) {
+      shareError.value = '対象の写真がありません。'
+      return
+    }
+    const started = await runShortcut(shortcutName.value.trim(), buildShortcutPayload(rows))
+    shareMessage.value = started
+      ? `${rows.length} 枚の一覧をコピーし、ショートカット「${shortcutName.value.trim()}」を呼び出しました。`
+      : ''
+    if (!started) shareError.value = 'クリップボードに書き込めませんでした。ショートカットは起動していません。'
+  } catch (cause) {
+    shareError.value = cause instanceof Error ? cause.message : 'ショートカットを起動できませんでした。'
+  } finally {
+    shareBusy.value = false
+  }
+}
+
 async function resumeSession() {
   if (!session.value) return openSettings()
+  // 別の環境で作られたセッションは、この端末の上限を超える枚数を持ちうる。
+  session.value.settings.groupSize = clampGroupSize(session.value.settings.groupSize, groupLimits)
   await enterStage()
 }
 
@@ -776,7 +1120,7 @@ async function confirmDeleteProject() {
 }
 
 function openGroupSizeDialog() {
-  pendingGroupSize.value = session.value?.settings.groupSize ?? 10
+  pendingGroupSize.value = clampGroupSize(session.value?.settings.groupSize ?? groupLimits.default, groupLimits)
   groupSizeDialog.value = true
 }
 
@@ -844,17 +1188,19 @@ function onKeydown(event: KeyboardEvent) {
   if (!photo) return
 
   event.preventDefault()
-  if (event.ctrlKey || event.metaKey) openZoom(photo)
+  if (event.ctrlKey || event.metaKey) openZoom(photo, tournamentPhotos.value)
   else if (event.shiftKey) void confirmPhoto(photo.id)
   else if (event.altKey) void openBurst(photo)
   else void toggleChoice(photo.id)
 }
 
-/** 拡大表示は、どのキーでも閉じる。 */
+/** 拡大表示は、左右キーだけ前後送りに使い、それ以外のキーでは閉じる。 */
 function onZoomKeydown(event: KeyboardEvent) {
   if (!zoomPhoto.value) return
   event.preventDefault()
   event.stopPropagation()
+  if (event.key === 'ArrowLeft') { stepZoom(-1); return }
+  if (event.key === 'ArrowRight') { stepZoom(1); return }
   zoomPhoto.value = null
 }
 
@@ -974,6 +1320,7 @@ onBeforeUnmount(() => {
           <v-progress-linear :model-value="analysisValue" :indeterminate="!analysisProgress?.total" color="primary" height="6" rounded class="mt-2" />
         </v-alert>
         <v-alert v-if="taskWarning" type="info" variant="tonal" density="compact" closable class="mb-5" @click:close="taskWarning = null">{{ taskWarning }}</v-alert>
+        <v-alert v-if="moveReport" type="success" variant="tonal" density="compact" closable class="mb-5" @click:close="moveReport = ''">{{ moveReport }}</v-alert>
         <!-- 1枚も解析できなくても選別は続けられる。件数だけ伝えて先へ進ませる。 -->
         <v-alert v-if="analysisFailures" type="warning" variant="tonal" density="compact" closable class="mb-5" @click:close="analysisFailures = 0">
           {{ analysisFailures.toLocaleString() }} 件を解析できませんでした。該当の写真は連写のまとめ対象から外れますが、選別はこのまま続けられます。
@@ -990,9 +1337,14 @@ onBeforeUnmount(() => {
         </template>
 
         <template v-else-if="view === 'project' && activeProject">
-          <div class="d-flex align-center justify-space-between flex-wrap ga-4 mb-7"><div><v-btn variant="text" prepend-icon="mdi-arrow-left" class="px-0" @click="view = 'home'">ホーム</v-btn><h1 class="text-h4 font-weight-bold">{{ activeProject.name }}</h1><p class="text-body-2 text-medium-emphasis mt-1">{{ activeProject.folderPath }}</p></div><div class="d-flex flex-wrap ga-2"><v-btn variant="text" prepend-icon="mdi-delete-outline" @click="askDeleteProject(activeProject)">削除</v-btn><v-btn v-if="hasSelectionData" variant="text" prepend-icon="mdi-star-outline" @click="openResults">選別結果を見る</v-btn><v-btn variant="outlined" prepend-icon="mdi-refresh" :loading="scanRunning" @click="startScan">写真を再読み込み</v-btn><v-btn color="primary" prepend-icon="mdi-play" :disabled="!activeProject.photoCount" @click="session ? resumeSession() : enterMethod()">{{ session ? '選別を再開' : '選別を開始' }}</v-btn></div></div>
-          <v-card class="mb-6"><v-card-text class="d-flex align-center ga-5"><v-avatar color="primary" size="50"><v-icon color="black" icon="mdi-image-multiple" /></v-avatar><div><div class="text-h6">{{ activeProject.photoCount.toLocaleString() }} 枚の写真</div><div class="text-body-2 text-medium-emphasis">サブフォルダも含めて参照します。写真ファイルは変更しません。</div></div></v-card-text></v-card>
-          <div v-if="previewPhotos.length" class="photo-grid"><div v-for="photo in previewPhotos" :key="photo.id" class="photo-tile"><img :src="desktop.photoThumbnailUrl(photo)" :alt="photo.name" loading="lazy"><div class="photo-tile__caption">{{ photo.relativePath }}</div></div></div>
+          <div class="d-flex align-center justify-space-between flex-wrap ga-4 mb-7"><div><v-btn variant="text" prepend-icon="mdi-arrow-left" class="px-0" @click="view = 'home'">ホーム</v-btn><h1 class="text-h4 font-weight-bold">{{ activeProject.name }}</h1><p class="text-body-2 text-medium-emphasis mt-1">{{ activeProject.folderPath }}</p></div><div class="d-flex flex-wrap ga-2"><v-btn variant="text" prepend-icon="mdi-delete-outline" @click="askDeleteProject(activeProject)">削除</v-btn><v-btn v-if="hasSelectionData" variant="text" prepend-icon="mdi-star-outline" @click="openResults">選別結果を見る</v-btn><v-btn v-if="canImportPhotos" variant="outlined" prepend-icon="mdi-image-plus" :loading="scanRunning" @click="openPhotoPicker">写真を追加</v-btn><v-btn v-else variant="outlined" prepend-icon="mdi-refresh" :loading="scanRunning" @click="startScan">写真を再読み込み</v-btn><v-btn color="primary" prepend-icon="mdi-play" :disabled="!activeProject.photoCount" @click="session ? resumeSession() : enterMethod()">{{ session ? '選別を再開' : '選別を開始' }}</v-btn></div></div>
+          <v-card class="mb-6"><v-card-text class="d-flex align-center ga-5"><v-avatar color="primary" size="50"><v-icon color="black" icon="mdi-image-multiple" /></v-avatar><div><div class="text-h6">{{ activeProject.photoCount.toLocaleString() }} 枚の写真</div><div class="text-body-2 text-medium-emphasis">{{ canImportPhotos ? '星とサムネイルはこの端末に保存されます。写真ライブラリは変更しません。' : 'サブフォルダも含めて参照します。写真ファイルは変更しません。' }}</div></div></v-card-text></v-card>
+          <div v-if="previewPhotos.length" class="d-flex align-center justify-end ga-3 mb-4">
+            <v-btn-toggle v-model="previewDensity" density="comfortable" variant="outlined" divided mandatory>
+              <v-btn v-for="option in densityOptions" :key="option.label" :value="option.value" :icon="option.icon" :aria-label="`一覧を${option.label}で表示`" />
+            </v-btn-toggle>
+          </div>
+          <div v-if="previewPhotos.length" class="photo-grid" :class="gridClass(previewDensity)" :style="gridStyle(previewDensity)"><div v-for="photo in previewPhotos" :key="photo.id" class="photo-tile" role="button" tabindex="0" @click="openZoom(photo, previewPhotos)" @keydown.enter="openZoom(photo, previewPhotos)"><img :src="desktop.photoThumbnailUrl(photo)" :alt="photo.name" loading="lazy"><div class="photo-tile__caption">{{ photo.relativePath }}</div></div></div>
           <v-alert v-if="previewTotal > previewPhotos.length" type="info" variant="tonal" class="mt-5">表示負荷を抑えるため、最初の {{ previewPhotos.length }} 枚だけを表示しています。選別にはすべての写真が含まれます。</v-alert>
         </template>
 
@@ -1003,7 +1355,7 @@ onBeforeUnmount(() => {
 
         <template v-else-if="view === 'settings'">
           <v-btn variant="text" prepend-icon="mdi-arrow-left" class="px-0 mb-4" @click="view = 'method'">方法の選択へ戻る</v-btn><div class="text-overline text-primary">Tournament setup</div><h1 class="text-h4 mb-6">トーナメントの設定</h1>
-          <v-card max-width="720" class="pa-6 settings-card"><div class="text-subtitle-1 font-weight-medium mb-5">何枚から選びますか？</div><v-slider v-model="settings.groupSize" class="selection-slider" :min="2" :max="10" :step="1" thumb-label aria-label="何枚から選ぶか"><template #append><v-text-field v-model.number="settings.groupSize" density="compact" variant="outlined" style="width: 86px" hide-details suffix="枚" /></template></v-slider><p class="text-caption text-medium-emphasis mt-2">少ないほど比較は丁寧に、多いほどテンポよく進みます。</p><v-divider class="my-7" /><v-switch v-model="settings.groupBursts" color="primary" label="事前にバースト写真（連写）をまとめる" hint="最大 8 問だけ答えると、残りは同じ基準で自動的にまとまります。" persistent-hint />
+          <v-card max-width="720" class="pa-6 settings-card"><div class="text-subtitle-1 font-weight-medium mb-5">何枚から選びますか？</div><v-slider v-model="settings.groupSize" class="selection-slider" :min="groupLimits.min" :max="groupLimits.max" :step="1" thumb-label aria-label="何枚から選ぶか"><template #append><v-text-field v-model.number="settings.groupSize" density="compact" variant="outlined" style="width: 86px" hide-details suffix="枚" /></template></v-slider><p class="text-caption text-medium-emphasis mt-2">少ないほど比較は丁寧に、多いほどテンポよく進みます。</p><v-divider class="my-7" /><v-switch v-model="settings.groupBursts" color="primary" label="事前にバースト写真（連写）をまとめる" hint="最大 8 問だけ答えると、残りは同じ基準で自動的にまとまります。" persistent-hint />
             <v-alert v-if="settings.groupBursts && activeProject?.burstThreshold !== null && activeProject?.burstThreshold !== undefined" type="info" variant="tonal" density="comfortable" class="mt-4">
               <div class="d-flex align-center justify-space-between flex-wrap ga-3">
                 <span>このプロジェクトは学習済みです（基準 {{ activeProject.burstThreshold }}）。質問は出ません。</span>
@@ -1117,12 +1469,24 @@ onBeforeUnmount(() => {
             >
               <span class="tournament-card__number">{{ index + 1 === 10 ? 0 : index + 1 }}</span>
 
-              <!-- 選択のクリックと切り分けるため、拡大は右上に置く。 -->
+              <!-- 選択のクリックと切り分けるため、拡大と確定は右上に置く。 -->
               <div class="tournament-card__tools">
+                <!-- 迷う必要のない1枚を、その場で★5にして以降の判定から外す。
+                     複数枚選択中はトグルなので、確定済みでも押せるように出し続ける
+                     （もう一度押すと確定を外せる）。単数選択では確定した時点で次へ
+                     進むため、確定済みの表示は残らない。 -->
+                <v-btn
+                  v-if="!isConfirmed(photo.id) || session.multiSelect"
+                  :icon="isConfirmed(photo.id) ? 'mdi-star' : 'mdi-star-outline'"
+                  size="x-small" variant="flat"
+                  :color="isConfirmed(photo.id) ? 'secondary' : undefined"
+                  :aria-label="isConfirmed(photo.id) ? `${photo.name} の★${MAX_RATING}確定を外す` : `${photo.name} を★${MAX_RATING} で確定`"
+                  @click.stop="confirmPhoto(photo.id)"
+                />
                 <v-btn
                   icon="mdi-magnify-plus-outline" size="x-small" variant="flat"
                   :aria-label="`${photo.name} を拡大`"
-                  @click.stop="openZoom(photo)"
+                  @click.stop="openZoom(photo, tournamentPhotos)"
                 />
               </div>
 
@@ -1150,8 +1514,9 @@ onBeforeUnmount(() => {
 
           <v-sheet class="d-flex align-center justify-space-between flex-wrap ga-3 mt-4 pa-3" color="surface-variant" rounded>
             <v-checkbox v-model="session.multiSelect" density="compact" hide-details label="複数枚選択（M）" @update:model-value="session.selectedInGroup = []; saveSession()" />
-            <div class="text-caption text-medium-emphasis">
-              1〜0 選ぶ ・ Ctrl+数字 拡大 ・ Shift+数字 確定 ・ Alt+数字 まとめを開く ・ Enter 確定 ・ ⌫ 戻す
+            <!-- キーボードが無い環境では案内しない。操作はカード上のボタンで完結する。 -->
+            <div v-if="!isTouchOnly" class="text-caption text-medium-emphasis">
+              1〜0 選ぶ ・ Ctrl+数字 拡大 ・ Shift+数字 ★{{ MAX_RATING }}で確定 ・ Alt+数字 まとめを開く ・ Enter 決定 ・ ⌫ 戻す
             </div>
             <div class="d-flex flex-wrap ga-2">
               <v-btn variant="outlined" @click="skipGroup">どれも選ばない</v-btn>
@@ -1186,11 +1551,18 @@ onBeforeUnmount(() => {
                 :model-value="selectionSummary?.total ? (ratingCount(rating) / selectionSummary.total) * 100 : 0"
                 :color="rating >= 4 ? 'primary' : 'secondary'" height="6" rounded
               />
-              <v-btn
-                size="small" variant="outlined" prepend-icon="mdi-tournament"
-                :disabled="ratingCount(rating) < 2"
-                @click.stop="openNextRoundDialog(rating)"
-              >この {{ ratingCount(rating).toLocaleString() }} 枚を選別</v-btn>
+              <span class="rating-row__actions">
+                <v-btn
+                  size="small" variant="outlined" prepend-icon="mdi-tournament"
+                  :disabled="ratingCount(rating) < 2"
+                  @click.stop="openNextRoundDialog(rating)"
+                >この {{ ratingCount(rating).toLocaleString() }} 枚を選別</v-btn>
+                <v-btn
+                  size="small" variant="text" prepend-icon="mdi-swap-horizontal"
+                  :disabled="!ratingCount(rating)"
+                  @click.stop="openMoveDialog(rating)"
+                >レートを移動</v-btn>
+              </span>
             </div>
           </div>
 
@@ -1199,21 +1571,31 @@ onBeforeUnmount(() => {
               <v-btn value="rating">星の高い順</v-btn>
               <v-btn value="name">ファイル名順</v-btn>
             </v-btn-toggle>
+            <v-btn-toggle v-model="resultsDensity" density="comfortable" variant="outlined" divided mandatory>
+              <v-btn v-for="option in densityOptions" :key="option.label" :value="option.value" :icon="option.icon" :aria-label="`一覧を${option.label}で表示`" />
+            </v-btn-toggle>
             <v-chip v-if="resultsRating !== null" closable color="primary" variant="flat" @click:close="selectResultsRating(null)">
               ★{{ resultsRating }} だけ表示中
             </v-chip>
             <v-spacer />
-            <v-btn variant="outlined" prepend-icon="mdi-folder-move-outline" @click="exportDialog = true">フォルダ分け</v-btn>
-            <v-btn variant="outlined" prepend-icon="mdi-tag-text-outline" @click="metadataDialog = true">メタデータに反映</v-btn>
+            <!-- デスクトップは原本のフォルダを直接操作できる。ブラウザはできないので、
+                 共有シート / ZIP / Shortcuts を通して渡す。 -->
+            <template v-if="canImportPhotos">
+              <v-btn variant="outlined" prepend-icon="mdi-export-variant" @click="shareDialog = true">書き出す</v-btn>
+            </template>
+            <template v-else>
+              <v-btn variant="outlined" prepend-icon="mdi-folder-move-outline" @click="exportDialog = true">フォルダ分け</v-btn>
+              <v-btn variant="outlined" prepend-icon="mdi-tag-text-outline" @click="metadataDialog = true">メタデータに反映</v-btn>
+            </template>
             <v-btn variant="text" prepend-icon="mdi-restart" @click="restartDialog = true">最初からやり直す</v-btn>
           </div>
 
-          <div v-if="resultsPhotos.length" class="result-grid">
+          <div v-if="resultsPhotos.length" class="result-grid" :class="gridClass(resultsDensity)" :style="gridStyle(resultsDensity)">
             <div
               v-for="photo in resultsPhotos" :key="photo.id" class="result-tile"
               :class="{ 'is-confirmed': photo.rating >= MAX_RATING, 'is-eliminated': photo.rating === 0 }"
               role="button" tabindex="0"
-              @click="openZoom(photo)" @keydown.enter="openZoom(photo)"
+              @click="openZoom(photo, resultsPhotos)" @keydown.enter="openZoom(photo, resultsPhotos)"
             >
               <img :src="desktop.photoThumbnailUrl(photo)" :alt="photo.name" loading="lazy">
               <div class="result-tile__meta">
@@ -1272,7 +1654,22 @@ onBeforeUnmount(() => {
       </v-container>
     </v-main>
 
-    <v-dialog v-model="createDialog" max-width="620"><v-card title="プロジェクトを作成"><v-card-text class="pt-5"><v-text-field v-model="projectName" label="プロジェクト名" :placeholder="folderPath ? fileName(folderPath) : '任意のプロジェクト名'" hint="空欄ならフォルダ名を使います。" persistent-hint class="mb-5" /><v-text-field v-model="folderPath" label="写真フォルダ" readonly prepend-inner-icon="mdi-folder-image"><template #append-inner><v-btn variant="outlined" size="small" @click="chooseFolder">選択</v-btn></template></v-text-field></v-card-text><v-card-actions class="pa-5 pt-2"><v-spacer /><v-btn variant="outlined" @click="createDialog = false">キャンセル</v-btn><v-btn variant="outlined" color="primary" :disabled="!folderPath" :loading="loading" @click="createProject">作成</v-btn></v-card-actions></v-card></v-dialog>
+    <!-- 写真ライブラリから受け取る口。ブラウザはフォルダを走査できないので、
+         これが取り込みの唯一の入口になる。 -->
+    <input
+      ref="photoInput" type="file" accept="image/*" multiple
+      class="d-none" aria-hidden="true" tabindex="-1"
+      @change="onPhotoPicked"
+    >
+
+    <v-dialog v-model="createDialog" max-width="620"><v-card title="プロジェクトを作成"><v-card-text class="pt-5">
+      <v-text-field v-model="projectName" label="プロジェクト名" :placeholder="folderPath ? fileName(folderPath) : '任意のプロジェクト名'" :hint="canImportPhotos ? '作成すると、続けて写真を選べます。' : '空欄ならフォルダ名を使います。'" persistent-hint class="mb-5" />
+      <!-- デスクトップはフォルダを参照する。ブラウザは作成後にピッカーで選ぶ。 -->
+      <v-text-field v-if="!canImportPhotos" v-model="folderPath" label="写真フォルダ" readonly prepend-inner-icon="mdi-folder-image"><template #append-inner><v-btn variant="outlined" size="small" @click="chooseFolder">選択</v-btn></template></v-text-field>
+      <v-alert v-else type="info" variant="tonal" density="comfortable">
+        この端末の写真から選びます。写真そのものは端末の外に出ません。
+      </v-alert>
+    </v-card-text><v-card-actions class="pa-5 pt-2"><v-spacer /><v-btn variant="outlined" @click="createDialog = false">キャンセル</v-btn><v-btn variant="outlined" color="primary" :disabled="!canImportPhotos && !folderPath" :loading="loading" @click="createProject">作成</v-btn></v-card-actions></v-card></v-dialog>
 
     <v-dialog v-model="taskDialog" persistent max-width="520"><v-card><v-card-title>写真を読み込み中</v-card-title><v-card-text class="pt-5"><div class="d-flex justify-space-between text-body-2 mb-3"><span>{{ taskProgress?.message }}</span><span v-if="taskProgress?.total">{{ taskProgress.processed.toLocaleString() }} / {{ taskProgress.total.toLocaleString() }}</span></div><v-progress-linear :model-value="progressValue" :indeterminate="!taskProgress?.total" color="primary" height="10" rounded /><p class="text-caption text-medium-emphasis mt-5 mb-0">読み込みのあと、連写の解析はバックグラウンドで少しずつ進みます。キャンセルしても、完了済みの読み込み結果は保持されます。</p></v-card-text><v-card-actions class="pa-5 pt-2"><v-spacer /><v-btn variant="outlined" @click="cancelTask">キャンセル</v-btn></v-card-actions></v-card></v-dialog>
 
@@ -1280,7 +1677,7 @@ onBeforeUnmount(() => {
     <v-dialog v-model="groupSizeDialog" max-width="520">
       <v-card title="1グループの表示枚数">
         <v-card-text class="pt-5">
-          <v-slider v-model="pendingGroupSize" class="selection-slider" :min="2" :max="10" :step="1" thumb-label aria-label="1グループの表示枚数">
+          <v-slider v-model="pendingGroupSize" class="selection-slider" :min="groupLimits.min" :max="groupLimits.max" :step="1" thumb-label aria-label="1グループの表示枚数">
             <template #append><v-text-field v-model.number="pendingGroupSize" density="compact" variant="outlined" style="width: 86px" hide-details suffix="枚" /></template>
           </v-slider>
           <p class="text-caption text-medium-emphasis mt-3 mb-0">
@@ -1295,7 +1692,8 @@ onBeforeUnmount(() => {
       </v-card>
     </v-dialog>
 
-    <!-- 拡大表示。写真だけを見せたいので余計な枠は置かない。どのキーでも閉じる。 -->
+    <!-- 拡大表示。写真だけを見せたいので余計な枠は置かない。
+         ← → だけ前後送りに使い、それ以外のキーでは閉じる。 -->
     <v-overlay
       :model-value="!!zoomPhoto"
       class="zoom-overlay align-center justify-center"
@@ -1306,10 +1704,167 @@ onBeforeUnmount(() => {
       @update:model-value="value => { if (!value) zoomPhoto = null }"
     >
       <div v-if="zoomPhoto" class="zoom-overlay__inner">
-        <img :src="desktop.photoUrl(zoomPhoto.path)" :alt="zoomPhoto.name">
-        <div class="zoom-overlay__caption text-caption">{{ zoomPhoto.name }} ・ クリックか任意のキーで閉じる</div>
+        <!-- 送りボタンは写真の外に置く。写真の上に重ねると、閉じるつもりの
+             クリックが送りに化ける。 -->
+        <div class="zoom-overlay__stage">
+          <v-btn
+            class="zoom-overlay__step" icon="mdi-chevron-left" variant="text" size="large"
+            aria-label="前の写真" :disabled="zoomIndex <= 0"
+            @click.stop="stepZoom(-1)"
+          />
+          <img :src="desktop.photoUrl(zoomPhoto.path)" :alt="zoomPhoto.name">
+          <v-btn
+            class="zoom-overlay__step" icon="mdi-chevron-right" variant="text" size="large"
+            aria-label="次の写真" :disabled="zoomIndex < 0 || zoomIndex >= zoomList.length - 1"
+            @click.stop="stepZoom(1)"
+          />
+        </div>
+        <div class="zoom-overlay__caption text-caption">
+          <span v-if="zoomList.length > 1" class="zoom-overlay__position">{{ zoomIndex + 1 }} / {{ zoomList.length }}</span>
+          {{ zoomPhoto.name }}
+          <template v-if="zoomList.length > 1"> ・ ← → で前後</template>
+          ・ クリックか他のキーで閉じる
+        </div>
       </div>
     </v-overlay>
+
+    <!-- 選別結果をライブラリ側へ渡す。ブラウザからは写真ライブラリを
+         直接書き換えられないので、どれも利用者の操作を経由する。 -->
+    <v-dialog v-model="shareDialog" max-width="640" scrollable>
+      <v-card title="選別結果を書き出す">
+        <v-card-text class="pt-5">
+          <v-alert v-if="shareError" type="error" density="compact" class="mb-4">{{ shareError }}</v-alert>
+          <v-alert v-if="shareMessage" type="success" density="compact" class="mb-4">{{ shareMessage }}</v-alert>
+
+          <div class="text-caption text-medium-emphasis mb-1">どの星を書き出しますか？</div>
+          <v-btn-toggle v-model="shareRatings" multiple density="comfortable" variant="outlined" divided class="mb-5">
+            <v-btn v-for="rating in [5, 4, 3, 2, 1, 0]" :key="rating" :value="rating">★{{ rating }}</v-btn>
+          </v-btn-toggle>
+
+          <v-alert type="info" variant="tonal" density="comfortable" class="mb-5">
+            写真アプリに星はなく「お気に入り(♡)」だけです。星そのものはこのアプリが持ち続けます。
+            <strong>原本はこの端末で取り込んだ回のあいだだけ手元にあります。</strong>
+            読み込み直したあとは、写真を選び直すと書き出せます。
+          </v-alert>
+
+          <v-list class="bg-transparent">
+            <v-list-item class="px-0">
+              <v-list-item-title>共有シートで渡す</v-list-item-title>
+              <v-list-item-subtitle class="text-wrap">
+                「画像を保存」で写真アプリへ、「ファイルに保存」でファイルアプリへ。
+                写真アプリには<strong>重複として</strong>入り、星は付きません（{{ SHARE_FILE_LIMIT }} 枚まで）。
+              </v-list-item-subtitle>
+              <template #append>
+                <v-btn variant="outlined" :loading="shareBusy" :disabled="!shareRatings.length" @click="shareSelectedPhotos">共有</v-btn>
+              </template>
+            </v-list-item>
+            <v-divider />
+            <v-list-item class="px-0">
+              <v-list-item-title>星ごとに ZIP で書き出す</v-list-item-title>
+              <v-list-item-subtitle class="text-wrap">
+                <code>star-5/</code> のように星ごとのフォルダに分けます。枚数が多いときや PC に渡すときはこちら。
+              </v-list-item-subtitle>
+              <template #append>
+                <v-btn variant="outlined" :loading="shareBusy" :disabled="!shareRatings.length" @click="exportZipByRating">ZIP</v-btn>
+              </template>
+            </v-list-item>
+            <v-divider />
+            <v-list-item class="px-0">
+              <v-list-item-title>お気に入り(♡)に反映する</v-list-item-title>
+              <v-list-item-subtitle class="text-wrap">
+                一覧をコピーして、iPad に入れたショートカットを呼び出します。
+                <strong>写真ライブラリを実際に変えられるのはこの方法だけです。</strong>
+                照合はファイル名で行うため、同名の写真があると取り違えることがあります。
+              </v-list-item-subtitle>
+            </v-list-item>
+            <v-list-item class="px-0">
+              <v-text-field
+                v-model="shortcutName" label="ショートカットの名前" density="compact"
+                variant="outlined" hide-details
+              >
+                <template #append>
+                  <v-btn variant="outlined" :loading="shareBusy" :disabled="!shareRatings.length || !shortcutName.trim()" @click="runFavoriteShortcut">実行</v-btn>
+                </template>
+              </v-text-field>
+            </v-list-item>
+          </v-list>
+        </v-card-text>
+        <v-divider />
+        <v-card-actions class="pa-4">
+          <v-spacer />
+          <v-btn variant="text" @click="shareDialog = false">閉じる</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <!-- レートの移動。既定は全選択で、外したい写真だけチェックを解く。 -->
+    <v-dialog v-model="moveDialog" fullscreen transition="dialog-bottom-transition" scrollable>
+      <v-card>
+        <v-toolbar color="surface" density="comfortable">
+          <v-toolbar-title>★{{ moveFrom }} の写真をどのレートへ移しますか？</v-toolbar-title>
+          <v-spacer />
+          <v-btn icon="mdi-close" aria-label="閉じる" @click="moveDialog = false" />
+        </v-toolbar>
+        <v-card-text class="pt-5">
+          <v-alert v-if="moveError" type="error" density="compact" class="mb-4">{{ moveError }}</v-alert>
+          <!-- 選別中に星を動かすと、進行中のラウンドの前提が変わる。 -->
+          <v-alert v-if="session" type="warning" variant="tonal" density="compact" class="mb-4">
+            選別が進行中です。星を動かすと、いま選別している対象と食い違うことがあります。
+          </v-alert>
+
+          <div class="d-flex flex-wrap align-center ga-4 mb-5">
+            <div>
+              <div class="text-caption text-medium-emphasis mb-1">移動先のレート</div>
+              <v-btn-toggle v-model="moveTo" density="comfortable" variant="outlined" divided mandatory>
+                <v-btn v-for="rating in [0, 1, 2, 3, 4, 5]" :key="rating" :value="rating" :disabled="rating === moveFrom">★{{ rating }}</v-btn>
+              </v-btn-toggle>
+            </div>
+            <v-spacer />
+            <div class="d-flex align-center ga-2">
+              <v-btn size="small" variant="text" :disabled="moveSelectedCount >= moveTotal" @click="setMoveSelectAll(true)">全選択</v-btn>
+              <v-btn size="small" variant="text" :disabled="!moveSelectedCount" @click="setMoveSelectAll(false)">全解除</v-btn>
+              <v-btn-toggle v-model="moveDensity" density="comfortable" variant="outlined" divided mandatory>
+                <v-btn v-for="option in densityOptions" :key="option.label" :value="option.value" :icon="option.icon" :aria-label="`一覧を${option.label}で表示`" />
+              </v-btn-toggle>
+            </div>
+          </div>
+
+          <div v-if="movePhotos.length" class="result-grid" :class="gridClass(moveDensity)" :style="gridStyle(moveDensity)">
+            <div
+              v-for="photo in movePhotos" :key="photo.id" class="result-tile"
+              :class="{ 'is-unpicked': !isMoveSelected(photo.id) }"
+              role="button" tabindex="0"
+              @click="toggleMoveSelection(photo.id)" @keydown.enter="toggleMoveSelection(photo.id)"
+            >
+              <v-checkbox-btn class="result-tile__pick" :model-value="isMoveSelected(photo.id)" density="compact" :aria-label="`${photo.name} を移動対象にする`" @click.stop="toggleMoveSelection(photo.id)" />
+              <img :src="desktop.photoThumbnailUrl(photo)" :alt="photo.name" loading="lazy">
+              <div class="result-tile__name text-caption">{{ photo.name }}</div>
+            </div>
+          </div>
+          <v-card v-else-if="!moveBusy" class="pa-10 text-center text-medium-emphasis">★{{ moveFrom }} の写真はありません。</v-card>
+
+          <div class="d-flex justify-center mt-5">
+            <v-btn v-if="movePhotos.length < moveTotal" variant="outlined" :loading="moveBusy" @click="loadMovePage()">
+              さらに読み込む（{{ movePhotos.length.toLocaleString() }} / {{ moveTotal.toLocaleString() }}）
+            </v-btn>
+            <span v-else-if="movePhotos.length" class="text-caption text-medium-emphasis">{{ moveTotal.toLocaleString() }} 枚すべて表示しました</span>
+          </div>
+          <!-- まだ読み込んでいない写真も移動の対象に入る。件数は総数から数える。 -->
+          <p v-if="movePhotos.length < moveTotal" class="text-caption text-medium-emphasis text-center mt-2">
+            表示していない写真も対象に含まれます。外したい写真だけを読み込んでチェックを外してください。
+          </p>
+        </v-card-text>
+        <v-divider />
+        <v-card-actions class="pa-4">
+          <div class="text-body-2">
+            <strong>{{ moveSelectedCount.toLocaleString() }} 枚</strong> を ★{{ moveFrom }} → ★{{ moveTo }} へ移します
+          </div>
+          <v-spacer />
+          <v-btn variant="text" @click="moveDialog = false">やめる</v-btn>
+          <v-btn color="primary" :loading="moveBusy" :disabled="!moveSelectedCount || moveFrom === moveTo" @click="runMove">移動する</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
 
     <!-- まとめられた連写の中身。ここで代表を差し替えられる。 -->
     <v-dialog v-model="burstDialog" fullscreen transition="dialog-bottom-transition" scrollable>
@@ -1341,7 +1896,7 @@ onBeforeUnmount(() => {
                 <v-btn
                   icon="mdi-magnify-plus-outline" size="x-small" variant="flat"
                   :aria-label="`${photo.name} を拡大`"
-                  @click.stop="openZoom(photo)"
+                  @click.stop="openZoom(photo, burstPhotos)"
                 />
               </div>
               <span v-if="index === 0" class="tournament-card__confirmed">代表</span>
@@ -1360,7 +1915,7 @@ onBeforeUnmount(() => {
             ★{{ nextRoundRating }} の <strong>{{ ratingCount(nextRoundRating).toLocaleString() }} 枚</strong>が対象です。
             選ばれた写真は ★{{ Math.min(MAX_RATING, nextRoundRating + 1) }} に上がり、選ばれなかった写真は ★{{ nextRoundRating }} のまま残ります。
           </p>
-          <v-slider v-model="nextRoundGroupSize" class="selection-slider" :min="2" :max="10" :step="1" thumb-label aria-label="1グループの表示枚数">
+          <v-slider v-model="nextRoundGroupSize" class="selection-slider" :min="groupLimits.min" :max="groupLimits.max" :step="1" thumb-label aria-label="1グループの表示枚数">
             <template #append><v-text-field v-model.number="nextRoundGroupSize" density="compact" variant="outlined" style="width: 86px" hide-details suffix="枚" /></template>
           </v-slider>
         </v-card-text>

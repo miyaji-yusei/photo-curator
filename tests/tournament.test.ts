@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { MAX_RATING } from '~/types/photo'
 import type { SelectionSession } from '~/types/photo'
 import { createThresholdState } from '~/utils/burstThreshold'
-import { collapseBursts, prepareRound, regroupRemaining,  setBurstRepresentative, undoLastStep } from '~/utils/tournament'
+import { collapseBursts, prepareRound, regroupRemaining, resolveChosen, setBurstRepresentative, undoLastStep } from '~/utils/tournament'
 
 function makeTestSession(groups: string[][]): SelectionSession {
   const ids = groups.flat()
@@ -27,6 +27,15 @@ function makeTestSession(groups: string[][]): SelectionSession {
     stage: 'tournament',
     updatedAt: 0
   }
+}
+
+/** 撮影順に並んだ候補だけを持つ、prepareRound に掛ける前のセッション。 */
+function makeSeededSession(candidates: string[], groupSize: number): SelectionSession {
+  const session = makeTestSession([])
+  session.candidates = [...candidates]
+  session.ratings = Object.fromEntries(candidates.map(id => [id, 0]))
+  session.settings = { groupSize, groupBursts: false }
+  return session
 }
 
 /** app.vue の confirmChoices と同じ手順で1グループを確定させる。 */
@@ -100,6 +109,56 @@ describe('undoLastStep', () => {
     expect(undoLastStep(session)).toBe(true)
     expect(session.stage).toBe('tournament')
     expect(session.groupIndex).toBe(0)
+  })
+})
+
+describe('prepareRound の並び順', () => {
+  // 似た構図は撮影時刻が近い。get_selection_seed が撮影順で返す並びを
+  // prepareRound が崩すと、同じ場面の写真が別々のグループにばらけて
+  // 「その中の1枚を選ぶ」比較にならない。
+  it('候補を並べ替えず、渡された順のままグループに切る', () => {
+    const order = ['p1', 'p2', 'p3', 'p4', 'p5', 'p6']
+    const session = makeSeededSession(order, 3)
+
+    prepareRound(session)
+
+    expect(session.groups).toEqual([['p1', 'p2', 'p3'], ['p4', 'p5', 'p6']])
+  })
+
+  it('端数が1枚になったら比較にならないのでそのまま通す', () => {
+    const session = makeSeededSession(['p1', 'p2', 'p3'], 2)
+    prepareRound(session)
+    expect(session.groups).toEqual([['p1', 'p2']])
+    expect(session.survivors).toEqual(['p3'])
+  })
+
+  it('2ラウンド目も撮影順が保たれる', () => {
+    const session = makeSeededSession(['p1', 'p2', 'p3', 'p4', 'p5', 'p6'], 2)
+    prepareRound(session)
+    // 各グループの先頭を通す。survivors はグループ順に積まれる。
+    for (const group of session.groups) choose(session, [group[0]!])
+    session.candidates = [...new Set(session.survivors)]
+    session.survivors = []
+
+    prepareRound(session)
+
+    expect(session.candidates).toEqual(['p1', 'p3', 'p5'])
+    expect(session.groups).toEqual([['p1', 'p3']])
+    expect(session.survivors).toEqual(['p5'])
+  })
+
+  it('まとめを畳み込んでも撮影順が崩れない', () => {
+    const session = makeSeededSession(['p1', 'p2', 'p3', 'p4'], 2)
+    // p2 と p3 が連写。代表は p2。
+    session.burstGroups = [
+      { id: 'b1', photoIds: ['p2', 'p3'], capturedSpanMs: 500, similarity: 95, accepted: true }
+    ]
+    collapseBursts(session)
+    prepareRound(session)
+
+    expect(session.candidates).toEqual(['p1', 'p2', 'p4'])
+    expect(session.groups).toEqual([['p1', 'p2']])
+    expect(session.survivors).toEqual(['p4'])
   })
 })
 
@@ -184,6 +243,29 @@ describe('setBurstRepresentative', () => {
   })
 })
 
+
+describe('resolveChosen（確定と選択の合流）', () => {
+  it('選択した写真をそのまま通す', () => {
+    expect(resolveChosen(['a'], ['a', 'b', 'c'], { a: 2, b: 2, c: 2 }, 5)).toEqual(['a'])
+  })
+
+  it('★5に確定した写真は、選んでいなくても通る', () => {
+    // 複数枚選択中に b を★5トグルしたが、決定時の selectedInGroup には無い。
+    const chosen = resolveChosen(['a'], ['a', 'b', 'c'], { a: 2, b: 5, c: 2 }, 5)
+    expect(chosen).toEqual(['a', 'b'])
+  })
+
+  it('「選択なしで次へ」でも、確定した写真は残る', () => {
+    // これが今回の不具合の核。確定してから何も選ばず決定しても落とさない。
+    const chosen = resolveChosen([], ['a', 'b'], { a: 5, b: 2 }, 5)
+    expect(chosen).toEqual(['a'])
+  })
+
+  it('選択と確定が重なっても二重に数えない', () => {
+    const chosen = resolveChosen(['a', 'b'], ['a', 'b'], { a: 5, b: 2 }, 5)
+    expect(chosen).toEqual(['a', 'b'])
+  })
+})
 
 describe('レーティング基準の選別', () => {
   /** app.vue の confirmChoices と同じ星の計算。選ばれなければ据え置き。 */
