@@ -284,7 +284,11 @@ async function openProject(project: Project) {
     // 一瞬表示されていた。
     // まだ一枚も読み込んでいないプロジェクトは、開いた時点で読み込みを始める。
     // 利用者がボタンを押すのを待つ理由が無い。
-    if (!project.photoCount && !scanRunning.value) {
+    //
+    // **フォルダを走査できる環境だけ。** ブラウザには走査するフォルダが無く、
+    // `startProjectScan` は何もしないので、進捗イベントも来ない。それを待つ
+    // ダイアログが閉じられなくなり、リロードしないと戻れなくなっていた。
+    if (!project.photoCount && !canImportPhotos.value && !scanRunning.value) {
       await startScan()
       return
     }
@@ -355,8 +359,10 @@ async function createProject() {
     folderPath.value = ''
     await refreshProjects()
     await openProject(project)
-    // 作った直後に写真を選ばせる。空のプロジェクトだけ残しても何もできない。
-    if (canImportPhotos.value) openPhotoPicker()
+    // ここで写真ピッカーを自動で開かない。iOS はファイル選択を
+    // **利用者の操作の流れの中でしか**許さず、`await` を挟んだあとの
+    // `click()` は黙って無視される。開いたつもりで何も起きない状態になるので、
+    // プロジェクト画面の「写真を追加」を押してもらう形にしてある。
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : 'プロジェクトを作成できませんでした。'
   } finally {
@@ -366,6 +372,10 @@ async function createProject() {
 
 async function startScan() {
   if (!activeProject.value || taskDialog.value) return
+  // 走査するフォルダを持たない環境では、待つべき進捗が一度も発生しない。
+  // ダイアログを出すと閉じる手立てが無くなるので、始めない。
+  // ブラウザでの取り込みは `openPhotoPicker` が入口。
+  if (canImportPhotos.value) return
   taskProgress.value = { projectId: activeProject.value.id, task: 'scan', phase: 'indexing', processed: 0, total: 0, message: '写真フォルダを確認しています…', warning: null, failed: 0 }
   taskWarning.value = null
   taskDialog.value = true
@@ -1126,8 +1136,17 @@ function openGroupSizeDialog() {
 
 async function cancelTask() {
   const progress = taskProgress.value
+  // ダイアログは**自分で閉じる**。以前は進捗イベントの `cancelled` が来るのを
+  // 待っていたため、イベントを出さないバックエンドでは閉じる手段が無くなり、
+  // リロードするしか戻れなかった。取り消しが届いたかに関係なく閉じてよい
+  // （完了済みの読み込み結果は残る）。
+  taskDialog.value = false
   if (!progress) return
-  await desktop.cancelProjectTask(progress.projectId, progress.task)
+  try {
+    await desktop.cancelProjectTask(progress.projectId, progress.task)
+  } catch {
+    // 取り消せなくても画面は閉じる。走っているぶんはそのまま終わる。
+  }
 }
 
 async function cancelAnalysis() {
@@ -1346,6 +1365,15 @@ onBeforeUnmount(() => {
           </div>
           <div v-if="previewPhotos.length" class="photo-grid" :class="gridClass(previewDensity)" :style="gridStyle(previewDensity)"><div v-for="photo in previewPhotos" :key="photo.id" class="photo-tile" role="button" tabindex="0" @click="openZoom(photo, previewPhotos)" @keydown.enter="openZoom(photo, previewPhotos)"><img :src="desktop.photoThumbnailUrl(photo)" :alt="photo.name" loading="lazy"><div class="photo-tile__caption">{{ photo.relativePath }}</div></div></div>
           <v-alert v-if="previewTotal > previewPhotos.length" type="info" variant="tonal" class="mt-5">表示負荷を抑えるため、最初の {{ previewPhotos.length }} 枚だけを表示しています。選別にはすべての写真が含まれます。</v-alert>
+          <!-- まだ 1 枚も無いプロジェクト。次にやることを 1 つだけ置く。 -->
+          <v-card v-if="canImportPhotos && !previewPhotos.length && !scanRunning" class="pa-10 text-center">
+            <v-icon icon="mdi-image-plus" size="44" class="text-medium-emphasis" />
+            <div class="text-h6 mt-4">まだ写真がありません</div>
+            <p class="text-body-2 text-medium-emphasis mt-2 mb-6">
+              この端末の写真から選びます。写真そのものは端末の外に出ません。
+            </p>
+            <v-btn color="primary" size="large" prepend-icon="mdi-image-plus" @click="openPhotoPicker">写真を追加</v-btn>
+          </v-card>
         </template>
 
         <template v-else-if="view === 'method'">
@@ -1663,7 +1691,7 @@ onBeforeUnmount(() => {
     >
 
     <v-dialog v-model="createDialog" max-width="620"><v-card title="プロジェクトを作成"><v-card-text class="pt-5">
-      <v-text-field v-model="projectName" label="プロジェクト名" :placeholder="folderPath ? fileName(folderPath) : '任意のプロジェクト名'" :hint="canImportPhotos ? '作成すると、続けて写真を選べます。' : '空欄ならフォルダ名を使います。'" persistent-hint class="mb-5" />
+      <v-text-field v-model="projectName" label="プロジェクト名" :placeholder="folderPath ? fileName(folderPath) : '任意のプロジェクト名'" :hint="canImportPhotos ? '作成したあと「写真を追加」から選びます。' : '空欄ならフォルダ名を使います。'" persistent-hint class="mb-5" />
       <!-- デスクトップはフォルダを参照する。ブラウザは作成後にピッカーで選ぶ。 -->
       <v-text-field v-if="!canImportPhotos" v-model="folderPath" label="写真フォルダ" readonly prepend-inner-icon="mdi-folder-image"><template #append-inner><v-btn variant="outlined" size="small" @click="chooseFolder">選択</v-btn></template></v-text-field>
       <v-alert v-else type="info" variant="tonal" density="comfortable">
