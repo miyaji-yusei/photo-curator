@@ -65,10 +65,10 @@ const pendingTournamentSettings = ref<TournamentSettings | null>(null)
  * 1 グループの枚数の既定と上限。デスクトップは 10 枚、iPad などブラウザは
  * 画面が狭く指で選ぶので既定 4 枚（2×2）・上限 9 枚（3×3）にする。
  */
-const groupLimits = groupSizeLimits(desktop.isDesktop())
+const groupLimits = groupSizeLimits(desktop.capabilities.largeGroups)
 const settings = reactive<TournamentSettings>({ groupSize: groupLimits.default, groupBursts: false })
 /** キーボードが無い環境ではショートカットの案内を出さない。 */
-const isTouchOnly = computed(() => !desktop.isDesktop())
+const isTouchOnly = computed(() => !desktop.capabilities.keyboard)
 let stopProgressListener: (() => void) | undefined
 
 // 狭い画面ではドロワーを常設しない。

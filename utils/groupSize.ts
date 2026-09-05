@@ -19,12 +19,12 @@ export const DESKTOP_GROUP_SIZE: GroupSizeLimits = { default: 10, max: 10, min: 
 export const TOUCH_GROUP_SIZE: GroupSizeLimits = { default: 4, max: 9, min: 2 }
 
 /**
- * どちらの枚数を使うか。判定はデスクトップアプリかどうかだけで決める。
- * 画面幅やポインタの種類で判定すると、タッチ対応のノート PC で
- * 意図せず枚数が変わってしまう。
+ * どちらの枚数を使うか。**画面の広さの能力だけで決める**
+ * （`capabilities.largeGroups`）。画面幅やポインタの種類で判定すると、
+ * タッチ対応のノート PC で意図せず枚数が変わってしまう。
  */
-export function groupSizeLimits(isDesktopApp: boolean): GroupSizeLimits {
-  return isDesktopApp ? DESKTOP_GROUP_SIZE : TOUCH_GROUP_SIZE
+export function groupSizeLimits(largeGroups: boolean): GroupSizeLimits {
+  return largeGroups ? DESKTOP_GROUP_SIZE : TOUCH_GROUP_SIZE
 }
 
 /**

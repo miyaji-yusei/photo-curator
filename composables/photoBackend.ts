@@ -1,3 +1,4 @@
+import type { BackendCapabilities } from '~/utils/capabilities'
 import type {
   BurstGroup, BurstPair, ExportReport, Photo, PhotoPage, PhotoSort, Project,
   ProjectProgress, ProjectTask, SelectionResult, SelectionSeed, SelectionSession, SelectionSummary
@@ -19,10 +20,10 @@ export interface PhotoBackend {
   readonly kind: BackendKind
 
   /**
-   * 原本フォルダを直接読める環境か。
-   * デスクトップだけが true。ブラウザはフォルダを走査できない。
+   * この環境ができること。**画面はこれだけを見て出し分ける。**
+   * 「Tauri かどうか」で分岐すると、Android を desktop と取り違える。
    */
-  isDesktop: () => boolean
+  readonly capabilities: BackendCapabilities
 
   chooseFolder: () => Promise<string | null>
 

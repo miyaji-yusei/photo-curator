@@ -118,8 +118,8 @@ const unsupported = (what: string) =>
 export function createLocalBackend(): PhotoBackend {
   return {
     kind: 'local',
+    capabilities: capabilitiesFor('browser'),
     // フォルダを走査できるのはデスクトップだけ。
-    isDesktop: () => false,
     chooseFolder: () => Promise.resolve(null),
 
     onProjectProgress: (callback) => {

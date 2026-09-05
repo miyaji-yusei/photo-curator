@@ -1,4 +1,5 @@
 import { convertFileSrc } from '@tauri-apps/api/core'
+import { capabilitiesFor, detectPlatform } from '~/utils/capabilities'
 import { open } from '@tauri-apps/plugin-dialog'
 import type {
   BurstGroup, BurstPair, ExportReport, Photo, PhotoPage, PhotoSort, Project,
@@ -27,7 +28,10 @@ async function invokeDesktop<T>(command: string, args?: Record<string, unknown>)
 export function createTauriBackend(): PhotoBackend {
   return {
     kind: 'tauri',
-    isDesktop: isTauriRuntime,
+    // Android も Tauri なので、UA まで見て初めて desktop と分かれる。
+    capabilities: capabilitiesFor(
+      detectPlatform(isTauriRuntime(), typeof navigator === 'undefined' ? '' : navigator.userAgent)
+    ),
     chooseFolder: async () => {
       if (!isTauriRuntime()) throw new Error('Folder selection is available in the Windows desktop app only.')
       const selected = await open({ directory: true, multiple: false, title: 'Select a photo folder' })

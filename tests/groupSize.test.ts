@@ -3,13 +3,13 @@ import { DESKTOP_GROUP_SIZE, TOUCH_GROUP_SIZE, clampGroupSize, groupSizeLimits }
 
 describe('groupSizeLimits', () => {
   it('iPad などブラウザでは既定 4 枚・上限 9 枚', () => {
-    const limits = groupSizeLimits(false)
+    const limits = groupSizeLimits(false)  // largeGroups なし
     expect(limits.default).toBe(4)
     expect(limits.max).toBe(9)
   })
 
   it('デスクトップアプリは今までどおり 10 枚', () => {
-    const limits = groupSizeLimits(true)
+    const limits = groupSizeLimits(true)   // largeGroups あり
     expect(limits.default).toBe(10)
     expect(limits.max).toBe(10)
   })
