@@ -18,11 +18,19 @@ import { readExifCapture } from '~/utils/exifReader'
 /** デスクトップの `THUMBNAIL_MAX_EDGE` / `THUMBNAIL_QUALITY` と同じ値。 */
 export const THUMBNAIL_MAX_EDGE = 256
 export const THUMBNAIL_QUALITY = 0.82
+/**
+ * 選別画面に出す表示用の長辺。デスクトップの DISPLAY_EDGE_DEFAULT と同じ値。
+ * サムネイル(256px)では良し悪しを判断できず、原本はリロードで失われるので、
+ * **これを保存しておくことでリロード後も選別の見えが落ちない。**
+ */
+export const DISPLAY_EDGE_DEFAULT = 1024
 /** EXIF は先頭付近にある。全体を読み込まずに済ませる。 */
 const EXIF_PREFIX_BYTES = 512 * 1024
 
 export interface AnalyzedPhoto {
   thumbnail: Blob | null
+  /** 選別画面用。原本が無くなっても、これがあれば判断できる。 */
+  display: Blob | null
   dHash: string | null
   capturedAt: number | null
   timestampSource: TimestampSource
@@ -61,16 +69,19 @@ function createSurface(width: number, height: number): Surface {
   }
 }
 
-/** 長辺を 256px に収める寸法。元が小さければ引き伸ばさない。 */
-export function thumbnailSize(width: number, height: number): { width: number, height: number } {
+/** 長辺を指定の大きさに収める寸法。元が小さければ引き伸ばさない。 */
+export function fitLongEdge(width: number, height: number, edge: number): { width: number, height: number } {
   const longest = Math.max(width, height)
-  if (longest <= THUMBNAIL_MAX_EDGE || longest === 0) return { width, height }
-  const ratio = THUMBNAIL_MAX_EDGE / longest
+  if (longest <= edge || longest === 0) return { width, height }
+  const ratio = edge / longest
   return {
     width: Math.max(1, Math.round(width * ratio)),
     height: Math.max(1, Math.round(height * ratio))
   }
 }
+
+export const thumbnailSize = (width: number, height: number) =>
+  fitLongEdge(width, height, THUMBNAIL_MAX_EDGE)
 
 async function readCaptureTime(file: File): Promise<CaptureTime | null> {
   let exif: CaptureTime | null = null
@@ -103,10 +114,14 @@ async function hashThumbnail(thumbnail: Blob): Promise<string> {
  * **例外は投げない**。1 枚失敗しても取り込み全体を止めないため、
  * 理由を `error` に入れて返す。
  */
-export async function analyzePhotoFile(file: File): Promise<AnalyzedPhoto> {
+export async function analyzePhotoFile(
+  file: File,
+  displayEdge: number = DISPLAY_EDGE_DEFAULT
+): Promise<AnalyzedPhoto> {
   const capture = await readCaptureTime(file)
   const base: AnalyzedPhoto = {
     thumbnail: null,
+    display: null,
     dHash: null,
     capturedAt: capture?.at ?? null,
     timestampSource: capture?.source ?? 'unknown',
@@ -128,7 +143,15 @@ export async function analyzePhotoFile(file: File): Promise<AnalyzedPhoto> {
     surface.context.drawImage(bitmap, 0, 0, size.width, size.height)
     const thumbnail = await surface.toBlob('image/jpeg', THUMBNAIL_QUALITY)
     if (!thumbnail) return { ...base, error: 'サムネイルを作れませんでした。' }
-    return { ...base, thumbnail, dHash: await hashThumbnail(thumbnail) }
+    // 表示用も同じ復号から作る。**原本をもう一度読まない。**
+    // iPad では原本がリロードで失われるので、ここで作らないと二度と作れない。
+    const displaySize = fitLongEdge(bitmap.width, bitmap.height, displayEdge)
+    const displaySurface = createSurface(displaySize.width, displaySize.height)
+    displaySurface.context.imageSmoothingEnabled = true
+    displaySurface.context.imageSmoothingQuality = 'high'
+    displaySurface.context.drawImage(bitmap, 0, 0, displaySize.width, displaySize.height)
+    const display = await displaySurface.toBlob('image/jpeg', THUMBNAIL_QUALITY)
+    return { ...base, thumbnail, display, dHash: await hashThumbnail(thumbnail) }
   } catch (cause) {
     // 非対応の形式・壊れたファイル・メモリ不足がここに来る。
     const message = cause instanceof Error ? cause.message : '画像を読み込めませんでした。'

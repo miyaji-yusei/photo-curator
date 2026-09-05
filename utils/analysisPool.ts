@@ -48,7 +48,9 @@ function runOnWorker(worker: Worker, job: AnalysisJob): Promise<AnalyzedPhoto> {
       finish(analyzed)
     }
     worker.onerror = () => finish({
-      thumbnail: null, dHash: null, capturedAt: null,
+      thumbnail: null,
+        display: null,
+        dHash: null, capturedAt: null,
       timestampSource: 'unknown', error: '解析中にエラーが発生しました。'
     })
     const request: AnalyzeWorkerRequest = { id: job.id, file: job.file }

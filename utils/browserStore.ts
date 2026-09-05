@@ -15,15 +15,17 @@ import type { Photo, SelectionSession } from '~/types/photo'
 import type { TimestampSource } from '~/utils/captureTime'
 
 const DATABASE_NAME = 'photo-curator'
-// 2 で `burstShapes` を足した。`onupgradeneeded` は「無ければ作る」だけなので、
+// 2 で `burstShapes`、3 で `displays` を足した。`onupgradeneeded` は「無ければ作る」だけなので、
 // 既存のストアと中身はそのまま残る。
-const DATABASE_VERSION = 2
+const DATABASE_VERSION = 3
 
 export const STORE_PROJECTS = 'projects'
 export const STORE_PHOTOS = 'photos'
 export const STORE_THUMBNAILS = 'thumbnails'
 export const STORE_STATES = 'states'
 export const STORE_BURST_SHAPES = 'burstShapes'
+/** 選別画面に出す表示用画像。サムネイルとは別ストアにして、一覧が引きずらない。 */
+export const STORE_DISPLAYS = 'displays'
 
 /** `photos` テーブルに相当する 1 行。デスクトップの列名に寄せてある。 */
 export interface StoredPhoto {
@@ -40,6 +42,8 @@ export interface StoredPhoto {
   isMissing: boolean
   /** 解析できなかった理由。成功したら null に戻す。 */
   analysisError: string | null
+  /** 表示用画像を作ったときの長辺。設定を変えたときの作り直し判定に使う。 */
+  displayEdge?: number | null
 }
 
 export interface StoredProject {
@@ -82,6 +86,9 @@ export function openStore(): Promise<IDBDatabase> {
       // 触ったペアの数だけしか増えないので、行に収めて構わない。
       if (!db.objectStoreNames.contains(STORE_BURST_SHAPES)) {
         db.createObjectStore(STORE_BURST_SHAPES, { keyPath: 'projectId' })
+      }
+      if (!db.objectStoreNames.contains(STORE_DISPLAYS)) {
+        db.createObjectStore(STORE_DISPLAYS, { keyPath: 'photoId' })
       }
     }
     request.onsuccess = () => resolve(request.result)
@@ -187,17 +194,24 @@ export async function requestPersistence(): Promise<boolean> {
 }
 
 /** 保存済みの行を画面が使う `Photo` に直す。URL は呼び出し側が埋める。 */
-export function toPhoto(row: StoredPhoto, thumbnailUrl: string | null, originalUrl: string | null): Photo {
+export function toPhoto(
+  row: StoredPhoto,
+  thumbnailUrl: string | null,
+  originalUrl: string | null,
+  displayUrl: string | null = null
+): Photo {
   return {
     id: row.id,
     projectId: row.projectId,
-    // 原本が手元に無ければサムネイルを見せる（拡大は 256px になる）。
-    path: originalUrl ?? thumbnailUrl ?? '',
+    // 原本が手元に無ければ表示用、それも無ければサムネイル。
+    // **表示用があるので、リロード後も選別の見えは落ちない。**
+    path: originalUrl ?? displayUrl ?? thumbnailUrl ?? '',
     relativePath: row.relativePath,
     name: row.name,
     capturedAt: row.capturedAt,
     dHash: row.dHash,
     rating: row.rating,
-    thumbnailPath: thumbnailUrl
+    thumbnailPath: thumbnailUrl,
+    displayPath: displayUrl ?? originalUrl ?? thumbnailUrl
   }
 }

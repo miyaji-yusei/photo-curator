@@ -18,13 +18,14 @@ import { MAX_RATING } from '~/types/photo'
 import type { PhotoBackend } from '~/composables/photoBackend'
 import { normalizeSession } from '~/utils/tournament'
 import { analyzeAll } from '~/utils/analysisPool'
+import { DISPLAY_EDGE_DEFAULT } from '~/utils/analyzePhoto'
 import {
   BURST_WINDOW_MS, HASH_DISTANCE_LIMIT, buildBurstGroups, buildBurstPairs,
   pairJoinsByThreshold, pairKey
 } from '~/utils/burstAnalysis'
 import type { BurstEntry } from '~/utils/burstAnalysis'
 import {
-  STORE_PHOTOS, STORE_PROJECTS, STORE_STATES, STORE_THUMBNAILS,
+  STORE_DISPLAYS, STORE_PHOTOS, STORE_PROJECTS, STORE_STATES, STORE_THUMBNAILS,
   deleteOne, getAll, getOne, photosOfProject, putOne, readPairOverrides, readSession,
   requestPersistence, toPhoto, withStores, writePairOverrides, writeSession
 } from '~/utils/browserStore'
@@ -38,6 +39,8 @@ import {
 const originals = new Map<string, File>()
 const thumbnailUrls = new ObjectUrlCache()
 const originalUrls = new ObjectUrlCache(64)
+/** 表示用は 1 枚 87KB 前後。選別中に見る範囲だけを持てば足りる。 */
+const displayUrls = new ObjectUrlCache(64)
 
 const listeners = new Set<(progress: ProjectProgress) => void>()
 const cancelled = new Set<string>()
@@ -68,20 +71,27 @@ function asProject(row: StoredProject): Project {
 
 /** 行に URL を付けて画面が使える形にする。サムネイルは 1 枚ずつ読む。 */
 async function decorate(rows: StoredPhoto[]): Promise<Photo[]> {
-  const blobs = await withStores([STORE_THUMBNAILS], 'readonly', async transaction => {
-    const found = new Map<string, Blob>()
-    for (const row of rows) {
-      const stored = await getOne<{ photoId: string, blob: Blob }>(transaction, STORE_THUMBNAILS, row.id)
-      if (stored?.blob) found.set(row.id, stored.blob)
+  const { thumbs, displays } = await withStores(
+    [STORE_THUMBNAILS, STORE_DISPLAYS], 'readonly', async transaction => {
+      const thumbs = new Map<string, Blob>()
+      const displays = new Map<string, Blob>()
+      for (const row of rows) {
+        const thumb = await getOne<{ photoId: string, blob: Blob }>(transaction, STORE_THUMBNAILS, row.id)
+        if (thumb?.blob) thumbs.set(row.id, thumb.blob)
+        const display = await getOne<{ photoId: string, blob: Blob }>(transaction, STORE_DISPLAYS, row.id)
+        if (display?.blob) displays.set(row.id, display.blob)
+      }
+      return { thumbs, displays }
     }
-    return found
-  })
+  )
   return rows.map(row => {
-    const blob = blobs.get(row.id)
-    const thumbnailUrl = blob ? thumbnailUrls.get(row.id, blob) : null
+    const thumb = thumbs.get(row.id)
+    const thumbnailUrl = thumb ? thumbnailUrls.get(row.id, thumb) : null
+    const display = displays.get(row.id)
+    const displayUrl = display ? displayUrls.get(row.id, display) : null
     const file = originals.get(row.id)
     const originalUrl = file ? originalUrls.get(row.id, file) : null
-    return toPhoto(row, thumbnailUrl, originalUrl)
+    return toPhoto(row, thumbnailUrl, originalUrl, displayUrl)
   })
 }
 
@@ -159,14 +169,16 @@ export function createLocalBackend(): PhotoBackend {
         photosOfProject(transaction, projectId)
       )
       await withStores(
-        [STORE_PROJECTS, STORE_PHOTOS, STORE_THUMBNAILS, STORE_STATES], 'readwrite',
+        [STORE_PROJECTS, STORE_PHOTOS, STORE_THUMBNAILS, STORE_DISPLAYS, STORE_STATES], 'readwrite',
         async transaction => {
           for (const row of rows) {
             thumbnailUrls.release(row.id)
             originalUrls.release(row.id)
+            displayUrls.release(row.id)
             originals.delete(row.id)
             await deleteOne(transaction, STORE_PHOTOS, row.id)
             await deleteOne(transaction, STORE_THUMBNAILS, row.id)
+            await deleteOne(transaction, STORE_DISPLAYS, row.id)
           }
           await deleteOne(transaction, STORE_STATES, projectId)
           await deleteOne(transaction, STORE_PROJECTS, projectId)
@@ -367,6 +379,23 @@ export function createLocalBackend(): PhotoBackend {
     // ブラウザでは既に表示できる URL が入っている。
     photoUrl: (path: string) => path,
     photoThumbnailUrl: (photo: Photo) => photo.thumbnailPath ?? photo.path,
+    photoDisplayUrl: (photo: Photo) => photo.displayPath ?? photo.thumbnailPath ?? photo.path,
+
+    // ブラウザでは表示用サイズを取り込み時に決め打ちで作る。**原本を保存しない**
+    // ので、あとから別の大きさで作り直すことができない（原本がもう無い）。
+    // 変えたいときは取り込み直してもらう。
+    getDisplaySettings: () => Promise.resolve({
+      edge: DISPLAY_EDGE_DEFAULT,
+      choices: [DISPLAY_EDGE_DEFAULT],
+      defaultEdge: DISPLAY_EDGE_DEFAULT,
+      largeEdge: DISPLAY_EDGE_DEFAULT
+    }),
+    saveDisplayEdge: () => Promise.resolve(DISPLAY_EDGE_DEFAULT),
+    saveProjectDisplayEdge: () => Promise.resolve(DISPLAY_EDGE_DEFAULT),
+    // 取り込みと同時に作っているので、あとから溜まる分は無い。
+    getDisplayBacklog: () => Promise.resolve(0),
+    startDisplayGeneration: () => Promise.resolve(),
+    resetDisplayImages: () => Promise.resolve(),
 
     exportByRating: (): Promise<ExportReport> => unsupported('フォルダ分け'),
     writeRatingsToFiles: (): Promise<ExportReport> => unsupported('メタデータへの書き込み'),
@@ -421,20 +450,28 @@ export function createLocalBackend(): PhotoBackend {
         onResult: async (id, analyzed) => {
           processed += 1
           if (analyzed.error) failed += 1
-          await withStores([STORE_PHOTOS, STORE_THUMBNAILS], 'readwrite', async transaction => {
-            const row = await getOne<StoredPhoto>(transaction, STORE_PHOTOS, id)
-            if (!row) return
-            await putOne(transaction, STORE_PHOTOS, {
-              ...row,
-              capturedAt: analyzed.capturedAt,
-              timestampSource: analyzed.timestampSource,
-              dHash: analyzed.dHash,
-              analysisError: analyzed.error
-            })
-            if (analyzed.thumbnail) {
-              await putOne(transaction, STORE_THUMBNAILS, { photoId: id, blob: analyzed.thumbnail })
+          await withStores(
+            [STORE_PHOTOS, STORE_THUMBNAILS, STORE_DISPLAYS], 'readwrite', async transaction => {
+              const row = await getOne<StoredPhoto>(transaction, STORE_PHOTOS, id)
+              if (!row) return
+              await putOne(transaction, STORE_PHOTOS, {
+                ...row,
+                capturedAt: analyzed.capturedAt,
+                timestampSource: analyzed.timestampSource,
+                dHash: analyzed.dHash,
+                analysisError: analyzed.error,
+                displayEdge: analyzed.display ? DISPLAY_EDGE_DEFAULT : null
+              })
+              if (analyzed.thumbnail) {
+                await putOne(transaction, STORE_THUMBNAILS, { photoId: id, blob: analyzed.thumbnail })
+              }
+              // **原本はリロードで失われる。** ここで表示用を残しておかないと、
+              // 次に開いたときの選別画面が 256px に落ちる。
+              if (analyzed.display) {
+                await putOne(transaction, STORE_DISPLAYS, { photoId: id, blob: analyzed.display })
+              }
             }
-          })
+          )
           emit(progressOf(projectId, 'background', 'hashing', processed, total, '写真を解析しています', failed))
         }
       })

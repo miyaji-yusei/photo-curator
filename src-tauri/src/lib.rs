@@ -32,6 +32,19 @@ const MIN_BURST_WINDOW_MS: i64 = 500;
 const THUMBNAIL_MAX_EDGE: u32 = 256;
 const THUMBNAIL_QUALITY: u8 = 82;
 const THUMBNAIL_DIR: &str = "thumbnails";
+// 選別画面に出す「表示用」画像の置き場。サムネイル(160x120 相当)では
+// 写真の良し悪しを判断できず、かといって原本(6.7MB)を毎回読むと
+// Android では 1 ラウンドで 13.4GB 流れる。その中間をここに作る。
+const DISPLAY_DIR: &str = "display";
+/// 既定の長辺。Galaxy Z Fold 8 の実機計測で 1 グループ 3〜4 枚なら 733px、
+/// 9 枚なら 489px あれば足りる。普段使いはこれで過不足ない。
+const DISPLAY_EDGE_DEFAULT: u32 = 1024;
+/// 「大きな画像で選別する」を on にしたときの長辺。2 枚を並べて見比べる
+/// ときに必要な 1238〜1420px（実測）を満たす。
+const DISPLAY_EDGE_LARGE: u32 = 1536;
+/// 選べる長辺。ここに無い値は既定に丸める。
+const DISPLAY_EDGES: [u32; 5] = [768, 1024, 1280, 1536, 1920];
+const DISPLAY_QUALITY: u8 = 82;
 // これより小さい EXIF サムネイルは dHash にも表示にも使わない。
 const MIN_EXIF_THUMBNAIL_EDGE: u32 = 96;
 // dHash の算出方式のバージョン。fingerprint は「ファイルが変わっていない」ことしか
@@ -200,6 +213,9 @@ struct Photo {
     rating: i64,
     /// 生成済みサムネイルの絶対パス。UI はここがあれば原本ではなくこちらを出す。
     thumbnail_path: Option<String>,
+    /// 選別画面に出す表示用画像の絶対パス。**まだ作っていなければ None**。
+    /// 画面はここが無いときだけ原本へ落ちる。
+    display_path: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -278,6 +294,17 @@ fn thumbnail_dir(app: &AppHandle) -> Result<PathBuf, String> {
         .app_data_dir()
         .map_err(|error| error.to_string())?
         .join(THUMBNAIL_DIR);
+    fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    Ok(dir)
+}
+
+/// 表示用画像の置き場。サムネイルと同じ app_data_dir 配下。
+fn display_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?
+        .join(DISPLAY_DIR);
     fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     Ok(dir)
 }
@@ -422,6 +449,13 @@ fn open_database(path: &Path) -> Result<Connection, String> {
     // 原本から作り直される。回転を無視して保存された古いサムネイルは、これで
     // 自動的に置き換わる。
     add_column_if_missing(&conn, "photos", "thumbnail_version", "INTEGER")?;
+    // 選別画面に出す表示用画像と、**実際に生成した長辺**。
+    // 長辺を持たないと、設定を変えても古い画像が使われ続ける
+    // （thumbnail_version と同じ轍）。
+    add_column_if_missing(&conn, "photos", "display_path", "TEXT")?;
+    add_column_if_missing(&conn, "photos", "display_edge", "INTEGER")?;
+    // プロジェクトごとの上書き。NULL なら全体の設定に従う。
+    add_column_if_missing(&conn, "projects", "display_edge", "INTEGER")?;
     // d_hash の算出方式。旧ビルドの行は NULL になり、キャッシュとして使われない。
     // 古い方式のハッシュと新しい方式のハッシュが混ざると連写判定が壊れるため、
     // 値を消さずに「使わない」ことで移行する。
@@ -439,6 +473,16 @@ fn open_database(path: &Path) -> Result<Connection, String> {
     //   join  … 閾値では切れるが、利用者が繋いだ
     // グループは「連続するペアがすべて閾値を満たす区間」なので、これだけで
     // 分割・切り離し・結合・全解除のすべてを表せる。
+    // アプリ全体の設定。いまは表示用サイズの既定だけだが、キーと値だけの表なので
+    // 増えても migration が要らない。
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS app_settings (
+           key TEXT PRIMARY KEY,
+           value TEXT NOT NULL
+         );",
+    )
+    .map_err(|error| error.to_string())?;
+
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS burst_pair_overrides (
            project_id TEXT NOT NULL,
@@ -1274,6 +1318,72 @@ fn decode_hash_source(path: &Path) -> Option<(DynamicImage, DecodeSource)> {
     decode_hash_source_from(&LocalPhoto(path))
 }
 
+/// 選べる長辺に丸める。設定ファイルや古いセッションから変な値が来ても、
+/// 生成する画像の大きさが暴れないようにする。
+fn normalize_display_edge(edge: i64) -> u32 {
+    let edge = edge.clamp(0, u32::MAX as i64) as u32;
+    DISPLAY_EDGES
+        .into_iter()
+        .find(|candidate| *candidate == edge)
+        .unwrap_or(DISPLAY_EDGE_DEFAULT)
+}
+
+fn display_file(dir: &Path, photo_id: &str) -> PathBuf {
+    dir.join(format!("{photo_id}.jpg"))
+}
+
+/// 表示用画像を作る。長辺を `edge` に収め、原本より大きくはしない。
+fn encode_display(image: &DynamicImage, edge: u32) -> Option<Vec<u8>> {
+    let scaled = if image.width().max(image.height()) <= edge {
+        image.clone()
+    } else {
+        image.thumbnail(edge, edge)
+    };
+    let rgb = scaled.to_rgb8();
+    let mut bytes = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, DISPLAY_QUALITY)
+        .encode(
+            rgb.as_raw(),
+            rgb.width(),
+            rgb.height(),
+            image::ExtendedColorType::Rgb8,
+        )
+        .ok()?;
+    Some(bytes)
+}
+
+/// 表示用画像を 1 枚ぶん用意する。
+///
+/// **要点は「下げるときは原本に戻らない」こと。** 既に保存してある表示用画像が
+/// 要求より大きければ、それを縮めれば足りる。1536 → 1024 の切り替えで
+/// 2,000 枚ぶん 13.4GB を読み直すのは無駄でしかない。
+/// 逆に上げるときは、小さい画像から大きい画像は作れないので原本へ戻る。
+fn build_display(
+    source: &dyn PhotoSource,
+    edge: u32,
+    existing: Option<(&Path, u32)>,
+) -> Option<Vec<u8>> {
+    if let Some((path, stored_edge)) = existing {
+        if stored_edge >= edge && path.is_file() {
+            if let Some(image) = fs::read(path)
+                .ok()
+                .and_then(|bytes| image::load_from_memory(&bytes).ok())
+            {
+                return encode_display(&image, edge);
+            }
+        }
+    }
+    // 原本から作る。**ここだけが全体を読む。**
+    // Orientation は decode_hash_source_from と同じ規則で焼き込む。
+    let bytes = source.all()?;
+    let orientation = source
+        .head(EXIF_HEAD_PROBE)
+        .map(|head| exif_orientation_bytes(&head))
+        .unwrap_or(1);
+    let image = image::load_from_memory(&bytes).ok()?;
+    encode_display(&apply_orientation(image, orientation), edge)
+}
+
 fn scale_for_thumbnail(image: &DynamicImage) -> DynamicImage {
     if image.width().max(image.height()) <= THUMBNAIL_MAX_EDGE {
         // EXIF サムネイルは 160x120 前後。引き伸ばしても情報は増えない。
@@ -1605,11 +1715,12 @@ fn photo_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Photo> {
         d_hash: row.get(6)?,
         rating: row.get(7)?,
         thumbnail_path: row.get(8)?,
+        display_path: row.get(9)?,
     })
 }
 
 const PHOTO_COLUMNS: &str =
-    "id,project_id,path,relative_path,name,captured_at,d_hash,rating,thumbnail_path";
+    "id,project_id,path,relative_path,name,captured_at,d_hash,rating,thumbnail_path,display_path";
 /// 星の上限。1ラウンド通過ごとに +1 で、ここで頭打ちになる。「確定」も同じ値。
 const MAX_RATING: i64 = 5;
 
@@ -3217,6 +3328,257 @@ fn save_burst_shape(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// 表示用画像の設定と生成
+// ---------------------------------------------------------------------------
+
+const SETTING_DISPLAY_EDGE: &str = "display_edge";
+
+fn read_setting(conn: &Connection, key: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT value FROM app_settings WHERE key=?1",
+        params![key],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
+/// このプロジェクトで使う表示用の長辺。
+/// **プロジェクトの上書き → 全体の既定 → 組み込みの既定**、の順に見る。
+fn resolve_display_edge(app: &AppHandle, project_id: &str) -> Result<u32, String> {
+    let conn = connection(app)?;
+    let per_project: Option<i64> = conn
+        .query_row(
+            "SELECT display_edge FROM projects WHERE id=?1",
+            params![project_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(None);
+    if let Some(edge) = per_project {
+        return Ok(normalize_display_edge(edge));
+    }
+    let global = read_setting(&conn, SETTING_DISPLAY_EDGE).and_then(|v| v.parse::<i64>().ok());
+    Ok(global.map_or(DISPLAY_EDGE_DEFAULT, normalize_display_edge))
+}
+
+/// 全体の既定と、選べる値。設定画面がそのまま使う。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DisplaySettings {
+    edge: u32,
+    choices: Vec<u32>,
+    default_edge: u32,
+    large_edge: u32,
+}
+
+#[tauri::command]
+fn get_display_settings(app: AppHandle) -> Result<DisplaySettings, String> {
+    let conn = connection(&app)?;
+    let edge = read_setting(&conn, SETTING_DISPLAY_EDGE)
+        .and_then(|v| v.parse::<i64>().ok())
+        .map_or(DISPLAY_EDGE_DEFAULT, normalize_display_edge);
+    Ok(DisplaySettings {
+        edge,
+        choices: DISPLAY_EDGES.to_vec(),
+        default_edge: DISPLAY_EDGE_DEFAULT,
+        large_edge: DISPLAY_EDGE_LARGE,
+    })
+}
+
+#[tauri::command]
+fn save_display_edge(app: AppHandle, edge: u32) -> Result<u32, String> {
+    let normalized = normalize_display_edge(edge as i64);
+    connection(&app)?
+        .execute(
+            "INSERT INTO app_settings (key,value) VALUES (?1,?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![SETTING_DISPLAY_EDGE, normalized.to_string()],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(normalized)
+}
+
+/// プロジェクト単位の上書き。`None` を渡すと全体の設定に戻す。
+#[tauri::command]
+fn save_project_display_edge(
+    app: AppHandle,
+    project_id: String,
+    edge: Option<u32>,
+) -> Result<u32, String> {
+    let normalized = edge.map(|value| normalize_display_edge(value as i64));
+    connection(&app)?
+        .execute(
+            "UPDATE projects SET display_edge=?1, updated_at=?2 WHERE id=?3",
+            params![normalized.map(|v| v as i64), now(), project_id],
+        )
+        .map_err(|error| error.to_string())?;
+    resolve_display_edge(&app, &project_id)
+}
+
+/// まだ表示用画像が要る枚数。0 なら生成を起動しない
+/// （`get_analysis_backlog` と同じ考え方）。
+#[tauri::command]
+fn get_display_backlog(app: AppHandle, project_id: String) -> Result<i64, String> {
+    let edge = resolve_display_edge(&app, &project_id)?;
+    connection(&app)?
+        .query_row(
+            "SELECT COUNT(*) FROM photos
+             WHERE project_id=?1 AND is_missing=0
+               AND (display_path IS NULL OR display_edge IS NULL OR display_edge <> ?2)",
+            params![project_id, edge as i64],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())
+}
+
+/// 表示用画像をまとめて作る。**走査とは分ける。**
+///
+/// 表示用は原本を全部読むので、走査に混ぜると解析が桁で遅くなる
+/// （Routine 1 実測: EXIF サムネイル経路 1.72ms/枚 に対しフルデコード 132ms/枚）。
+/// 走査が終われば dHash は揃うので、連写のまとめと閾値学習はすぐ始められる。
+/// こちらは裏で溜めていく。
+fn run_display_generation(
+    app: AppHandle,
+    registry: &TaskRegistry,
+    project_id: String,
+) -> Result<(), String> {
+    let task_key = format!("display:{project_id}");
+    let edge = resolve_display_edge(&app, &project_id)?;
+    let dir = display_dir(&app)?;
+
+    let pending: Vec<(String, String, Option<String>, Option<i64>)> = {
+        let conn = connection(&app)?;
+        let mut statement = conn
+            .prepare(
+                "SELECT id,path,display_path,display_edge FROM photos
+                 WHERE project_id=?1 AND is_missing=0
+                   AND (display_path IS NULL OR display_edge IS NULL OR display_edge <> ?2)
+                 ORDER BY captured_at IS NULL, captured_at",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![project_id, edge as i64], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+
+    let total = pending.len();
+    progress(
+        &app,
+        &project_id,
+        "display",
+        "hashing",
+        0,
+        total,
+        "選別用の画像を作っています…",
+    );
+
+    let mut done = 0usize;
+    for (photo_id, path, stored_path, stored_edge) in pending {
+        if registry.is_cancelled(&task_key) {
+            progress_note(
+                &app,
+                &project_id,
+                "display",
+                "cancelled",
+                done,
+                total,
+                format!("中断しました。{done} 件まで作成済みです。"),
+                ProgressNote {
+                    warning: None,
+                    failed: 0,
+                },
+            );
+            return Ok(());
+        }
+        let existing = match (stored_path.as_deref(), stored_edge) {
+            (Some(p), Some(e)) if e > 0 => Some((Path::new(p), e as u32)),
+            _ => None,
+        };
+        let built = build_display(&LocalPhoto(Path::new(&path)), edge, existing);
+        let file = display_file(&dir, &photo_id);
+        let saved = built.and_then(|bytes| fs::write(&file, &bytes).ok().map(|_| ()));
+        {
+            let conn = connection(&app)?;
+            if saved.is_some() {
+                conn.execute(
+                    "UPDATE photos SET display_path=?1, display_edge=?2 WHERE id=?3",
+                    params![file.to_string_lossy().to_string(), edge as i64, photo_id],
+                )
+                .map_err(|error| error.to_string())?;
+            } else {
+                // 作れなかった写真は次回また拾えるよう、印を残さない。
+                conn.execute(
+                    "UPDATE photos SET display_path=NULL, display_edge=NULL WHERE id=?1",
+                    params![photo_id],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+        }
+        done += 1;
+        if done % 10 == 0 || done == total {
+            progress(
+                &app,
+                &project_id,
+                "display",
+                "hashing",
+                done,
+                total,
+                "選別用の画像を作っています…",
+            );
+        }
+    }
+
+    progress(
+        &app,
+        &project_id,
+        "display",
+        "complete",
+        total,
+        total,
+        "選別用の画像がそろいました。",
+    );
+    Ok(())
+}
+
+#[tauri::command]
+fn start_display_generation(
+    app: AppHandle,
+    registry: State<'_, TaskRegistry>,
+    project_id: String,
+) -> Result<(), String> {
+    let task_key = format!("display:{project_id}");
+    // 既に走っていれば黙って何もしない。ボタンを二度押しても壊れないように。
+    if registry.start(&task_key).is_err() {
+        return Ok(());
+    }
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let registry = handle.state::<TaskRegistry>();
+        let result = run_display_generation(handle.clone(), &registry, project_id.clone());
+        if let Err(message) = result {
+            progress(&handle, &project_id, "display", "error", 0, 0, message);
+        }
+        registry.finish(&task_key);
+    });
+    Ok(())
+}
+
+/// 表示用画像を作り直す。設定を変えたときと、利用者が明示的に押したとき。
+#[tauri::command]
+fn reset_display_images(app: AppHandle, project_id: String) -> Result<(), String> {
+    connection(&app)?
+        .execute(
+            "UPDATE photos SET display_path=NULL, display_edge=NULL WHERE project_id=?1",
+            params![project_id],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 fn load_burst_threshold(app: &AppHandle, project_id: &str) -> Result<Option<u32>, String> {
     let conn = connection(app)?;
     let stored: Option<i64> = conn
@@ -3574,6 +3936,12 @@ pub fn run() {
             get_selection_summary,
             export_by_rating,
             write_ratings_to_files,
+            get_display_settings,
+            save_display_edge,
+            save_project_display_edge,
+            get_display_backlog,
+            start_display_generation,
+            reset_display_images,
             get_burst_groups,
             get_burst_neighborhood,
             save_burst_shape,
@@ -4599,6 +4967,70 @@ mod tests {
         let capture = read_capture_time_from(&plain).expect("capture time");
         assert_eq!(capture.source, TimestampSource::FilesystemMtime);
         assert_eq!(capture.at, 1_700_000_000_000);
+    }
+
+    // -----------------------------------------------------------------------
+    // Routine 10b: 表示用サイズ
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_display_edge_is_clamped_to_the_offered_choices() {
+        for edge in DISPLAY_EDGES {
+            assert_eq!(normalize_display_edge(edge as i64), edge);
+        }
+        // 表に無い値・負・極端な値は既定へ。生成する画像が暴れないように。
+        for broken in [0, -1, 999, 4096, i64::MAX] {
+            assert_eq!(normalize_display_edge(broken), DISPLAY_EDGE_DEFAULT);
+        }
+    }
+
+    /// **下げるときに原本を読み直さないこと。**
+    /// 1536 → 1024 の切り替えで 2,000 枚ぶん 13.4GB を読むのは無駄でしかない。
+    #[test]
+    fn shrinking_the_display_size_reuses_the_saved_image() {
+        let directory = test_directory("display-size");
+        let photo = directory.join("photo.jpg");
+        Fixture {
+            size: (4000, 3000),
+            ..Default::default()
+        }
+        .write(&photo);
+
+        // まず大きい方を作る。ここは原本を読む。
+        let source = CountingSource::new(fs::read(&photo).expect("read"), "photo.jpg");
+        let large = build_display(&source, 1536, None).expect("build large");
+        assert_eq!(source.all_calls.get(), 1, "初回は原本が要る");
+        let stored = directory.join("display-1536.jpg");
+        fs::write(&stored, &large).expect("write display");
+
+        // 次に小さい方へ。**保存済みを縮めるだけで、原本には戻らない。**
+        let shrink = CountingSource::new(fs::read(&photo).expect("read"), "photo.jpg");
+        let small = build_display(&shrink, 1024, Some((&stored, 1536))).expect("build small");
+        assert_eq!(
+            shrink.all_calls.get(),
+            0,
+            "下げるだけなのに原本を読み直している"
+        );
+        let decoded = image::load_from_memory(&small).expect("decode");
+        assert_eq!(decoded.width().max(decoded.height()), 1024);
+
+        // 逆に上げるときは、小さい画像から大きい画像は作れないので原本へ戻る。
+        let grow = CountingSource::new(fs::read(&photo).expect("read"), "photo.jpg");
+        let bigger = build_display(&grow, 1536, Some((&stored, 1024))).expect("build bigger");
+        assert_eq!(grow.all_calls.get(), 1, "上げるときは原本が要る");
+        let decoded = image::load_from_memory(&bigger).expect("decode");
+        assert_eq!(decoded.width().max(decoded.height()), 1536);
+
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    /// 原本より大きくは引き伸ばさない。情報は増えないのに容量だけ増える。
+    #[test]
+    fn the_display_image_never_upscales_the_original() {
+        let small = synthetic_image(320, 240, 7);
+        let bytes = encode_display(&small, 1536).expect("encode");
+        let decoded = image::load_from_memory(&bytes).expect("decode");
+        assert_eq!((decoded.width(), decoded.height()), (320, 240));
     }
 
     // -----------------------------------------------------------------------

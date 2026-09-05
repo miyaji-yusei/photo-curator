@@ -1,4 +1,12 @@
 import type { BackendCapabilities } from '~/utils/capabilities'
+
+/** 表示用サイズの選択肢と、いまの既定。設定画面がそのまま使う。 */
+export interface DisplaySettings {
+  edge: number
+  choices: number[]
+  defaultEdge: number
+  largeEdge: number
+}
 import type {
   BurstGroup, BurstPair, ExportReport, Photo, PhotoPage, PhotoSort, Project,
   ProjectProgress, ProjectTask, SelectionResult, SelectionSeed, SelectionSession, SelectionSummary
@@ -82,6 +90,17 @@ export interface PhotoBackend {
     projectId: string, orderedPhotoIds: string[], blocks: string[][]
   ) => Promise<void>
 
+  /** 表示用画像の設定と生成。 */
+  getDisplaySettings: () => Promise<DisplaySettings>
+  saveDisplayEdge: (edge: number) => Promise<number>
+  /** null を渡すと全体の設定に戻す。戻り値は解決後の長辺。 */
+  saveProjectDisplayEdge: (projectId: string, edge: number | null) => Promise<number>
+  /** まだ表示用画像が要る枚数。0 なら生成を起動しない。 */
+  getDisplayBacklog: (projectId: string) => Promise<number>
+  startDisplayGeneration: (projectId: string) => Promise<void>
+  /** 作り直しのために印を消す。呼んだあと startDisplayGeneration する。 */
+  resetDisplayImages: (projectId: string) => Promise<void>
+
   startProjectScan: (projectId: string) => Promise<void>
   startBurstAnalysis: (projectId: string) => Promise<void>
   /** まだ解析が要る写真の枚数。0 なら事前生成を起動しない。 */
@@ -103,6 +122,11 @@ export interface PhotoBackend {
    * 追加のデコードは無い。まだ解析していない写真は原本へ落ちる。
    */
   photoThumbnailUrl: (photo: Photo) => string
+  /**
+   * **選別画面に出すための URL。** 表示用画像 → サムネイル → 原本 の順に落ちる。
+   * 原本まで落ちるのはまだ生成が追いついていないときだけ。
+   */
+  photoDisplayUrl: (photo: Photo) => string
 
   /** 星ごとのフォルダへ書き出す。moveFiles が true なら原本を移動する。 */
   exportByRating: (

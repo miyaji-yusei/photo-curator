@@ -4,6 +4,7 @@ import type {
   SelectionResult, SelectionSession, SelectionSummary, TournamentSettings
 } from '~/types/photo'
 import { MAX_RATING } from '~/types/photo'
+import type { DisplaySettings } from '~/composables/photoBackend'
 import type { MoveSelection } from '~/utils/ratingMove'
 // `selectedCount` は選別画面側の computed と名前がぶつかるので別名にする。
 import {
@@ -60,6 +61,20 @@ const taskDialog = ref(false)
 // 連写解析は前面をブロックしない。ダイアログではなく帯で知らせるだけにする。
 const analysisProgress = ref<ProjectProgress | null>(null)
 const analysisFailures = ref(0)
+// 選別画面に出す表示用画像の設定。既定は全体、プロジェクトごとに上書きできる。
+const displaySettings = ref<DisplaySettings | null>(null)
+/** このプロジェクトで実際に使う長辺。 */
+const displayEdge = ref(0)
+const displayBacklog = ref(0)
+const displayBusy = ref(false)
+/** 「大きな画像で選別する」= 大きい方の長辺を選んでいるか。 */
+const largeDisplay = computed({
+  get: () => displayEdge.value >= (displaySettings.value?.largeEdge ?? 1536),
+  set: (on: boolean) => {
+    const settings = displaySettings.value
+    if (settings) void applyDisplayEdge(on ? settings.largeEdge : settings.defaultEdge)
+  }
+})
 const pendingTournamentSettings = ref<TournamentSettings | null>(null)
 /**
  * 1 グループの枚数の既定と上限。デスクトップは 10 枚、iPad などブラウザは
@@ -330,6 +345,12 @@ async function openProject(project: Project) {
     }
     const backlog = await desktop.getAnalysisBacklog(project.id).catch(() => 0)
     if (backlog > 0) desktop.startBackgroundAnalysis(project.id).catch(() => undefined)
+    // 表示用画像は走査とは別に溜める。**走査に混ぜると解析が桁で遅くなる**
+    // （EXIF サムネイル経路 1.72ms/枚 に対しフルデコード 132ms/枚）。
+    await refreshDisplayState()
+    if (displayBacklog.value > 0) {
+      desktop.startDisplayGeneration(project.id).catch(() => undefined)
+    }
     await loadSummary()
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : 'プロジェクトを開けませんでした。'
@@ -1210,6 +1231,60 @@ async function skipBurstReview() {
   }
 }
 
+// ---- 表示用画像 ----------------------------------------------------------
+
+/**
+ * 表示用画像の設定と、残っている生成量を読む。
+ * プロジェクトを開くたびに呼ぶので、外で作られた分もここで拾える。
+ */
+async function refreshDisplayState() {
+  if (!activeProject.value) return
+  try {
+    displaySettings.value = await desktop.getDisplaySettings()
+    // プロジェクトの上書きを反映した実効値。null を渡すと現状のまま返る。
+    displayEdge.value = await desktop.saveProjectDisplayEdge(activeProject.value.id, null)
+    displayBacklog.value = await desktop.getDisplayBacklog(activeProject.value.id)
+  } catch {
+    // 設定が読めなくても選別は続けられる。表示用が無ければ原本に落ちるだけ。
+    displaySettings.value = null
+  }
+}
+
+/**
+ * 長辺を変えて作り直す。
+ *
+ * **下げるときは原本を読み直さない**（保存済みを縮めるだけ）。上げるときは
+ * 原本が要るので通信量が増える。UI にその違いを出しておく。
+ */
+async function applyDisplayEdge(edge: number) {
+  if (!activeProject.value || displayBusy.value) return
+  displayBusy.value = true
+  try {
+    displayEdge.value = await desktop.saveProjectDisplayEdge(activeProject.value.id, edge)
+    displayBacklog.value = await desktop.getDisplayBacklog(activeProject.value.id)
+    await desktop.startDisplayGeneration(activeProject.value.id)
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : '表示用の設定を変えられませんでした。'
+  } finally {
+    displayBusy.value = false
+  }
+}
+
+/** 明示的に作り直す。壊れたときや、途中で止まったときの逃げ道。 */
+async function regenerateDisplayImages() {
+  if (!activeProject.value || displayBusy.value) return
+  displayBusy.value = true
+  try {
+    await desktop.resetDisplayImages(activeProject.value.id)
+    displayBacklog.value = await desktop.getDisplayBacklog(activeProject.value.id)
+    await desktop.startDisplayGeneration(activeProject.value.id)
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : '作り直しを始められませんでした。'
+  } finally {
+    displayBusy.value = false
+  }
+}
+
 // ---- レートの移動 --------------------------------------------------------
 
 /**
@@ -1663,6 +1738,35 @@ onBeforeUnmount(() => {
         <template v-else-if="view === 'project' && activeProject">
           <div class="d-flex align-center justify-space-between flex-wrap ga-4 mb-7"><div><v-btn variant="text" prepend-icon="mdi-arrow-left" class="px-0" @click="view = 'home'">ホーム</v-btn><h1 class="text-h4 font-weight-bold">{{ activeProject.name }}</h1><p class="text-body-2 text-medium-emphasis mt-1">{{ activeProject.folderPath }}</p></div><div class="d-flex flex-wrap ga-2"><v-btn variant="text" prepend-icon="mdi-delete-outline" @click="askDeleteProject(activeProject)">削除</v-btn><v-btn v-if="hasSelectionData" variant="text" prepend-icon="mdi-star-outline" @click="openResults">選別結果を見る</v-btn><v-btn v-if="canImportPhotos" variant="outlined" prepend-icon="mdi-image-plus" :loading="scanRunning" @click="openPhotoPicker">写真を追加</v-btn><v-btn v-else variant="outlined" prepend-icon="mdi-refresh" :loading="scanRunning" @click="startScan">写真を再読み込み</v-btn><v-btn color="primary" prepend-icon="mdi-play" :disabled="!activeProject.photoCount" @click="session ? resumeSession() : enterMethod()">{{ session ? '選別を再開' : '選別を開始' }}</v-btn></div></div>
           <v-card class="mb-6"><v-card-text class="d-flex align-center ga-5"><v-avatar color="primary" size="50"><v-icon color="black" icon="mdi-image-multiple" /></v-avatar><div><div class="text-h6">{{ activeProject.photoCount.toLocaleString() }} 枚の写真</div><div class="text-body-2 text-medium-emphasis">{{ canImportPhotos ? '星とサムネイルはこの端末に保存されます。写真ライブラリは変更しません。' : 'サブフォルダも含めて参照します。写真ファイルは変更しません。' }}</div></div></v-card-text></v-card>
+          <!-- 選別画面に出す画像の大きさ。**解析を起こす場所の隣に置く**ので
+               対応が分かりやすい。設定画面では全体の既定を決められる。 -->
+          <v-card v-if=displaySettings class="mb-6">
+            <v-card-text>
+              <div class="d-flex align-center flex-wrap ga-4">
+                <v-switch
+                  v-model="largeDisplay" color="primary" hide-details density="comfortable"
+                  :disabled="displayBusy || displaySettings.choices.length < 2"
+                  label="大きな画像で選別する"
+                />
+                <span class="text-caption text-medium-emphasis">
+                  いま長辺 <strong>{{ displayEdge }}px</strong>
+                  <template v-if="displayBacklog > 0">・残り {{ displayBacklog.toLocaleString() }} 枚を作成中</template>
+                </span>
+                <v-spacer />
+                <v-btn
+                  size="small" variant="text" prepend-icon="mdi-refresh"
+                  :loading="displayBusy" :disabled="displaySettings.choices.length < 2"
+                  @click="regenerateDisplayImages"
+                >作り直す</v-btn>
+              </div>
+              <p class="text-caption text-medium-emphasis mt-2 mb-0">
+                2 枚並べて見比べるときだけ大きさが要ります。3〜4 枚なら既定で十分です。
+                <strong>大きくするときは写真を読み直す</strong>ので時間がかかります（小さくするときは一瞬です）。
+              </p>
+              <v-progress-linear v-if="displayBacklog > 0" indeterminate color="primary" class="mt-3" />
+            </v-card-text>
+          </v-card>
+
           <div v-if="previewPhotos.length" class="d-flex align-center justify-end ga-3 mb-4">
             <v-btn-toggle v-model="previewDensity" density="comfortable" variant="outlined" divided mandatory>
               <v-btn v-for="option in densityOptions" :key="option.label" :value="option.value" :icon="option.icon" :aria-label="`一覧を${option.label}で表示`" />
@@ -1695,6 +1799,25 @@ onBeforeUnmount(() => {
                 <v-btn size="small" variant="outlined" @click="relearnThreshold">学習し直す</v-btn>
               </div>
             </v-alert>
+            <template v-if="displaySettings && displaySettings.choices.length > 1">
+              <v-divider class="my-7" />
+              <div class="text-subtitle-1 font-weight-medium mb-2">選別に出す画像の大きさ</div>
+              <p class="text-caption text-medium-emphasis mb-4">
+                ここで選ぶとこのプロジェクトに適用されます。長辺の画素数です。
+              </p>
+              <v-btn-toggle
+                :model-value="displayEdge" density="comfortable" variant="outlined" divided mandatory
+                @update:model-value="applyDisplayEdge($event as number)"
+              >
+                <v-btn v-for="choice in displaySettings.choices" :key="choice" :value="choice" :disabled="displayBusy">
+                  {{ choice }}
+                </v-btn>
+              </v-btn-toggle>
+              <p class="text-caption text-medium-emphasis mt-3 mb-0">
+                既定は {{ displaySettings.defaultEdge }}px。2 枚を並べて見比べるときは {{ displaySettings.largeEdge }}px 以上あると
+                引き伸ばされません（実機計測）。
+              </p>
+            </template>
             <div class="d-flex justify-end mt-8"><v-btn color="primary" size="large" prepend-icon="mdi-play" @click="beginTournament">選別を開始</v-btn></div></v-card>
         </template>
 
@@ -1714,7 +1837,7 @@ onBeforeUnmount(() => {
           <template v-if="currentPair && pairPhotos.length === 2">
             <div class="compare-pair">
               <figure v-for="photo in pairPhotos" :key="photo.id" class="compare-pair__item">
-                <img :src="desktop.photoUrl(photo.path)" :alt="photo.name">
+                <img :src="desktop.photoDisplayUrl(photo)" :alt="photo.name">
                 <figcaption class="text-caption text-medium-emphasis mt-2 text-truncate">{{ photo.name }}</figcaption>
               </figure>
             </div>
@@ -1841,7 +1964,7 @@ onBeforeUnmount(() => {
               </span>
               <span v-if="isConfirmed(photo.id)" class="tournament-card__confirmed">確定</span>
 
-              <img :src="desktop.photoUrl(photo.path)" :alt="photo.name">
+              <img :src="desktop.photoDisplayUrl(photo)" :alt="photo.name">
             </v-card>
           </div>
 
@@ -1995,7 +2118,7 @@ onBeforeUnmount(() => {
                   <v-icon icon="mdi-check-bold" size="20" />
                 </span>
                 <span class="tournament-card__confirmed">★{{ photo.rating }}</span>
-                <img :src="desktop.photoUrl(photo.path)" :alt="photo.name">
+                <img :src="desktop.photoDisplayUrl(photo)" :alt="photo.name">
               </v-card>
             </div>
 
@@ -2319,7 +2442,7 @@ onBeforeUnmount(() => {
                     <v-icon icon="mdi-check-bold" size="20" />
                   </span>
                   <span class="tournament-card__number">★{{ burstPhotoOf(photoId)?.rating ?? 0 }}</span>
-                  <img :src="desktop.photoUrl(burstPhotoOf(photoId)?.path ?? '')" :alt="burstPhotoOf(photoId)?.name">
+                  <img v-if="burstPhotoOf(photoId)" :src="desktop.photoDisplayUrl(burstPhotoOf(photoId)!)" :alt="burstPhotoOf(photoId)?.name">
                 </v-card>
               </div>
             </div>

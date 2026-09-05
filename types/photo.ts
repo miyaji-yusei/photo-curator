@@ -14,6 +14,12 @@ export interface Photo {
   rating: number
   /** 解析時に一度だけ作られる 256px のサムネイル。未解析なら null。 */
   thumbnailPath: string | null
+  /**
+   * 選別画面に出す表示用画像。**まだ作っていなければ null**。
+   * サムネイル(160x120 相当)では良し悪しを判断できず、原本(6.7MB)を毎回読むと
+   * ネットワーク越しでは重すぎる。その中間がこれ。
+   */
+  displayPath: string | null
 }
 
 /** 星の上限。1ラウンド通過ごとに +1 で頭打ち。 */
@@ -51,7 +57,7 @@ export interface SelectionSeed {
 }
 
 /** `background` は scan 完了後の事前生成。UI をブロックしない。 */
-export type ProjectTask = 'scan' | 'burst' | 'background'
+export type ProjectTask = 'scan' | 'burst' | 'background' | 'display'
 
 export interface ProjectProgress {
   projectId: string

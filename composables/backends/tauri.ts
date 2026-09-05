@@ -6,7 +6,7 @@ import type {
   ProjectProgress, ProjectTask, SelectionResult, SelectionSeed, SelectionSession, SelectionSummary
 } from '~/types/photo'
 import { normalizeSession } from '~/utils/tournament'
-import type { PhotoBackend } from '~/composables/photoBackend'
+import type { DisplaySettings, PhotoBackend } from '~/composables/photoBackend'
 import { isTauriRuntime } from '~/composables/photoBackend'
 
 async function invokeDesktop<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -89,6 +89,18 @@ export function createTauriBackend(): PhotoBackend {
     photoThumbnailUrl: (photo: Photo) => {
       if (!isTauriRuntime()) return ''
       return convertFileSrc(photo.thumbnailPath ?? photo.path)
-    }
+    },
+    // 表示用 → サムネイル → 原本。原本まで落ちるのは生成が追いつく前だけ。
+    photoDisplayUrl: (photo: Photo) => {
+      if (!isTauriRuntime()) return ''
+      return convertFileSrc(photo.displayPath ?? photo.thumbnailPath ?? photo.path)
+    },
+    getDisplaySettings: () => invokeDesktop<DisplaySettings>('get_display_settings'),
+    saveDisplayEdge: (edge: number) => invokeDesktop<number>('save_display_edge', { edge }),
+    saveProjectDisplayEdge: (projectId: string, edge: number | null) =>
+      invokeDesktop<number>('save_project_display_edge', { projectId, edge }),
+    getDisplayBacklog: (projectId: string) => invokeDesktop<number>('get_display_backlog', { projectId }),
+    startDisplayGeneration: (projectId: string) => invokeDesktop<void>('start_display_generation', { projectId }),
+    resetDisplayImages: (projectId: string) => invokeDesktop<void>('reset_display_images', { projectId })
   }
 }
