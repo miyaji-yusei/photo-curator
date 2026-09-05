@@ -6,7 +6,7 @@ import type {
   ProjectProgress, ProjectTask, SelectionResult, SelectionSeed, SelectionSession, SelectionSummary
 } from '~/types/photo'
 import { normalizeSession } from '~/utils/tournament'
-import type { DisplaySettings, PhotoBackend } from '~/composables/photoBackend'
+import type { DisplaySettings, PhotoAlbum, PhotoBackend } from '~/composables/photoBackend'
 import { isTauriRuntime } from '~/composables/photoBackend'
 
 async function invokeDesktop<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -37,6 +37,7 @@ export function createTauriBackend(): PhotoBackend {
       const selected = await open({ directory: true, multiple: false, title: 'Select a photo folder' })
       return typeof selected === 'string' ? selected : null
     },
+    listPhotoAlbums: () => invokeDesktop<PhotoAlbum[]>('list_photo_albums'),
     onProjectProgress: async (callback: (progress: ProjectProgress) => void) => {
       if (!isTauriRuntime()) return () => undefined
       const { listen } = await import('@tauri-apps/api/event')

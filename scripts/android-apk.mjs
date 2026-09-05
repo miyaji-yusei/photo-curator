@@ -43,9 +43,43 @@ const TARGET = {
   library: 'libphoto_curator_lib.so'
 }
 
+/** `app/build.gradle.kts` の minSdk と揃える。clang の名前に入る。 */
+const MIN_SDK = 24
+
 const release = process.argv.includes('--release')
 const profile = release ? 'Release' : 'Debug'
 const profileDir = release ? 'release' : 'debug'
+
+/**
+ * NDK のツールチェインを cargo に教える。
+ *
+ * `rusqlite` は C を含む（bundled SQLite）ので、cc-rs が clang を探す。
+ * 素の PATH には無く、`failed to find tool "clang.exe"` で止まる。
+ * これは `tauri android build` が内部でやっていたことと同じ。
+ */
+function androidToolchainEnv() {
+  const ndk = process.env.NDK_HOME || process.env.ANDROID_NDK_HOME
+  if (!ndk) {
+    console.error('NDK_HOME が設定されていません。')
+    process.exit(1)
+  }
+  const host = process.platform === 'win32' ? 'windows-x86_64'
+    : process.platform === 'darwin' ? 'darwin-x86_64' : 'linux-x86_64'
+  const bin = join(ndk, 'toolchains', 'llvm', 'prebuilt', host, 'bin')
+  if (!existsSync(bin)) {
+    console.error(`NDK のツールチェインが見つかりません: ${bin}`)
+    process.exit(1)
+  }
+  const suffix = process.platform === 'win32' ? '.cmd' : ''
+  const clang = join(bin, `aarch64-linux-android${MIN_SDK}-clang${suffix}`)
+  return {
+    PATH: `${bin}${process.platform === 'win32' ? ';' : ':'}${process.env.PATH}`,
+    CC_aarch64_linux_android: clang,
+    CXX_aarch64_linux_android: join(bin, `aarch64-linux-android${MIN_SDK}-clang++${suffix}`),
+    AR_aarch64_linux_android: join(bin, 'llvm-ar' + (process.platform === 'win32' ? '.exe' : '')),
+    CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: clang
+  }
+}
 
 function run(command, args, options = {}) {
   const shown = [command, ...args].join(' ')
@@ -74,7 +108,7 @@ run('cargo', [
   '--features', 'tauri/custom-protocol',
   '--lib',
   ...(release ? ['--release'] : [])
-])
+], { env: androidToolchainEnv() })
 
 // 3. シンボリックリンクの代わりにコピー。
 const built = join(ROOT, 'src-tauri', 'target', TARGET.rust, profileDir, TARGET.library)
@@ -88,7 +122,8 @@ copyFileSync(built, join(jniDir, TARGET.library))
 console.log(`\n配置: ${TARGET.abi}/${TARGET.library} (${(statSync(built).size / 1048576).toFixed(1)} MB)`)
 
 // 4. Gradle。Rust のタスクは済ませたので外す。
-const gradlew = process.platform === 'win32' ? 'gradlew.bat' : './gradlew'
+// cmd は cwd の実行ファイルを PATH から探さないので、絶対パスで渡す。
+const gradlew = join(ANDROID, process.platform === 'win32' ? 'gradlew.bat' : 'gradlew')
 run(gradlew, [
   `assemble${TARGET.arch}${profile}`,
   '-x', `rustBuild${TARGET.arch}${profile}`,

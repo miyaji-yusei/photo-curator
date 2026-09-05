@@ -1,3 +1,6 @@
+#[cfg(target_os = "android")]
+mod android_photos;
+
 use exif::{In, Reader, Tag, Value};
 use image::{imageops::FilterType, DynamicImage, GenericImageView};
 use rusqlite::{params, Connection};
@@ -910,8 +913,83 @@ pub trait PhotoSource {
 /// 64KB あれば 1 往復で足りる。足りなかったときだけ全体を取り直す。
 const EXIF_HEAD_PROBE: usize = 64 * 1024;
 
+/// `photos.path` に入っている文字列が、どこの写真を指しているか。
+///
+/// **DB のスキーマは変えない。** 列は既に `TEXT` で、`content://…` も
+/// そのまま入る。前置きだけで見分けられるので、既存の行はすべて
+/// ローカルパスとして読まれ、移行処理が要らない。
+pub enum PhotoRef {
+    Local(PathBuf),
+    /// Android の MediaStore。`content://…`
+    Content(String),
+}
+
+impl PhotoRef {
+    pub fn parse(raw: &str) -> Self {
+        if raw.starts_with("content://") {
+            Self::Content(raw.to_owned())
+        } else {
+            Self::Local(PathBuf::from(raw))
+        }
+    }
+
+    /// その指し先を読む口を返す。**解析コードはこれだけを見る。**
+    pub fn source(&self) -> Box<dyn PhotoSource + '_> {
+        match self {
+            Self::Local(path) => Box::new(LocalPhoto(path)),
+            #[cfg(target_os = "android")]
+            Self::Content(uri) => Box::new(ContentPhoto(uri)),
+            // Android 以外で content:// が来たら読めない。壊れた行として扱う。
+            #[cfg(not(target_os = "android"))]
+            Self::Content(_) => Box::new(MissingPhoto),
+        }
+    }
+}
+
 /// ローカルのファイル。デスクトップはこれだけを使う。
 pub struct LocalPhoto<'a>(pub &'a Path);
+
+/// 読めない指し先。**この環境では扱えない**ことを、失敗として素直に返す。
+#[cfg(not(target_os = "android"))]
+pub struct MissingPhoto;
+
+#[cfg(not(target_os = "android"))]
+impl PhotoSource for MissingPhoto {
+    fn head(&self, _want: usize) -> Option<Vec<u8>> {
+        None
+    }
+    fn all(&self) -> Option<Vec<u8>> {
+        None
+    }
+    fn fingerprint(&self) -> Option<(i64, i64)> {
+        None
+    }
+    fn name(&self) -> Option<String> {
+        None
+    }
+}
+
+/// Android の MediaStore。Kotlin 経由で読む。
+#[cfg(target_os = "android")]
+pub struct ContentPhoto<'a>(pub &'a str);
+
+#[cfg(target_os = "android")]
+impl PhotoSource for ContentPhoto<'_> {
+    fn head(&self, want: usize) -> Option<Vec<u8>> {
+        crate::android_photos::read_bytes(self.0, 0, want as i32)
+    }
+    fn all(&self) -> Option<Vec<u8>> {
+        crate::android_photos::read_bytes(self.0, 0, 0)
+    }
+    fn fingerprint(&self) -> Option<(i64, i64)> {
+        crate::android_photos::stat(self.0)
+    }
+    fn name(&self) -> Option<String> {
+        // content:// の末尾は数字の id で、名前にならない。
+        // 撮影時刻の手がかりは EXIF と mtime に任せる。
+        None
+    }
+}
 
 impl PhotoSource for LocalPhoto<'_> {
     fn head(&self, want: usize) -> Option<Vec<u8>> {
@@ -1490,7 +1568,7 @@ fn thumbnail_file(dir: &Path, photo_id: &str) -> PathBuf {
 fn analyse_photo(
     thumbnail_dir: &Path,
     photo_id: &str,
-    source: &Path,
+    source: &dyn PhotoSource,
     current: Option<(i64, i64)>,
     cached: &CachedAnalysis,
 ) -> AnalysisOutcome {
@@ -1542,7 +1620,7 @@ fn analyse_photo(
         }
     }
 
-    let Some((image, decode_source)) = decode_hash_source(source) else {
+    let Some((image, decode_source)) = decode_hash_source_from(source) else {
         return failed();
     };
     let Some(bytes) = encode_thumbnail(&scale_for_thumbnail(&image)) else {
@@ -1770,15 +1848,73 @@ fn project_folder(app: &AppHandle, project_id: &str) -> Result<String, String> {
         .map_err(|_| "Project was not found.".to_string())
 }
 
-fn run_scan(app: AppHandle, registry: &TaskRegistry, project_id: String) -> Result<(), String> {
-    let task_key = format!("scan:{project_id}");
-    let folder = project_folder(&app, &project_id)?;
-    let entries: Vec<PathBuf> = WalkDir::new(&folder)
+/// 走査で見つけた 1 枚。**デスクトップと Android で同じ形にする。**
+/// `path` は DB の `photos.path` にそのまま入る（絶対パス、または content:// URI）。
+struct ScanEntry {
+    path: String,
+    relative_path: String,
+    name: String,
+    fingerprint: Option<(i64, i64)>,
+}
+
+/// **Android の `mediastore://<bucketId>` はフォルダではない。**
+/// 走査の入口をここで分け、以降は同じ形を扱う。
+const MEDIASTORE_PREFIX: &str = "mediastore://";
+
+fn collect_scan_entries(folder: &str) -> Result<Vec<ScanEntry>, String> {
+    if let Some(bucket) = folder.strip_prefix(MEDIASTORE_PREFIX) {
+        return collect_mediastore_entries(bucket);
+    }
+    Ok(WalkDir::new(folder)
         .into_iter()
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file() && is_supported(entry.path()))
-        .map(|entry| entry.into_path())
-        .collect();
+        .map(|entry| {
+            let path = entry.into_path();
+            let relative_path = path
+                .strip_prefix(folder)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string();
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("photo")
+                .to_owned();
+            ScanEntry {
+                // metadata が読めない場合に (0,0) を入れると、読めない
+                // ファイル同士が「同じ fingerprint」に見えてしまう。
+                fingerprint: fingerprint(&path),
+                path: path.to_string_lossy().to_string(),
+                relative_path,
+                name,
+            }
+        })
+        .collect())
+}
+
+#[cfg(target_os = "android")]
+fn collect_mediastore_entries(bucket: &str) -> Result<Vec<ScanEntry>, String> {
+    Ok(android_photos::list_photos(bucket)?
+        .into_iter()
+        .map(|photo| ScanEntry {
+            path: photo.uri,
+            relative_path: photo.relative_path,
+            name: photo.name,
+            fingerprint: Some((photo.modified_at, photo.size)),
+        })
+        .collect())
+}
+
+#[cfg(not(target_os = "android"))]
+fn collect_mediastore_entries(_bucket: &str) -> Result<Vec<ScanEntry>, String> {
+    Err("端末の写真はこの環境では読めません。".into())
+}
+
+fn run_scan(app: AppHandle, registry: &TaskRegistry, project_id: String) -> Result<(), String> {
+    let task_key = format!("scan:{project_id}");
+    let folder = project_folder(&app, &project_id)?;
+    let entries = collect_scan_entries(&folder)?;
     let total = entries.len();
     progress(
         &app,
@@ -1805,7 +1941,7 @@ fn run_scan(app: AppHandle, registry: &TaskRegistry, project_id: String) -> Resu
     let transaction = conn
         .unchecked_transaction()
         .map_err(|error| error.to_string())?;
-    for (index, path) in entries.iter().enumerate() {
+    for (index, entry) in entries.iter().enumerate() {
         if registry.is_cancelled(&task_key) {
             transaction.rollback().map_err(|error| error.to_string())?;
             connection(&app)?
@@ -1825,20 +1961,10 @@ fn run_scan(app: AppHandle, registry: &TaskRegistry, project_id: String) -> Resu
             );
             return Ok(());
         }
-        let relative = path
-            .strip_prefix(&folder)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .to_string();
-        let name = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("photo")
-            .to_owned();
-        let absolute = path.to_string_lossy().to_string();
-        // metadata が読めない場合に (0,0) を入れると、読めないファイル同士が
-        // 「同じ fingerprint」に見えてしまう。NULL のまま持たせる。
-        let (mtime, size) = match fingerprint(path) {
+        let relative = entry.relative_path.clone();
+        let name = entry.name.clone();
+        let absolute = entry.path.clone();
+        let (mtime, size) = match entry.fingerprint {
             Some((mtime, size)) => (Some(mtime), Some(size)),
             None => (None, None),
         };
@@ -1906,9 +2032,11 @@ fn run_scan(app: AppHandle, registry: &TaskRegistry, project_id: String) -> Resu
 /// **DB には触れない。**書き込みは writer が `flush_results` でまとめて行う。
 fn hash_one(thumbnails: &Path, index: usize, record: &HashRecord) -> PhotoWork {
     let mut result = PhotoWork::new(index, &record.id);
-    let photo_path = Path::new(&record.path);
-    let current = fingerprint(photo_path);
-    let analysed = analyse_photo(thumbnails, &record.id, photo_path, current, &record.cached);
+    // ローカルのパスでも content:// でも、ここから先は同じ経路を通る。
+    let reference = PhotoRef::parse(&record.path);
+    let source = reference.source();
+    let current = source.fingerprint();
+    let analysed = analyse_photo(thumbnails, &record.id, source.as_ref(), current, &record.cached);
     result.fingerprint = current;
     result.d_hash = analysed.d_hash;
     result.thumbnail_path = analysed.thumbnail_path;
@@ -3329,6 +3457,41 @@ fn save_burst_shape(
 }
 
 // ---------------------------------------------------------------------------
+// 端末の写真（Android）
+// ---------------------------------------------------------------------------
+
+/// 選べる写真の出所。デスクトップは「フォルダを選ぶ」だが、Android には
+/// 走査できるフォルダが無いので、**アルバム（MediaStore の bucket）を選ぶ**。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PhotoAlbum {
+    /// `create_project` にそのまま渡せる形。`mediastore://<bucketId>`
+    path: String,
+    name: String,
+    count: i64,
+}
+
+/// この端末で選べるアルバム。デスクトップでは常に空で、画面はフォルダ選択を出す。
+#[tauri::command]
+fn list_photo_albums() -> Result<Vec<PhotoAlbum>, String> {
+    #[cfg(target_os = "android")]
+    {
+        Ok(android_photos::list_albums()?
+            .into_iter()
+            .map(|album| PhotoAlbum {
+                path: format!("{MEDIASTORE_PREFIX}{}", album.id),
+                name: album.name,
+                count: album.count,
+            })
+            .collect())
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        Ok(Vec::new())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 表示用画像の設定と生成
 // ---------------------------------------------------------------------------
 
@@ -3829,7 +3992,13 @@ pub mod bench_api {
         current: Option<(i64, i64)>,
         cached: &CachedAnalysis,
     ) -> AnalysisOutcome {
-        super::analyse_photo(thumbnail_dir, photo_id, source, current, cached)
+        super::analyse_photo(
+            thumbnail_dir,
+            photo_id,
+            &super::LocalPhoto(source),
+            current,
+            cached,
+        )
     }
 
     /// どのデコード経路が使われるかだけを調べる（サムネイルは書かない）。
@@ -3936,6 +4105,7 @@ pub fn run() {
             get_selection_summary,
             export_by_rating,
             write_ratings_to_files,
+            list_photo_albums,
             get_display_settings,
             save_display_edge,
             save_project_display_edge,
@@ -4970,6 +5140,50 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Routine 11: 写真の指し先
+    // -----------------------------------------------------------------------
+
+    /// **既存の行を壊さないことが要点。** DB には絶対パスがそのまま入っており、
+    /// 判別を間違えると全部が「読めない写真」になる。
+    #[test]
+    fn a_photo_reference_tells_local_paths_from_content_uris() {
+        let local = |raw: &str| matches!(PhotoRef::parse(raw), PhotoRef::Local(_));
+        let content = |raw: &str| matches!(PhotoRef::parse(raw), PhotoRef::Content(_));
+
+        // 既存の行はすべてローカル扱い。
+        assert!(local(r"C:\Users\miyaj\Pictures\a.jpg"));
+        assert!(local("/home/user/photos/a.jpg"));
+        assert!(local(r"\\nas\share\a.jpg"));
+        // 紛らわしい名前でも、前置きが違えばローカル。
+        assert!(local("contents://not-a-uri.jpg"));
+        assert!(local("content:/single-slash.jpg"));
+
+        assert!(content("content://media/external/images/media/1234"));
+
+        // 往復して同じ文字列に戻る（DB へ書き戻すときに崩れない）。
+        for raw in [r"C:\a\b.jpg", "content://media/external/images/media/1"] {
+            let restored = match PhotoRef::parse(raw) {
+                PhotoRef::Local(path) => path.to_string_lossy().to_string(),
+                PhotoRef::Content(uri) => uri,
+            };
+            assert_eq!(restored, raw);
+        }
+    }
+
+    /// Android 以外で content:// が来ても、落ちずに「読めない」で済むこと。
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn a_content_uri_is_simply_unreadable_off_android() {
+        let reference = PhotoRef::parse("content://media/external/images/media/1");
+        let source = reference.source();
+        assert!(source.head(1024).is_none());
+        assert!(source.all().is_none());
+        assert!(source.fingerprint().is_none());
+        // 解析に掛けても panic せず、失敗として返る。
+        assert!(decode_hash_source_from(source.as_ref()).is_none());
+    }
+
+    // -----------------------------------------------------------------------
     // Routine 10b: 表示用サイズ
     // -----------------------------------------------------------------------
 
@@ -5179,7 +5393,7 @@ mod tests {
         .write(&photo);
 
         let run = |cached: &CachedAnalysis| {
-            analyse_photo(&thumbnails, "photo-1", &photo, fingerprint(&photo), cached)
+            analyse_photo(&thumbnails, "photo-1", &LocalPhoto(&photo), fingerprint(&photo), cached)
         };
         let store = |outcome: &AnalysisOutcome, photo: &Path| {
             let (mtime, size) = fingerprint(photo).expect("fingerprint");
@@ -5277,7 +5491,7 @@ mod tests {
         );
 
         // --- fingerprint が読めないときはキャッシュを信用しない ---------------
-        let unreadable = analyse_photo(&thumbnails, "photo-1", &photo, None, &cached);
+        let unreadable = analyse_photo(&thumbnails, "photo-1", &LocalPhoto(&photo), None, &cached);
         assert!(matches!(
             unreadable.thumbnail_state,
             ThumbnailState::Generated(_)
@@ -5331,7 +5545,7 @@ mod tests {
             let outcome = analyse_photo(
                 &thumbnails,
                 &format!("id-{}", path.display()),
-                path,
+                &LocalPhoto(path),
                 fingerprint(path),
                 &CachedAnalysis::default(),
             );

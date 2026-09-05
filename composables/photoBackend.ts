@@ -1,5 +1,12 @@
 import type { BackendCapabilities } from '~/utils/capabilities'
 
+/** 写真の出所。path はそのまま createProject に渡せる。 */
+export interface PhotoAlbum {
+  path: string
+  name: string
+  count: number
+}
+
 /** 表示用サイズの選択肢と、いまの既定。設定画面がそのまま使う。 */
 export interface DisplaySettings {
   edge: number
@@ -34,6 +41,12 @@ export interface PhotoBackend {
   readonly capabilities: BackendCapabilities
 
   chooseFolder: () => Promise<string | null>
+  /**
+   * この端末で選べる写真の出所。
+   * デスクトップは空（フォルダ選択を出す）。**Android はアルバムの一覧**で、
+   * 走査できるフォルダが無いため、これが「フォルダを選ぶ」の代わりになる。
+   */
+  listPhotoAlbums: () => Promise<PhotoAlbum[]>
 
   /** 解析の進捗。戻り値を呼ぶと購読を解除する。 */
   onProjectProgress: (callback: (progress: ProjectProgress) => void) => Promise<() => void>

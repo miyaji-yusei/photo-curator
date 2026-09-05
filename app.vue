@@ -4,7 +4,7 @@ import type {
   SelectionResult, SelectionSession, SelectionSummary, TournamentSettings
 } from '~/types/photo'
 import { MAX_RATING } from '~/types/photo'
-import type { DisplaySettings } from '~/composables/photoBackend'
+import type { DisplaySettings, PhotoAlbum } from '~/composables/photoBackend'
 import type { MoveSelection } from '~/utils/ratingMove'
 // `selectedCount` は選別画面側の computed と名前がぶつかるので別名にする。
 import {
@@ -373,6 +373,31 @@ async function chooseFolder() {
  * 代わりに写真ピッカーから受け取る。
  */
 const canImportPhotos = computed(() => typeof desktop.importPhotos === 'function')
+/**
+ * この端末で選べる写真の出所。**Android はフォルダを走査できない**ので、
+ * アルバム（MediaStore の bucket）の一覧がフォルダ選択の代わりになる。
+ * デスクトップでは空のままで、今までどおりフォルダ選択が出る。
+ */
+const photoAlbums = ref<PhotoAlbum[]>([])
+const albumsBusy = ref(false)
+const usesAlbums = computed(() => photoAlbums.value.length > 0)
+
+function openCreateDialog() {
+  createDialog.value = true
+  void loadPhotoAlbums()
+}
+
+async function loadPhotoAlbums() {
+  albumsBusy.value = true
+  try {
+    photoAlbums.value = await desktop.listPhotoAlbums()
+  } catch {
+    // 権限が無い・端末が対応しない。フォルダ選択に落ちるだけ。
+    photoAlbums.value = []
+  } finally {
+    albumsBusy.value = false
+  }
+}
 const photoInput = ref<HTMLInputElement | null>(null)
 
 function openPhotoPicker() {
@@ -1728,7 +1753,7 @@ onBeforeUnmount(() => {
         <template v-if="view === 'home'">
           <div class="d-flex align-start justify-space-between flex-wrap ga-4 mb-8">
             <div><div class="text-overline text-primary">Photo selection workspace</div><h1 class="text-h3 font-weight-bold">写真を、選びやすい形へ。</h1><p class="text-medium-emphasis mt-2">プロジェクトを作成して、直感的な選択を始めましょう。</p></div>
-            <v-btn color="primary" size="large" prepend-icon="mdi-plus" @click="createDialog = true">プロジェクトを作成</v-btn>
+            <v-btn color="primary" size="large" prepend-icon="mdi-plus" @click="openCreateDialog">プロジェクトを作成</v-btn>
           </div>
           <v-row>
             <v-col cols="12"><v-card><v-card-title class="pt-5 px-5">プロジェクト</v-card-title><v-card-subtitle class="px-5">選別の状況をここから確認できます。</v-card-subtitle><v-list v-if="projects.length" lines="two" class="mt-3"><v-list-item v-for="project in projects" :key="project.id" :title="project.name" :subtitle="shortPath(project.folderPath)" @click="openProject(project)"><template #prepend><v-avatar color="surface-variant"><v-icon icon="mdi-folder-image" /></v-avatar></template><template #append><div class="d-flex align-center ga-4"><div class="text-right"><div class="text-body-2">{{ statusLabel(project) }}</div><div class="text-caption text-medium-emphasis">更新 {{ formatDate(project.updatedAt) }}</div></div><v-btn icon="mdi-delete-outline" variant="text" size="small" :aria-label="`${project.name} を削除`" @click.stop="askDeleteProject(project)" /></div></template></v-list-item></v-list><v-card-text v-else class="py-12 text-center text-medium-emphasis">まだプロジェクトがありません。</v-card-text></v-card></v-col>
@@ -2187,8 +2212,31 @@ onBeforeUnmount(() => {
 
     <v-dialog v-model="createDialog" max-width="620"><v-card title="プロジェクトを作成"><v-card-text class="pt-5">
       <v-text-field v-model="projectName" label="プロジェクト名" :placeholder="folderPath ? fileName(folderPath) : '任意のプロジェクト名'" :hint="canImportPhotos ? '作成したあと「写真を追加」から選びます。' : '空欄ならフォルダ名を使います。'" persistent-hint class="mb-5" />
-      <!-- デスクトップはフォルダを参照する。ブラウザは作成後にピッカーで選ぶ。 -->
-      <v-text-field v-if="!canImportPhotos" v-model="folderPath" label="写真フォルダ" readonly prepend-inner-icon="mdi-folder-image"><template #append-inner><v-btn variant="outlined" size="small" @click="chooseFolder">選択</v-btn></template></v-text-field>
+      <!-- 出所の選び方は環境で 3 通りある。
+           デスクトップ … フォルダを参照する
+           Android      … 走査できるフォルダが無いのでアルバムを選ぶ
+           ブラウザ     … 作成後に写真ピッカーで選ぶ -->
+      <template v-if="usesAlbums">
+        <div class="text-body-2 mb-2">どのアルバムから選びますか？</div>
+        <v-list density="compact" class="album-list" bg-color="transparent">
+          <v-list-item
+            v-for="album in photoAlbums" :key="album.path"
+            :active="folderPath === album.path" color="primary" rounded="lg"
+            @click="folderPath = album.path"
+          >
+            <template #prepend><v-icon icon="mdi-image-multiple-outline" /></template>
+            <v-list-item-title>{{ album.name }}</v-list-item-title>
+            <template #append>
+              <span class="text-caption text-medium-emphasis">{{ album.count.toLocaleString() }} 枚</span>
+            </template>
+          </v-list-item>
+        </v-list>
+        <p class="text-caption text-medium-emphasis mt-2 mb-0">
+          写真そのものは端末の外に出ません。原本も変更しません。
+        </p>
+      </template>
+      <v-progress-linear v-else-if="albumsBusy" indeterminate color="primary" class="my-4" />
+      <v-text-field v-else-if="!canImportPhotos" v-model="folderPath" label="写真フォルダ" readonly prepend-inner-icon="mdi-folder-image"><template #append-inner><v-btn variant="outlined" size="small" @click="chooseFolder">選択</v-btn></template></v-text-field>
       <v-alert v-else type="info" variant="tonal" density="comfortable">
         この端末の写真から選びます。写真そのものは端末の外に出ません。
       </v-alert>

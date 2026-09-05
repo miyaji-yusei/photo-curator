@@ -1,3 +1,7 @@
 {
-  "extends": "./.nuxt/tsconfig.json"
+  "extends": "./.nuxt/tsconfig.json",
+  // Rust のビルド成果物を型検査に混ぜない。Tauri は画面を .so に埋め込むため、
+  // src-tauri/target の下に圧縮済みの .js が生成される。これを拾うと
+  // 「binary に見える」「不正な文字」で typecheck が落ちる。
+  "exclude": ["src-tauri", "node_modules", "dist", ".output", ".nuxt/dist"]
 }

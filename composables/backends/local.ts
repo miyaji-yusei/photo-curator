@@ -131,6 +131,8 @@ export function createLocalBackend(): PhotoBackend {
     capabilities: capabilitiesFor('browser'),
     // フォルダを走査できるのはデスクトップだけ。
     chooseFolder: () => Promise.resolve(null),
+    // ブラウザは写真ピッカーが唯一の入口。並べられる出所は無い。
+    listPhotoAlbums: () => Promise.resolve([]),
 
     onProjectProgress: (callback) => {
       listeners.add(callback)

@@ -41,3 +41,13 @@ uuid = { version = "1", features = ["v4"] }
 # scaled decode を提供しないため、EXIF サムネイルが無い JPEG の
 # フォールバック経路としてこちらを併用する。
 jpeg-decoder = "0.3"
+
+# Android だけ。端末の写真（MediaStore）へは Kotlin 経由でしか届かないので、
+# JNI で PhotoAccess.kt の静的メソッドを呼ぶ。**Tauri のプラグイン機構は使わない**：
+# 必要なのが「一覧を返す」「バイト列を返す」の 2 つだけで、Activity の
+# やりとりが要らないため。
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+# JavaVM は Android のランタイムが ndk-context に登録している。
+# Tauri の AppHandle からは取れないので、こちらから引く。
+ndk-context = "0.1"
