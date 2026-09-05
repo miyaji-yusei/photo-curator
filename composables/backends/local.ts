@@ -133,6 +133,9 @@ export function createLocalBackend(): PhotoBackend {
     chooseFolder: () => Promise.resolve(null),
     // ブラウザは写真ピッカーが唯一の入口。並べられる出所は無い。
     listPhotoAlbums: () => Promise.resolve([]),
+    // ブラウザから SMB へは届かない。
+    connectNas: () => unsupported('NAS への接続'),
+    disconnectNas: () => Promise.resolve(),
 
     onProjectProgress: (callback) => {
       listeners.add(callback)

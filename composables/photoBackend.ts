@@ -47,6 +47,14 @@ export interface PhotoBackend {
    * 走査できるフォルダが無いため、これが「フォルダを選ぶ」の代わりになる。
    */
   listPhotoAlbums: () => Promise<PhotoAlbum[]>
+  /**
+   * NAS へ繋ぐ。繋がったら共有の直下のフォルダを返す。
+   * **認証情報は保存しない。** アプリを終了すると消える。
+   */
+  connectNas: (
+    host: string, share: string, user: string, password: string
+  ) => Promise<PhotoAlbum[]>
+  disconnectNas: () => Promise<void>
 
   /** 解析の進捗。戻り値を呼ぶと購読を解除する。 */
   onProjectProgress: (callback: (progress: ProjectProgress) => void) => Promise<() => void>

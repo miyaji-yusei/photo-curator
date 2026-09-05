@@ -31,7 +31,7 @@ fn java_vm() -> Result<JavaVM, String> {
 
 /// JNI を触るときの共通の型。**失敗は全部これに畳む。**
 /// 1 枚読めなくても解析全体は続けるので、詳細より「駄目だった」ことが大事。
-type Bridge<T> = Result<T, String>;
+pub type Bridge<T> = Result<T, String>;
 
 fn with_env<T>(body: impl FnOnce(&mut jni::AttachGuard<'_>) -> Bridge<T>) -> Bridge<T> {
     let vm = java_vm()?;
@@ -46,15 +46,28 @@ fn with_env<T>(body: impl FnOnce(&mut jni::AttachGuard<'_>) -> Bridge<T>) -> Bri
     result
 }
 
-/// 静的メソッドを呼んで文字列を受け取る。
-fn call_string(method: &str, signature: &str, args: &[JValue<'_, '_>]) -> Bridge<String> {
+/// 文字列引数だけを取る静的メソッドを呼び、文字列を受け取る。
+/// **戻り値が void でも呼べる**（その場合は空文字が返る）。
+/// android_smb からも使うので、ここが JNI の共通の入口になる。
+pub fn jni_string(class: &str, method: &str, signature: &str, args: &[&str]) -> Bridge<String> {
     with_env(|env| {
+        // JString は env から作るので、参照を保ったまま JValue に詰める。
+        let mut objects = Vec::with_capacity(args.len());
+        for argument in args {
+            objects.push(
+                env.new_string(argument)
+                    .map_err(|error| format!("引数を渡せません: {error}"))?,
+            );
+        }
+        let values: Vec<JValue<'_, '_>> =
+            objects.iter().map(|o| JValue::Object(o)).collect();
         let value = env
-            .call_static_method(CLASS, method, signature, args)
+            .call_static_method(class, method, signature, &values)
             .map_err(|error| format!("{method} を呼べません: {error}"))?;
-        let object = value
-            .l()
-            .map_err(|error| format!("{method} の戻り値が文字列ではありません: {error}"))?;
+        // void のときは l() が失敗する。呼べたこと自体は成功なので空文字を返す。
+        let Ok(object) = value.l() else {
+            return Ok(String::new());
+        };
         if object.is_null() {
             return Ok(String::new());
         }
@@ -64,6 +77,39 @@ fn call_string(method: &str, signature: &str, args: &[JValue<'_, '_>]) -> Bridge
             .into();
         Ok(text)
     })
+}
+
+/// (String, long, int) から byte[] を受け取る形の静的メソッドを呼ぶ。
+/// **部分読みの入口。** 全体を読むときは length に 0 を渡す。
+pub fn jni_bytes(
+    class: &str,
+    method: &str,
+    url: &str,
+    offset: i64,
+    length: i32,
+) -> Option<Vec<u8>> {
+    with_env(|env| {
+        let argument = env.new_string(url).map_err(|e| e.to_string())?;
+        let value = env
+            .call_static_method(
+                class,
+                method,
+                "(Ljava/lang/String;JI)[B",
+                &[
+                    JValue::Object(&argument),
+                    JValue::Long(offset),
+                    JValue::Int(length),
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        let object: JObject<'_> = value.l().map_err(|e| e.to_string())?;
+        if object.is_null() {
+            return Err("読めませんでした。".into());
+        }
+        let array = JByteArray::from(object);
+        env.convert_byte_array(&array).map_err(|e| e.to_string())
+    })
+    .ok()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,7 +138,7 @@ struct Stat {
 }
 
 pub fn list_albums() -> Bridge<Vec<Album>> {
-    let json = call_string("listAlbums", "()Ljava/lang/String;", &[])?;
+    let json = jni_string(CLASS, "listAlbums", "()Ljava/lang/String;", &[])?;
     if json.is_empty() {
         return Ok(Vec::new());
     }
@@ -100,28 +146,12 @@ pub fn list_albums() -> Bridge<Vec<Album>> {
 }
 
 pub fn list_photos(bucket_id: &str) -> Bridge<Vec<MediaPhoto>> {
-    let json = with_env(|env| {
-        let argument = env
-            .new_string(bucket_id)
-            .map_err(|error| format!("引数を渡せません: {error}"))?;
-        let value = env
-            .call_static_method(
-                CLASS,
-                "listPhotos",
-                "(Ljava/lang/String;)Ljava/lang/String;",
-                &[JValue::Object(&argument)],
-            )
-            .map_err(|error| format!("listPhotos を呼べません: {error}"))?;
-        let object = value.l().map_err(|error| format!("戻り値が不正です: {error}"))?;
-        if object.is_null() {
-            return Ok(String::new());
-        }
-        let text: String = env
-            .get_string(&JString::from(object))
-            .map_err(|error| format!("文字列を読めません: {error}"))?
-            .into();
-        Ok(text)
-    })?;
+    let json = jni_string(
+        CLASS,
+        "listPhotos",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        &[bucket_id],
+    )?;
     if json.is_empty() {
         return Ok(Vec::new());
     }
@@ -130,26 +160,12 @@ pub fn list_photos(bucket_id: &str) -> Bridge<Vec<MediaPhoto>> {
 
 /// 1 枚ぶんの mtime と size。**既存のキャッシュ無効化がそのまま効く。**
 pub fn stat(uri: &str) -> Option<(i64, i64)> {
-    let json = with_env(|env| {
-        let argument = env.new_string(uri).map_err(|e| e.to_string())?;
-        let value = env
-            .call_static_method(
-                CLASS,
-                "statPhoto",
-                "(Ljava/lang/String;)Ljava/lang/String;",
-                &[JValue::Object(&argument)],
-            )
-            .map_err(|e| e.to_string())?;
-        let object = value.l().map_err(|e| e.to_string())?;
-        if object.is_null() {
-            return Ok(String::new());
-        }
-        let text: String = env
-            .get_string(&JString::from(object))
-            .map_err(|e| e.to_string())?
-            .into();
-        Ok(text)
-    })
+    let json = jni_string(
+        CLASS,
+        "statPhoto",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        &[uri],
+    )
     .ok()?;
     let parsed: Stat = serde_json::from_str(&json).ok()?;
     Some((parsed.modified_at, parsed.size))
@@ -157,27 +173,5 @@ pub fn stat(uri: &str) -> Option<(i64, i64)> {
 
 /// 写真のバイト列。`length` が 0 なら最後まで。
 pub fn read_bytes(uri: &str, offset: i64, length: i32) -> Option<Vec<u8>> {
-    with_env(|env| {
-        let argument = env.new_string(uri).map_err(|e| e.to_string())?;
-        let value = env
-            .call_static_method(
-                CLASS,
-                "readBytes",
-                "(Ljava/lang/String;JI)[B",
-                &[
-                    JValue::Object(&argument),
-                    JValue::Long(offset),
-                    JValue::Int(length),
-                ],
-            )
-            .map_err(|e| e.to_string())?;
-        let object: JObject<'_> = value.l().map_err(|e| e.to_string())?;
-        if object.is_null() {
-            return Err("写真を読めませんでした。".into());
-        }
-        let array = JByteArray::from(object);
-        let bytes = env.convert_byte_array(&array).map_err(|e| e.to_string())?;
-        Ok(bytes)
-    })
-    .ok()
+    jni_bytes(CLASS, "readBytes", uri, offset, length)
 }

@@ -45,8 +45,31 @@ android {
             )
         }
     }
+    compileOptions {
+        // smbj は java.time など Java 8 の API を使う。minSdk 24 では
+        // そのままでは無いので、脱糖（desugaring）で補う。
+        isCoreLibraryDesugaringEnabled = true
+        sourceCompatibility = JavaVersion.VERSION_1_8
+        targetCompatibility = JavaVersion.VERSION_1_8
+    }
     kotlinOptions {
         jvmTarget = "1.8"
+    }
+    packaging {
+        resources {
+            // smbj とその依存が同じ META-INF を持ち込んでぶつかる。
+            excludes += setOf(
+                "META-INF/DEPENDENCIES",
+                "META-INF/LICENSE*",
+                "META-INF/NOTICE*",
+                "META-INF/INDEX.LIST",
+                "META-INF/*.kotlin_module",
+                "META-INF/versions/9/module-info.class",
+                // bouncycastle と jspecify が同じ道を持ち込む。
+                "META-INF/versions/**/OSGI-INF/MANIFEST.MF",
+                "META-INF/versions/**/MANIFEST.MF"
+            )
+        }
     }
     buildFeatures {
         buildConfig = true
@@ -58,6 +81,11 @@ rust {
 }
 
 dependencies {
+    // NAS(SMB2/3)。純 Java で Android での実績がある。Apache 2.0。
+    implementation("com.hierynomus:smbj:0.14.0")
+    // smbj は slf4j を要求する。何も出さない実装を入れて警告を止める。
+    implementation("org.slf4j:slf4j-nop:2.0.16")
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")
     implementation("androidx.webkit:webkit:1.14.0")
     implementation("androidx.appcompat:appcompat:1.7.1")
     implementation("androidx.activity:activity-ktx:1.10.1")

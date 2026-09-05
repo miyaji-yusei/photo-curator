@@ -38,6 +38,9 @@ export function createTauriBackend(): PhotoBackend {
       return typeof selected === 'string' ? selected : null
     },
     listPhotoAlbums: () => invokeDesktop<PhotoAlbum[]>('list_photo_albums'),
+    connectNas: (host: string, share: string, user: string, password: string) =>
+      invokeDesktop<PhotoAlbum[]>('connect_nas', { host, share, user, password }),
+    disconnectNas: () => invokeDesktop<void>('disconnect_nas'),
     onProjectProgress: async (callback: (progress: ProjectProgress) => void) => {
       if (!isTauriRuntime()) return () => undefined
       const { listen } = await import('@tauri-apps/api/event')

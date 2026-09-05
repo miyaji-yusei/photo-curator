@@ -1,5 +1,7 @@
 #[cfg(target_os = "android")]
 mod android_photos;
+#[cfg(target_os = "android")]
+mod android_smb;
 
 use exif::{In, Reader, Tag, Value};
 use image::{imageops::FilterType, DynamicImage, GenericImageView};
@@ -922,12 +924,16 @@ pub enum PhotoRef {
     Local(PathBuf),
     /// Android の MediaStore。`content://…`
     Content(String),
+    /// NAS。`smb://<host>/<share>/<相対パス>`
+    Smb(String),
 }
 
 impl PhotoRef {
     pub fn parse(raw: &str) -> Self {
         if raw.starts_with("content://") {
             Self::Content(raw.to_owned())
+        } else if raw.starts_with(SMB_PREFIX) {
+            Self::Smb(raw.to_owned())
         } else {
             Self::Local(PathBuf::from(raw))
         }
@@ -939,9 +945,11 @@ impl PhotoRef {
             Self::Local(path) => Box::new(LocalPhoto(path)),
             #[cfg(target_os = "android")]
             Self::Content(uri) => Box::new(ContentPhoto(uri)),
-            // Android 以外で content:// が来たら読めない。壊れた行として扱う。
+            #[cfg(target_os = "android")]
+            Self::Smb(url) => Box::new(SmbPhoto(url)),
+            // Android 以外では読めない。壊れた行として扱う。
             #[cfg(not(target_os = "android"))]
-            Self::Content(_) => Box::new(MissingPhoto),
+            Self::Content(_) | Self::Smb(_) => Box::new(MissingPhoto),
         }
     }
 }
@@ -969,9 +977,33 @@ impl PhotoSource for MissingPhoto {
     }
 }
 
+/// NAS の写真を指す前置き。
+pub const SMB_PREFIX: &str = "smb://";
+
 /// Android の MediaStore。Kotlin 経由で読む。
 #[cfg(target_os = "android")]
 pub struct ContentPhoto<'a>(pub &'a str);
+
+/// NAS（SMB）。Kotlin 経由で読む。**先頭だけ読めることが要点。**
+#[cfg(target_os = "android")]
+pub struct SmbPhoto<'a>(pub &'a str);
+
+#[cfg(target_os = "android")]
+impl PhotoSource for SmbPhoto<'_> {
+    fn head(&self, want: usize) -> Option<Vec<u8>> {
+        crate::android_smb::read_bytes(self.0, 0, want as i32)
+    }
+    fn all(&self) -> Option<Vec<u8>> {
+        crate::android_smb::read_bytes(self.0, 0, 0)
+    }
+    fn fingerprint(&self) -> Option<(i64, i64)> {
+        crate::android_smb::stat(self.0)
+    }
+    fn name(&self) -> Option<String> {
+        // smb://host/share/a/b.jpg の末尾。撮影時刻の手がかりになる。
+        self.0.rsplit('/').next().map(str::to_owned)
+    }
+}
 
 #[cfg(target_os = "android")]
 impl PhotoSource for ContentPhoto<'_> {
@@ -1865,6 +1897,9 @@ fn collect_scan_entries(folder: &str) -> Result<Vec<ScanEntry>, String> {
     if let Some(bucket) = folder.strip_prefix(MEDIASTORE_PREFIX) {
         return collect_mediastore_entries(bucket);
     }
+    if folder.starts_with(SMB_PREFIX) {
+        return collect_smb_entries(folder);
+    }
     Ok(WalkDir::new(folder)
         .into_iter()
         .filter_map(Result::ok)
@@ -1909,6 +1944,24 @@ fn collect_mediastore_entries(bucket: &str) -> Result<Vec<ScanEntry>, String> {
 #[cfg(not(target_os = "android"))]
 fn collect_mediastore_entries(_bucket: &str) -> Result<Vec<ScanEntry>, String> {
     Err("端末の写真はこの環境では読めません。".into())
+}
+
+#[cfg(target_os = "android")]
+fn collect_smb_entries(folder: &str) -> Result<Vec<ScanEntry>, String> {
+    Ok(android_smb::list_photos(folder)?
+        .into_iter()
+        .map(|photo| ScanEntry {
+            path: photo.uri,
+            relative_path: photo.relative_path,
+            name: photo.name,
+            fingerprint: Some((photo.modified_at, photo.size)),
+        })
+        .collect())
+}
+
+#[cfg(not(target_os = "android"))]
+fn collect_smb_entries(_folder: &str) -> Result<Vec<ScanEntry>, String> {
+    Err("NAS はこの環境では読めません。".into())
 }
 
 fn run_scan(app: AppHandle, registry: &TaskRegistry, project_id: String) -> Result<(), String> {
@@ -3471,6 +3524,43 @@ struct PhotoAlbum {
     count: i64,
 }
 
+/// NAS へ繋ぐ。**認証情報は保存しない。** メモリにしか置かないので、
+/// アプリを終了すると消え、次に開くときにもう一度入れてもらう。
+/// 「NAS に繋がっているときだけ使えればよい」という方針なので、保存する理由がない。
+#[tauri::command]
+fn connect_nas(
+    host: String,
+    share: String,
+    user: String,
+    password: String,
+) -> Result<Vec<PhotoAlbum>, String> {
+    #[cfg(target_os = "android")]
+    {
+        android_smb::connect(&host, &share, &user, &password)?;
+        // 繋がったら、共有の直下にあるフォルダを「選べる出所」として返す。
+        Ok(android_smb::list_folders("")?
+            .into_iter()
+            .map(|folder| PhotoAlbum {
+                path: folder.path,
+                name: folder.name,
+                // 枚数は数えると全走査になる。選ぶ時点では出さない。
+                count: -1,
+            })
+            .collect())
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (host, share, user, password);
+        Err("NAS への接続はこの環境では行えません。".into())
+    }
+}
+
+#[tauri::command]
+fn disconnect_nas() {
+    #[cfg(target_os = "android")]
+    android_smb::disconnect();
+}
+
 /// この端末で選べるアルバム。デスクトップでは常に空で、画面はフォルダ選択を出す。
 #[tauri::command]
 fn list_photo_albums() -> Result<Vec<PhotoAlbum>, String> {
@@ -4106,6 +4196,8 @@ pub fn run() {
             export_by_rating,
             write_ratings_to_files,
             list_photo_albums,
+            connect_nas,
+            disconnect_nas,
             get_display_settings,
             save_display_edge,
             save_project_display_edge,
@@ -5160,11 +5252,22 @@ mod tests {
 
         assert!(content("content://media/external/images/media/1234"));
 
+        let smb = |raw: &str| matches!(PhotoRef::parse(raw), PhotoRef::Smb(_));
+        assert!(smb("smb://192.168.11.10/photos/2026/a.jpg"));
+        // 紛らわしいが前置きが違う。
+        assert!(local("smbx://host/share/a.jpg"));
+        assert!(local(r"\\host\share\a.jpg"));
+
         // 往復して同じ文字列に戻る（DB へ書き戻すときに崩れない）。
-        for raw in [r"C:\a\b.jpg", "content://media/external/images/media/1"] {
+        for raw in [
+            r"C:\a\b.jpg",
+            "content://media/external/images/media/1",
+            "smb://192.168.11.10/photos/2026/a.jpg",
+        ] {
             let restored = match PhotoRef::parse(raw) {
                 PhotoRef::Local(path) => path.to_string_lossy().to_string(),
                 PhotoRef::Content(uri) => uri,
+                PhotoRef::Smb(url) => url,
             };
             assert_eq!(restored, raw);
         }

@@ -379,12 +379,56 @@ const canImportPhotos = computed(() => typeof desktop.importPhotos === 'function
  * デスクトップでは空のままで、今までどおりフォルダ選択が出る。
  */
 const photoAlbums = ref<PhotoAlbum[]>([])
+// NAS への接続。**認証情報は持ち回らない**（保存もしない）。
+const nasDialog = ref(false)
+const nasHost = ref('')
+const nasShare = ref('')
+const nasUser = ref('')
+const nasPassword = ref('')
+const nasBusy = ref(false)
+const nasError = ref('')
+const nasConnected = ref(false)
 const albumsBusy = ref(false)
 const usesAlbums = computed(() => photoAlbums.value.length > 0)
 
 function openCreateDialog() {
   createDialog.value = true
   void loadPhotoAlbums()
+}
+
+/**
+ * NAS へ繋ぎ、共有の直下のフォルダを「選べる出所」として並べる。
+ * 失敗しても端末のアルバムはそのまま残るので、選別を始められなくなることはない。
+ */
+async function connectNas() {
+  if (!nasHost.value.trim() || !nasShare.value.trim()) return
+  nasBusy.value = true
+  nasError.value = ''
+  try {
+    const folders = await desktop.connectNas(
+      nasHost.value.trim(), nasShare.value.trim(), nasUser.value, nasPassword.value
+    )
+    photoAlbums.value = folders
+    nasConnected.value = true
+    // 使い終わったら消す。画面にも DB にも残さない。
+    nasPassword.value = ''
+    nasDialog.value = false
+  } catch (cause) {
+    nasError.value = cause instanceof Error ? cause.message : 'NAS に接続できませんでした。'
+    nasConnected.value = false
+  } finally {
+    nasBusy.value = false
+  }
+}
+
+async function disconnectNas() {
+  try {
+    await desktop.disconnectNas()
+  } catch {
+    // 切断に失敗しても、画面上は繋がっていない扱いでよい。
+  }
+  nasConnected.value = false
+  await loadPhotoAlbums()
 }
 
 async function loadPhotoAlbums() {
@@ -2216,8 +2260,19 @@ onBeforeUnmount(() => {
            デスクトップ … フォルダを参照する
            Android      … 走査できるフォルダが無いのでアルバムを選ぶ
            ブラウザ     … 作成後に写真ピッカーで選ぶ -->
+      <!-- NAS は端末のアルバムと同じ「出所」として並べる。
+           繋がると共有の直下のフォルダが一覧に差し替わる。 -->
+      <div v-if="desktop.capabilities.browseFolders && !canImportPhotos" class="d-flex align-center flex-wrap ga-2 mb-4">
+        <v-btn
+          size="small" variant="outlined" prepend-icon="mdi-nas"
+          :loading="nasBusy" @click="nasDialog = true"
+        >{{ nasConnected ? 'NAS を切り替える' : 'NAS に繋ぐ' }}</v-btn>
+        <v-btn v-if="nasConnected" size="small" variant="text" @click="disconnectNas">端末の写真に戻す</v-btn>
+        <span v-if="nasConnected" class="text-caption text-medium-emphasis">{{ nasHost }} / {{ nasShare }}</span>
+      </div>
+
       <template v-if="usesAlbums">
-        <div class="text-body-2 mb-2">どのアルバムから選びますか？</div>
+        <div class="text-body-2 mb-2">{{ nasConnected ? 'どのフォルダから選びますか？' : 'どのアルバムから選びますか？' }}</div>
         <v-list density="compact" class="album-list" bg-color="transparent">
           <v-list-item
             v-for="album in photoAlbums" :key="album.path"
@@ -2227,7 +2282,9 @@ onBeforeUnmount(() => {
             <template #prepend><v-icon icon="mdi-image-multiple-outline" /></template>
             <v-list-item-title>{{ album.name }}</v-list-item-title>
             <template #append>
-              <span class="text-caption text-medium-emphasis">{{ album.count.toLocaleString() }} 枚</span>
+              <span v-if="album.count >= 0" class="text-caption text-medium-emphasis">
+                {{ album.count.toLocaleString() }} 枚
+              </span>
             </template>
           </v-list-item>
         </v-list>
@@ -2241,6 +2298,31 @@ onBeforeUnmount(() => {
         この端末の写真から選びます。写真そのものは端末の外に出ません。
       </v-alert>
     </v-card-text><v-card-actions class="pa-5 pt-2"><v-spacer /><v-btn variant="outlined" @click="createDialog = false">キャンセル</v-btn><v-btn variant="outlined" color="primary" :disabled="!canImportPhotos && !folderPath" :loading="loading" @click="createProject">作成</v-btn></v-card-actions></v-card></v-dialog>
+
+    <!-- NAS への接続。**認証情報は保存しない。**
+         アプリを終了すると消えるので、次に開くときはもう一度入れてもらう。 -->
+    <v-dialog v-model="nasDialog" max-width="520">
+      <v-card title="NAS に繋ぐ">
+        <v-card-text class="pt-5">
+          <v-text-field v-model="nasHost" label="ホスト名または IP" placeholder="192.168.11.10" class="mb-3" hide-details="auto" />
+          <v-text-field v-model="nasShare" label="共有名" placeholder="share" class="mb-3" hide-details="auto" />
+          <v-text-field v-model="nasUser" label="ユーザー名（空ならゲスト）" class="mb-3" hide-details="auto" />
+          <v-text-field v-model="nasPassword" label="パスワード" type="password" hide-details="auto" />
+          <v-alert v-if="nasError" type="error" variant="tonal" density="comfortable" class="mt-4">
+            {{ nasError }}
+          </v-alert>
+          <p class="text-caption text-medium-emphasis mt-4 mb-0">
+            <strong>パスワードは保存しません。</strong>アプリを終了すると消えます。
+            写真は読むだけで、NAS 上の原本は変更しません。
+          </p>
+        </v-card-text>
+        <v-card-actions class="pa-5 pt-2">
+          <v-spacer />
+          <v-btn variant="outlined" @click="nasDialog = false">キャンセル</v-btn>
+          <v-btn color="primary" :loading="nasBusy" :disabled="!nasHost.trim() || !nasShare.trim()" @click="connectNas">繋ぐ</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
 
     <v-dialog v-model="taskDialog" persistent max-width="520"><v-card><v-card-title>写真を読み込み中</v-card-title><v-card-text class="pt-5"><div class="d-flex justify-space-between text-body-2 mb-3"><span>{{ taskProgress?.message }}</span><span v-if="taskProgress?.total">{{ taskProgress.processed.toLocaleString() }} / {{ taskProgress.total.toLocaleString() }}</span></div><v-progress-linear :model-value="progressValue" :indeterminate="!taskProgress?.total" color="primary" height="10" rounded /><p class="text-caption text-medium-emphasis mt-5 mb-0">読み込みのあと、連写の解析はバックグラウンドで少しずつ進みます。キャンセルしても、完了済みの読み込み結果は保持されます。</p></v-card-text><v-card-actions class="pa-5 pt-2"><v-spacer /><v-btn variant="outlined" @click="cancelTask">キャンセル</v-btn></v-card-actions></v-card></v-dialog>
 
