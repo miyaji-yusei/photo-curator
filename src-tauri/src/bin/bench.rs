@@ -415,7 +415,7 @@ fn run_pipeline(
         let mut statement = conn
             .prepare(
                 "SELECT id,path,captured_at,timestamp_source,d_hash,d_hash_version,
-                        thumbnail_path,thumbnail_mtime,thumbnail_size
+                        thumbnail_path,thumbnail_mtime,thumbnail_size,thumbnail_version
                  FROM photos
                  WHERE project_id=?1 AND is_missing=0 AND captured_at IS NOT NULL
                  ORDER BY captured_at",
@@ -435,6 +435,7 @@ fn run_pipeline(
                         thumbnail_path: row.get(6)?,
                         thumbnail_mtime: row.get(7)?,
                         thumbnail_size: row.get(8)?,
+                        thumbnail_version: row.get(9)?,
                     },
                 })
             })

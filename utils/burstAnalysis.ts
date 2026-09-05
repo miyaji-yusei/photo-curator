@@ -55,11 +55,39 @@ export function buildBurstPairs(entries: BurstEntry[]): BurstPair[] {
 }
 
 /**
+ * 手で直したまとめ。隣り合うペアに対する例外だけを持つ。
+ * キーは撮影順の左→右で `pairKey` が作る。値は「繋ぐ (true) / 切る (false)」。
+ */
+export type PairOverrides = Map<string, boolean>
+
+/** 例外の鍵。**撮影順の左→右**で作る。逆順は別のキーになる。 */
+export function pairKey(leftPhotoId: string, rightPhotoId: string): string {
+  return `${leftPhotoId}:${rightPhotoId}`
+}
+
+/**
+ * 隣り合う 2 枚を、閾値だけで見たときに繋ぐか。**例外を当てる前の素の判定。**
+ * デスクトップの `pair_joins_by_threshold` と同じ規則。
+ */
+export function pairJoinsByThreshold(
+  left: BurstEntry, right: BurstEntry, threshold: number
+): boolean {
+  return right.capturedAt - left.capturedAt <= BURST_WINDOW_MS &&
+    hammingDistance(right.dHash, left.dHash) <= threshold
+}
+
+/**
  * 閾値を当てて連写をまとめる。**連続するペアがすべて閾値を満たす区間**が 1 グループ。
  * これにより「1 枚目はまとめないが 2 と 3 枚目はまとめる」もそのまま表せる。
  * 1 枚だけの区間はまとめない。
+ *
+ * `overrides` に境目の指定があれば、閾値より優先する。
  */
-export function buildBurstGroups(entries: BurstEntry[], threshold: number): BurstGroup[] {
+export function buildBurstGroups(
+  entries: BurstEntry[],
+  threshold: number,
+  overrides: PairOverrides = new Map()
+): BurstGroup[] {
   const groups: BurstGroup[] = []
   let current: BurstEntry[] = []
 
@@ -86,9 +114,10 @@ export function buildBurstGroups(entries: BurstEntry[], threshold: number): Burs
 
   for (const entry of entries) {
     const previous = current[current.length - 1]
+    // 利用者が手で決めた境目があれば、閾値より優先する。
+    const override = previous && overrides.get(pairKey(previous.id, entry.id))
     const isNear = previous !== undefined &&
-      entry.capturedAt - previous.capturedAt <= BURST_WINDOW_MS &&
-      hammingDistance(entry.dHash, previous.dHash) <= threshold
+      (override ?? pairJoinsByThreshold(previous, entry, threshold))
     if (current.length > 0 && !isNear) flush()
     current.push(entry)
   }

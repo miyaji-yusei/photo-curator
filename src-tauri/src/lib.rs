@@ -38,6 +38,12 @@ const MIN_EXIF_THUMBNAIL_EDGE: u32 = 96;
 // 見ておらず、**アルゴリズムの変更を検知できない**。方式を変えたらこの値を上げる。
 // 版が合わない d_hash はキャッシュとして使わず、サムネイルから引き直す。
 const D_HASH_VERSION: i64 = 2;
+// サムネイルの生成方式のバージョン。**d_hash とは別に持つ必要がある。**
+// `analyse_photo` は保存済みのサムネイルが使えると判断したら原本に戻らないため、
+// `D_HASH_VERSION` を上げても「古いサムネイルから引き直す」だけで、サムネイルの
+// 中身そのものは作り変わらない。生成方式を変えたらこちらを上げる。
+// 1 = EXIF Orientation を焼き込む（それ以前は回転を無視して保存していた）。
+const THUMBNAIL_VERSION: i64 = 1;
 // 解析結果をこの件数ごとに確定させる。処理全体をひとつのトランザクションで
 // 囲むと、キャンセル時の rollback で解析済みの分まで消えてしまい、再開しても
 // 毎回ゼロからやり直しになる。
@@ -412,6 +418,10 @@ fn open_database(path: &Path) -> Result<Connection, String> {
     // どのデコード経路でサムネイルを作ったか。速い経路がどれだけ効いているかを
     // あとから実データで確かめられるようにしておく。
     add_column_if_missing(&conn, "photos", "thumbnail_source", "TEXT")?;
+    // サムネイルの生成方式。旧ビルドが作った行は NULL になり、版が合わないので
+    // 原本から作り直される。回転を無視して保存された古いサムネイルは、これで
+    // 自動的に置き換わる。
+    add_column_if_missing(&conn, "photos", "thumbnail_version", "INTEGER")?;
     // d_hash の算出方式。旧ビルドの行は NULL になり、キャッシュとして使われない。
     // 古い方式のハッシュと新しい方式のハッシュが混ざると連写判定が壊れるため、
     // 値を消さずに「使わない」ことで移行する。
@@ -421,6 +431,25 @@ fn open_database(path: &Path) -> Result<Connection, String> {
     // 「◯件を解析できませんでした」と伝え、**解析自体は続行する**。
     add_column_if_missing(&conn, "photos", "analysis_error", "TEXT")?;
     add_column_if_missing(&conn, "photos", "analysis_error_at", "INTEGER")?;
+
+    // 手で直したまとめ。**グループ単位では持てない。** まとめは dHash と閾値から
+    // そのつど導出していて実体が無く、閾値が変われば別物になって紐づかないため。
+    // 導出の材料である「隣り合うペア」に対する例外として持つ。
+    //   split … 閾値では繋がるが、利用者が切った
+    //   join  … 閾値では切れるが、利用者が繋いだ
+    // グループは「連続するペアがすべて閾値を満たす区間」なので、これだけで
+    // 分割・切り離し・結合・全解除のすべてを表せる。
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS burst_pair_overrides (
+           project_id TEXT NOT NULL,
+           left_photo_id TEXT NOT NULL,
+           right_photo_id TEXT NOT NULL,
+           decision TEXT NOT NULL,
+           updated_at INTEGER NOT NULL,
+           PRIMARY KEY (project_id, left_photo_id, right_photo_id)
+         );",
+    )
+    .map_err(|error| error.to_string())?;
 
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS photos_project_visible
@@ -1009,10 +1038,63 @@ impl DecodeSource {
     }
 }
 
+/// 既に読み込んだ EXIF のフィールド列から、指定した IFD の Orientation を取る。
+fn orientation_field(fields: &[exif::Field], ifd: In) -> Option<u16> {
+    fields
+        .iter()
+        .find(|field| field.tag == Tag::Orientation && field.ifd_num == ifd)
+        .and_then(|field| match &field.value {
+            Value::Short(values) => values.first().copied(),
+            _ => None,
+        })
+}
+
+/// 原本の EXIF Orientation。読めなければ 1（無変換）を返す。
+///
+/// `exif_thumbnail_image` が失敗した経路でだけ呼ぶ。あちらは既に EXIF を
+/// 読んでいるので、同じファイルを二度開かずに済ませる。
+fn exif_orientation(path: &Path) -> u16 {
+    let Ok(file) = File::open(path) else {
+        return 1;
+    };
+    let Ok(exif) = Reader::new().read_from_container(&mut BufReader::new(file)) else {
+        return 1;
+    };
+    match exif.get_field(Tag::Orientation, In::PRIMARY).map(|f| &f.value) {
+        Some(Value::Short(values)) => values.first().copied().unwrap_or(1),
+        _ => 1,
+    }
+}
+
+/// EXIF Orientation を画素に焼き込んで、見たままの向きにする。
+///
+/// **これをしないと一覧だけが横倒しになる。** 一覧はここで作ったサムネイルを
+/// 表示し、選別・拡大は原本を `<img>` に渡す。WebView は原本の Orientation を
+/// 自動で適用するので、焼き込まないほうだけが回転しない状態になる。
+///
+/// 値の意味は EXIF 規格のとおり。`rotate90` は時計回り。
+fn apply_orientation(image: DynamicImage, orientation: u16) -> DynamicImage {
+    match orientation {
+        2 => image.fliph(),
+        3 => image.rotate180(),
+        4 => image.flipv(),
+        5 => image.rotate90().fliph(),
+        6 => image.rotate90(),
+        7 => image.rotate270().fliph(),
+        8 => image.rotate270(),
+        // 1（無変換）と、規格外の値。壊れた EXIF で画像を回さない。
+        _ => image,
+    }
+}
+
 /// EXIF の APP1 に埋め込まれたサムネイル JPEG を取り出してデコードする。
 /// IFD1 の JPEGInterchangeFormat（オフセット）と同 Length が実体を指す。
 /// 読むのは APP1 セグメントまでで、本体の画素には一切触れない。
-fn exif_thumbnail_image(path: &Path) -> Option<DynamicImage> {
+///
+/// Orientation も一緒に返す。**IFD1 のものを優先する。** 埋め込みサムネイルを
+/// 既に正立させて保存するカメラがあり、そこで IFD0 の値を当てると二重に回る。
+/// IFD1 に無ければ本体（IFD0）の値に従う。
+fn exif_thumbnail_image(path: &Path) -> Option<(DynamicImage, u16)> {
     let file = File::open(path).ok()?;
     let tiff = exif::get_exif_attr_from_jpeg(&mut BufReader::new(file)).ok()?;
     let (fields, _) = exif::parse_exif(&tiff).ok()?;
@@ -1037,8 +1119,12 @@ fn exif_thumbnail_image(path: &Path) -> Option<DynamicImage> {
     }
     let image =
         image::load_from_memory_with_format(&tiff[offset..end], image::ImageFormat::Jpeg).ok()?;
+    let orientation = orientation_field(&fields, In::THUMBNAIL)
+        .or_else(|| orientation_field(&fields, In::PRIMARY))
+        .unwrap_or(1);
     // 極端に小さいサムネイルは dHash も表示も成立しない。次の経路へ落とす。
-    (image.width().max(image.height()) >= MIN_EXIF_THUMBNAIL_EDGE).then_some(image)
+    (image.width().max(image.height()) >= MIN_EXIF_THUMBNAIL_EDGE)
+        .then_some((image, orientation))
 }
 
 /// jpeg-decoder の IDCT スケーリングで 1/8 相当まで小さくデコードする。
@@ -1080,16 +1166,26 @@ fn scaled_jpeg_decode(path: &Path) -> Option<DynamicImage> {
 ///
 /// ②は③より 23 倍速く、判定の壊れ方は同じだったので②を主経路に置く。
 /// ③は JPEG 専用なので、PNG/WebP とサムネイル非搭載 JPEG は①に落ちる。
+///
+/// どの経路を通っても、返す時点で **Orientation は焼き込み済み**。
 fn decode_hash_source(path: &Path) -> Option<(DynamicImage, DecodeSource)> {
-    if let Some(image) = exif_thumbnail_image(path) {
-        return Some((image, DecodeSource::ExifThumbnail));
+    if let Some((image, orientation)) = exif_thumbnail_image(path) {
+        return Some((
+            apply_orientation(image, orientation),
+            DecodeSource::ExifThumbnail,
+        ));
     }
+    // ここから先は生の画素なので、本体（IFD0）の Orientation をそのまま当てる。
+    let orientation = exif_orientation(path);
     if let Some(image) = scaled_jpeg_decode(path) {
-        return Some((image, DecodeSource::JpegScaled));
+        return Some((
+            apply_orientation(image, orientation),
+            DecodeSource::JpegScaled,
+        ));
     }
     image::open(path)
         .ok()
-        .map(|image| (image, DecodeSource::FullDecode))
+        .map(|image| (apply_orientation(image, orientation), DecodeSource::FullDecode))
 }
 
 fn scale_for_thumbnail(image: &DynamicImage) -> DynamicImage {
@@ -1152,6 +1248,7 @@ pub struct CachedAnalysis {
     pub thumbnail_path: Option<String>,
     pub thumbnail_mtime: Option<i64>,
     pub thumbnail_size: Option<i64>,
+    pub thumbnail_version: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1215,6 +1312,10 @@ fn analyse_photo(
             cached.thumbnail_mtime == Some(mtime)
                 && cached.thumbnail_size == Some(size)
                 && cached.thumbnail_path.as_deref() == Some(stored.as_str())
+                // 生成方式が変わっていたら、ファイルが残っていても使わない。
+                // fingerprint は「原本が変わっていない」ことしか見ておらず、
+                // こちら側の作り方の変更を検知できない。
+                && cached.thumbnail_version == Some(THUMBNAIL_VERSION)
                 && file.is_file()
         }
         None => false,
@@ -1452,6 +1553,7 @@ fn upsert_photo(
            thumbnail_mtime=CASE WHEN photos.fingerprint_mtime IS excluded.fingerprint_mtime AND photos.fingerprint_size IS excluded.fingerprint_size THEN photos.thumbnail_mtime ELSE NULL END,
            thumbnail_size=CASE WHEN photos.fingerprint_mtime IS excluded.fingerprint_mtime AND photos.fingerprint_size IS excluded.fingerprint_size THEN photos.thumbnail_size ELSE NULL END,
            thumbnail_source=CASE WHEN photos.fingerprint_mtime IS excluded.fingerprint_mtime AND photos.fingerprint_size IS excluded.fingerprint_size THEN photos.thumbnail_source ELSE NULL END,
+           thumbnail_version=CASE WHEN photos.fingerprint_mtime IS excluded.fingerprint_mtime AND photos.fingerprint_size IS excluded.fingerprint_size THEN photos.thumbnail_version ELSE NULL END,
            analysis_error=CASE WHEN photos.fingerprint_mtime IS excluded.fingerprint_mtime AND photos.fingerprint_size IS excluded.fingerprint_size THEN photos.analysis_error ELSE NULL END,
            analysis_error_at=CASE WHEN photos.fingerprint_mtime IS excluded.fingerprint_mtime AND photos.fingerprint_size IS excluded.fingerprint_size THEN photos.analysis_error_at ELSE NULL END,
            fingerprint_mtime=excluded.fingerprint_mtime, fingerprint_size=excluded.fingerprint_size",
@@ -1798,7 +1900,7 @@ fn run_burst_analysis(
         let mut statement = conn
             .prepare(
                 "SELECT id,path,captured_at,timestamp_source,d_hash,d_hash_version,
-                        thumbnail_path,thumbnail_mtime,thumbnail_size
+                        thumbnail_path,thumbnail_mtime,thumbnail_size,thumbnail_version
                  FROM photos
                  WHERE project_id=?1 AND is_missing=0 AND captured_at IS NOT NULL
                  ORDER BY captured_at",
@@ -1818,6 +1920,7 @@ fn run_burst_analysis(
                         thumbnail_path: row.get(6)?,
                         thumbnail_mtime: row.get(7)?,
                         thumbnail_size: row.get(8)?,
+                        thumbnail_version: row.get(9)?,
                     },
                 })
             })
@@ -1889,9 +1992,10 @@ fn run_burst_analysis(
             "UPDATE photos SET d_hash=?1,d_hash_version=?2,thumbnail_path=?3,
                thumbnail_mtime=?4,thumbnail_size=?5,
                thumbnail_source=COALESCE(?6,thumbnail_source),
-               fingerprint_mtime=?7,fingerprint_size=?8,
-               analysis_error=?9,analysis_error_at=?10
-             WHERE id=?11",
+               thumbnail_version=?7,
+               fingerprint_mtime=?8,fingerprint_size=?9,
+               analysis_error=?10,analysis_error_at=?11
+             WHERE id=?12",
             params![
                 item.d_hash,
                 item.d_hash.as_ref().map(|_| D_HASH_VERSION),
@@ -1899,6 +2003,9 @@ fn run_burst_analysis(
                 thumb_mtime,
                 thumb_size,
                 item.thumbnail_source,
+                // 版はサムネイルを保存できたときだけ立てる。パスが NULL のまま
+                // 版だけ残ると、次回「使える」と誤判定する。
+                item.thumbnail_path.as_ref().map(|_| THUMBNAIL_VERSION),
                 mtime,
                 size,
                 item.error,
@@ -2061,8 +2168,10 @@ fn get_analysis_backlog(app: AppHandle, project_id: String) -> Result<i64, Strin
                  OR d_hash IS NULL
                  OR d_hash_version IS NULL
                  OR d_hash_version <> ?2
-                 OR thumbnail_path IS NULL)",
-            params![project_id, D_HASH_VERSION],
+                 OR thumbnail_path IS NULL
+                 OR thumbnail_version IS NULL
+                 OR thumbnail_version <> ?3)",
+            params![project_id, D_HASH_VERSION, THUMBNAIL_VERSION],
             |row| row.get(0),
         )
         .map_err(|error| error.to_string())
@@ -2872,13 +2981,154 @@ fn get_burst_groups(
         Some(value) => value,
         None => load_burst_threshold(&app, &project_id)?.unwrap_or(HASH_DISTANCE_LIMIT),
     };
+    let overrides = load_pair_overrides(&app, &project_id)?;
     Ok(build_burst_groups(
         entries
             .into_iter()
             .map(|(id, captured_at, hash, _)| (id, captured_at, hash))
             .collect(),
         threshold,
+        &overrides,
     ))
+}
+
+fn load_pair_overrides(app: &AppHandle, project_id: &str) -> Result<PairOverrides, String> {
+    let conn = connection(app)?;
+    let mut statement = conn
+        .prepare(
+            "SELECT left_photo_id,right_photo_id,decision FROM burst_pair_overrides WHERE project_id=?1",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params![project_id], |row| {
+            let left: String = row.get(0)?;
+            let right: String = row.get(1)?;
+            let decision: String = row.get(2)?;
+            Ok(((left, right), decision == "join"))
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<PairOverrides, _>>()
+        .map_err(|error| error.to_string())
+}
+
+/// まとまりを見直すための「1続きの写真」。指定した写真の前後 `window_ms` に入る
+/// ものを撮影順で返す。まとめの判定に使う写真だけを対象にするので、
+/// `load_burst_entries` と同じ絞り込み（撮影時刻とハッシュがある・欠損でない）にする。
+#[tauri::command]
+fn get_burst_neighborhood(
+    app: AppHandle,
+    project_id: String,
+    photo_ids: Vec<String>,
+    window_ms: Option<i64>,
+) -> Result<Vec<Photo>, String> {
+    if photo_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let conn = connection(&app)?;
+    let window = window_ms.unwrap_or(BURST_WINDOW_MS).max(0);
+
+    // 与えられた写真が占める時間の幅を求め、そこから前後へ広げる。
+    let mut span: Option<(i64, i64)> = None;
+    {
+        let mut statement = conn
+            .prepare("SELECT captured_at FROM photos WHERE project_id=?1 AND id=?2")
+            .map_err(|error| error.to_string())?;
+        for id in &photo_ids {
+            let at: Option<i64> = statement
+                .query_row(params![project_id, id], |row| row.get(0))
+                .unwrap_or(None);
+            let Some(at) = at else { continue };
+            span = Some(match span {
+                Some((low, high)) => (low.min(at), high.max(at)),
+                None => (at, at),
+            });
+        }
+    }
+    let Some((low, high)) = span else {
+        return Ok(Vec::new());
+    };
+
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT {PHOTO_COLUMNS} FROM photos
+             WHERE project_id=?1 AND is_missing=0
+               AND captured_at IS NOT NULL AND d_hash IS NOT NULL
+               AND captured_at BETWEEN ?2 AND ?3
+             ORDER BY captured_at"
+        ))
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params![project_id, low - window, high + window], photo_from_row)
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+/// 見直した結果のまとまりを保存する。
+///
+/// **受け取るのは「こう分かれていてほしい」という形だけ**で、例外そのものではない。
+/// 閾値だけで出る素の判定と突き合わせ、**食い違うペアだけ**を例外として残し、
+/// 一致するペアの例外は消す。こうすると、
+/// - 切ってから元に戻したときに、無意味な例外が溜まらない
+/// - 同じ形を何度保存しても結果が変わらない（冪等）
+/// - 閾値を学習し直しても、利用者が触っていないペアは新しい閾値に従う
+#[tauri::command]
+fn save_burst_shape(
+    app: AppHandle,
+    project_id: String,
+    ordered_photo_ids: Vec<String>,
+    blocks: Vec<Vec<String>>,
+) -> Result<(), String> {
+    if ordered_photo_ids.len() < 2 {
+        return Ok(());
+    }
+    let threshold = load_burst_threshold(&app, &project_id)?.unwrap_or(HASH_DISTANCE_LIMIT);
+    let entries = load_burst_entries(&app, &project_id)?;
+    let by_id: std::collections::HashMap<&str, (i64, &str)> = entries
+        .iter()
+        .map(|(id, at, hash, _)| (id.as_str(), (*at, hash.as_str())))
+        .collect();
+    let block_of: std::collections::HashMap<&str, usize> = blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(index, block)| block.iter().map(move |id| (id.as_str(), index)))
+        .collect();
+
+    let mut conn = connection(&app)?;
+    let tx = conn.transaction().map_err(|error| error.to_string())?;
+    let now = now();
+    for window in ordered_photo_ids.windows(2) {
+        let [left, right] = window else { continue };
+        let (Some(left_entry), Some(right_entry)) =
+            (by_id.get(left.as_str()), by_id.get(right.as_str()))
+        else {
+            continue;
+        };
+        let raw = pair_joins_by_threshold(*left_entry, *right_entry, threshold);
+        // 同じ塊に居るなら繋がっていてほしい、という意味。
+        let wanted = match (block_of.get(left.as_str()), block_of.get(right.as_str())) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        };
+        if wanted == raw {
+            tx.execute(
+                "DELETE FROM burst_pair_overrides WHERE project_id=?1 AND left_photo_id=?2 AND right_photo_id=?3",
+                params![project_id, left, right],
+            )
+            .map_err(|error| error.to_string())?;
+        } else {
+            tx.execute(
+                "INSERT INTO burst_pair_overrides (project_id,left_photo_id,right_photo_id,decision,updated_at)
+                 VALUES (?1,?2,?3,?4,?5)
+                 ON CONFLICT(project_id,left_photo_id,right_photo_id)
+                 DO UPDATE SET decision=excluded.decision, updated_at=excluded.updated_at",
+                params![project_id, left, right, if wanted { "join" } else { "split" }, now],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+    }
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn load_burst_threshold(app: &AppHandle, project_id: &str) -> Result<Option<u32>, String> {
@@ -2917,7 +3167,25 @@ fn clear_burst_threshold(app: AppHandle, project_id: String) -> Result<(), Strin
 
 // グルーピング本体。DB アクセスと分けてあるのは計測ハーネス（feature = "bench"）
 // から実コードそのものを呼べるようにするため。挙動は分離前と同一。
-fn build_burst_groups(entries: Vec<(String, i64, String)>, threshold: u32) -> Vec<BurstGroup> {
+/// 手で直したまとめ。隣り合うペアに対する例外だけを持つ。
+/// キーは (左の写真, 右の写真) で、**撮影順の左→右**。
+pub type PairOverrides = std::collections::HashMap<(String, String), bool>;
+
+/// 隣り合う 2 枚を、閾値だけで見たときに繋ぐか。**例外を当てる前の素の判定。**
+/// `build_burst_groups` と `save_burst_shape` が同じ規則を使うよう、1 か所に出す。
+fn pair_joins_by_threshold(
+    left: (i64, &str),
+    right: (i64, &str),
+    threshold: u32,
+) -> bool {
+    right.0 - left.0 <= BURST_WINDOW_MS && hash_distance(right.1, left.1) <= threshold
+}
+
+fn build_burst_groups(
+    entries: Vec<(String, i64, String)>,
+    threshold: u32,
+    overrides: &PairOverrides,
+) -> Vec<BurstGroup> {
     let mut groups = Vec::new();
     let mut current: Vec<(String, i64, String)> = Vec::new();
     let mut push = |photos: &mut Vec<(String, i64, String)>| {
@@ -2944,8 +3212,17 @@ fn build_burst_groups(entries: Vec<(String, i64, String)>, threshold: u32) -> Ve
         let is_near = current
             .last()
             .map(|previous| {
-                entry.1 - previous.1 <= BURST_WINDOW_MS
-                    && hash_distance(&entry.2, &previous.2) <= threshold
+                // 利用者が手で決めた境目があれば、閾値より優先する。
+                overrides
+                    .get(&(previous.0.clone(), entry.0.clone()))
+                    .copied()
+                    .unwrap_or_else(|| {
+                        pair_joins_by_threshold(
+                            (previous.1, &previous.2),
+                            (entry.1, &entry.2),
+                            threshold,
+                        )
+                    })
             })
             .unwrap_or(false);
         if !current.is_empty() && !is_near {
@@ -3184,7 +3461,8 @@ pub mod bench_api {
         entries: Vec<(String, i64, String)>,
         threshold: u32,
     ) -> Vec<Vec<String>> {
-        super::build_burst_groups(entries, threshold)
+        // 計測では手の入った例外を当てない。素の閾値だけを測る。
+        super::build_burst_groups(entries, threshold, &super::PairOverrides::new())
             .into_iter()
             .map(|group| group.photo_ids)
             .collect()
@@ -3211,6 +3489,8 @@ pub fn run() {
             export_by_rating,
             write_ratings_to_files,
             get_burst_groups,
+            get_burst_neighborhood,
+            save_burst_shape,
             get_burst_pairs,
             save_burst_threshold,
             clear_burst_threshold,
@@ -3304,6 +3584,8 @@ mod tests {
 
     enum Val {
         Ascii(String),
+        /// SHORT 1個。4バイトの値欄に収まるので inline に置く。
+        Short(u16),
         ExifPointer,
         ThumbOffset,
         ThumbLength,
@@ -3324,6 +3606,7 @@ mod tests {
             .iter()
             .map(|(tag, value)| match value {
                 Val::ExifPointer => (*tag, 4u16, 1u32, exif_off),
+                Val::Short(value) => (*tag, 3, 1, u32::from(*value)),
                 Val::ThumbOffset => (*tag, 4, 1, thumb.0),
                 Val::ThumbLength => (*tag, 4, 1, thumb.1),
                 Val::Ascii(text) => {
@@ -3352,12 +3635,15 @@ mod tests {
         out.extend_from_slice(&next.to_le_bytes());
     }
 
-    /// IFD0（DateTime）/ Exif サブIFD（DateTimeOriginal・OffsetTimeOriginal）/
-    /// IFD1（サムネイル）を持つ TIFF ブロックを組む。リトルエンディアン。
+    /// IFD0（Orientation・DateTime）/ Exif サブIFD（DateTimeOriginal・
+    /// OffsetTimeOriginal）/ IFD1（Orientation・サムネイル）を持つ TIFF ブロックを
+    /// 組む。リトルエンディアン。**IFD の項目はタグの昇順**に並べる（規格の要求）。
     fn tiff_block(
         datetime: Option<&str>,
         datetime_original: Option<&str>,
         offset_original: Option<&str>,
+        orientation: Option<u16>,
+        thumbnail_orientation: Option<u16>,
         thumbnail: Option<&[u8]>,
     ) -> Vec<u8> {
         let mut exif_entries = Vec::new();
@@ -3368,6 +3654,9 @@ mod tests {
             exif_entries.push((0x9011, Val::Ascii(value.to_owned())));
         }
         let mut ifd0_entries = Vec::new();
+        if let Some(value) = orientation {
+            ifd0_entries.push((0x0112, Val::Short(value)));
+        }
         if let Some(value) = datetime {
             ifd0_entries.push((0x0132, Val::Ascii(value.to_owned())));
         }
@@ -3375,6 +3664,9 @@ mod tests {
             ifd0_entries.push((0x8769, Val::ExifPointer));
         }
         let mut ifd1_entries = Vec::new();
+        if let Some(value) = thumbnail_orientation {
+            ifd1_entries.push((0x0112, Val::Short(value)));
+        }
         if thumbnail.is_some() {
             ifd1_entries.push((0x0201, Val::ThumbOffset));
             ifd1_entries.push((0x0202, Val::ThumbLength));
@@ -3455,6 +3747,11 @@ mod tests {
         datetime: Option<String>,
         datetime_original: Option<String>,
         offset_original: Option<String>,
+        /// IFD0 の Orientation。本体の画素に対する向きの指定。
+        orientation: Option<u16>,
+        /// IFD1 の Orientation。埋め込みサムネイルを既に正立させて保存する
+        /// カメラを再現するために、IFD0 とは別に指定できる。
+        thumbnail_orientation: Option<u16>,
         thumbnail: Option<(u32, u32)>,
         size: (u32, u32),
         seed: u8,
@@ -3466,6 +3763,8 @@ mod tests {
                 datetime: None,
                 datetime_original: None,
                 offset_original: None,
+                orientation: None,
+                thumbnail_orientation: None,
                 thumbnail: None,
                 size: (600, 400),
                 seed: 0,
@@ -3479,13 +3778,17 @@ mod tests {
             let thumbnail = self
                 .thumbnail
                 .map(|(width, height)| jpeg_bytes(width, height, self.seed));
-            let has_exif =
-                self.datetime.is_some() || self.datetime_original.is_some() || thumbnail.is_some();
+            let has_exif = self.datetime.is_some()
+                || self.datetime_original.is_some()
+                || self.orientation.is_some()
+                || thumbnail.is_some();
             let tiff = has_exif.then(|| {
                 tiff_block(
                     self.datetime.as_deref(),
                     self.datetime_original.as_deref(),
                     self.offset_original.as_deref(),
+                    self.orientation,
+                    self.thumbnail_orientation,
                     thumbnail.as_deref(),
                 )
             });
@@ -4108,6 +4411,140 @@ mod tests {
         fs::remove_dir_all(&directory).expect("remove test directory");
     }
 
+    // -----------------------------------------------------------------------
+    // Routine 5: EXIF Orientation
+    // -----------------------------------------------------------------------
+
+    /// 画素を行ごとに取り出す。回転や反転の結果を並びそのままで比べる。
+    fn grid(image: &DynamicImage) -> Vec<Vec<u8>> {
+        (0..image.height())
+            .map(|y| {
+                (0..image.width())
+                    .map(|x| image.get_pixel(x, y).0[0])
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// 3x2 の非対称な画像。値はすべて異なるので、取り違えれば必ず落ちる。
+    ///
+    /// ```text
+    /// 1 2 3
+    /// 4 5 6
+    /// ```
+    fn asymmetric() -> DynamicImage {
+        let mut image = image::RgbImage::new(3, 2);
+        for y in 0..2u32 {
+            for x in 0..3u32 {
+                let value = (1 + x + y * 3) as u8;
+                image.put_pixel(x, y, image::Rgb([value, value, value]));
+            }
+        }
+        DynamicImage::ImageRgb8(image)
+    }
+
+    #[test]
+    fn every_exif_orientation_maps_to_its_own_transform() {
+        let expected: [(u16, Vec<Vec<u8>>); 8] = [
+            (1, vec![vec![1, 2, 3], vec![4, 5, 6]]),
+            (2, vec![vec![3, 2, 1], vec![6, 5, 4]]),
+            (3, vec![vec![6, 5, 4], vec![3, 2, 1]]),
+            (4, vec![vec![4, 5, 6], vec![1, 2, 3]]),
+            (5, vec![vec![1, 4], vec![2, 5], vec![3, 6]]),
+            (6, vec![vec![4, 1], vec![5, 2], vec![6, 3]]),
+            (7, vec![vec![6, 3], vec![5, 2], vec![4, 1]]),
+            (8, vec![vec![3, 6], vec![2, 5], vec![1, 4]]),
+        ];
+        for (orientation, want) in expected {
+            assert_eq!(
+                grid(&apply_orientation(asymmetric(), orientation)),
+                want,
+                "Orientation {orientation} の変換が違う"
+            );
+        }
+
+        // 0 と 9 は規格外。壊れた EXIF で画像を回さない。
+        for broken in [0u16, 9, 65535] {
+            assert_eq!(
+                grid(&apply_orientation(asymmetric(), broken)),
+                grid(&asymmetric()),
+                "規格外の値 {broken} で画像を回してしまった"
+            );
+        }
+    }
+
+    // 一覧が横倒しになっていた原因そのもの。サムネイルの生成経路で
+    // Orientation を焼き込まないと、原本を直接見る選別画面とだけ向きがずれる。
+    #[test]
+    fn the_thumbnail_source_comes_back_upright() {
+        let directory = test_directory("orientation");
+
+        // ① EXIF サムネイルが無い JPEG（1/8 デコード経路）。IFD0 の指定に従う。
+        let rotated = directory.join("rotated.jpg");
+        Fixture {
+            size: (600, 400),
+            orientation: Some(6),
+            ..Default::default()
+        }
+        .write(&rotated);
+        let (image, source) = decode_hash_source(&rotated).expect("decode");
+        assert_eq!(source, DecodeSource::JpegScaled);
+        assert!(
+            image.height() > image.width(),
+            "横長のまま返っている（{}x{}）",
+            image.width(),
+            image.height()
+        );
+
+        // ② 同じ写真から Orientation を外すと、回らない。①が「たまたま縦長」
+        //    ではないことの裏取り。
+        let upright = directory.join("upright.jpg");
+        Fixture {
+            size: (600, 400),
+            datetime: Some("2026:06:30 18:19:32".into()),
+            ..Default::default()
+        }
+        .write(&upright);
+        let (image, _) = decode_hash_source(&upright).expect("decode");
+        assert!(image.width() > image.height(), "回すべきでない画像を回した");
+
+        // ③ EXIF サムネイル経路でも焼き込む。
+        let with_thumbnail = directory.join("with-thumbnail.jpg");
+        Fixture {
+            thumbnail: Some((160, 120)),
+            orientation: Some(6),
+            ..Default::default()
+        }
+        .write(&with_thumbnail);
+        let (image, source) = decode_hash_source(&with_thumbnail).expect("decode");
+        assert_eq!(source, DecodeSource::ExifThumbnail);
+        assert_eq!(
+            (image.width(), image.height()),
+            (120, 160),
+            "埋め込みサムネイルに Orientation が効いていない"
+        );
+
+        // ④ 埋め込みサムネイルを既に正立させて保存するカメラ。IFD1 が 1 なので、
+        //    IFD0 が 6 でも回してはいけない（回すと二重になる）。
+        let pre_rotated = directory.join("pre-rotated-thumbnail.jpg");
+        Fixture {
+            thumbnail: Some((160, 120)),
+            orientation: Some(6),
+            thumbnail_orientation: Some(1),
+            ..Default::default()
+        }
+        .write(&pre_rotated);
+        let (image, source) = decode_hash_source(&pre_rotated).expect("decode");
+        assert_eq!(source, DecodeSource::ExifThumbnail);
+        assert_eq!(
+            (image.width(), image.height()),
+            (160, 120),
+            "IFD1 の指定を無視して二重に回している"
+        );
+
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
     #[test]
     fn reuses_the_cached_thumbnail_until_the_photo_changes() {
         let directory = test_directory("thumbnail-cache");
@@ -4130,6 +4567,7 @@ mod tests {
                 thumbnail_path: outcome.thumbnail_path.clone(),
                 thumbnail_mtime: outcome.thumbnail_path.as_ref().map(|_| mtime),
                 thumbnail_size: outcome.thumbnail_path.as_ref().map(|_| size),
+                thumbnail_version: outcome.thumbnail_path.as_ref().map(|_| THUMBNAIL_VERSION),
             }
         };
 
@@ -4173,6 +4611,19 @@ mod tests {
             rehashed.d_hash,
             Some(hash.clone()),
             "同じサムネイルからは必ず同じハッシュが出る"
+        );
+
+        // --- 生成方式が変わったとき: 原本まで戻って作り直す --------------------
+        // d_hash の版とは扱いが違う。あちらは保存済みのサムネイルから引き直せば
+        // 足りるが、こちらは**サムネイルの中身そのもの**が古いので作り直す。
+        let old_format = CachedAnalysis {
+            thumbnail_version: Some(THUMBNAIL_VERSION - 1),
+            ..cached.clone()
+        };
+        let rebuilt = run(&old_format);
+        assert!(
+            matches!(rebuilt.thumbnail_state, ThumbnailState::Generated(_)),
+            "生成方式が変わったのに古いサムネイルを使い回している"
         );
 
         // --- 無効化: サムネイルのファイルが消えたら作り直す -------------------
@@ -4877,7 +5328,7 @@ mod tests {
             ("c".to_string(), 2_000, "000000000000003f".to_string()), // b から 4
         ];
         let sizes = |threshold: u32| -> Vec<usize> {
-            build_burst_groups(entries.clone(), threshold)
+            build_burst_groups(entries.clone(), threshold, &PairOverrides::new())
                 .iter()
                 .map(|group| group.photo_ids.len())
                 .collect()
@@ -4886,6 +5337,65 @@ mod tests {
         assert!(sizes(0).is_empty(), "閾値 0 では何もまとまらない");
         assert_eq!(sizes(2), vec![2], "a-b だけがまとまる");
         assert_eq!(sizes(64), vec![3], "閾値を上げ切れば1グループ");
+    }
+
+    /// 手で直したまとめは閾値より優先される。ここが効かないと、
+    /// 解除したはずのまとまりが次のラウンドで復活する。
+    #[test]
+    fn hand_edited_pairs_win_over_the_threshold() {
+        let entries = vec![
+            ("a".to_string(), 0, "0000000000000000".to_string()),
+            ("b".to_string(), 1_000, "0000000000000003".to_string()), // a から 2
+            ("c".to_string(), 2_000, "000000000000003f".to_string()), // b から 4
+        ];
+        let shapes = |threshold: u32, overrides: &PairOverrides| -> Vec<Vec<String>> {
+            build_burst_groups(entries.clone(), threshold, overrides)
+                .into_iter()
+                .map(|group| group.photo_ids)
+                .collect()
+        };
+        let pair = |left: &str, right: &str, join: bool| {
+            PairOverrides::from([((left.to_string(), right.to_string()), join)])
+        };
+
+        // 閾値 64 なら素では 1 グループ。a-b を切ると 2 枚だけが残る。
+        assert_eq!(
+            shapes(64, &pair("a", "b", false)),
+            vec![vec!["b".to_string(), "c".to_string()]],
+            "切った境目で分かれていない"
+        );
+        // 真ん中を両側から切ると b が独立し、1 枚のまとまりは消える。
+        let split_both = PairOverrides::from([
+            (("a".to_string(), "b".to_string()), false),
+            (("b".to_string(), "c".to_string()), false),
+        ]);
+        assert!(shapes(64, &split_both).is_empty(), "b を外しきれていない");
+
+        // 逆に、閾値では切れるペアも繋げる。
+        assert_eq!(
+            shapes(0, &pair("a", "b", true)),
+            vec![vec!["a".to_string(), "b".to_string()]],
+            "繋いだ境目が閾値に潰されている"
+        );
+
+        // 例外が無ければ従来どおり。
+        assert_eq!(shapes(64, &PairOverrides::new()).len(), 1);
+    }
+
+    /// 例外の向きは撮影順の左→右。逆順のキーを拾ってしまうと、
+    /// 切ったつもりが別の境目に効いてしまう。
+    #[test]
+    fn pair_overrides_are_keyed_left_to_right() {
+        let entries = vec![
+            ("a".to_string(), 0, "0000000000000000".to_string()),
+            ("b".to_string(), 1_000, "0000000000000003".to_string()),
+        ];
+        let reversed = PairOverrides::from([(("b".to_string(), "a".to_string()), false)]);
+        assert_eq!(
+            build_burst_groups(entries, 64, &reversed).len(),
+            1,
+            "逆向きのキーが効いてしまっている"
+        );
     }
 
     #[test]

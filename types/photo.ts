@@ -158,6 +158,14 @@ export interface SelectionSession {
    * トーナメントには代表だけを出し、1カードとして扱う。
    */
   burstMembers: Record<string, string[]>
+  /**
+   * まとめの中で**もう星が決まった**写真。★5 で確定したものと、明らかに脱落と
+   * して下げたものが入る。
+   *
+   * これが無いと `spreadBurstRatings` が「代表と同じ星」を配るときに上書きして
+   * しまい、せっかく下げた星が元に戻る。
+   */
+  burstSettled: string[]
   round: number
   /** 閾値を適用した結果のグループ。確認画面と、以降のまとめ処理で使う。 */
   burstGroups: BurstGroup[]

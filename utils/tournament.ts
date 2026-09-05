@@ -1,4 +1,6 @@
-import type { BurstPair, SelectionSeed, SelectionSession, TournamentSettings } from '~/types/photo'
+import type {
+  BurstPair, SelectionResult, SelectionSeed, SelectionSession, TournamentSettings
+} from '~/types/photo'
 import { createThresholdState, sortPairsByDistance } from '~/utils/burstThreshold'
 
 const nextRandom = (seed: number) => {
@@ -50,6 +52,7 @@ export function makeSession(
     history: [],
     targetRating,
     burstMembers: {},
+    burstSettled: [],
     round: 1,
     burstGroups: [],
     burstPairs: sorted,
@@ -75,7 +78,8 @@ export function normalizeSession(session: SelectionSession): SelectionSession {
     ...session,
     history: session.history ?? [],
     targetRating: session.targetRating ?? 0,
-    burstMembers: session.burstMembers ?? {}
+    burstMembers: session.burstMembers ?? {},
+    burstSettled: session.burstSettled ?? []
   }
   if (Array.isArray(session.burstPairs) && session.burstThresholdState) return patched
   session = patched
@@ -169,6 +173,86 @@ export function resolveChosen(
 ): string[] {
   const confirmed = group.filter(id => (ratings[id] ?? 0) >= maxRating)
   return [...new Set([...selectedInGroup, ...confirmed])]
+}
+
+/**
+ * 代表に付いた星を、まとめられた仲間にも配る。**変更した写真の id を返す。**
+ *
+ * 代表しか選別に出ないので、これをしないと仲間は選別前の星のまま取り残され、
+ * 結果一覧では「見て落とした写真」と見分けが付かなくなる。
+ *
+ * 星は `+1` ではなく**代表と同じ値**にする。代表が★5で確定されたときは
+ * `+1` では追いつかないため。
+ *
+ * **`burstSettled` に入っている写真は飛ばす。** まとめの中で★5に確定した
+ * ものや、明らかに脱落として下げたものまで代表の星に揃えてしまうと、
+ * わざわざ手で付けた判断がグループ確定の瞬間に消える。
+ */
+export function spreadBurstRatings(session: SelectionSession, chosen: string[]): string[] {
+  const settled = new Set(session.burstSettled ?? [])
+  const spread: string[] = []
+  for (const id of chosen) {
+    const members = session.burstMembers[id]
+    if (!members) continue
+    const rating = session.ratings[id] ?? 0
+    for (const member of members) {
+      if (member === id || settled.has(member)) continue
+      session.ratings[member] = rating
+      spread.push(member)
+    }
+  }
+  return spread
+}
+
+/**
+ * まとめから外した写真を、このラウンドの**まだ見ていない分**に混ぜる。
+ *
+ * `regroupRemaining` との違いは起点。あちらは `groupIndex` から詰め直すので
+ * **いま見ているグループも並び替わる**。まとめを直している最中に目の前の
+ * グループが変わってしまうため、ここでは次のグループから詰め直す。
+ *
+ * 外した写真は先頭に置く。撮影順では代表のすぐ隣にあり、その代表は今見ている
+ * グループに居るので、次に見るのが自然な位置になる。
+ */
+export function insertIntoUpcoming(session: SelectionSession, ids: string[]): SelectionSession {
+  const known = new Set(session.groups.flat())
+  const added = ids.filter(id => !known.has(id))
+  if (!added.length) return session
+
+  const kept = session.groups.slice(0, session.groupIndex + 1)
+  const pool = [...added, ...session.groups.slice(session.groupIndex + 1).flat()]
+  const chunks: string[][] = []
+  for (let index = 0; index < pool.length; index += session.settings.groupSize) {
+    const chunk = pool.slice(index, index + session.settings.groupSize)
+    // 1枚だけになったグループは比較にならないのでそのまま通す（prepareRound と同じ）。
+    if (chunk.length > 1) chunks.push(chunk)
+    else session.survivors.push(...chunk)
+  }
+  session.groups = [...kept, ...chunks]
+  // `collapseBursts` が候補から外していたので、戻しておく。
+  const inCandidates = new Set(session.candidates)
+  session.candidates = [...session.candidates, ...added.filter(id => !inCandidates.has(id))]
+  return session
+}
+
+/**
+ * 連写の見直しで星を上げ下げする。**残す写真は+1、外した写真は−1。**
+ *
+ * 通常の選別（外しても下げない）とは意図的に変えてある。連写は星をそろえた
+ * あとの絞り込みなので、下げられないとまとめの全員が高い星のまま残ってしまう。
+ */
+export function reviewBurstRatings(
+  photos: { id: string, rating: number }[],
+  keptIds: string[],
+  maxRating: number
+): SelectionResult[] {
+  const kept = new Set(keptIds)
+  return photos.map(photo => ({
+    id: photo.id,
+    rating: kept.has(photo.id)
+      ? Math.min(maxRating, photo.rating + 1)
+      : Math.max(0, photo.rating - 1)
+  }))
 }
 
 /**

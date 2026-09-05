@@ -45,15 +45,23 @@ body { margin: 0; }
      写真の縦横比（3:2 前後）に合わせて幅の上限を高さから決める。 */
   max-width: calc(1.6 * (100vh - 300px) / var(--tournament-rows, 2));
 }
+/* v-card はホバーで白い膜（.v-card__overlay）を写真の上に掛ける。写真の見えを
+   変える経路はすべて塞ぐので、.choice-card と同じように無効化する。 */
+.tournament-card::before, .tournament-card .v-card__overlay { opacity: 0 !important; }
 .tournament-card:hover { border-color: rgba(214,255,115,.65); }
-/* 複数枚選ぶと、どれを選んだか分からなくなる。枠だけでなく、明るさを落とした
-   背景・発光・チェックの3つで差を付ける。 */
+/* ホバーは**枠の外側**だけで示す。outline はカードの外に描かれるので写真に
+   重ならず、白い枠の連写カードでも暗い通常カードでも同じように見える。
+   連写カードは .is-burst が border-color: #fff を後勝ちで当てるため、
+   枠の色だけでは手応えが出ない。 */
+.tournament-card:hover { outline: 3px solid rgba(214,255,115,.75); outline-offset: 2px; }
+/* 複数枚選ぶと、どれを選んだか分からなくなる。枠・発光・チェックの3つで差を付ける。
+   **写真そのものは決して暗くしない。** 以前は未選択の写真を opacity .82 にして
+   いたが、選ぶために明るさを見る画面で写真を沈ませるのは本末転倒で、さらに
+   連写カード（背景が白）では白が透けて写真が白飛びして見えていた。 */
 .tournament-card.is-selected {
   border-color: rgb(var(--v-theme-primary));
   box-shadow: 0 0 0 3px rgba(214,255,115,.35), 0 8px 24px rgba(0,0,0,.35);
 }
-.tournament-card:not(.is-selected) img { opacity: .82; transition: opacity .12s; }
-.tournament-card.is-selected img, .tournament-card:hover img { opacity: 1; }
 .tournament-card.is-confirmed { border-color: rgb(var(--v-theme-secondary)); }
 .tournament-card__number { position: absolute; top: 8px; left: 8px; z-index: 2; min-width: 26px; text-align: center; background: rgba(0,0,0,.72); border-radius: 999px; padding: 3px 7px; font-weight: 700; }
 /* 選択のクリックと切り分けるため、拡大とまとめは右上にまとめる。 */
@@ -80,9 +88,18 @@ body { margin: 0; }
 .zoom-overlay__position { background: rgba(255,255,255,.14); border-radius: 999px; padding: 2px 9px; margin-right: 6px; font-weight: 700; }
 
 /* まとめの中身は選別画面と同じ .tournament-grid を使う。
-   全画面ダイアログの中なので、上の説明文ぶんだけ高さを譲る。 */
-.burst-review-grid .tournament-card img { height: calc((100vh - 340px) / var(--tournament-rows, 2)); }
-.burst-review-grid .tournament-card { max-width: calc(1.6 * (100vh - 340px) / var(--tournament-rows, 2)); }
+   まとまりが縦に積まれるので、1行ぶんの高さに抑える。 */
+.burst-review-grid .tournament-card img { height: min(30vh, 220px); }
+.burst-review-grid .tournament-card { max-width: calc(1.6 * min(30vh, 220px)); }
+
+/* まとまりの単位。枠で囲って「どこまでが1つか」を見せる。 */
+.burst-block { border: 1px solid rgba(255,255,255,.10); border-radius: 12px; padding: 12px; background: #14161a; }
+/* まだまとめに入っていない近くの写真。破線で「外」だと分かるようにする。 */
+.burst-block.is-outside { border-style: dashed; border-color: rgba(255,255,255,.18); background: transparent; }
+.burst-block.is-outside .tournament-card img { opacity: 1; }
+/* まとまりどうしの境目。ここ自体が「つなぐ」の操作対象。 */
+.burst-seam { display: flex; align-items: center; gap: 12px; margin: 10px 0; }
+.burst-seam__line { flex: 1; border-top: 1px dashed rgba(255,255,255,.22); }
 
 /* 写真の良し悪しを見るのに切り取ってはいけない。cover ではなく contain。
    高さは行数で割って、グループ全体がスクロールなしで収まるようにする。 */

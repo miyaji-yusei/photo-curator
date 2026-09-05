@@ -64,6 +64,22 @@ export interface PhotoBackend {
   getBurstPairs: (projectId: string) => Promise<BurstPair[]>
   saveBurstThreshold: (projectId: string, threshold: number) => Promise<void>
   clearBurstThreshold: (projectId: string) => Promise<void>
+  /**
+   * まとまりを見直すための「1続きの写真」。指定した写真の前後 `windowMs` に
+   * 入るものを撮影順で返す。まとめの中身も、まとめに入れられる近くの写真も、
+   * どちらもこの1本の並びの上にある。
+   */
+  getBurstNeighborhood: (
+    projectId: string, photoIds: string[], windowMs?: number
+  ) => Promise<Photo[]>
+  /**
+   * 見直した結果の形を保存する。渡すのは**例外そのものではなく「こう分かれて
+   * いてほしい」という形**で、閾値との食い違いだけが例外として残る。
+   * 何度保存しても結果が変わらない。
+   */
+  saveBurstShape: (
+    projectId: string, orderedPhotoIds: string[], blocks: string[][]
+  ) => Promise<void>
 
   startProjectScan: (projectId: string) => Promise<void>
   startBurstAnalysis: (projectId: string) => Promise<void>

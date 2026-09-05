@@ -15,12 +15,15 @@ import type { Photo, SelectionSession } from '~/types/photo'
 import type { TimestampSource } from '~/utils/captureTime'
 
 const DATABASE_NAME = 'photo-curator'
-const DATABASE_VERSION = 1
+// 2 で `burstShapes` を足した。`onupgradeneeded` は「無ければ作る」だけなので、
+// 既存のストアと中身はそのまま残る。
+const DATABASE_VERSION = 2
 
 export const STORE_PROJECTS = 'projects'
 export const STORE_PHOTOS = 'photos'
 export const STORE_THUMBNAILS = 'thumbnails'
 export const STORE_STATES = 'states'
+export const STORE_BURST_SHAPES = 'burstShapes'
 
 /** `photos` テーブルに相当する 1 行。デスクトップの列名に寄せてある。 */
 export interface StoredPhoto {
@@ -74,6 +77,11 @@ export function openStore(): Promise<IDBDatabase> {
       }
       if (!db.objectStoreNames.contains(STORE_STATES)) {
         db.createObjectStore(STORE_STATES, { keyPath: 'projectId' })
+      }
+      // 手で直したまとめの例外。1 プロジェクト 1 行に畳んで持つ。
+      // 触ったペアの数だけしか増えないので、行に収めて構わない。
+      if (!db.objectStoreNames.contains(STORE_BURST_SHAPES)) {
+        db.createObjectStore(STORE_BURST_SHAPES, { keyPath: 'projectId' })
       }
     }
     request.onsuccess = () => resolve(request.result)
@@ -137,6 +145,28 @@ export async function writeSession(session: SelectionSession): Promise<void> {
     putOne(transaction, STORE_STATES, {
       projectId: session.projectId,
       stateJson: JSON.stringify(session),
+      updatedAt: Date.now()
+    })
+  )
+}
+
+/** 手で直したまとめの例外。キーは `pairKey`、値は繋ぐ(true)/切る(false)。 */
+export async function readPairOverrides(projectId: string): Promise<Map<string, boolean>> {
+  const row = await withStores([STORE_BURST_SHAPES], 'readonly', transaction =>
+    getOne<{ projectId: string, overrides: Record<string, boolean> }>(
+      transaction, STORE_BURST_SHAPES, projectId
+    )
+  )
+  return new Map(Object.entries(row?.overrides ?? {}))
+}
+
+export async function writePairOverrides(
+  projectId: string, overrides: Map<string, boolean>
+): Promise<void> {
+  await withStores([STORE_BURST_SHAPES], 'readwrite', transaction =>
+    putOne(transaction, STORE_BURST_SHAPES, {
+      projectId,
+      overrides: Object.fromEntries(overrides),
       updatedAt: Date.now()
     })
   )

@@ -115,7 +115,12 @@ export async function analyzePhotoFile(file: File): Promise<AnalyzedPhoto> {
 
   let bitmap: ImageBitmap | null = null
   try {
-    bitmap = await createImageBitmap(file)
+    // **`imageOrientation` を明示する。** 既定値は仕様の改訂で `none` から
+    // `from-image` に変わっており、端末によってどちらが効くか分からない。
+    // ここを取り違えると、一覧のサムネイルだけが横倒しになる（原本を直接
+    // `<img>` に渡す選別画面はブラウザが自動で正立させるため）。
+    // デスクトップの `apply_orientation` と同じ結果になる。
+    bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' })
     const size = thumbnailSize(bitmap.width, bitmap.height)
     const surface = createSurface(size.width, size.height)
     surface.context.imageSmoothingEnabled = true

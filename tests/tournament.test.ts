@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { MAX_RATING } from '~/types/photo'
 import type { SelectionSession } from '~/types/photo'
 import { createThresholdState } from '~/utils/burstThreshold'
-import { collapseBursts, prepareRound, regroupRemaining, resolveChosen, setBurstRepresentative, undoLastStep } from '~/utils/tournament'
+import { collapseBursts, insertIntoUpcoming, prepareRound, regroupRemaining, resolveChosen, reviewBurstRatings, setBurstRepresentative, spreadBurstRatings, undoLastStep } from '~/utils/tournament'
 
 function makeTestSession(groups: string[][]): SelectionSession {
   const ids = groups.flat()
@@ -19,6 +19,7 @@ function makeTestSession(groups: string[][]): SelectionSession {
     history: [],
     targetRating: 0,
     burstMembers: {},
+    burstSettled: [],
     round: 1,
     burstGroups: [],
     burstPairs: [],
@@ -320,5 +321,235 @@ describe('レーティング基準の選別', () => {
     // reset_selection_results と同じ結果。
     for (const id of Object.keys(session.ratings)) session.ratings[id] = 0
     expect(Object.values(session.ratings).every(rating => rating === 0)).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Routine 6: 連写の事後扱い
+// ---------------------------------------------------------------------------
+
+describe('spreadBurstRatings', () => {
+  /** 代表 a がまとめている 3 枚と、まとめに属さない b。 */
+  const withBurst = () => {
+    const session = makeTestSession([['a', 'b']])
+    session.burstMembers = { a: ['a', 'a2', 'a3'] }
+    session.ratings = { a: 0, a2: 0, a3: 0, b: 0 }
+    return session
+  }
+
+  it('代表と同じ星を仲間にも配り、配った id を返す', () => {
+    const session = withBurst()
+    session.ratings.a = 3
+    expect(spreadBurstRatings(session, ['a'])).toEqual(['a2', 'a3'])
+    expect(session.ratings.a2).toBe(3)
+    expect(session.ratings.a3).toBe(3)
+  })
+
+  it('★5で確定した代表にも追随する。+1 では追いつかない', () => {
+    const session = withBurst()
+    session.ratings.a = MAX_RATING
+    spreadBurstRatings(session, ['a'])
+    expect(session.ratings.a2).toBe(MAX_RATING)
+  })
+
+  it('通らなかった代表のまとめには手を付けない', () => {
+    const session = withBurst()
+    session.ratings.a = 3
+    expect(spreadBurstRatings(session, ['b'])).toEqual([])
+    expect(session.ratings.a2).toBe(0)
+  })
+
+  it('まとめを持たない写真は何も起きない', () => {
+    const session = withBurst()
+    session.ratings.b = 4
+    expect(spreadBurstRatings(session, ['b'])).toEqual([])
+    expect(session.ratings.b).toBe(4)
+  })
+
+  it('代表自身は配る対象に含めない（二重に数えない）', () => {
+    const session = withBurst()
+    session.ratings.a = 2
+    expect(spreadBurstRatings(session, ['a'])).not.toContain('a')
+  })
+})
+
+describe('reviewBurstRatings', () => {
+  const photos = [
+    { id: 'a', rating: 3 },
+    { id: 'b', rating: 3 },
+    { id: 'c', rating: 3 }
+  ]
+
+  it('残した写真は上がり、外した写真は下がる', () => {
+    expect(reviewBurstRatings(photos, ['b'], MAX_RATING)).toEqual([
+      { id: 'a', rating: 2 },
+      { id: 'b', rating: 4 },
+      { id: 'c', rating: 2 }
+    ])
+  })
+
+  it('★5 を超えて上がらない', () => {
+    expect(reviewBurstRatings([{ id: 'a', rating: MAX_RATING }], ['a'], MAX_RATING))
+      .toEqual([{ id: 'a', rating: MAX_RATING }])
+  })
+
+  it('★0 を下回って下がらない', () => {
+    expect(reviewBurstRatings([{ id: 'a', rating: 0 }], [], MAX_RATING))
+      .toEqual([{ id: 'a', rating: 0 }])
+  })
+
+  it('複数枚を残せる', () => {
+    const result = reviewBurstRatings(photos, ['a', 'c'], MAX_RATING)
+    expect(result.map(entry => entry.rating)).toEqual([4, 2, 4])
+  })
+
+  it('まとめに含まれない id を残す指定は無視する', () => {
+    expect(reviewBurstRatings([{ id: 'a', rating: 3 }], ['z'], MAX_RATING))
+      .toEqual([{ id: 'a', rating: 2 }])
+  })
+})
+
+// 代表と仲間で星が食い違ったままになると、結果一覧に説明できない星が残る。
+// app.vue の confirmChoices / undoChoice と同じ順序で確かめる。
+describe('連写の星は代表と一緒に動く', () => {
+  const session = () => {
+    const built = makeTestSession([['a', 'b']])
+    built.burstMembers = { a: ['a', 'a2'] }
+    built.ratings = { a: 2, a2: 2, b: 2 }
+    built.targetRating = 2
+    return built
+  }
+
+  it('代表が通ると仲間も同じ星に上がる', () => {
+    const current = session()
+    const chosen = resolveChosen(['a'], ['a', 'b'], current.ratings, MAX_RATING)
+    for (const id of chosen) {
+      current.survivors.push(id)
+      current.ratings[id] = Math.min(MAX_RATING, (current.ratings[id] ?? 0) + 1)
+    }
+    spreadBurstRatings(current, chosen)
+    expect(current.ratings.a).toBe(3)
+    expect(current.ratings.a2).toBe(3)
+    expect(current.ratings.b).toBe(2)
+  })
+
+  it('1つ戻すと仲間の星も元に戻る', () => {
+    const current = session()
+    const chosen = resolveChosen(['a'], ['a', 'b'], current.ratings, MAX_RATING)
+    for (const id of chosen) {
+      current.survivors.push(id)
+      current.ratings[id] = Math.min(MAX_RATING, (current.ratings[id] ?? 0) + 1)
+    }
+    const spread = spreadBurstRatings(current, chosen)
+    current.history.push({ groupIndex: 0, chosen: [...chosen, ...spread] })
+    current.groupIndex += 1
+
+    undoLastStep(current)
+
+    expect(current.ratings.a).toBe(2)
+    expect(current.ratings.a2).toBe(2)
+    // 仲間は survivors に入れない。入れると畳んだ意味が消える。
+    expect(current.survivors).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Routine 7: まとめの中身を編集する
+// ---------------------------------------------------------------------------
+
+describe('spreadBurstRatings は決着済みを上書きしない', () => {
+  const session = () => {
+    const built = makeTestSession([['a', 'b']])
+    built.burstMembers = { a: ['a', 'a2', 'a3'] }
+    built.ratings = { a: 2, a2: 2, a3: 2, b: 2 }
+    built.targetRating = 2
+    return built
+  }
+
+  it('まとめの中で下げた星は、代表が通っても戻らない', () => {
+    const current = session()
+    current.ratings.a2 = 1          // 明らかに脱落として −1
+    current.burstSettled = ['a2']
+    current.ratings.a = 3
+    expect(spreadBurstRatings(current, ['a'])).toEqual(['a3'])
+    expect(current.ratings.a2).toBe(1)
+    expect(current.ratings.a3).toBe(3)
+  })
+
+  it('まとめの中で★5に確定した写真も代表の星に引き下げられない', () => {
+    const current = session()
+    current.ratings.a2 = MAX_RATING
+    current.burstSettled = ['a2']
+    current.ratings.a = 3
+    spreadBurstRatings(current, ['a'])
+    expect(current.ratings.a2).toBe(MAX_RATING)
+  })
+
+  it('決着済みが空なら従来どおり全員に配る', () => {
+    const current = session()
+    current.burstSettled = []
+    current.ratings.a = 3
+    expect(spreadBurstRatings(current, ['a'])).toEqual(['a2', 'a3'])
+  })
+})
+
+describe('insertIntoUpcoming', () => {
+  const session = () => {
+    const built = makeTestSession([['a', 'b'], ['c', 'd'], ['e', 'f']])
+    built.settings = { groupSize: 2, groupBursts: true }
+    built.groupIndex = 1 // いま c,d を見ている
+    return built
+  }
+
+  it('いま見ているグループは絶対に変えない', () => {
+    const current = session()
+    insertIntoUpcoming(current, ['x', 'y'])
+    expect(current.groups[1]).toEqual(['c', 'd'])
+  })
+
+  it('済んだグループも変えない', () => {
+    const current = session()
+    insertIntoUpcoming(current, ['x', 'y'])
+    expect(current.groups[0]).toEqual(['a', 'b'])
+  })
+
+  it('外した写真は次に見る分の先頭に入る', () => {
+    const current = session()
+    insertIntoUpcoming(current, ['x', 'y'])
+    expect(current.groups.slice(2)).toEqual([['x', 'y'], ['e', 'f']])
+  })
+
+  it('候補にも戻す。戻さないと次のラウンドから消える', () => {
+    const current = session()
+    insertIntoUpcoming(current, ['x'])
+    expect(current.candidates).toContain('x')
+  })
+
+  it('端数が1枚になったら比較にならないのでそのまま通す', () => {
+    const current = session()
+    insertIntoUpcoming(current, ['x'])
+    // 未処理は x,e,f の3枚。2枚ずつだと1枚余る。
+    expect(current.groups.slice(2)).toEqual([['x', 'e']])
+    expect(current.survivors).toEqual(['f'])
+  })
+
+  it('既にグループに居る写真は二重に入れない', () => {
+    const current = session()
+    insertIntoUpcoming(current, ['e'])
+    expect(current.groups.slice(2)).toEqual([['e', 'f']])
+    expect(current.groups.flat().filter(id => id === 'e')).toHaveLength(1)
+  })
+
+  it('最後のグループを見ているときは、そのうしろに足す', () => {
+    const current = session()
+    current.groupIndex = 2
+    insertIntoUpcoming(current, ['x', 'y'])
+    expect(current.groups).toEqual([['a', 'b'], ['c', 'd'], ['e', 'f'], ['x', 'y']])
+  })
+
+  it('戻る履歴の位置は動かさない', () => {
+    const current = session()
+    insertIntoUpcoming(current, ['x', 'y'])
+    expect(current.groupIndex).toBe(1)
   })
 })

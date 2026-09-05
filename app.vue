@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import type {
-  BurstPair, ExportReport, Photo, PhotoSort, Project, ProjectProgress,
+  BurstGroup, BurstPair, ExportReport, Photo, PhotoSort, Project, ProjectProgress,
   SelectionResult, SelectionSession, SelectionSummary, TournamentSettings
 } from '~/types/photo'
 import { MAX_RATING } from '~/types/photo'
@@ -12,17 +12,21 @@ import {
 } from '~/utils/ratingMove'
 import {
   collapseBursts,
+  insertIntoUpcoming,
   makeSession,
   prepareRound,
   regroupRemaining,
   resolveChosen,
-  setBurstRepresentative,
+  reviewBurstRatings,
+  spreadBurstRatings,
   undoLastStep
 } from '~/utils/tournament'
-import { clampGroupSize, groupSizeLimits } from '~/utils/groupSize'
-import type { ShortcutRow } from '~/utils/shareExport'
 import {
-  SHARE_FILE_LIMIT, buildShortcutPayload, downloadBlob, runShortcut, shareFiles, zipEntriesByRating
+  blocksFromCuts, cutAll, cutAroundSelection, cutsFromGroups, joinAt
+} from '~/utils/burstEdit'
+import { clampGroupSize, groupSizeLimits } from '~/utils/groupSize'
+import {
+  SHARE_FILE_LIMIT, downloadBlob, shareFiles, zipEntriesByRating
 } from '~/utils/shareExport'
 import { createStoredZip } from '~/utils/zip'
 import {
@@ -35,7 +39,7 @@ import {
   skipPair
 } from '~/utils/burstThreshold'
 
-type View = 'home' | 'project' | 'method' | 'settings' | 'burst-threshold' | 'burst-preview' | 'tournament' | 'result' | 'results'
+type View = 'home' | 'project' | 'method' | 'settings' | 'burst-threshold' | 'burst-preview' | 'tournament' | 'result' | 'results' | 'burst-review'
 
 const desktop = useDesktop()
 const projects = ref<Project[]>([])
@@ -106,13 +110,10 @@ const tournamentColumns = computed(() => columnsFor(tournamentPhotos.value.lengt
 const tournamentRows = computed(() =>
   Math.max(1, Math.ceil(tournamentPhotos.value.length / tournamentColumns.value))
 )
-/** まとめの中身も選別画面と同じ組み方にして、同じ大きさで見比べられるようにする。 */
-const burstColumns = computed(() => columnsFor(burstPhotos.value.length))
-const burstRows = computed(() =>
-  Math.max(1, Math.ceil(burstPhotos.value.length / burstColumns.value))
-)
 /** 写真を見比べている画面かどうか。余白の詰め方を変える。 */
-const isSelecting = computed(() => view.value === 'tournament' || view.value === 'burst-threshold')
+const isSelecting = computed(() =>
+  view.value === 'tournament' || view.value === 'burst-threshold' || view.value === 'burst-review'
+)
 
 // 次ラウンドと選別結果ビュー
 const nextRoundDialog = ref(false)
@@ -171,14 +172,17 @@ const metadataBusy = ref(false)
 const metadataAcknowledged = ref(false)
 const metadataResult = ref<ExportReport | null>(null)
 
-// ブラウザからライブラリへ渡す 3 つの出口（共有シート / ZIP / Shortcuts）。
+// ブラウザからライブラリへ渡す出口（共有シート / 星ごとの ZIP）。
+//
+// Shortcuts でアルバムに入れる経路も試したが、写真ライブラリを名前で辿る手立てが
+// 実機に無く（「写真を検索」に相当するアクションが見当たらず、写真アプリの
+// 「検索」はファイル名で検索できない）、成立しないので取り下げた。
+// 星はこのアプリが持ち続け、写真そのものは共有シートか ZIP で渡す。
 const shareDialog = ref(false)
 const shareRatings = ref<number[]>([MAX_RATING])
 const shareBusy = ref(false)
 const shareError = ref('')
 const shareMessage = ref('')
-/** 利用者が iPad に入れておくショートカットの名前。 */
-const shortcutName = ref('写真をお気に入りに')
 
 // 拡大表示・まとめの展開
 const zoomPhoto = ref<Photo | null>(null)
@@ -201,9 +205,41 @@ const moveDensity = ref<GridDensity>('auto')
 const gridClass = (density: GridDensity) => (density === 'auto' ? '' : 'is-fixed')
 const gridStyle = (density: GridDensity) =>
   density === 'auto' ? undefined : { '--grid-columns': String(density) }
+// まとめの中身を直す画面。
+//
+// 状態の中心は **`burstCuts`（隣どうしの境目）** ひとつだけ。まとまりは
+// `burstPhotos` の並びの上で必ず連続しているので、境目の真偽値の列があれば
+// 分割・切り離し・結合・全解除がすべて表せる。詳細は `utils/burstEdit.ts`。
 const burstDialog = ref(false)
 const burstOwner = ref<Photo | null>(null)
+/** 撮影順に並んだ1続きの写真。まとめの中身と、近くの写真の両方が入る。 */
 const burstPhotos = ref<Photo[]>([])
+const burstCuts = ref<boolean[]>([])
+/** 開いたときに元のまとめへ入っていた写真。外の写真と見分けるために持つ。 */
+const burstOriginal = ref<string[]>([])
+const burstPicked = ref<string[]>([])
+/** 利用者が明示的に代表へ指名した写真。まとまりを組み直すときに優先する。 */
+const burstReps = ref<string[]>([])
+const burstBusy = ref(false)
+
+// 連写の見直し（選別が終わったあと）。
+//
+// 選別中、まとめは代表1枚に畳まれ、仲間には代表と同じ星が配られる。そこまでで
+// 「まとめ全体の良し悪し」は決まるが、**その中のどれが一番良いか**はまだ決めて
+// いない。この画面がその1手を引き受ける。
+//
+// グループは保存していない。`getBurstGroups` が学習済みの閾値から**そのつど
+// 引き直す**ので、セッションが終わっても、何度でもここへ戻ってこられる。
+const burstReviewGroups = ref<BurstGroup[]>([])
+const burstReviewIndex = ref(0)
+const burstReviewPhotos = ref<Photo[]>([])
+const burstReviewKept = ref<string[]>([])
+const burstReviewBusy = ref(false)
+const burstReviewLoaded = ref(false)
+const burstReviewColumns = computed(() => columnsFor(burstReviewPhotos.value.length))
+const burstReviewRows = computed(() =>
+  Math.max(1, Math.ceil(burstReviewPhotos.value.length / burstReviewColumns.value))
+)
 
 /** 星が最大なら「確定」扱い。別のフラグは持たない。 */
 const isConfirmed = (photoId: string) => (session.value?.ratings[photoId] ?? 0) >= MAX_RATING
@@ -599,13 +635,18 @@ async function confirmChoices() {
   const group = [...currentGroup.value]
   // 選択した写真に加え、このグループで★5に確定した写真も通す。
   const chosen = resolveChosen(session.value.selectedInGroup, group, session.value.ratings, MAX_RATING)
-  session.value.history.push({ groupIndex: session.value.groupIndex, chosen })
   for (const id of chosen) {
     session.value.survivors.push(id)
     // 星は 1 ラウンド通過ごとに +1 で、MAX_RATING で頭打ち。
     session.value.ratings[id] = Math.min(MAX_RATING, (session.value.ratings[id] ?? 0) + 1)
   }
-  await persistGroupResults(group)
+  // 代表に付いた星を、まとめられた仲間にも配る。**survivors には入れない。**
+  // 入れると同じラウンドの次の回にまとめの全員が出てきて、畳んだ意味が消える。
+  // 星が揃うので、次に「その星を選別」したときには自然に一緒に出てくる。
+  const spread = spreadBurstRatings(session.value, chosen)
+  // 戻すときは仲間の星も一緒に戻す。survivors に居ない id は undo 側で読み飛ばされる。
+  session.value.history.push({ groupIndex: session.value.groupIndex, chosen: [...chosen, ...spread] })
+  await persistGroupResults([...group, ...spread])
   session.value.groupIndex += 1
   session.value.selectedInGroup = []
   session.value.multiSelect = false
@@ -691,34 +732,215 @@ function stepZoom(step: number) {
   if (next) zoomPhoto.value = next
 }
 
-/** まとめられた連写の中身を開く。代表の差し替えもここから。 */
+/**
+ * まとめの中身を開く。**ここが「まとまりの形」を直す唯一の場所。**
+ *
+ * 表示するのは代表のまとめだけではなく、**撮影順で前後 4 秒に入る1続きの写真**。
+ * まとめの中身も、まとめに入れられる近くの写真も、同じ1本の並びの上にあるので、
+ * 「切る」「繋ぐ」の 2 つだけで分割・切り離し・追加・全解除がすべて表せる。
+ */
 async function openBurst(photo: Photo | null) {
-  if (!photo || !session.value || burstSizeOf(photo.id) < 2) return
-  const ids = session.value.burstMembers[photo.id] ?? []
+  if (!photo || !session.value || !activeProject.value || burstSizeOf(photo.id) < 2) return
+  const members = session.value.burstMembers[photo.id] ?? []
   burstOwner.value = photo
-  burstPhotos.value = activeProject.value
-    ? await desktop.getPhotosByIds(activeProject.value.id, ids)
-    : []
   burstDialog.value = true
+  burstBusy.value = true
+  burstPicked.value = []
+  burstReps.value = []
+  try {
+    const run = await desktop.getBurstNeighborhood(activeProject.value.id, members)
+    // 近くに何も無ければ、まとめの中身だけで組む。
+    burstPhotos.value = run.length ? run : await desktop.getPhotosByIds(activeProject.value.id, members)
+    const ids = burstPhotos.value.map(item => item.id)
+    // いまのまとまり方を境目に起こす。まとめに属さない近くの写真は、
+    // それぞれ1枚のまとまりとして並ぶ。
+    burstCuts.value = cutsFromGroups(ids, Object.values(session.value.burstMembers))
+    burstOriginal.value = ids.filter(id => members.includes(id))
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : 'まとめを読み込めませんでした。'
+    burstPhotos.value = []
+    burstCuts.value = []
+  } finally {
+    burstBusy.value = false
+  }
 }
 
-/** まとめの代表を差し替える。選別画面に出る1枚が変わる。 */
-async function chooseRepresentative(photoId: string) {
-  if (!session.value || !burstOwner.value) return
-  setBurstRepresentative(session.value, burstOwner.value.id, photoId)
-  burstDialog.value = false
-  burstOwner.value = null
-  await loadCurrentPhotos()
+/** いま画面に見えているまとまりの並び。 */
+const burstBlocks = computed(() =>
+  blocksFromCuts(burstPhotos.value.map(photo => photo.id), burstCuts.value)
+)
+const burstPhotoOf = (photoId: string) => burstPhotos.value.find(photo => photo.id === photoId) ?? null
+/**
+ * まだまとめの外にある塊か。**1枚でも元のまとめの写真を含んでいれば「中」**。
+ * 外の写真を繋いで取り込んだ塊を「外」と呼び続けないため。
+ */
+const isOutsideBurst = (block: string[]) =>
+  !block.some(id => burstOriginal.value.includes(id))
+
+/** その塊の代表。指名があればそれ、無ければ撮影順の先頭。 */
+const representativeOf = (block: string[]) =>
+  block.find(id => burstReps.value.includes(id)) ?? block[0]!
+
+function toggleBurstPick(photoId: string) {
+  burstPicked.value = burstPicked.value.includes(photoId)
+    ? burstPicked.value.filter(id => id !== photoId)
+    : [...burstPicked.value, photoId]
+}
+
+/** 選んだ写真を、連続した塊ごとに切り離す。 */
+function splitBurstSelection() {
+  if (!burstPicked.value.length) return
+  burstCuts.value = cutAroundSelection(
+    burstPhotos.value.map(photo => photo.id), burstCuts.value, burstPicked.value
+  )
+  burstPicked.value = []
+}
+
+/** 隣り合うまとまりを繋ぐ。近くの写真を取り込むのもこれ。 */
+function joinBurstAt(boundaryIndex: number) {
+  burstCuts.value = joinAt(burstCuts.value, boundaryIndex)
+}
+
+function scatterBurst() {
+  burstCuts.value = cutAll(burstCuts.value)
+  burstPicked.value = []
+}
+
+/** ある写真の直前の境目。まとまりの先頭以外は必ずある。 */
+function boundaryBefore(photoId: string) {
+  return burstPhotos.value.findIndex(photo => photo.id === photoId) - 1
+}
+
+/**
+ * まとめの中で1枚の星を決める。★5 の確定と、明らかな脱落（−1）。
+ *
+ * 決めた写真は `burstSettled` に入れる。**これが無いとグループを確定した
+ * 瞬間に `spreadBurstRatings` が代表の星で塗り潰してしまう。**
+ */
+async function settleBurstPhoto(photoId: string, rating: number) {
+  if (!session.value || !activeProject.value) return
+  const current = session.value.ratings[photoId] ?? 0
+  // もう一度押したら取り消し。まとめの外に出すわけではないので星だけ戻す。
+  const settled = session.value.burstSettled.includes(photoId)
+  const next = settled && current === rating ? session.value.targetRating : rating
+  session.value.ratings[photoId] = next
+  session.value.burstSettled = next === session.value.targetRating
+    ? session.value.burstSettled.filter(id => id !== photoId)
+    : [...new Set([...session.value.burstSettled, photoId])]
+  const photo = burstPhotoOf(photoId)
+  if (photo) photo.rating = next
+  try {
+    await desktop.saveSelectionResults(activeProject.value.id, [{ id: photoId, rating: next }])
+    await loadSummary()
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : '星を保存できませんでした。'
+  }
   await saveSession()
+}
+
+const confirmBurstPhoto = (photoId: string) => settleBurstPhoto(photoId, MAX_RATING)
+const dropBurstPhoto = (photoId: string) =>
+  settleBurstPhoto(photoId, Math.max(0, (session.value?.targetRating ?? 0) - 1))
+
+/**
+ * 選んだ1枚をそのまとまりの代表に指名する。
+ * **反映は「この形で戻る」のとき。** 途中で候補やグループを書き換えると、
+ * そのあとの切り離しと噛み合わなくなる。
+ */
+function makeBurstRepresentative(photoId: string) {
+  const block = burstBlocks.value.find(ids => ids.includes(photoId))
+  if (!block) return
+  // 同じ塊の中の古い指名は外す。代表は塊に1枚。
+  burstReps.value = [...burstReps.value.filter(id => !block.includes(id)), photoId]
+  burstPicked.value = []
+}
+
+/**
+ * まとまりを代表1枚に畳む。並びの中で**最初に出会った位置に代表を置き**、
+ * 残りのメンバーは取り除く。位置が動かないので撮影順の意味が保たれる。
+ */
+function collapseTo(ids: string[], members: Set<string>, representative: string): string[] {
+  let placed = false
+  const out: string[] = []
+  for (const id of ids) {
+    if (!members.has(id)) {
+      out.push(id)
+      continue
+    }
+    if (!placed) {
+      out.push(representative)
+      placed = true
+    }
+  }
+  return out
+}
+
+/**
+ * 直した形を確定して選別画面へ戻す。
+ *
+ * 保存するのは**例外そのものではなく「こう分かれていてほしい」という形**で、
+ * 閾値との食い違いだけがバックエンドで例外として残る。何度押しても結果は同じ。
+ */
+async function applyBurstShape() {
+  if (!session.value || !activeProject.value) return
+  burstBusy.value = true
+  try {
+    const ids = burstPhotos.value.map(photo => photo.id)
+    await desktop.saveBurstShape(activeProject.value.id, ids, burstBlocks.value)
+
+    // セッション側のまとめを組み直す。2枚以上の塊だけが「まとめ」になる。
+    // この並びに関わる古いまとめは、いったん全部落としてから作り直す。
+    const owned = new Set(burstOriginal.value)
+    for (const id of ids) delete session.value.burstMembers[id]
+
+    const released: string[] = []
+    for (const block of burstBlocks.value) {
+      if (block.length < 2) {
+        // 元のまとめから外れて1枚になった写真は、選別に出し直す必要がある。
+        if (owned.has(block[0]!)) released.push(block[0]!)
+        continue
+      }
+      const representative = representativeOf(block)
+      session.value.burstMembers[representative] = [
+        representative, ...block.filter(id => id !== representative)
+      ]
+      // 代表以外を畳む。**代表が入れ替わってもカードの位置は動かない。**
+      const members = new Set(block)
+      session.value.candidates = collapseTo(session.value.candidates, members, representative)
+      session.value.groups = session.value.groups.map(
+        group => collapseTo(group, members, representative)
+      )
+      session.value.survivors = collapseTo(session.value.survivors, members, representative)
+      session.value.selectedInGroup = collapseTo(
+        session.value.selectedInGroup, members, representative
+      )
+    }
+
+    // 外した写真は**今見ているグループを崩さず**、次に見る分の先頭へ。
+    insertIntoUpcoming(session.value, released)
+
+    burstDialog.value = false
+    burstOwner.value = null
+    await loadCurrentPhotos()
+    await saveSession()
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : 'まとめの形を保存できませんでした。'
+  } finally {
+    burstBusy.value = false
+  }
 }
 
 /** 直前の1グループぶんの判断を取り消してやり直す。 */
 async function undoChoice() {
   if (!session.value || !session.value.history.length) return
+  // 戻す対象を**先に**控える。`undoLastStep` が履歴から取り出してしまうため。
+  // まとめの仲間は表示中のグループに居ないので、これが無いと画面の星だけ戻って
+  // DB には上がったままの星が残る。
+  const restored = [...(session.value.history[session.value.history.length - 1]?.chosen ?? [])]
   undoLastStep(session.value)
   // 戻したぶんの星と落選を DB からも取り消す。まだ判定していない状態に戻す。
   const group = session.value.groups[session.value.groupIndex] ?? []
-  await persistGroupResults(group)
+  await persistGroupResults([...new Set([...group, ...restored])])
   view.value = 'tournament'
   await loadCurrentPhotos()
   await saveSession()
@@ -891,6 +1113,103 @@ async function loadResultsPage(reset = false) {
   }
 }
 
+// ---- 連写の見直し --------------------------------------------------------
+
+/** いま見ているまとめ。 */
+const burstReviewGroup = computed(() => burstReviewGroups.value[burstReviewIndex.value] ?? null)
+
+/**
+ * 連写の見直しを開く。**まとめは保存していない**ので、学習済みの閾値から
+ * その場で引き直す。2枚以上のものだけが対象。
+ */
+async function openBurstReview() {
+  if (!activeProject.value) return
+  view.value = 'burst-review'
+  burstReviewLoaded.value = false
+  burstReviewBusy.value = true
+  burstReviewGroups.value = []
+  burstReviewIndex.value = 0
+  burstReviewPhotos.value = []
+  try {
+    const groups = await desktop.getBurstGroups(activeProject.value.id)
+    burstReviewGroups.value = groups.filter(group => group.photoIds.length > 1)
+    await loadBurstReviewPhotos()
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : '連写を読み込めませんでした。'
+  } finally {
+    burstReviewBusy.value = false
+    burstReviewLoaded.value = true
+  }
+}
+
+/**
+ * いま見ているまとめの写真だけを読む。**全グループぶんを先読みしない。**
+ * 連写が数百グループある写真集でも、載るのは常に1グループぶん。
+ */
+async function loadBurstReviewPhotos() {
+  const group = burstReviewGroup.value
+  burstReviewKept.value = []
+  if (!activeProject.value || !group) {
+    burstReviewPhotos.value = []
+    return
+  }
+  const photos = await desktop.getPhotosByIds(activeProject.value.id, group.photoIds)
+  // getPhotosByIds の並びは問わない。まとめの中は撮影順で見せる。
+  const order = new Map(group.photoIds.map((id, index) => [id, index]))
+  burstReviewPhotos.value = [...photos].sort(
+    (left, right) => (order.get(left.id) ?? 0) - (order.get(right.id) ?? 0)
+  )
+}
+
+function toggleBurstReviewKeep(photoId: string) {
+  const kept = burstReviewKept.value
+  burstReviewKept.value = kept.includes(photoId)
+    ? kept.filter(id => id !== photoId)
+    : [...kept, photoId]
+}
+
+/** 次のまとめへ。最後まで来たら結果画面に戻す。 */
+async function advanceBurstReview() {
+  if (burstReviewIndex.value + 1 >= burstReviewGroups.value.length) {
+    await openResults()
+    return
+  }
+  burstReviewIndex.value += 1
+  await loadBurstReviewPhotos()
+}
+
+/**
+ * 残す写真を確定する。**残した写真は+1、外した写真は−1。**
+ * 通常の選別と違って下げるのは、ここが「星をそろえたあとの絞り込み」だから。
+ */
+async function applyBurstReview() {
+  if (!activeProject.value || !burstReviewKept.value.length) return
+  burstReviewBusy.value = true
+  try {
+    const entries = reviewBurstRatings(
+      burstReviewPhotos.value.map(photo => ({ id: photo.id, rating: photo.rating })),
+      burstReviewKept.value,
+      MAX_RATING
+    )
+    await desktop.saveSelectionResults(activeProject.value.id, entries)
+    await loadSummary()
+    await advanceBurstReview()
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : '連写の結果を保存できませんでした。'
+  } finally {
+    burstReviewBusy.value = false
+  }
+}
+
+async function skipBurstReview() {
+  burstReviewBusy.value = true
+  try {
+    await advanceBurstReview()
+  } finally {
+    burstReviewBusy.value = false
+  }
+}
+
 // ---- レートの移動 --------------------------------------------------------
 
 /**
@@ -1054,44 +1373,10 @@ async function exportZipByRating() {
   }
 }
 
-/**
- * 一覧をクリップボードに入れてショートカットを起動する。
- * 写真アプリのお気に入り（♡）やアルバムに反映できる唯一の経路。
- */
-async function runFavoriteShortcut() {
-  const project = activeProject.value
-  if (!project) return
-  shareBusy.value = true
+function openShareDialog() {
   shareError.value = ''
   shareMessage.value = ''
-  try {
-    const rows: ShortcutRow[] = []
-    for (const rating of [...shareRatings.value].sort((left, right) => right - left)) {
-      let offset = 0
-      for (;;) {
-        const page = await desktop.getProjectPhotoPage(project.id, offset, 200, rating, 'name')
-        // 原本が無くてもファイル名は残っているので、こちらは全件渡せる。
-        for (const photo of page.photos) {
-          rows.push({ name: photo.name, rating: photo.rating, capturedAt: photo.capturedAt })
-        }
-        offset += page.photos.length
-        if (!page.photos.length || offset >= page.total) break
-      }
-    }
-    if (!rows.length) {
-      shareError.value = '対象の写真がありません。'
-      return
-    }
-    const started = await runShortcut(shortcutName.value.trim(), buildShortcutPayload(rows))
-    shareMessage.value = started
-      ? `${rows.length} 枚の一覧をコピーし、ショートカット「${shortcutName.value.trim()}」を呼び出しました。`
-      : ''
-    if (!started) shareError.value = 'クリップボードに書き込めませんでした。ショートカットは起動していません。'
-  } catch (cause) {
-    shareError.value = cause instanceof Error ? cause.message : 'ショートカットを起動できませんでした。'
-  } finally {
-    shareBusy.value = false
-  }
+  shareDialog.value = true
 }
 
 async function resumeSession() {
@@ -1161,7 +1446,27 @@ function onKeydown(event: KeyboardEvent) {
     onZoomKeydown(event)
     return
   }
-  if (!session.value || event.target instanceof HTMLInputElement) return
+  if (event.target instanceof HTMLInputElement) return
+
+  // 連写の見直し。**セッションが無くても開ける**画面なので、下の session 判定より
+  // 手前で拾う。操作は選別画面と同じ（数字で選ぶ／Ctrl+数字で拡大／Enter で確定）。
+  if (view.value === 'burst-review') {
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      if (burstReviewKept.value.length) void applyBurstReview()
+      return
+    }
+    const digit = /^(Digit|Numpad)(\d)$/.exec(event.code)
+    const index = digit ? (Number(digit[2]) === 0 ? 10 : Number(digit[2])) : 0
+    const target = burstReviewPhotos.value[index - 1] ?? null
+    if (!target) return
+    event.preventDefault()
+    if (event.ctrlKey || event.metaKey) openZoom(target, burstReviewPhotos.value)
+    else toggleBurstReviewKeep(target.id)
+    return
+  }
+
+  if (!session.value) return
 
   // 閾値の判定画面。テンポよく答えられるよう手を離さずに済ませる。
   if (view.value === 'burst-threshold' && currentPair.value) {
@@ -1606,10 +1911,12 @@ onBeforeUnmount(() => {
               ★{{ resultsRating }} だけ表示中
             </v-chip>
             <v-spacer />
+            <!-- 選別中は「まとめの中から1枚」を決めていない。その1手をここで引き受ける。 -->
+            <v-btn variant="outlined" prepend-icon="mdi-layers-triple-outline" @click="openBurstReview">連写を見直す</v-btn>
             <!-- デスクトップは原本のフォルダを直接操作できる。ブラウザはできないので、
-                 共有シート / ZIP / Shortcuts を通して渡す。 -->
+                 共有シートか星ごとの ZIP を通して渡す。 -->
             <template v-if="canImportPhotos">
-              <v-btn variant="outlined" prepend-icon="mdi-export-variant" @click="shareDialog = true">書き出す</v-btn>
+              <v-btn variant="outlined" prepend-icon="mdi-export-variant" @click="openShareDialog">書き出す</v-btn>
             </template>
             <template v-else>
               <v-btn variant="outlined" prepend-icon="mdi-folder-move-outline" @click="exportDialog = true">フォルダ分け</v-btn>
@@ -1644,6 +1951,71 @@ onBeforeUnmount(() => {
             </v-btn>
             <span v-else-if="resultsPhotos.length" class="text-caption text-medium-emphasis">{{ resultsTotal.toLocaleString() }} 枚すべて表示しました</span>
           </div>
+        </template>
+
+        <!-- 連写の見直し。まとめ単位で「残す写真」を決めて星を上げ下げする。 -->
+        <template v-else-if="view === 'burst-review'">
+          <div class="d-flex flex-wrap align-center justify-space-between ga-3 mb-3">
+            <v-btn variant="text" prepend-icon="mdi-arrow-left" class="px-0" @click="openResults">レーティングへ戻る</v-btn>
+            <span v-if="burstReviewGroups.length" class="text-caption text-medium-emphasis">
+              {{ (burstReviewIndex + 1).toLocaleString() }} / {{ burstReviewGroups.length.toLocaleString() }} グループ
+            </span>
+          </div>
+
+          <template v-if="burstReviewGroups.length && burstReviewPhotos.length">
+            <h1 class="text-h6 text-md-h5">まとめられた {{ burstReviewPhotos.length }} 枚から残す写真を選ぶ</h1>
+            <p class="text-body-2 text-medium-emphasis mt-1 mb-3">
+              残した写真は星が1つ上がり、外した写真は1つ下がります。
+            </p>
+            <v-progress-linear
+              :model-value="burstReviewGroups.length ? (burstReviewIndex / burstReviewGroups.length) * 100 : 100"
+              color="primary" height="6" rounded class="mb-4"
+            />
+
+            <div
+              class="tournament-grid"
+              :style="{ '--tournament-columns': burstReviewColumns, '--tournament-rows': burstReviewRows }"
+            >
+              <v-card
+                v-for="(photo, index) in burstReviewPhotos"
+                :key="photo.id"
+                class="tournament-card"
+                :class="{ 'is-selected': burstReviewKept.includes(photo.id) }"
+                @click="toggleBurstReviewKeep(photo.id)"
+              >
+                <span class="tournament-card__number">{{ index + 1 === 10 ? 0 : index + 1 }}</span>
+                <div class="tournament-card__tools">
+                  <v-btn
+                    icon="mdi-magnify-plus-outline" size="x-small" variant="flat"
+                    :aria-label="`${photo.name} を拡大`"
+                    @click.stop="openZoom(photo, burstReviewPhotos)"
+                  />
+                </div>
+                <span v-if="burstReviewKept.includes(photo.id)" class="tournament-card__check">
+                  <v-icon icon="mdi-check-bold" size="20" />
+                </span>
+                <span class="tournament-card__confirmed">★{{ photo.rating }}</span>
+                <img :src="desktop.photoUrl(photo.path)" :alt="photo.name">
+              </v-card>
+            </div>
+
+            <v-sheet class="d-flex align-center justify-space-between flex-wrap ga-3 mt-4 pa-3" color="surface-variant" rounded>
+              <span class="text-caption text-medium-emphasis">
+                残す {{ burstReviewKept.length }} 枚 ・ 下げる {{ burstReviewPhotos.length - burstReviewKept.length }} 枚
+              </span>
+              <div class="d-flex flex-wrap ga-2">
+                <v-btn variant="outlined" :disabled="burstReviewBusy" @click="skipBurstReview">変更しない</v-btn>
+                <v-btn
+                  color="primary" :loading="burstReviewBusy" :disabled="!burstReviewKept.length"
+                  @click="applyBurstReview"
+                >この {{ burstReviewKept.length }} 枚を残す</v-btn>
+              </div>
+            </v-sheet>
+          </template>
+
+          <v-card v-else-if="burstReviewLoaded" class="pa-10 text-center text-medium-emphasis">
+            まとめられた連写はありません。
+          </v-card>
         </template>
 
         <template v-else-if="view === 'result' && session">
@@ -1796,25 +2168,6 @@ onBeforeUnmount(() => {
                 <v-btn variant="outlined" :loading="shareBusy" :disabled="!shareRatings.length" @click="exportZipByRating">ZIP</v-btn>
               </template>
             </v-list-item>
-            <v-divider />
-            <v-list-item class="px-0">
-              <v-list-item-title>お気に入り(♡)に反映する</v-list-item-title>
-              <v-list-item-subtitle class="text-wrap">
-                一覧をコピーして、iPad に入れたショートカットを呼び出します。
-                <strong>写真ライブラリを実際に変えられるのはこの方法だけです。</strong>
-                照合はファイル名で行うため、同名の写真があると取り違えることがあります。
-              </v-list-item-subtitle>
-            </v-list-item>
-            <v-list-item class="px-0">
-              <v-text-field
-                v-model="shortcutName" label="ショートカットの名前" density="compact"
-                variant="outlined" hide-details
-              >
-                <template #append>
-                  <v-btn variant="outlined" :loading="shareBusy" :disabled="!shareRatings.length || !shortcutName.trim()" @click="runFavoriteShortcut">実行</v-btn>
-                </template>
-              </v-text-field>
-            </v-list-item>
           </v-list>
         </v-card-text>
         <v-divider />
@@ -1898,40 +2251,99 @@ onBeforeUnmount(() => {
     <v-dialog v-model="burstDialog" fullscreen transition="dialog-bottom-transition" scrollable>
       <v-card>
         <v-toolbar color="surface" density="comfortable">
-          <v-toolbar-title>まとめられた {{ burstPhotos.length }} 枚</v-toolbar-title>
+          <v-toolbar-title>連写 {{ burstOriginal.length }} 枚 — {{ burstBlocks.length }} つのまとまり</v-toolbar-title>
           <v-spacer />
           <v-btn icon="mdi-close" aria-label="閉じる" @click="burstDialog = false" />
         </v-toolbar>
         <v-card-text class="pt-5">
-          <p class="text-body-2 text-medium-emphasis mb-5">
-            選別画面に出るのは「代表」の1枚です。写真をクリックすると代表が入れ替わります。
-            右上の虫めがねで拡大できます。
+          <p class="text-body-2 text-medium-emphasis mb-4">
+            写真を選んで「切り離す」と、選んだぶんが別のまとまりになります。
+            まとまりの境目の「つなぐ」で元に戻せます。薄い写真はまとめの外にある近くの写真で、
+            つなぐと取り込めます。
           </p>
-          <!-- 選別画面と同じ組み方・同じ大きさ。見比べる作業は同じなので、
-               別のレイアウトにする理由がない。 -->
-          <div
-            class="tournament-grid burst-review-grid"
-            :style="{ '--tournament-columns': burstColumns, '--tournament-rows': burstRows }"
-          >
-            <v-card
-              v-for="(photo, index) in burstPhotos"
-              :key="photo.id"
-              class="tournament-card"
-              :class="{ 'is-representative': index === 0 }"
-              @click="chooseRepresentative(photo.id)"
-            >
-              <div class="tournament-card__tools">
-                <v-btn
-                  icon="mdi-magnify-plus-outline" size="x-small" variant="flat"
-                  :aria-label="`${photo.name} を拡大`"
-                  @click.stop="openZoom(photo, burstPhotos)"
-                />
+
+          <v-progress-linear v-if="burstBusy" indeterminate color="primary" class="mb-4" />
+
+          <!-- まとまりごとに枠で囲む。境目そのものが操作の対象なので、
+               間に「つなぐ」を置いて、切れているのが見えるようにする。 -->
+          <template v-for="(block, blockIndex) in burstBlocks" :key="block[0]">
+            <div v-if="blockIndex > 0" class="burst-seam">
+              <span class="burst-seam__line" />
+              <v-btn
+                size="small" variant="outlined" prepend-icon="mdi-link-variant"
+                @click="joinBurstAt(boundaryBefore(block[0]!))"
+              >つなぐ</v-btn>
+              <span class="burst-seam__line" />
+            </div>
+
+            <div class="burst-block" :class="{ 'is-outside': isOutsideBurst(block) }">
+              <div class="text-caption text-medium-emphasis mb-2">
+                {{ isOutsideBurst(block) ? 'まとめの外' : `まとまり ${blockIndex + 1}` }}
+                ・ {{ block.length }} 枚
               </div>
-              <span v-if="index === 0" class="tournament-card__confirmed">代表</span>
-              <img :src="desktop.photoUrl(photo.path)" :alt="photo.name">
-            </v-card>
-          </div>
+              <div
+                class="tournament-grid burst-review-grid"
+                :style="{ '--tournament-columns': columnsFor(block.length), '--tournament-rows': 1 }"
+              >
+                <v-card
+                  v-for="photoId in block"
+                  :key="photoId"
+                  class="tournament-card"
+                  :class="{
+                    'is-selected': burstPicked.includes(photoId),
+                    'is-representative': block.length > 1 && representativeOf(block) === photoId
+                  }"
+                  @click="toggleBurstPick(photoId)"
+                >
+                  <div class="tournament-card__tools">
+                    <v-btn
+                      :icon="burstPhotoOf(photoId)?.rating === MAX_RATING ? 'mdi-star' : 'mdi-star-outline'"
+                      size="x-small" variant="flat"
+                      :color="burstPhotoOf(photoId)?.rating === MAX_RATING ? 'secondary' : undefined"
+                      :aria-label="`${burstPhotoOf(photoId)?.name} を★${MAX_RATING} で確定`"
+                      @click.stop="confirmBurstPhoto(photoId)"
+                    />
+                    <v-btn
+                      icon="mdi-thumb-down-outline" size="x-small" variant="flat"
+                      :aria-label="`${burstPhotoOf(photoId)?.name} を脱落させる`"
+                      @click.stop="dropBurstPhoto(photoId)"
+                    />
+                    <v-btn
+                      icon="mdi-magnify-plus-outline" size="x-small" variant="flat"
+                      :aria-label="`${burstPhotoOf(photoId)?.name} を拡大`"
+                      @click.stop="openZoom(burstPhotoOf(photoId), burstPhotos)"
+                    />
+                  </div>
+                  <span v-if="block.length > 1 && representativeOf(block) === photoId" class="tournament-card__confirmed">代表</span>
+                  <span v-if="burstPicked.includes(photoId)" class="tournament-card__check">
+                    <v-icon icon="mdi-check-bold" size="20" />
+                  </span>
+                  <span class="tournament-card__number">★{{ burstPhotoOf(photoId)?.rating ?? 0 }}</span>
+                  <img :src="desktop.photoUrl(burstPhotoOf(photoId)?.path ?? '')" :alt="burstPhotoOf(photoId)?.name">
+                </v-card>
+              </div>
+            </div>
+          </template>
+
+          <v-card v-if="!burstBusy && !burstPhotos.length" class="pa-10 text-center text-medium-emphasis">
+            この連写を読み込めませんでした。
+          </v-card>
         </v-card-text>
+
+        <v-card-actions class="pa-5 flex-wrap ga-2">
+          <span class="text-caption text-medium-emphasis">{{ burstPicked.length }} 枚を選択中</span>
+          <v-spacer />
+          <v-btn
+            variant="text" :disabled="burstPicked.length !== 1"
+            @click="makeBurstRepresentative(burstPicked[0]!)"
+          >代表にする</v-btn>
+          <v-btn variant="text" :disabled="burstBusy" @click="scatterBurst">全部バラバラに</v-btn>
+          <v-btn
+            variant="outlined" prepend-icon="mdi-arrow-split-vertical"
+            :disabled="!burstPicked.length" @click="splitBurstSelection"
+          >切り離す</v-btn>
+          <v-btn color="primary" :loading="burstBusy" @click="applyBurstShape">この形で戻る</v-btn>
+        </v-card-actions>
       </v-card>
     </v-dialog>
 

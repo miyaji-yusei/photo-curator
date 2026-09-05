@@ -64,6 +64,10 @@ export function createTauriBackend(): PhotoBackend {
     saveBurstThreshold: (projectId: string, threshold: number) =>
       invokeDesktop<void>('save_burst_threshold', { projectId, threshold }),
     clearBurstThreshold: (projectId: string) => invokeDesktop<void>('clear_burst_threshold', { projectId }),
+    getBurstNeighborhood: (projectId: string, photoIds: string[], windowMs?: number) =>
+      invokeDesktop<Photo[]>('get_burst_neighborhood', { projectId, photoIds, windowMs: windowMs ?? null }),
+    saveBurstShape: (projectId: string, orderedPhotoIds: string[], blocks: string[][]) =>
+      invokeDesktop<void>('save_burst_shape', { projectId, orderedPhotoIds, blocks }),
     startProjectScan: (projectId: string) => invokeDesktop<void>('start_project_scan', { projectId }),
     startBurstAnalysis: (projectId: string) => invokeDesktop<void>('start_burst_analysis', { projectId }),
     getAnalysisBacklog: (projectId: string) => invokeDesktop<number>('get_analysis_backlog', { projectId }),

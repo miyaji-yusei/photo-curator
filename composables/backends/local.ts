@@ -18,12 +18,15 @@ import { MAX_RATING } from '~/types/photo'
 import type { PhotoBackend } from '~/composables/photoBackend'
 import { normalizeSession } from '~/utils/tournament'
 import { analyzeAll } from '~/utils/analysisPool'
-import { HASH_DISTANCE_LIMIT, buildBurstGroups, buildBurstPairs } from '~/utils/burstAnalysis'
+import {
+  BURST_WINDOW_MS, HASH_DISTANCE_LIMIT, buildBurstGroups, buildBurstPairs,
+  pairJoinsByThreshold, pairKey
+} from '~/utils/burstAnalysis'
 import type { BurstEntry } from '~/utils/burstAnalysis'
 import {
   STORE_PHOTOS, STORE_PROJECTS, STORE_STATES, STORE_THUMBNAILS,
-  deleteOne, getAll, getOne, photosOfProject, putOne, readSession,
-  requestPersistence, toPhoto, withStores, writeSession
+  deleteOne, getAll, getOne, photosOfProject, putOne, readPairOverrides, readSession,
+  requestPersistence, toPhoto, withStores, writePairOverrides, writeSession
 } from '~/utils/browserStore'
 import type { StoredPhoto, StoredProject } from '~/utils/browserStore'
 import { ObjectUrlCache } from '~/utils/objectUrlCache'
@@ -261,12 +264,67 @@ export function createLocalBackend(): PhotoBackend {
     },
 
     getBurstGroups: async (projectId: string, threshold?: number): Promise<BurstGroup[]> => {
-      const [rows, project] = await Promise.all([
+      const [rows, project, overrides] = await Promise.all([
         withStores([STORE_PHOTOS], 'readonly', transaction => photosOfProject(transaction, projectId)),
-        loadProject(projectId)
+        loadProject(projectId),
+        readPairOverrides(projectId)
       ])
       const limit = threshold ?? project?.burstThreshold ?? HASH_DISTANCE_LIMIT
-      return buildBurstGroups(burstEntries(rows), limit)
+      return buildBurstGroups(burstEntries(rows), limit, overrides)
+    },
+
+    getBurstNeighborhood: async (
+      projectId: string, photoIds: string[], windowMs = BURST_WINDOW_MS
+    ): Promise<Photo[]> => {
+      if (!photoIds.length) return []
+      const rows = await withStores([STORE_PHOTOS], 'readonly', transaction =>
+        photosOfProject(transaction, projectId)
+      )
+      // まとめの判定に使える写真だけを対象にする。デスクトップ側と同じ絞り込み。
+      const usable = rows.filter(
+        row => !row.isMissing && row.capturedAt !== null && row.dHash !== null
+      )
+      const target = new Set(photoIds)
+      const times = usable.filter(row => target.has(row.id)).map(row => row.capturedAt!)
+      if (!times.length) return []
+      const low = Math.min(...times) - Math.max(0, windowMs)
+      const high = Math.max(...times) + Math.max(0, windowMs)
+      return decorate(
+        usable
+          .filter(row => row.capturedAt! >= low && row.capturedAt! <= high)
+          .sort(compareByCaptureOrder)
+      )
+    },
+
+    saveBurstShape: async (
+      projectId: string, orderedPhotoIds: string[], blocks: string[][]
+    ): Promise<void> => {
+      if (orderedPhotoIds.length < 2) return
+      const [rows, project, overrides] = await Promise.all([
+        withStores([STORE_PHOTOS], 'readonly', transaction => photosOfProject(transaction, projectId)),
+        loadProject(projectId),
+        readPairOverrides(projectId)
+      ])
+      const threshold = project?.burstThreshold ?? HASH_DISTANCE_LIMIT
+      const byId = new Map(burstEntries(rows).map(entry => [entry.id, entry]))
+      const blockOf = new Map<string, number>()
+      blocks.forEach((block, index) => {
+        for (const id of block) blockOf.set(id, index)
+      })
+      // 閾値だけで出る素の判定と食い違うペアだけを残す。一致するものは消すので、
+      // 切ってから元に戻しても無意味な例外が溜まらない（デスクトップと同じ規則）。
+      for (let index = 0; index + 1 < orderedPhotoIds.length; index += 1) {
+        const left = byId.get(orderedPhotoIds[index]!)
+        const right = byId.get(orderedPhotoIds[index + 1]!)
+        if (!left || !right) continue
+        const raw = pairJoinsByThreshold(left, right, threshold)
+        const leftBlock = blockOf.get(left.id)
+        const wanted = leftBlock !== undefined && leftBlock === blockOf.get(right.id)
+        const key = pairKey(left.id, right.id)
+        if (wanted === raw) overrides.delete(key)
+        else overrides.set(key, wanted)
+      }
+      await writePairOverrides(projectId, overrides)
     },
 
     getBurstPairs: async (projectId: string): Promise<BurstPair[]> => {

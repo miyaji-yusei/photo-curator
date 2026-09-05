@@ -1,15 +1,17 @@
 /**
- * 選別の結果をライブラリ側へ渡す 3 つの出口。
+ * 選別の結果をライブラリ側へ渡す 2 つの出口。
  *
  * **前提**: ブラウザから iPadOS の写真ライブラリは書き換えられない。
- * さらに Apple の写真アプリに星は無く、あるのは「お気に入り(♡)」だけ。
- * だから「星をライブラリに反映する」ことは原理的にできず、
- * 出口はどれも**利用者の操作を経由する**形になる。
+ * さらに Apple の写真アプリに星は無い。だから「星をライブラリに反映する」ことは
+ * 原理的にできず、出口はどちらも**利用者の操作を経由する**形になる。
  *
  * - 共有シート … 選んだ写真を渡す。写真アプリには**重複として**入る
  * - ZIP        … `star-N/` に分けてファイルアプリへ。あとで PC に渡しやすい
- * - Shortcuts  … 利用者が入れたショートカットに一覧を渡し、
- *                お気に入りやアルバムへ反映してもらう（唯一ライブラリを変えられる道）
+ *
+ * Shortcuts でアルバムへ入れる経路も試したが、**写真ライブラリをファイル名で
+ * 辿る手立てが実機に無く**（相当するアクションが見当たらず、写真アプリの
+ * 「検索」はファイル名で検索できない）、成立しないので取り下げた。
+ * 星はこのアプリが持ち続ける。
  */
 import type { ZipEntry } from '~/utils/zip'
 import { uniquePath } from '~/utils/zip'
@@ -81,52 +83,4 @@ export function zipEntriesByRating(candidates: ExportCandidate[]): ZipEntry[] {
     blob: candidate.blob,
     modifiedAt: candidate.modifiedAt
   }))
-}
-
-export interface ShortcutRow {
-  name: string
-  rating: number
-  capturedAt: number | null
-}
-
-/**
- * Shortcuts に渡す一覧。1 行 1 枚の TSV で `ファイル名 / 撮影日時 / 星`。
- *
- * **照合の鍵はファイル名。** 写真ライブラリから選んだファイルは、iOS が
- * 元の資産名（`IMG_1234.HEIC` など）を返すので、ショートカットの
- * 「名前が◯◯を含む写真を検索」で辿れる。
- * 撮影日時は人が見て取り違えを確かめるための補助で、EXIF に時差が
- * 書かれていた写真ではその分ずれることがある。
- */
-export function buildShortcutPayload(rows: ShortcutRow[]): string {
-  return rows
-    .map(row => [row.name, formatCapturedAt(row.capturedAt), String(row.rating)].join('\t'))
-    .join('\n')
-}
-
-/** 保存してある値（UTC 基準のミリ秒）を `YYYY-MM-DD HH:MM:SS` に戻す。 */
-export function formatCapturedAt(capturedAt: number | null): string {
-  if (capturedAt === null || !Number.isFinite(capturedAt)) return ''
-  const pad = (value: number) => String(value).padStart(2, '0')
-  const date = new Date(capturedAt)
-  return [
-    `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}`,
-    `${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`
-  ].join(' ')
-}
-
-/**
- * ショートカットを起動する。一覧はクリップボード経由で渡す。
- * URL に載せると件数が増えたときに長さの上限に当たるため。
- */
-export async function runShortcut(name: string, payload: string): Promise<boolean> {
-  try {
-    await navigator.clipboard.writeText(payload)
-  } catch {
-    // クリップボードが使えないときは起動しない。黙って動かすと
-    // 前回の内容で処理されてしまう。
-    return false
-  }
-  window.location.href = `shortcuts://run-shortcut?name=${encodeURIComponent(name)}`
-  return true
 }
