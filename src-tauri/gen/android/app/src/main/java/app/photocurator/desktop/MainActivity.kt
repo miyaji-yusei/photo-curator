@@ -1,6 +1,7 @@
 package app.photocurator.desktop
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -19,11 +20,36 @@ class MainActivity : TauriActivity() {
   private val requestPhotos =
     registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { }
 
+  /**
+   * フォルダ選択（SAF）。**NAS のベンダー製アプリが DocumentsProvider として
+   * 登録されていれば、ここに NAS が現れる。**
+   *
+   * 結果は `TreeAccess` に置くだけ。Rust は「開く」→「あとで取りに来る」の
+   * 2 段で読み、Activity Result を Rust まで運ぶ仕掛けを避ける。
+   */
+  private val pickTree =
+    registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+      val uri = result.data?.data ?: return@registerForActivityResult
+      // 権限を永続化する。**これが無いと再起動後に読めなくなる。**
+      contentResolver.takePersistableUriPermission(
+        uri,
+        Intent.FLAG_GRANT_READ_URI_PERMISSION
+      )
+      TreeAccess.setPickedTree(uri.toString())
+    }
+
   override fun onCreate(savedInstanceState: Bundle?) {
     enableEdgeToEdge()
     super.onCreate(savedInstanceState)
     PhotoAccess.attach(this)
+    TreeAccess.attach(this)
+    instance = this
     requestPhotoPermissions()
+  }
+
+  override fun onDestroy() {
+    if (instance === this) instance = null
+    super.onDestroy()
   }
 
   private fun requestPhotoPermissions() {
@@ -42,5 +68,19 @@ class MainActivity : TauriActivity() {
       ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
     }
     if (missing.isNotEmpty()) requestPhotos.launch(missing.toTypedArray())
+  }
+
+  companion object {
+    /** Rust からフォルダ選択を開くための入口。 */
+    @Volatile
+    private var instance: MainActivity? = null
+
+    @JvmStatic
+    fun openTreePicker() {
+      val activity = instance ?: return
+      activity.runOnUiThread {
+        runCatching { activity.pickTree.launch(TreeAccess.pickIntent()) }
+      }
+    }
   }
 }

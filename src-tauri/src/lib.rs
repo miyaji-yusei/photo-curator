@@ -2,6 +2,8 @@
 mod android_photos;
 #[cfg(target_os = "android")]
 mod android_smb;
+#[cfg(target_os = "android")]
+mod android_tree;
 
 use exif::{In, Reader, Tag, Value};
 use image::{imageops::FilterType, DynamicImage, GenericImageView};
@@ -1900,6 +1902,9 @@ fn collect_scan_entries(folder: &str) -> Result<Vec<ScanEntry>, String> {
     if folder.starts_with(SMB_PREFIX) {
         return collect_smb_entries(folder);
     }
+    if let Some(tree) = folder.strip_prefix(TREE_PREFIX) {
+        return collect_tree_entries(tree);
+    }
     Ok(WalkDir::new(folder)
         .into_iter()
         .filter_map(Result::ok)
@@ -1962,6 +1967,28 @@ fn collect_smb_entries(folder: &str) -> Result<Vec<ScanEntry>, String> {
 #[cfg(not(target_os = "android"))]
 fn collect_smb_entries(_folder: &str) -> Result<Vec<ScanEntry>, String> {
     Err("NAS はこの環境では読めません。".into())
+}
+
+/// SAF で選んだフォルダを指す前置き。中の写真は content:// なので、
+/// **読み出しは PhotoRef::Content がそのまま使える。**
+const TREE_PREFIX: &str = "tree://";
+
+#[cfg(target_os = "android")]
+fn collect_tree_entries(tree: &str) -> Result<Vec<ScanEntry>, String> {
+    Ok(android_tree::list_photos(tree)?
+        .into_iter()
+        .map(|photo| ScanEntry {
+            path: photo.uri,
+            relative_path: photo.relative_path,
+            name: photo.name,
+            fingerprint: Some((photo.modified_at, photo.size)),
+        })
+        .collect())
+}
+
+#[cfg(not(target_os = "android"))]
+fn collect_tree_entries(_tree: &str) -> Result<Vec<ScanEntry>, String> {
+    Err("フォルダはこの環境では読めません。".into())
 }
 
 fn run_scan(app: AppHandle, registry: &TaskRegistry, project_id: String) -> Result<(), String> {
@@ -3555,6 +3582,39 @@ fn connect_nas(
     }
 }
 
+/// フォルダ選択（SAF）を開く。**結果はここでは返らない。**
+/// Activity の結果を待つ仕掛けを Rust に作らずに済ませるため、
+/// 画面は開いたあと `take_picked_folder` を数回試す。
+#[tauri::command]
+fn open_folder_picker() -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        android_tree::open_picker()
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        Err("この環境ではフォルダ選択を開けません。".into())
+    }
+}
+
+/// 選ばれたフォルダ。まだなら None。
+#[tauri::command]
+fn take_picked_folder() -> Result<Option<String>, String> {
+    #[cfg(target_os = "android")]
+    {
+        let picked = android_tree::take_picked()?;
+        Ok(if picked.is_empty() {
+            None
+        } else {
+            Some(format!("{TREE_PREFIX}{picked}"))
+        })
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        Ok(None)
+    }
+}
+
 #[tauri::command]
 fn disconnect_nas() {
     #[cfg(target_os = "android")]
@@ -3566,14 +3626,25 @@ fn disconnect_nas() {
 fn list_photo_albums() -> Result<Vec<PhotoAlbum>, String> {
     #[cfg(target_os = "android")]
     {
-        Ok(android_photos::list_albums()?
+        let mut sources: Vec<PhotoAlbum> = android_photos::list_albums()?
             .into_iter()
             .map(|album| PhotoAlbum {
                 path: format!("{MEDIASTORE_PREFIX}{}", album.id),
                 name: album.name,
                 count: album.count,
             })
-            .collect())
+            .collect();
+        // 一度選んだフォルダは権限が残るので、次からは選び直さずに使える。
+        // **NAS のアプリを選んでいれば、ここに NAS が並ぶ。**
+        for tree in android_tree::list_granted().unwrap_or_default() {
+            sources.push(PhotoAlbum {
+                path: format!("{TREE_PREFIX}{}", tree.path),
+                name: tree.name,
+                // 数えると全走査になる。選ぶ時点では出さない。
+                count: -1,
+            });
+        }
+        Ok(sources)
     }
     #[cfg(not(target_os = "android"))]
     {
@@ -4197,6 +4268,8 @@ pub fn run() {
             write_ratings_to_files,
             list_photo_albums,
             connect_nas,
+            open_folder_picker,
+            take_picked_folder,
             disconnect_nas,
             get_display_settings,
             save_display_edge,

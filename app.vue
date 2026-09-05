@@ -388,6 +388,9 @@ const nasPassword = ref('')
 const nasBusy = ref(false)
 const nasError = ref('')
 const nasConnected = ref(false)
+// SAF のフォルダ選択。**NAS のベンダー製アプリが DocumentsProvider として
+// 登録されていれば、この選択画面に NAS が現れる。**
+const folderPickerBusy = ref(false)
 const albumsBusy = ref(false)
 const usesAlbums = computed(() => photoAlbums.value.length > 0)
 
@@ -418,6 +421,33 @@ async function connectNas() {
     nasConnected.value = false
   } finally {
     nasBusy.value = false
+  }
+}
+
+/**
+ * フォルダ選択（SAF）を開いて、選ばれるのを待つ。
+ *
+ * Activity の結果は Rust に直接返らないので、**開いたあと数回取りに行く**。
+ * 選択画面が出ている間はこちらが前面に居ないため、戻ってきた最初の数秒で拾える。
+ */
+async function pickFolder() {
+  folderPickerBusy.value = true
+  try {
+    await desktop.openFolderPicker()
+    // 利用者が選ぶまでの時間を見込んで、少しずつ間隔を空けながら試す。
+    for (const wait of [400, 600, 800, 1000, 1500, 2000, 3000, 5000, 8000, 12000]) {
+      await new Promise(resolve => setTimeout(resolve, wait))
+      const picked = await desktop.takePickedFolder()
+      if (picked) {
+        folderPath.value = picked
+        await loadPhotoAlbums()
+        return
+      }
+    }
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : 'フォルダを選べませんでした。'
+  } finally {
+    folderPickerBusy.value = false
   }
 }
 
@@ -2267,6 +2297,10 @@ onBeforeUnmount(() => {
           size="small" variant="outlined" prepend-icon="mdi-nas"
           :loading="nasBusy" @click="nasDialog = true"
         >{{ nasConnected ? 'NAS を切り替える' : 'NAS に繋ぐ' }}</v-btn>
+        <v-btn
+          size="small" variant="outlined" prepend-icon="mdi-folder-search-outline"
+          :loading="folderPickerBusy" @click="pickFolder"
+        >フォルダを選ぶ</v-btn>
         <v-btn v-if="nasConnected" size="small" variant="text" @click="disconnectNas">端末の写真に戻す</v-btn>
         <span v-if="nasConnected" class="text-caption text-medium-emphasis">{{ nasHost }} / {{ nasShare }}</span>
       </div>
@@ -2289,7 +2323,8 @@ onBeforeUnmount(() => {
           </v-list-item>
         </v-list>
         <p class="text-caption text-medium-emphasis mt-2 mb-0">
-          写真そのものは端末の外に出ません。原本も変更しません。
+          原本は変更しません。「フォルダを選ぶ」からは、端末のフォルダのほか
+          <strong>ファイルアプリに出てくる場所</strong>（NAS のアプリが対応していればそれも）を選べます。
         </p>
       </template>
       <v-progress-linear v-else-if="albumsBusy" indeterminate color="primary" class="my-4" />

@@ -41,6 +41,8 @@ export function createTauriBackend(): PhotoBackend {
     connectNas: (host: string, share: string, user: string, password: string) =>
       invokeDesktop<PhotoAlbum[]>('connect_nas', { host, share, user, password }),
     disconnectNas: () => invokeDesktop<void>('disconnect_nas'),
+    openFolderPicker: () => invokeDesktop<void>('open_folder_picker'),
+    takePickedFolder: () => invokeDesktop<string | null>('take_picked_folder'),
     onProjectProgress: async (callback: (progress: ProjectProgress) => void) => {
       if (!isTauriRuntime()) return () => undefined
       const { listen } = await import('@tauri-apps/api/event')

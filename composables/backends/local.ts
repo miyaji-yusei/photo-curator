@@ -136,6 +136,8 @@ export function createLocalBackend(): PhotoBackend {
     // ブラウザから SMB へは届かない。
     connectNas: () => unsupported('NAS への接続'),
     disconnectNas: () => Promise.resolve(),
+    openFolderPicker: () => unsupported('フォルダの選択'),
+    takePickedFolder: () => Promise.resolve(null),
 
     onProjectProgress: (callback) => {
       listeners.add(callback)

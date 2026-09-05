@@ -55,6 +55,16 @@ export interface PhotoBackend {
     host: string, share: string, user: string, password: string
   ) => Promise<PhotoAlbum[]>
   disconnectNas: () => Promise<void>
+  /**
+   * フォルダ選択（SAF）を開く。**結果はここでは返らない。**
+   * 開いたあと `takePickedFolder` を数回試す。Activity の結果を
+   * Rust まで運ぶ仕掛けを作らずに済ませるため。
+   *
+   * NAS のベンダー製アプリが DocumentsProvider として登録されていれば、
+   * この選択画面に NAS が現れる。
+   */
+  openFolderPicker: () => Promise<void>
+  takePickedFolder: () => Promise<string | null>
 
   /** 解析の進捗。戻り値を呼ぶと購読を解除する。 */
   onProjectProgress: (callback: (progress: ProjectProgress) => void) => Promise<() => void>
