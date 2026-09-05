@@ -16,7 +16,10 @@
     "dev:app": "node scripts/tauri-dev.mjs",
     "tauri:build": "tauri build",
     "test": "vitest run",
-    "typecheck": "nuxt typecheck"
+    "typecheck": "nuxt typecheck",
+    "android:init": "tauri android init",
+    "android:apk": "node scripts/android-apk.mjs",
+    "android:install": "node scripts/android-apk.mjs && adb install -r src-tauri/gen/android/app/build/outputs/apk/arm64/debug/app-arm64-debug.apk"
   },
   "dependencies": {
     "@mdi/font": "^7.4.47",

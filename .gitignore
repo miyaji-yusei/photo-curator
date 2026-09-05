@@ -10,7 +10,10 @@ node_modules/
 
 # Tauri / Rust
 src-tauri/target/
-src-tauri/gen/
+# 生成されるスキーマだけ無視する。**gen/android は追跡する**：
+# Kotlin プラグインと AndroidManifest の権限をこの下に置くので、
+# 無視すると clone しただけではビルドできなくなる。
+src-tauri/gen/schemas/
 
 # Local files
 .env
