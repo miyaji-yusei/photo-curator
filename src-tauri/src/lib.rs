@@ -845,24 +845,83 @@ pub struct CaptureTime {
     source: TimestampSource,
 }
 
+/// 写真の実体をどこから取るか。**解析コードはこれ以外を知らない。**
+///
+/// 要点は `head` があること。EXIF 埋め込みサムネイル経路は**先頭 26KB 程度で
+/// 用が済む**（実データで計測）。ここを `all` に一本化すると、Android から
+/// NAS 越しに読むときに 1 枚 6.7MB を落とすことになり、転送量が 260 倍になる。
+/// デスクトップでは OS の SMB クライアントが同じことを黙ってやってくれていた。
+pub trait PhotoSource {
+    /// 先頭 `want` バイト。ファイルがそれより短ければあるだけ返す。
+    fn head(&self, want: usize) -> Option<Vec<u8>>;
+    /// 全体。EXIF サムネイルが無い写真だけがここへ落ちる。
+    fn all(&self) -> Option<Vec<u8>>;
+    /// mtime と size。**既存のキャッシュ無効化がそのまま効く。**
+    fn fingerprint(&self) -> Option<(i64, i64)>;
+    /// ファイル名。EXIF が無いときの撮影時刻の手がかりになる。
+    fn name(&self) -> Option<String>;
+}
+
+/// EXIF を読むために先に取る量。実データでは APP1 が先頭 26KB で終わるので
+/// 64KB あれば 1 往復で足りる。足りなかったときだけ全体を取り直す。
+const EXIF_HEAD_PROBE: usize = 64 * 1024;
+
+/// ローカルのファイル。デスクトップはこれだけを使う。
+pub struct LocalPhoto<'a>(pub &'a Path);
+
+impl PhotoSource for LocalPhoto<'_> {
+    fn head(&self, want: usize) -> Option<Vec<u8>> {
+        use std::io::Read;
+        let file = File::open(self.0).ok()?;
+        let mut buffer = Vec::new();
+        // `take` で読む量を区切る。**ここを fs::read にすると、EXIF だけ見たい
+        // ときにも全体を読んでしまう。**
+        BufReader::new(file)
+            .take(want as u64)
+            .read_to_end(&mut buffer)
+            .ok()?;
+        Some(buffer)
+    }
+
+    fn all(&self) -> Option<Vec<u8>> {
+        fs::read(self.0).ok()
+    }
+
+    fn fingerprint(&self) -> Option<(i64, i64)> {
+        fingerprint(self.0)
+    }
+
+    fn name(&self) -> Option<String> {
+        self.0.file_name()?.to_str().map(str::to_owned)
+    }
+}
+
 /// 撮影時刻を、根拠の強い順に探す。
 /// EXIF → ファイル名 → mtime。ファイル名を mtime より優先するのは、
 /// 書き出しや転送で EXIF が落ちても `20260630_181932` の類は残ることが多く、
 /// mtime よりはるかに撮影時刻に近いため。
-fn read_capture_time(path: &Path) -> Option<CaptureTime> {
-    exif_capture_time(path)
+fn read_capture_time_from(source: &dyn PhotoSource) -> Option<CaptureTime> {
+    source
+        .head(EXIF_HEAD_PROBE)
+        .and_then(|head| exif_capture_time_bytes(&head))
         .or_else(|| {
-            filename_capture_time(path).map(|at| CaptureTime {
+            let name = source.name()?;
+            let stem = Path::new(&name).file_stem()?.to_str()?.to_owned();
+            filename_capture_time_of(&stem).map(|at| CaptureTime {
                 at,
                 source: TimestampSource::FilenameInferred,
             })
         })
         .or_else(|| {
-            fingerprint(path).map(|(mtime, _)| CaptureTime {
+            source.fingerprint().map(|(mtime, _)| CaptureTime {
                 at: mtime,
                 source: TimestampSource::FilesystemMtime,
             })
         })
+}
+
+fn read_capture_time(path: &Path) -> Option<CaptureTime> {
+    read_capture_time_from(&LocalPhoto(path))
 }
 
 fn ascii_field(exif: &exif::Exif, tag: Tag) -> Option<Vec<u8>> {
@@ -876,10 +935,9 @@ fn ascii_field(exif: &exif::Exif, tag: Tag) -> Option<Vec<u8>> {
 // 文字列に依存していたうえ timezone を無視し、月や日の範囲も検証していなかった
 // ため、壊れた EXIF が「それらしい値」に化けるか、失敗して mtime fallback に
 // 落ちて候補爆発を誘発していた。ここでは生の ASCII を規格どおりに解釈する。
-fn exif_capture_time(path: &Path) -> Option<CaptureTime> {
-    let file = File::open(path).ok()?;
+fn exif_capture_time_bytes(bytes: &[u8]) -> Option<CaptureTime> {
     let exif = Reader::new()
-        .read_from_container(&mut BufReader::new(file))
+        .read_from_container(&mut std::io::Cursor::new(bytes))
         .ok()?;
     let offset =
         ascii_field(&exif, Tag::OffsetTimeOriginal).or_else(|| ascii_field(&exif, Tag::OffsetTime));
@@ -1010,10 +1068,16 @@ fn timestamp_from_groups(groups: &[&str]) -> Option<i64> {
 /// ファイル名から撮影時刻らしい並びを読む。`2026-06-30_18-19-32` /
 /// `20260630_181932` / `IMG_20260630_181932` に対応する。
 /// 数字の並びとして成立していても暦として不正なら採らない。
-fn filename_capture_time(path: &Path) -> Option<i64> {
-    let stem = path.file_stem()?.to_str()?;
+fn filename_capture_time_of(stem: &str) -> Option<i64> {
     let groups = digit_groups(stem);
     (0..groups.len()).find_map(|start| timestamp_from_groups(&groups[start..]))
+}
+
+/// パスから拡張子を落として上に渡すだけ。本番の経路は `PhotoSource::name()`
+/// から名前を受け取るので、こちらはテストの読みやすさのために残している。
+#[cfg(test)]
+fn filename_capture_time(path: &Path) -> Option<i64> {
+    filename_capture_time_of(path.file_stem()?.to_str()?)
 }
 
 // ---------------------------------------------------------------------------
@@ -1051,13 +1115,9 @@ fn orientation_field(fields: &[exif::Field], ifd: In) -> Option<u16> {
 
 /// 原本の EXIF Orientation。読めなければ 1（無変換）を返す。
 ///
-/// `exif_thumbnail_image` が失敗した経路でだけ呼ぶ。あちらは既に EXIF を
-/// 読んでいるので、同じファイルを二度開かずに済ませる。
-fn exif_orientation(path: &Path) -> u16 {
-    let Ok(file) = File::open(path) else {
-        return 1;
-    };
-    let Ok(exif) = Reader::new().read_from_container(&mut BufReader::new(file)) else {
+/// IFD0 は TIFF ブロックの先頭近くにあるので、先頭だけ読めていれば足りる。
+fn exif_orientation_bytes(bytes: &[u8]) -> u16 {
+    let Ok(exif) = Reader::new().read_from_container(&mut std::io::Cursor::new(bytes)) else {
         return 1;
     };
     match exif.get_field(Tag::Orientation, In::PRIMARY).map(|f| &f.value) {
@@ -1094,9 +1154,8 @@ fn apply_orientation(image: DynamicImage, orientation: u16) -> DynamicImage {
 /// Orientation も一緒に返す。**IFD1 のものを優先する。** 埋め込みサムネイルを
 /// 既に正立させて保存するカメラがあり、そこで IFD0 の値を当てると二重に回る。
 /// IFD1 に無ければ本体（IFD0）の値に従う。
-fn exif_thumbnail_image(path: &Path) -> Option<(DynamicImage, u16)> {
-    let file = File::open(path).ok()?;
-    let tiff = exif::get_exif_attr_from_jpeg(&mut BufReader::new(file)).ok()?;
+fn exif_thumbnail_image_bytes(bytes: &[u8]) -> Option<(DynamicImage, u16)> {
+    let tiff = exif::get_exif_attr_from_jpeg(&mut std::io::Cursor::new(bytes)).ok()?;
     let (fields, _) = exif::parse_exif(&tiff).ok()?;
     let find = |tag: Tag| -> Option<usize> {
         fields
@@ -1131,9 +1190,8 @@ fn exif_thumbnail_image(path: &Path) -> Option<(DynamicImage, u16)> {
 /// `scale()` は 1/8・1/4・1/2・1/1 のうち要求以上で最小のものを選ぶ。
 /// image 0.25 のバックエンド zune-jpeg は 1/8 デコードを提供しないため、
 /// この経路のためだけに jpeg-decoder を併用している。
-fn scaled_jpeg_decode(path: &Path) -> Option<DynamicImage> {
-    let file = File::open(path).ok()?;
-    let mut decoder = jpeg_decoder::Decoder::new(BufReader::new(file));
+fn scaled_jpeg_decode_bytes(bytes: &[u8]) -> Option<DynamicImage> {
+    let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(bytes));
     decoder.read_info().ok()?;
     let info = decoder.info()?;
     decoder
@@ -1168,24 +1226,52 @@ fn scaled_jpeg_decode(path: &Path) -> Option<DynamicImage> {
 /// ③は JPEG 専用なので、PNG/WebP とサムネイル非搭載 JPEG は①に落ちる。
 ///
 /// どの経路を通っても、返す時点で **Orientation は焼き込み済み**。
-fn decode_hash_source(path: &Path) -> Option<(DynamicImage, DecodeSource)> {
-    if let Some((image, orientation)) = exif_thumbnail_image(path) {
+///
+/// **①は先頭 64KB しか読まない。**②③に落ちたときだけ全体を取る。
+/// 実データでは 97.4% が①なので、読む量は 1 枚あたり 26KB で収まる。
+fn decode_hash_source_from(source: &dyn PhotoSource) -> Option<(DynamicImage, DecodeSource)> {
+    let head = source.head(EXIF_HEAD_PROBE)?;
+    // 先頭が上限いっぱいなら、APP1 がまだ続いている可能性がある。
+    let maybe_truncated = head.len() >= EXIF_HEAD_PROBE;
+    let mut full: Option<Vec<u8>> = None;
+
+    if let Some((image, orientation)) = exif_thumbnail_image_bytes(&head) {
         return Some((
             apply_orientation(image, orientation),
             DecodeSource::ExifThumbnail,
         ));
     }
+    if maybe_truncated {
+        // APP1 が 64KB に収まらないカメラ。全体を読み直して一度だけ試す。
+        full = source.all();
+        if let Some((image, orientation)) = full.as_deref().and_then(exif_thumbnail_image_bytes) {
+            return Some((
+                apply_orientation(image, orientation),
+                DecodeSource::ExifThumbnail,
+            ));
+        }
+    }
+
     // ここから先は生の画素なので、本体（IFD0）の Orientation をそのまま当てる。
-    let orientation = exif_orientation(path);
-    if let Some(image) = scaled_jpeg_decode(path) {
+    // IFD0 は TIFF ブロックの先頭近くなので、先頭だけで読める。
+    let orientation = exif_orientation_bytes(&head);
+    let bytes = match full {
+        Some(bytes) => bytes,
+        None => source.all()?,
+    };
+    if let Some(image) = scaled_jpeg_decode_bytes(&bytes) {
         return Some((
             apply_orientation(image, orientation),
             DecodeSource::JpegScaled,
         ));
     }
-    image::open(path)
+    image::load_from_memory(&bytes)
         .ok()
         .map(|image| (apply_orientation(image, orientation), DecodeSource::FullDecode))
+}
+
+fn decode_hash_source(path: &Path) -> Option<(DynamicImage, DecodeSource)> {
+    decode_hash_source_from(&LocalPhoto(path))
 }
 
 fn scale_for_thumbnail(image: &DynamicImage) -> DynamicImage {
@@ -4409,6 +4495,110 @@ mod tests {
         );
 
         fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    // -----------------------------------------------------------------------
+    // Routine 10: 解析の入口をバイト列にする
+    // -----------------------------------------------------------------------
+
+    /// 読んだ量を数える `PhotoSource`。**部分読みが効いているか**を測るためだけの実装。
+    struct CountingSource {
+        bytes: Vec<u8>,
+        name: String,
+        served: std::cell::Cell<usize>,
+        all_calls: std::cell::Cell<usize>,
+    }
+
+    impl CountingSource {
+        fn new(bytes: Vec<u8>, name: &str) -> Self {
+            Self {
+                bytes,
+                name: name.to_owned(),
+                served: std::cell::Cell::new(0),
+                all_calls: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl PhotoSource for CountingSource {
+        fn head(&self, want: usize) -> Option<Vec<u8>> {
+            let end = want.min(self.bytes.len());
+            self.served.set(self.served.get() + end);
+            Some(self.bytes[..end].to_vec())
+        }
+        fn all(&self) -> Option<Vec<u8>> {
+            self.all_calls.set(self.all_calls.get() + 1);
+            self.served.set(self.served.get() + self.bytes.len());
+            Some(self.bytes.clone())
+        }
+        fn fingerprint(&self) -> Option<(i64, i64)> {
+            Some((1_700_000_000_000, self.bytes.len() as i64))
+        }
+        fn name(&self) -> Option<String> {
+            Some(self.name.clone())
+        }
+    }
+
+    /// **これが Android で NAS を読めるかどうかの分かれ目。**
+    /// EXIF サムネイルがある写真は、原本の全体を一度も要求してはいけない。
+    #[test]
+    fn the_exif_thumbnail_path_never_asks_for_the_whole_file() {
+        let directory = test_directory("partial-read");
+
+        let with_thumbnail = directory.join("with-thumbnail.jpg");
+        Fixture {
+            thumbnail: Some((160, 120)),
+            size: (4000, 3000),
+            ..Default::default()
+        }
+        .write(&with_thumbnail);
+        let bytes = fs::read(&with_thumbnail).expect("read fixture");
+        let total = bytes.len();
+        let source = CountingSource::new(bytes, "with-thumbnail.jpg");
+
+        let (_, decode) = decode_hash_source_from(&source).expect("decode");
+        assert_eq!(decode, DecodeSource::ExifThumbnail);
+        assert_eq!(
+            source.all_calls.get(),
+            0,
+            "EXIF サムネイルで済むのに全体を読んでいる"
+        );
+        assert!(
+            source.served.get() <= EXIF_HEAD_PROBE,
+            "先頭 {EXIF_HEAD_PROBE} バイトを超えて読んでいる（{} / 全体 {total}）",
+            source.served.get()
+        );
+
+        // 逆に、EXIF サムネイルが無ければ全体が要る。ここを読まないと画像にならない。
+        let plain = directory.join("plain.jpg");
+        Fixture {
+            size: (4000, 3000),
+            ..Default::default()
+        }
+        .write(&plain);
+        let plain_source = CountingSource::new(fs::read(&plain).expect("read"), "plain.jpg");
+        let (_, decode) = decode_hash_source_from(&plain_source).expect("decode");
+        assert_eq!(decode, DecodeSource::JpegScaled);
+        assert_eq!(plain_source.all_calls.get(), 1, "全体を 1 回だけ読む");
+
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    /// EXIF が無いときに、`PhotoSource::name()` が撮影時刻の手がかりになること。
+    /// Android の `content://` はパスを持たないので、名前を別途もらう必要がある。
+    #[test]
+    fn the_capture_time_falls_back_to_the_name_then_the_fingerprint() {
+        let bytes = jpeg_bytes(64, 48, 0);
+
+        let named = CountingSource::new(bytes.clone(), "2026-06-30_18-19-32.jpg");
+        let capture = read_capture_time_from(&named).expect("capture time");
+        assert_eq!(capture.source, TimestampSource::FilenameInferred);
+
+        // 名前も手がかりにならなければ fingerprint（mtime）へ落ちる。
+        let plain = CountingSource::new(bytes, "photo.jpg");
+        let capture = read_capture_time_from(&plain).expect("capture time");
+        assert_eq!(capture.source, TimestampSource::FilesystemMtime);
+        assert_eq!(capture.at, 1_700_000_000_000);
     }
 
     // -----------------------------------------------------------------------
