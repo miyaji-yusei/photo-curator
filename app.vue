@@ -99,17 +99,37 @@ let stopProgressListener: (() => void) | undefined
 // Vuetify の useDisplay() は、この構成（vite-plugin-vuetify + build.transpile）だと
 // plugin 側と別インスタンスを掴むことがあり、1265px でも mdAndUp が false になった。
 // 判定を matchMedia に任せて取り違えを避ける。CSS 側のブレークポイントとも揃う。
-const COMPACT_QUERY = '(max-width: 960px)'
-const isCompact = ref(false)
+/**
+ * 画面の幅で構成を変える。**環境名（Android/PC）では分けない。**
+ *
+ * 同じ Android でも Fold を開けば 933px、閉じれば 476px で、要る構成が違う。
+ * PC を狭くしたときも同じ扱いでよい。
+ *
+ * - `wide`（≥1100）… アプリバー＋ドロワー。カード 3 列
+ * - 中間（600–1099）… 各画面にバー 1 本。カード 2 列。Fold 開・iPad 縦
+ * - `narrow`（<600）… ラベルはアイコンのみ。カード 1 列。Fold カバー・一般スマホ
+ *
+ * Vuetify の useDisplay() は、この構成（vite-plugin-vuetify + build.transpile）
+ * だと plugin 側と別インスタンスを掴むことがあり、1265px でも mdAndUp が
+ * false になった。判定を matchMedia に任せて取り違えを避ける。
+ */
+const WIDE_QUERY = '(min-width: 1100px)'
+const NARROW_QUERY = '(max-width: 599px)'
+const isWide = ref(false)
+const isNarrow = ref(false)
 const drawerOpen = ref(false)
 /** 広い画面でサイドバーをアイコンだけの細い状態に畳む。 */
 const drawerRail = ref(false)
-let compactQuery: MediaQueryList | undefined
+let wideQuery: MediaQueryList | undefined
+let narrowQuery: MediaQueryList | undefined
 // permanent でも v-model が false だとドロワーは画面外へ寄ってしまう。
 // 幅に合わせて開閉状態も揃える。広い画面では開き、狭い画面では閉じて始める。
-const syncCompact = (event: MediaQueryList | MediaQueryListEvent) => {
-  isCompact.value = event.matches
-  drawerOpen.value = !event.matches
+const syncWide = (event: MediaQueryList | MediaQueryListEvent) => {
+  isWide.value = event.matches
+  drawerOpen.value = event.matches
+}
+const syncNarrow = (event: MediaQueryList | MediaQueryListEvent) => {
+  isNarrow.value = event.matches
 }
 
 // 閾値の学習・確認まわり
@@ -1788,39 +1808,50 @@ onMounted(async () => {
     error.value = cause instanceof Error ? cause.message : 'プロジェクトを読み込めませんでした。'
   }
   window.addEventListener('keydown', onKeydown)
-  compactQuery = window.matchMedia(COMPACT_QUERY)
-  syncCompact(compactQuery)
-  compactQuery.addEventListener('change', syncCompact)
+  wideQuery = window.matchMedia(WIDE_QUERY)
+  syncWide(wideQuery)
+  wideQuery.addEventListener('change', syncWide)
+  narrowQuery = window.matchMedia(NARROW_QUERY)
+  syncNarrow(narrowQuery)
+  narrowQuery.addEventListener('change', syncNarrow)
 })
 
 onBeforeUnmount(() => {
   stopProgressListener?.()
   window.removeEventListener('keydown', onKeydown)
-  compactQuery?.removeEventListener('change', syncCompact)
+  wideQuery?.removeEventListener('change', syncWide)
+  narrowQuery?.removeEventListener('change', syncNarrow)
 })
 </script>
 
 <template>
-  <v-app>
-    <!-- 狭い画面では常設をやめ、ヘッダーのボタンで開閉する。 -->
-    <v-app-bar v-if="isCompact" flat color="surface" density="comfortable">
+  <!-- ステータスバーのぶんを空ける。**Android ではここを空けないと、
+       アプリの中身がシステムの時刻・電池表示の下に潜り込む。**
+       潜り込んだ部分はタップもシステム側に吸われて届かない（実機で確認）。 -->
+  <v-app class="app-root">
+    <!-- **狭い画面には共通のアプリバーを置かない。**
+         ここに 110px を常時使っていたが、載っていたのはアプリ名と
+         メニューボタンだけで、どの画面でも中身を押し下げていた。
+         各画面は自分のバーで戻り先と操作を出す。
+         ドロワーは広い画面（≥1100）でだけ常設する。 -->
+    <v-app-bar v-if="isWide" flat color="surface" density="comfortable">
       <v-app-bar-nav-icon aria-label="メニューを開く" @click="drawerOpen = !drawerOpen" />
       <v-app-bar-title class="text-body-1">Photo Curator</v-app-bar-title>
     </v-app-bar>
 
     <!-- 選別中は写真に幅を使いたい。rail でアイコンだけの細い状態に畳める。 -->
     <v-navigation-drawer
+      v-if="isWide"
       v-model="drawerOpen"
-      :permanent="!isCompact"
-      :temporary="isCompact"
-      :rail="!isCompact && drawerRail"
+      permanent
+      :rail="drawerRail"
       :width="280"
       rail-width="60"
       color="surface"
     >
       <v-list-item class="py-4" :title="drawerRail ? undefined : 'Photo Curator'" :subtitle="drawerRail ? undefined : '人の目で、素早く選ぶ'">
         <template #prepend><v-avatar color="primary" size="34"><v-icon color="black" icon="mdi-image-multiple-outline" /></v-avatar></template>
-        <template v-if="!drawerRail && !isCompact" #append>
+        <template v-if="!drawerRail" #append>
           <v-btn icon="mdi-chevron-left" variant="text" size="small" aria-label="サイドバーをたたむ" @click.stop="drawerRail = true" />
         </template>
       </v-list-item>
@@ -1829,7 +1860,7 @@ onBeforeUnmount(() => {
         <v-list-item prepend-icon="mdi-home-outline" title="ホーム" :active="view === 'home'" @click="view = 'home'" />
         <!-- rail では入れ子のリストが開けないので、畳んだときは1項目にまとめる。 -->
         <v-list-item
-          v-if="drawerRail && !isCompact"
+          v-if="drawerRail"
           prepend-icon="mdi-folder-multiple-image" title="プロジェクト"
           @click="drawerRail = false"
         />
@@ -1844,7 +1875,6 @@ onBeforeUnmount(() => {
       <template #append>
         <v-list nav class="pb-2">
           <v-list-item
-            v-if="!isCompact"
             :prepend-icon="drawerRail ? 'mdi-chevron-right' : 'mdi-chevron-left'"
             :title="drawerRail ? '広げる' : 'サイドバーをたたむ'"
             @click="drawerRail = !drawerRail"

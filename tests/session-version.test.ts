@@ -12,7 +12,7 @@ describe('セッションの版', () => {
    * 選んだか」だけ。移行を書くより確実で、失うものも小さい。
    */
   it('新しく作ったセッションは今の版を名乗る', () => {
-    const session = makeSession('p', [{ id: 'a', rating: 0, capturedAt: 1 }], settings)
+    const session = makeSession('p', [{ id: 'a', rating: 0 }], settings)
     expect(session.version).toBe(SESSION_VERSION)
     expect(isCurrentSession(session)).toBe(true)
   })
