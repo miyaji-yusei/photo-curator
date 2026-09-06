@@ -42,7 +42,7 @@ import {
   skipPair
 } from '~/utils/burstThreshold'
 
-type View = 'home' | 'project' | 'method' | 'settings' | 'settings-app' | 'burst-threshold' | 'burst-preview' | 'tournament' | 'result' | 'results' | 'burst-review'
+type View = 'home' | 'project' | 'settings' | 'settings-app' | 'burst-threshold' | 'burst-preview' | 'tournament' | 'result' | 'results' | 'burst-review'
 
 const desktop = useDesktop()
 const projects = ref<Project[]>([])
@@ -791,11 +791,29 @@ async function startScan() {
   }
 }
 
+/**
+ * 選別を始める。**「方法を選ぶ」画面は通らない。**
+ *
+ * 選択肢が実質 1 つ（もう 1 つは「準備中」）の画面を毎回挟んでいた。
+ * 2,000 枚を捌く作業では、通路の画面 1 つが数十回の無駄なタップになる。
+ *
+ * 開始前の設定も、既定では出さない。枚数も連写まとめも選別中に「…」から
+ * 変えられるので、毎回止める理由がない。確認したい人は設定画面で
+ * 「毎回確認する」を入れる。
+ */
 function enterMethod() {
   if (!activeProject.value?.photoCount) return
-  view.value = 'method'
+  const prior = session.value?.settings
+  settings.groupSize = clampGroupSize(prior?.groupSize ?? groupLimits.default, groupLimits)
+  settings.groupBursts = prior?.groupBursts ?? false
+  if (confirmBeforeStart.value) {
+    view.value = 'settings'
+    return
+  }
+  void beginTournament()
 }
 
+/** 開始前の設定を明示的に開く（「毎回確認する」が入っているとき）。 */
 function openSettings() {
   const prior = session.value?.settings
   settings.groupSize = clampGroupSize(prior?.groupSize ?? groupLimits.default, groupLimits)
@@ -2406,13 +2424,8 @@ onBeforeUnmount(() => {
           </v-card>
         </template>
 
-        <template v-else-if="view === 'method'">
-          <v-btn variant="text" prepend-icon="mdi-arrow-left" class="px-0 mb-4" @click="view = 'project'">プロジェクトへ戻る</v-btn><div class="text-overline text-primary">選別を開始</div><h1 class="text-h4 mb-6">方法を選んでください</h1>
-          <v-row><v-col cols="12" md="6"><v-card class="choice-card pa-6 h-100" role="button" tabindex="0" @click="openSettings" @keydown.enter="openSettings"><v-icon color="primary" size="40" icon="mdi-tournament" /><div class="text-h5 mt-5">トーナメントで選別</div><p class="text-medium-emphasis mt-2">複数の写真から、次のラウンドに進める1枚を選びます。</p><v-btn color="primary" class="mt-4">設定へ進む</v-btn></v-card></v-col><v-col cols="12" md="6"><v-card class="choice-card choice-card--disabled pa-6 h-100" aria-disabled="true"><v-icon size="40" icon="mdi-play-box-outline" /><div class="text-h5 mt-5">スライドショーで選別</div><p class="text-medium-emphasis mt-2">1枚ずつ直感的に選べる方法です。</p><v-chip class="mt-4">準備中</v-chip></v-card></v-col></v-row>
-        </template>
-
         <template v-else-if="view === 'settings'">
-          <v-btn variant="text" prepend-icon="mdi-arrow-left" class="px-0 mb-4" @click="view = 'method'">方法の選択へ戻る</v-btn><div class="text-overline text-primary">Tournament setup</div><h1 class="text-h4 mb-6">トーナメントの設定</h1>
+          <v-btn variant="text" prepend-icon="mdi-arrow-left" class="px-0 mb-4" @click="view = 'project'">プロジェクトへ戻る</v-btn><div class="text-overline text-primary">Tournament setup</div><h1 class="text-h4 mb-6">トーナメントの設定</h1>
           <v-card max-width="720" class="pa-6 settings-card"><div class="text-subtitle-1 font-weight-medium mb-5">何枚から選びますか？</div><v-slider v-model="settings.groupSize" class="selection-slider" :min="groupLimits.min" :max="groupLimits.max" :step="1" thumb-label aria-label="何枚から選ぶか"><template #append><v-text-field v-model.number="settings.groupSize" density="compact" variant="outlined" style="width: 86px" hide-details suffix="枚" /></template></v-slider><p class="text-caption text-medium-emphasis mt-2">少ないほど比較は丁寧に、多いほどテンポよく進みます。</p><v-divider class="my-7" /><v-switch v-model="settings.groupBursts" color="primary" label="事前にバースト写真（連写）をまとめる" hint="最大 8 問だけ答えると、残りは同じ基準で自動的にまとまります。" persistent-hint />
             <v-alert v-if="settings.groupBursts && activeProject?.burstThreshold !== null && activeProject?.burstThreshold !== undefined" type="info" variant="tonal" density="comfortable" class="mt-4">
               <div class="d-flex align-center justify-space-between flex-wrap ga-3">
