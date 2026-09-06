@@ -5,6 +5,7 @@ import android.content.Context
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
+import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.InputStream
@@ -169,6 +170,8 @@ object PhotoAccess {
             }
         } catch (error: Exception) {
             // 消された・権限が無い・壊れている。1 枚で全体を止めない。
+            // **理由は必ず残す。** 握り潰すと実機で原因に辿り着けない。
+            Log.w("PhotoAccess", "readBytes(" + uri + ") に失敗した。", error)
             null
         }
     }

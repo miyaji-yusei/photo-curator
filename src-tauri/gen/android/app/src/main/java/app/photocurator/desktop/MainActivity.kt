@@ -23,6 +23,7 @@ class MainActivity : TauriActivity() {
     enableEdgeToEdge()
     super.onCreate(savedInstanceState)
     PhotoAccess.attach(this)
+    SecretStore.attach(this)
     requestPhotoPermissions()
   }
 
