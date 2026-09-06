@@ -295,6 +295,8 @@ function previewStateOf(photo: Photo) {
 
 /** 詳細画面の「…」。 */
 const projectMenu = ref(false)
+/** 結果画面の「…」。取り出しはすべてここへ集める。 */
+const resultsMenu = ref(false)
 
 /** 主ボタンの文言。**押したときに起きることをそのまま名前にする。** */
 const primaryActionLabel = computed(() => {
@@ -2665,13 +2667,28 @@ onBeforeUnmount(() => {
         </template>
 
         <template v-else-if="view === 'results'">
-          <v-btn variant="text" prepend-icon="mdi-arrow-left" class="px-0 mb-3" @click="view = 'project'">プロジェクトへ戻る</v-btn>
-          <h1 class="text-h5 text-md-h4">レーティング</h1>
-          <p class="text-body-2 text-medium-emphasis mt-2">
-            星を選ぶと、その星の写真だけを選別できます。選ばれた写真は星が1つ上がり、選ばれなかった写真はそのままです。
+          <header class="screen-bar">
+            <v-btn icon="mdi-arrow-left" variant="text" aria-label="プロジェクトへ戻る" @click="view = 'project'" />
+            <h1 class="screen-bar__title text-truncate">結果<template v-if="activeProject"> &middot; {{ activeProject.name }}</template></h1>
+            <div class="screen-bar__end">
+              <v-btn icon="mdi-dots-horizontal" variant="text" aria-label="結果の操作" @click="resultsMenu = true" />
+            </div>
+          </header>
+
+          <!-- **1 本の帯で全体の比を見せる。** 数字の羅列より先に目に入る。 -->
+          <div v-if="starBreakdown.length" class="star-bar mb-2">
+            <span
+              v-for="part in starBreakdown" :key="part.rating"
+              :style="{ width: part.percent + '%', background: part.color }"
+              :title="`★${part.rating} ${part.count} 枚`"
+            />
+          </div>
+          <p class="text-body-2 text-medium-emphasis mb-5">
+            星を選ぶと、その星の写真だけを選別できます。選ばれた写真は星が 1 つ上がり、
+            選ばれなかった写真はそのままです。
           </p>
 
-          <div class="rating-board mt-6">
+          <div class="rating-board">
             <div
               v-for="rating in [5, 4, 3, 2, 1, 0]" :key="rating"
               class="rating-row" :class="{ 'is-active': resultsRating === rating }"
@@ -2717,16 +2734,8 @@ onBeforeUnmount(() => {
             <v-spacer />
             <!-- 選別中は「まとめの中から1枚」を決めていない。その1手をここで引き受ける。 -->
             <v-btn variant="outlined" prepend-icon="mdi-layers-triple-outline" @click="openBurstReview">連写を見直す</v-btn>
-            <!-- デスクトップは原本のフォルダを直接操作できる。ブラウザはできないので、
-                 共有シートか星ごとの ZIP を通して渡す。 -->
-            <template v-if="canImportPhotos">
-              <v-btn variant="outlined" prepend-icon="mdi-export-variant" @click="openShareDialog">書き出す</v-btn>
-            </template>
-            <template v-else>
-              <v-btn variant="outlined" prepend-icon="mdi-folder-move-outline" @click="exportDialog = true">フォルダ分け</v-btn>
-              <v-btn variant="outlined" prepend-icon="mdi-tag-text-outline" @click="metadataDialog = true">メタデータに反映</v-btn>
-            </template>
-            <v-btn variant="text" prepend-icon="mdi-restart" @click="restartDialog = true">最初からやり直す</v-btn>
+            <!-- 取り出しは「…」に畳んだ。**原本を変える操作を、並のボタンと
+                 同じ列に置かない。** -->
           </div>
 
           <div v-if="resultsPhotos.length" class="result-grid" :class="gridClass(resultsDensity)" :style="gridStyle(resultsDensity)">
@@ -3111,6 +3120,53 @@ onBeforeUnmount(() => {
       </v-card>
     </v-bottom-sheet>
 
+    <!-- 結果の「…」。**原本を変える操作は、実行前に必ず確認する。** -->
+    <v-bottom-sheet v-model="resultsMenu" :inset="isWide" max-width="520">
+      <v-card>
+        <v-list>
+          <v-list-subheader>取り出す</v-list-subheader>
+          <v-list-item
+            v-if="canImportPhotos" prepend-icon="mdi-export-variant"
+            title="書き出す" subtitle="星ごとに ZIP、または共有"
+            @click="resultsMenu = false; openShareDialog()"
+          />
+          <template v-else>
+            <v-list-item
+              v-if="desktop.capabilities.exportFolders"
+              prepend-icon="mdi-folder-move-outline"
+              title="フォルダ分けして書き出す" subtitle="コピーが既定。移動は確認します"
+              @click="resultsMenu = false; exportDialog = true"
+            />
+            <v-list-item
+              v-if="desktop.capabilities.writeMetadata"
+              prepend-icon="mdi-tag-text-outline"
+              title="星をメタデータに書き込む" subtitle="原本の XMP を書き換えます"
+              @click="resultsMenu = false; metadataDialog = true"
+            />
+            <!-- できないものも見せる。**何ができるアプリなのかが伝わる。** -->
+            <v-list-item
+              v-if="!desktop.capabilities.exportFolders"
+              prepend-icon="mdi-folder-move-outline" disabled
+              title="フォルダ分けして書き出す" subtitle="PC 版で実行できます"
+            />
+            <v-list-item
+              v-if="!desktop.capabilities.writeMetadata"
+              prepend-icon="mdi-tag-text-outline" disabled
+              title="星をメタデータに書き込む" subtitle="PC 版で実行できます"
+            />
+          </template>
+          <v-divider class="my-2" />
+          <v-list-item
+            prepend-icon="mdi-restart" title="最初からやり直す" base-color="error"
+            @click="resultsMenu = false; restartDialog = true"
+          />
+        </v-list>
+        <div class="px-4 pb-4 text-caption text-medium-emphasis">
+          この端末だけの結果です（NAS との同期は今後）。
+        </div>
+      </v-card>
+    </v-bottom-sheet>
+
     <v-dialog v-model="groupSizeDialog" max-width="520">
       <v-card title="1グループの表示枚数">
         <v-card-text class="pt-5">
@@ -3445,7 +3501,7 @@ onBeforeUnmount(() => {
             <v-radio value="copy" label="コピーする（原本はそのまま残る）" />
             <v-radio value="move" label="移動する（原本フォルダから写真が無くなる）" />
           </v-radio-group>
-          <v-alert v-if="exportMode === 'move'" type="warning" variant="tonal" density="comfortable" class="mt-3">
+          <v-alert v-if="exportMode === 'move'" type="error" variant="tonal" density="comfortable" class="mt-3">
             移動すると<strong>元のフォルダから写真が無くなります</strong>。移動後はプロジェクトの索引が古くなるため、
             「写真を再読み込み」が必要になります。
           </v-alert>
@@ -3478,7 +3534,7 @@ onBeforeUnmount(() => {
     <v-dialog v-model="metadataDialog" max-width="640">
       <v-card title="レーティングをメタデータに反映">
         <v-card-text class="pt-5">
-          <v-alert type="warning" variant="tonal" density="comfortable" class="mb-4">
+          <v-alert type="error" variant="tonal" density="comfortable" class="mb-4">
             <strong>写真の原本を書き換えます。</strong>
             星は XMP（<code>xmp:Rating</code>）として写真の中に書き込まれ、Lightroom や Bridge などが読み取れます。
             撮影情報（EXIF）と画像そのものには手を加えません。
