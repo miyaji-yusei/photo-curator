@@ -258,48 +258,57 @@ private fun CullBar(
         verticalAlignment = Alignment.CenterVertically
     ) {
         IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, "中断して戻る") }
-        IconButton(onClick = onUndo, enabled = session.history.isNotEmpty()) {
-            Icon(Icons.Filled.Undo, "1 つ戻す")
-        }
-        FilterChip(
-            selected = multi, onClick = onToggleMulti,
-            label = { Text("複数", fontSize = 12.sp) },
-            leadingIcon = if (multi) {
-                { Icon(Icons.Filled.Check, null, Modifier.size(16.dp)) }
-            } else null
-        )
-        if (multi && selectedCount > 0) {
-            TextButton(onClick = onClear) { Text("解除", fontSize = 12.sp) }
+        // ラウンドが終わったら、選別のための道具は出さない。**押せるものは効くもの
+        // だけにする。** 効かないボタンが並ぶと、他のボタンまで信用されなくなる。
+        if (!session.finished) {
+            IconButton(onClick = onUndo, enabled = session.history.isNotEmpty()) {
+                Icon(Icons.Filled.Undo, "1 つ戻す")
+            }
+            FilterChip(
+                selected = multi, onClick = onToggleMulti,
+                label = { Text("複数", fontSize = 12.sp) },
+                leadingIcon = if (multi) {
+                    { Icon(Icons.Filled.Check, null, Modifier.size(16.dp)) }
+                } else null
+            )
+            if (multi && selectedCount > 0) {
+                TextButton(onClick = onClear) { Text("解除", fontSize = 12.sp) }
+            }
         }
 
         Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(
-                "★${session.targetStar} を選別中 · ROUND ${session.round}",
-                fontSize = 11.sp, color = Lime
-            )
-            // **畳んだことを隠さない。** 人は枚数で考えているので、
-            // 代表の数だけを「残り」と言うと数が合わなくて不安になる。
-            val remainingGroups = session.queue.size + session.current.size
-            val remainingPhotos = (session.queue + session.current)
-                .sumOf { session.members[it]?.size ?: 1 }
-            Text(
-                if (remainingPhotos == remainingGroups) "残り $remainingGroups 枚"
-                else "残り $remainingGroups 組 · $remainingPhotos 枚",
-                fontSize = 13.sp
-            )
+            if (session.finished) {
+                Text(album.name, fontSize = 13.sp)
+            } else {
+                Text(
+                    "★${session.targetStar} を選別中 · ROUND ${session.round}",
+                    fontSize = 11.sp, color = Lime
+                )
+                // **畳んだことを隠さない。** 人は枚数で考えているので、
+                // 代表の数だけを「残り」と言うと数が合わなくて不安になる。
+                val remainingGroups = session.queue.size + session.current.size
+                val remainingPhotos = (session.queue + session.current)
+                    .sumOf { session.members[it]?.size ?: 1 }
+                Text(
+                    if (remainingPhotos == remainingGroups) "残り $remainingGroups 枚"
+                    else "残り $remainingGroups 組 · $remainingPhotos 枚",
+                    fontSize = 13.sp
+                )
+            }
         }
 
-        Button(
-            onClick = onCommit,
-            shape = androidx.compose.foundation.shape.RoundedCornerShape(50),
-            enabled = !session.finished
-        ) {
-            // **結果を枚数で言う。** 押すと何が起きるかが読み取れるように。
-            Text(
-                if (selectedCount == 0) "${session.current.size} 枚とも落とす"
-                else "$selectedCount 枚を残す",
-                fontWeight = FontWeight.Bold, fontSize = 13.sp
-            )
+        if (!session.finished) {
+            Button(
+                onClick = onCommit,
+                shape = androidx.compose.foundation.shape.RoundedCornerShape(50)
+            ) {
+                // **結果を枚数で言う。** 押すと何が起きるかが読み取れるように。
+                Text(
+                    if (selectedCount == 0) "${session.current.size} 枚とも落とす"
+                    else "$selectedCount 枚を残す",
+                    fontWeight = FontWeight.Bold, fontSize = 13.sp
+                )
+            }
         }
     }
 }
@@ -376,8 +385,10 @@ private fun RoundDone(
             fontSize = 22.sp, fontWeight = FontWeight.Bold
         )
         Text(
-            if (keptPhotos == kept) "$seen 枚から $kept 枚に絞られました。"
-            else "$seen 枚から $kept 組（$keptPhotos 枚）に絞られました。",
+            // **単位を混ぜない。** 「3 組（4 枚）」は、どちらの数を読めばよいか
+            // 分からない。枚数で言い切って、まとめたことは後ろに添える。
+            if (keptPhotos == kept) "$seen 枚から $keptPhotos 枚に絞られました。"
+            else "$seen 枚から $keptPhotos 枚に絞られました（$kept 組にまとめて選びました）。",
             fontSize = 13.sp, color = Faint, modifier = Modifier.padding(top = 6.dp)
         )
 
