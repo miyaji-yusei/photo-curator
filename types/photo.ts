@@ -20,7 +20,15 @@ export interface Photo {
    * ネットワーク越しでは重すぎる。その中間がこれ。
    */
   displayPath: string | null
+  /**
+   * 解析できなかった理由。**空のタイルの意味を出し分けるのに使う。**
+   * これが無いと、まだ作っていないのか読めなかったのかが区別できない。
+   */
+  analysisError?: string | null
 }
+
+/** 1 枚ぶんの準備状態。一覧の空タイルはこの 5 つで描き分ける。 */
+export type PreviewState = 'ready' | 'generating' | 'queued' | 'failed' | 'unsupported'
 
 /** 星の上限。1ラウンド通過ごとに +1 で頭打ち。 */
 export const MAX_RATING = 5

@@ -389,3 +389,18 @@ body { margin: 0; }
 .prep-row__name { flex: 1; min-width: 0; }
 .prep-row__count { color: rgba(255,255,255,.6); font-variant-numeric: tabular-nums; }
 .min-w-0 { min-width: 0; }
+
+/* 技術的な文言。**利用者が開いたときだけ出す。** 等幅で、選んでコピーできる。 */
+.notice-detail {
+  margin: 6px 0 0; padding: 8px 10px; border-radius: 6px;
+  background: rgba(0,0,0,.35); font-size: 11px; line-height: 1.5;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap; word-break: break-all; user-select: text;
+}
+
+/* サムネイルがまだ無いタイル。**空白のままにせず、理由を出す。** */
+.photo-tile__pending {
+  position: absolute; inset: 0; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 6px;
+  font-size: 11px; color: rgba(255,255,255,.55);
+}

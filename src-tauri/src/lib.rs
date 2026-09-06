@@ -230,6 +230,9 @@ struct Photo {
     /// 選別画面に出す表示用画像の絶対パス。**まだ作っていなければ None**。
     /// 画面はここが無いときだけ原本へ落ちる。
     display_path: Option<String>,
+    /// 解析できなかった理由。**画面が「空のタイル」の意味を出し分けるのに使う。**
+    /// これが無いと、まだ作っていないのか読めなかったのかが区別できない。
+    analysis_error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1849,11 +1852,12 @@ fn photo_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Photo> {
         rating: row.get(7)?,
         thumbnail_path: row.get(8)?,
         display_path: row.get(9)?,
+        analysis_error: row.get(10)?,
     })
 }
 
 const PHOTO_COLUMNS: &str =
-    "id,project_id,path,relative_path,name,captured_at,d_hash,rating,thumbnail_path,display_path";
+    "id,project_id,path,relative_path,name,captured_at,d_hash,rating,thumbnail_path,display_path,analysis_error";
 /// 星の上限。1ラウンド通過ごとに +1 で、ここで頭打ちになる。「確定」も同じ値。
 const MAX_RATING: i64 = 5;
 

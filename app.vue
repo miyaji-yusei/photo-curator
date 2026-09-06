@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import type {
   BurstGroup, BurstPair, ExportReport, Photo, PhotoSort, Prep, Project, ProjectProgress,
-  SelectionResult, SelectionSession, SelectionSummary, SourceKind, TournamentSettings
+  PreviewState, SelectionResult, SelectionSession, SelectionSummary, SourceKind, TournamentSettings
 } from '~/types/photo'
 import { MAX_RATING } from '~/types/photo'
 import type { DisplaySettings, PhotoAlbum } from '~/composables/photoBackend'
 import type { MoveSelection } from '~/utils/ratingMove'
+import { PREVIEW_STATE_TEXT, previewStateOf as statePreviewOf } from '~/utils/previewState'
 // `selectedCount` は選別画面側の computed と名前がぶつかるので別名にする。
 import {
   createMoveSelection, isSelected as isMovePicked, selectedCount as countMoveSelection,
@@ -53,7 +54,39 @@ const tournamentPhotos = ref<Photo[]>([])
 const session = ref<SelectionSession | null>(null)
 const view = ref<View>('home')
 const loading = ref(false)
-const error = ref('')
+/**
+ * 画面に出す知らせ。**「何が起きたか」を人の言葉で 1 文、技術の言葉は畳む。**
+ *
+ * 以前は `cause instanceof Error ? cause.message : '日本語の文'` と書いていて、
+ * **失敗の理由が分かっているときほど機械の言葉が出る**という逆の形だった。
+ * 実機では「listPhotos を呼べません: Java exception was thrown」がそのまま
+ * 赤い帯に出ていた。
+ */
+interface Notice {
+  /** 何が起きたか。1 文。 */
+  text: string
+  /** できること。1 文。無ければ出さない。 */
+  hint?: string
+  /** 技術の言葉。「詳細」を開いたときだけ出す。 */
+  detail?: string
+}
+const notice = ref<Notice | null>(null)
+const noticeOpen = ref(false)
+
+function report(text: string, cause?: unknown, hint?: string) {
+  const detail = cause instanceof Error
+    ? cause.message
+    : typeof cause === 'string' ? cause : undefined
+  // 同じ文が続けて出ると、直ったのか出続けているのか分からない。開き直す。
+  noticeOpen.value = false
+  notice.value = { text, hint, detail }
+}
+
+/** 旧来の入口。まだ文字列で受けている箇所のために残す。 */
+const error = computed({
+  get: () => notice.value?.text ?? '',
+  set: (value: string) => { notice.value = value ? { text: value } : null }
+})
 const createDialog = ref(false)
 const projectName = ref('')
 const folderPath = ref('')
@@ -255,6 +288,11 @@ async function refreshPrep() {
   }
 }
 
+/** 画面から使う入口。解析が走っているかは prep から渡す。 */
+function previewStateOf(photo: Photo) {
+  return statePreviewOf(photo, prep.value?.meta.state === 'running')
+}
+
 /** 詳細画面の「…」。 */
 const projectMenu = ref(false)
 
@@ -278,7 +316,7 @@ async function saveDefaultDisplayEdge(edge: number) {
     await desktop.saveDisplayEdge(edge)
     displaySettings.value = await desktop.getDisplaySettings()
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : '表示用の既定を変えられませんでした。'
+    report('表示用の既定を変えられませんでした。', cause)
   } finally {
     displayBusy.value = false
   }
@@ -562,7 +600,7 @@ async function openProject(project: Project) {
     }
     await loadSummary()
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : 'プロジェクトを開けませんでした。'
+    report('プロジェクトを開けませんでした。', cause)
   } finally {
     loading.value = false
   }
@@ -573,7 +611,7 @@ async function chooseFolder() {
     const selected = await desktop.chooseFolder()
     if (selected) folderPath.value = selected
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : 'フォルダを選択できませんでした。'
+    report('フォルダを選択できませんでした。', cause)
   }
 }
 
@@ -595,7 +633,9 @@ const nasShare = ref('')
 const nasUser = ref('')
 const nasPassword = ref('')
 const nasBusy = ref(false)
-const nasError = ref('')
+/** NAS の接続失敗。**ダイアログの中で出すので、本体の知らせとは別に持つ。** */
+const nasError = ref<Notice | null>(null)
+const nasDetailOpen = ref(false)
 const nasConnected = ref(false)
 /** この環境が NAS に直接繋ぐか。デスクトップは OS が共有をマウントするので繋がない。 */
 const usesNas = computed(() => desktop.capabilities.browseFolders && !canImportPhotos.value)
@@ -633,7 +673,7 @@ function openCreateDialog() {
  * パスワードだけは「覚える」を選んだときにしか入らない。
  */
 async function openNasDialog() {
-  nasError.value = ''
+  nasError.value = null
   nasPasswordVisible.value = false
   try {
     const saved = await desktop.getNasSettings()
@@ -658,7 +698,7 @@ async function openNasDialog() {
 async function connectNas() {
   if (!nasHost.value.trim() || !nasShare.value.trim()) return
   nasBusy.value = true
-  nasError.value = ''
+  nasError.value = null
   try {
     const folders = await desktop.connectNas(
       nasHost.value.trim(), nasShare.value.trim(), nasUser.value, nasPassword.value
@@ -682,7 +722,13 @@ async function connectNas() {
     nasPasswordVisible.value = false
     nasDialog.value = false
   } catch (cause) {
-    nasError.value = cause instanceof Error ? cause.message : 'NAS に接続できませんでした。'
+    // **一番よく出る失敗なので、できることまで添える。**
+    nasError.value = {
+      text: `${nasHost.value.trim()} に繋がりませんでした。`,
+      hint: '同じ Wi-Fi に繋がっているか、ホスト名・共有名・パスワードを確認してください。',
+      detail: cause instanceof Error ? cause.message : undefined
+    }
+    nasDetailOpen.value = false
     nasConnected.value = false
   } finally {
     nasBusy.value = false
@@ -732,7 +778,7 @@ async function onPhotoPicked(event: Event) {
   try {
     await desktop.importPhotos(activeProject.value.id, files)
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : '写真を取り込めませんでした。'
+    report('写真を取り込めませんでした。', cause)
   } finally {
     taskDialog.value = false
     await refreshProjects()
@@ -768,7 +814,7 @@ async function createProject() {
     // `click()` は黙って無視される。開いたつもりで何も起きない状態になるので、
     // プロジェクト画面の「写真を追加」を押してもらう形にしてある。
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : 'プロジェクトを作成できませんでした。'
+    report('プロジェクトを作成できませんでした。', cause)
   } finally {
     loading.value = false
   }
@@ -787,7 +833,7 @@ async function startScan() {
     await desktop.startProjectScan(activeProject.value.id)
   } catch (cause) {
     taskDialog.value = false
-    error.value = cause instanceof Error ? cause.message : '写真の読み込みを開始できませんでした。'
+    report('写真の読み込みを開始できませんでした。', cause)
   }
 }
 
@@ -857,7 +903,7 @@ async function finishTournamentStart() {
     await enterStage()
     await saveSession()
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : '選別を準備できませんでした。'
+    report('選別を準備できませんでした。', cause)
   } finally {
     pendingTournamentSettings.value = null
     loading.value = false
@@ -947,7 +993,7 @@ async function refreshBurstPreview(threshold: number) {
     session.value.burstGroups = await desktop.getBurstGroups(activeProject.value.id, threshold)
     session.value.burstThreshold = threshold
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : '連写のまとめ結果を取得できませんでした。'
+    report('連写のまとめ結果を取得できませんでした。', cause)
   } finally {
     previewBusy.value = false
   }
@@ -970,7 +1016,7 @@ async function acceptBurstThreshold() {
     activeProject.value.burstThreshold = previewThreshold.value
     await refreshProjects()
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : '閾値を保存できませんでした。'
+    report('閾値を保存できませんでした。', cause)
   }
   // まとめた連写は代表1枚に畳み込む。以降は1カードとして扱う。
   collapseBursts(session.value)
@@ -988,7 +1034,7 @@ async function relearnThreshold() {
     activeProject.value.burstThreshold = null
     await refreshProjects()
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : '閾値を消去できませんでした。'
+    report('閾値を消去できませんでした。', cause)
   }
 }
 
@@ -1066,7 +1112,7 @@ async function persistGroupResults(group: string[]) {
     await desktop.saveSelectionResults(activeProject.value.id, entries)
     await loadSummary()
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : '選別結果を保存できませんでした。'
+    report('選別結果を保存できませんでした。', cause)
   }
 }
 
@@ -1142,7 +1188,7 @@ async function openBurst(photo: Photo | null) {
     burstCuts.value = cutsFromGroups(ids, Object.values(session.value.burstMembers))
     burstOriginal.value = ids.filter(id => members.includes(id))
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : 'まとめを読み込めませんでした。'
+    report('まとめを読み込めませんでした。', cause)
     burstPhotos.value = []
     burstCuts.value = []
   } finally {
@@ -1218,7 +1264,7 @@ async function settleBurstPhoto(photoId: string, rating: number) {
     await desktop.saveSelectionResults(activeProject.value.id, [{ id: photoId, rating: next }])
     await loadSummary()
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : '星を保存できませんでした。'
+    report('星を保存できませんでした。', cause)
   }
   await saveSession()
 }
@@ -1309,7 +1355,7 @@ async function applyBurstShape() {
     await loadCurrentPhotos()
     await saveSession()
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : 'まとめの形を保存できませんでした。'
+    report('まとめの形を保存できませんでした。', cause)
   } finally {
     burstBusy.value = false
   }
@@ -1374,7 +1420,7 @@ async function startRatingSelection(rating: number) {
         : Promise.resolve<BurstPair[]>([])
     ])
     if (seed.length < 2) {
-      error.value = `★${rating} の写真が ${seed.length} 枚しかないため、選別できません。`
+      report(`★${rating} の写真が ${seed.length} 枚しかないため、選別できません。`)
       return
     }
     session.value = makeSession(
@@ -1384,7 +1430,7 @@ async function startRatingSelection(rating: number) {
     await enterStage()
     await saveSession()
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : '選別を準備できませんでした。'
+    report('選別を準備できませんでした。', cause)
   } finally {
     loading.value = false
   }
@@ -1402,7 +1448,7 @@ async function restartFromScratch() {
     restartDialog.value = false
     view.value = 'project'
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : 'やり直せませんでした。'
+    report('やり直せませんでした。', cause)
   } finally {
     restartBusy.value = false
   }
@@ -1415,7 +1461,7 @@ async function chooseExportDestination() {
     const selected = await desktop.chooseFolder()
     if (selected) exportDestination.value = selected
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : 'フォルダを選択できませんでした。'
+    report('フォルダを選択できませんでした。', cause)
   }
 }
 
@@ -1492,7 +1538,7 @@ async function loadResultsPage(reset = false) {
     resultsTotal.value = page.total
     resultsOffset.value += page.photos.length
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : '選別結果を読み込めませんでした。'
+    report('選別結果を読み込めませんでした。', cause)
   } finally {
     resultsBusy.value = false
   }
@@ -1520,7 +1566,7 @@ async function openBurstReview() {
     burstReviewGroups.value = groups.filter(group => group.photoIds.length > 1)
     await loadBurstReviewPhotos()
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : '連写を読み込めませんでした。'
+    report('連写を読み込めませんでした。', cause)
   } finally {
     burstReviewBusy.value = false
     burstReviewLoaded.value = true
@@ -1580,7 +1626,7 @@ async function applyBurstReview() {
     await loadSummary()
     await advanceBurstReview()
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : '連写の結果を保存できませんでした。'
+    report('連写の結果を保存できませんでした。', cause)
   } finally {
     burstReviewBusy.value = false
   }
@@ -1628,7 +1674,7 @@ async function applyDisplayEdge(edge: number) {
     displayBacklog.value = await desktop.getDisplayBacklog(activeProject.value.id)
     await desktop.startDisplayGeneration(activeProject.value.id)
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : '表示用の設定を変えられませんでした。'
+    report('表示用の設定を変えられませんでした。', cause)
   } finally {
     displayBusy.value = false
   }
@@ -1643,7 +1689,7 @@ async function regenerateDisplayImages() {
     displayBacklog.value = await desktop.getDisplayBacklog(activeProject.value.id)
     await desktop.startDisplayGeneration(activeProject.value.id)
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : '作り直しを始められませんでした。'
+    report('作り直しを始められませんでした。', cause)
   } finally {
     displayBusy.value = false
   }
@@ -1720,7 +1766,7 @@ async function runMove() {
     moveDialog.value = false
     await loadSummary()
     if (view.value === 'results') await loadResultsPage(true)
-    error.value = ''
+    notice.value = null
     moveReport.value = `${moved.toLocaleString()} 枚を ★${moveFrom.value} から ★${moveTo.value} へ移しました。`
   } catch (cause) {
     moveError.value = cause instanceof Error ? cause.message : 'レートを移動できませんでした。'
@@ -1847,7 +1893,7 @@ async function confirmDeleteProject() {
     deleteDialog.value = false
     deleteTarget.value = null
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : 'プロジェクトを削除できませんでした。'
+    report('プロジェクトを削除できませんでした。', cause)
   } finally {
     deleteBusy.value = false
   }
@@ -1978,7 +2024,7 @@ onMounted(async () => {
         analysisFailures.value = progress.failed
         // 警告は解析中の1イベントにしか乗らないので、別に保持して出し続ける。
         if (progress.warning) taskWarning.value = progress.warning
-        if (progress.phase === 'error') error.value = progress.message
+        if (progress.phase === 'error') report('写真の読み込みが止まりました。', progress.message)
         return
       }
       taskProgress.value = progress
@@ -1991,11 +2037,11 @@ onMounted(async () => {
       }
       if (progress.phase === 'cancelled' || progress.phase === 'error') {
         taskDialog.value = false
-        if (progress.phase === 'error') error.value = progress.message
+        if (progress.phase === 'error') report('写真の読み込みが止まりました。', progress.message)
       }
     })
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : 'プロジェクトを読み込めませんでした。'
+    report('プロジェクトを読み込めませんでした。', cause)
   }
   window.addEventListener('keydown', onKeydown)
   wideQuery = window.matchMedia(WIDE_QUERY)
@@ -2189,7 +2235,21 @@ onBeforeUnmount(() => {
         :class="isSelecting ? 'pa-3 pa-md-5' : 'pa-5 pa-md-8'"
         :style="{ maxWidth: isSelecting ? '100%' : '1680px' }"
       >
-        <v-alert v-if="error" type="error" closable class="mb-5" @click:close="error = ''">{{ error }}</v-alert>
+        <!-- **技術の言葉は「詳細」の中だけ。** 画面に出すのは
+             「何が起きたか」と「できること」の 2 文まで。 -->
+        <v-alert
+          v-if="notice" type="error" variant="tonal" closable class="mb-5"
+          @click:close="notice = null"
+        >
+          <div class="text-body-2">{{ notice.text }}</div>
+          <div v-if="notice.hint" class="text-caption mt-1">{{ notice.hint }}</div>
+          <template v-if="notice.detail">
+            <v-btn size="x-small" variant="text" class="px-0 mt-1" @click="noticeOpen = !noticeOpen">
+              {{ noticeOpen ? '詳細を閉じる' : '詳細' }}
+            </v-btn>
+            <pre v-if="noticeOpen" class="notice-detail">{{ notice.detail }}</pre>
+          </template>
+        </v-alert>
         <v-progress-linear v-if="loading" indeterminate color="primary" class="mb-6" />
 
         <!-- 連写解析はバックグラウンドで進む。操作を止めずに状況だけ見せる。 -->
@@ -2411,7 +2471,7 @@ onBeforeUnmount(() => {
               <v-btn v-for="option in densityOptions" :key="option.label" :value="option.value" :icon="option.icon" :aria-label="`一覧を${option.label}で表示`" />
             </v-btn-toggle>
           </div>
-          <div v-if="previewPhotos.length" class="photo-grid" :class="gridClass(previewDensity)" :style="gridStyle(previewDensity)"><div v-for="photo in previewPhotos" :key="photo.id" class="photo-tile" role="button" tabindex="0" @click="openZoom(photo, previewPhotos)" @keydown.enter="openZoom(photo, previewPhotos)"><img :src="desktop.photoThumbnailUrl(photo)" :alt="photo.name" loading="lazy"><div class="photo-tile__caption">{{ photo.relativePath }}</div></div></div>
+          <div v-if="previewPhotos.length" class="photo-grid" :class="gridClass(previewDensity)" :style="gridStyle(previewDensity)"><div v-for="photo in previewPhotos" :key="photo.id" class="photo-tile" role="button" tabindex="0" @click="openZoom(photo, previewPhotos)" @keydown.enter="openZoom(photo, previewPhotos)"><img v-if="previewStateOf(photo) === 'ready'" :src="desktop.photoThumbnailUrl(photo)" :alt="photo.name" loading="lazy"><div v-else class="photo-tile__pending"><v-icon :icon="PREVIEW_STATE_TEXT[previewStateOf(photo)].icon" :color="PREVIEW_STATE_TEXT[previewStateOf(photo)].color" size="20" /><span>{{ PREVIEW_STATE_TEXT[previewStateOf(photo)].label }}</span></div><div class="photo-tile__caption">{{ photo.relativePath }}</div></div></div>
           <v-alert v-if="previewTotal > previewPhotos.length" type="info" variant="tonal" class="mt-5">表示負荷を抑えるため、最初の {{ previewPhotos.length }} 枚だけを表示しています。選別にはすべての写真が含まれます。</v-alert>
           <!-- まだ 1 枚も無いプロジェクト。次にやることを 1 つだけ置く。 -->
           <v-card v-if="canImportPhotos && !previewPhotos.length && !scanRunning" class="pa-10 text-center">
@@ -2812,7 +2872,14 @@ onBeforeUnmount(() => {
             label="パスワードをこの端末に保存する"
           />
           <v-alert v-if="nasError" type="error" variant="tonal" density="comfortable" class="mt-4">
-            {{ nasError }}
+            <div class="text-body-2">{{ nasError.text }}</div>
+            <div v-if="nasError.hint" class="text-caption mt-1">{{ nasError.hint }}</div>
+            <template v-if="nasError.detail">
+              <v-btn size="x-small" variant="text" class="px-0 mt-1" @click="nasDetailOpen = !nasDetailOpen">
+                {{ nasDetailOpen ? '詳細を閉じる' : '詳細' }}
+              </v-btn>
+              <pre v-if="nasDetailOpen" class="notice-detail">{{ nasError.detail }}</pre>
+            </template>
           </v-alert>
           <p class="text-caption text-medium-emphasis mt-4 mb-0">
             <template v-if="nasRemember && nasCanRemember">

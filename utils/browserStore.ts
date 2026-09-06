@@ -212,6 +212,7 @@ export function toPhoto(
     dHash: row.dHash,
     rating: row.rating,
     thumbnailPath: thumbnailUrl,
-    displayPath: displayUrl ?? originalUrl ?? thumbnailUrl
+    displayPath: displayUrl ?? originalUrl ?? thumbnailUrl,
+    analysisError: row.analysisError
   }
 }
