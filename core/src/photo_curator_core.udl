@@ -17,6 +17,13 @@ namespace photo_curator_core {
     // dHash どうしの距離。**0 が同一。** 版が違うものは比べない。
     u32 hash_distance(string left, string right);
 
+    // 9x8 に潰し終えた輝度から dHash を作る。
+    string? d_hash_from_luma(sequence<u8> luma);
+
+    // 任意の大きさの輝度から dHash を作る。**縮小もここでやる。**
+    // 各環境の縮小器に任せると値が揃わない（実測で距離 5 の差が出た）。
+    string? d_hash_from_gray(sequence<u8> gray, u32 width, u32 height);
+
     // ---- 選別 ----
     // ラウンドを始める。連写のまとめは中で済ませる。
     Session start_round(
@@ -33,6 +40,16 @@ namespace photo_curator_core {
 
     // 直前の判断を取り消す。星も戻る。
     Session undo(Session session);
+
+    // 次のラウンドへ。**進めないときは null。** 通ったものが 2 枚未満か、
+    // 星が上限に達しているとき。
+    Session? next_round(
+        Session previous,
+        sequence<PhotoRef> photos,
+        boolean group_bursts,
+        BurstThreshold threshold,
+        sequence<PairOverride> overrides
+    );
 
     // ---- 保存 ----
     // 保存の形は core が持つ。各環境が独自に組み立てない。

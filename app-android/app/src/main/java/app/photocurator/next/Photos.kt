@@ -100,9 +100,12 @@ object Photos {
             MediaStore.Images.Media.DATE_MODIFIED
         )
         val out = ArrayList<Photo>()
+        // 並べ替えは SQL に任せない。**この端末では 2,257 枚のうち 1,497 枚で
+        // DATE_TAKEN が NULL** で、SQL に並べさせると mtime に落とした時刻と
+        // 並び順が食い違う。連写は隣どうしでしか畳まないので、順が違えば
+        // どれだけ似ていてもまとまらない。実際にまとまり 0 になっていた。
         context.contentResolver.query(
-            COLLECTION, projection, where, args,
-            "${MediaStore.Images.Media.DATE_TAKEN} ASC"
+            COLLECTION, projection, where, args, null
         )?.use { cursor ->
             val idColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
             val nameColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
@@ -125,7 +128,8 @@ object Photos {
                 )
             }
         }
-        out
+        // **使う値そのもので並べる。** 同時刻のものは名前で決める（毎回同じ順）。
+        out.sortedWith(compareBy({ it.takenAt }, { it.relativePath }))
     }
 
     /**

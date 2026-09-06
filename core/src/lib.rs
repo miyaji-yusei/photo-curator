@@ -140,6 +140,87 @@ fn finish(current: &mut Vec<String>) -> BurstGroup {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// dHash
+// ---------------------------------------------------------------------------
+
+/// dHash を作るときの一辺。9x8 の輝度から横の差分 64 個を取る。
+pub const D_HASH_WIDTH: u32 = 9;
+pub const D_HASH_HEIGHT: u32 = 8;
+/// いまの作り方の版。**変えたら上げる。** 版が違う値は比べない。
+pub const D_HASH_VERSION: i32 = 2;
+
+/// 9x8 の輝度から dHash を作る。
+///
+/// **デコードと縮小は各環境に任せる。** Android は BitmapFactory、
+/// Web は createImageBitmap が一番速い。ここに置くのは「同じ画素なら
+/// 同じ値でなければ困る」部分だけ。
+///
+/// `luma` は 9x8 = 72 個の輝度（0-255）を、左上から行優先で並べたもの。
+/// 長さが違えば None。**黙って 0 を返すと、読めない写真が全部同じ値になり、
+/// 誤ってまとまる。**
+pub fn d_hash_from_luma(luma: Vec<u8>) -> Option<String> {
+    let expected = (D_HASH_WIDTH * D_HASH_HEIGHT) as usize;
+    if luma.len() != expected {
+        return None;
+    }
+    let mut bits: u64 = 0;
+    let mut at = 0;
+    for row in 0..D_HASH_HEIGHT as usize {
+        for col in 0..(D_HASH_WIDTH as usize - 1) {
+            let left = luma[row * D_HASH_WIDTH as usize + col];
+            let right = luma[row * D_HASH_WIDTH as usize + col + 1];
+            // 左が右より明るければ 1。**絶対値ではなく隣との差**を見るので、
+            // 全体の明るさが変わっても値が動かない。
+            if left > right {
+                bits |= 1 << at;
+            }
+            at += 1;
+        }
+    }
+    Some(format!("{bits:016x}"))
+}
+
+/// 任意の大きさの輝度画像から dHash を作る。**縮小もここでやる。**
+///
+/// `d_hash_from_luma` は 9x8 に潰し終えたものを受け取るが、潰し方を各環境に
+/// 任せると値が揃わない。Android の `createScaledBitmap` は縮小率が大きいと
+/// 2x2 しか読まないので、**同じ絵を JPEG で作り直しただけで距離が 5 開いた**。
+/// 閾値 6 のすぐ隣で、これでは連写かどうかを判断できない。
+///
+/// ここでは升目の平均を取る。全画素を読むので、縮小率が大きくても値が飛ばない。
+/// 各環境は「輝度を並べて渡す」だけになり、**答えは 1 か所で決まる。**
+pub fn d_hash_from_gray(gray: Vec<u8>, width: u32, height: u32) -> Option<String> {
+    if width < D_HASH_WIDTH || height < D_HASH_HEIGHT {
+        return None;
+    }
+    if gray.len() != (width as usize) * (height as usize) {
+        return None;
+    }
+    let mut cells = vec![0u8; (D_HASH_WIDTH * D_HASH_HEIGHT) as usize];
+    for row in 0..D_HASH_HEIGHT {
+        // 端数は上下の升に散らす。切り捨てだけだと右端と下端が痩せる。
+        let top = (row * height / D_HASH_HEIGHT) as usize;
+        let bottom = ((row + 1) * height / D_HASH_HEIGHT) as usize;
+        for col in 0..D_HASH_WIDTH {
+            let left = (col * width / D_HASH_WIDTH) as usize;
+            let right = ((col + 1) * width / D_HASH_WIDTH) as usize;
+            let mut total: u64 = 0;
+            let mut count: u64 = 0;
+            for y in top..bottom {
+                for x in left..right {
+                    total += gray[y * width as usize + x] as u64;
+                    count += 1;
+                }
+            }
+            // width >= 9 かつ height >= 8 なので count が 0 になることはない。
+            cells[(row * D_HASH_WIDTH + col) as usize] = (total / count.max(1)) as u8;
+        }
+    }
+    d_hash_from_luma(cells)
+}
+
 // ---------------------------------------------------------------------------
 // 選別
 // ---------------------------------------------------------------------------
@@ -301,6 +382,55 @@ pub fn undo(session: Session) -> Session {
     next
 }
 
+
+/// 次のラウンドへ。**前を通ったものだけが、星を持ったまま上がる。**
+///
+/// 進めないときは None を返す。「まだ続けられます」と言っておいて
+/// 何も出ない画面を見せるより、進めないと先に言う方がよい。
+/// 進めないのは 2 つ:
+/// - 通ったものが 2 枚未満（比べる相手がいない）
+/// - 星が上限（これ以上つけられない）
+pub fn next_round(
+    previous: Session,
+    photos: Vec<PhotoRef>,
+    group_bursts_on: bool,
+    threshold: BurstThreshold,
+    overrides: Vec<PairOverride>,
+) -> Option<Session> {
+    let target_star = previous.target_star + 1;
+    if target_star >= MAX_STAR {
+        return None;
+    }
+    if previous.survivors.len() < 2 {
+        return None;
+    }
+
+    // survivors の並びではなく、渡された写真の並び（撮影順）を保つ。
+    // 連写は隣どうしで畳むので、順が崩れるとまとまらなくなる。
+    let remaining: Vec<PhotoRef> = photos
+        .into_iter()
+        .filter(|photo| previous.survivors.contains(&photo.relative_path))
+        .collect();
+    if remaining.len() < 2 {
+        return None;
+    }
+
+    let mut session = start_round(
+        remaining,
+        previous.group_size,
+        target_star,
+        group_bursts_on,
+        threshold,
+        overrides,
+    );
+    session.round = previous.round + 1;
+    // 星は引き継ぐ。start_round は target_star で埋め直すが、それでは
+    // **畳まれて画面に出なかった仲間の星**と、落ちたものの星が消える。
+    session.ratings = previous.ratings;
+    // history は引き継がない。**戻すはラウンドをまたがない。**
+    // またぐと、戻した先の round と target_star が合わなくなる。
+    Some(session)
+}
 
 // ---------------------------------------------------------------------------
 // 保存
@@ -502,6 +632,66 @@ mod tests {
         assert_eq!(after.ratings["1"], 5);
     }
 
+
+    /// 9x8 の輝度を作る補助。`f(row, col)` が輝度を返す。
+    fn luma(f: impl Fn(usize, usize) -> u8) -> Vec<u8> {
+        let mut out = Vec::with_capacity(72);
+        for row in 0..8 {
+            for col in 0..9 {
+                out.push(f(row, col));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn 画素数が合わなければ作らない() {
+        // **黙って 0 を返すと、読めない写真が全部同じ値になり誤ってまとまる。**
+        assert!(d_hash_from_luma(vec![]).is_none());
+        assert!(d_hash_from_luma(vec![0; 71]).is_none());
+        assert!(d_hash_from_luma(vec![0; 73]).is_none());
+    }
+
+    #[test]
+    fn 一様な画像は零になる() {
+        // 隣と差が無ければビットは立たない。
+        assert_eq!(d_hash_from_luma(luma(|_, _| 128)).unwrap(), "0000000000000000");
+    }
+
+    #[test]
+    fn 左が明るいと全ビットが立つ() {
+        // 左ほど明るい＝どの隣どうしでも left > right。
+        let value = d_hash_from_luma(luma(|_, col| (200 - col * 20) as u8)).unwrap();
+        assert_eq!(value, "ffffffffffffffff");
+    }
+
+    #[test]
+    fn 全体を明るくしても値が変わらない() {
+        // **隣との差だけを見るので、露出が違っても同じ構図なら同じ値になる。**
+        let dark = d_hash_from_luma(luma(|row, col| (10 + row * 2 + col * 3) as u8)).unwrap();
+        let bright = d_hash_from_luma(luma(|row, col| (90 + row * 2 + col * 3) as u8)).unwrap();
+        assert_eq!(dark, bright);
+    }
+
+    #[test]
+    fn 違う構図は距離が開く() {
+        let left = d_hash_from_luma(luma(|_, col| (200 - col * 20) as u8)).unwrap();
+        let right = d_hash_from_luma(luma(|_, col| (10 + col * 20) as u8)).unwrap();
+        assert_eq!(hash_distance(left, right), 64, "正反対なら全ビット違う");
+    }
+
+    #[test]
+    fn 少し違うだけなら距離は小さい() {
+        let base = luma(|row, col| (10 + row * 2 + col * 3) as u8);
+        let mut tweaked = base.clone();
+        // 1 か所だけ隣との大小を反転させる。
+        tweaked[0] = 255;
+        let a = d_hash_from_luma(base).unwrap();
+        let b = d_hash_from_luma(tweaked).unwrap();
+        let distance = hash_distance(a, b);
+        assert!(distance > 0 && distance <= 2, "距離が {distance} は大きすぎる");
+    }
+
     #[test]
     fn 読めない写真どうしを同一と見なさない() {
         // 0 を返すと、**読めない写真が全部 1 つのまとまりに落ちる。**
@@ -605,5 +795,182 @@ mod tests {
         let groups = group_bursts(photos, threshold(), overrides);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].members, vec!["1.jpg", "2.jpg"]);
+    }
+
+    // ---- 次のラウンド ----
+
+    /// 全部残す形でラウンドを終わらせる。
+    fn run_all(mut session: Session) -> Session {
+        while !session.finished {
+            let all = session.current.clone();
+            session = advance(session, all);
+        }
+        session
+    }
+
+    #[test]
+    fn 次のラウンドは通ったものだけで始まる() {
+        let photos = plain(&["1", "2", "3", "4"]);
+        let first = start_round(photos.clone(), 2, 0, false, threshold(), vec![]);
+        let first = advance(first, vec!["1".into()]);
+        let first = advance(first, vec!["3".into()]);
+
+        let second = next_round(first, photos, false, threshold(), vec![]).unwrap();
+        assert_eq!(second.round, 2);
+        assert_eq!(second.target_star, 1);
+        // 通った 2 枚だけ。落ちたものは出てこない。
+        assert_eq!(second.current, vec!["1", "3"]);
+        assert!(second.queue.is_empty());
+    }
+
+    #[test]
+    fn 次のラウンドでも星は引き継がれる() {
+        let photos = plain(&["1", "2", "3", "4"]);
+        let first = start_round(photos.clone(), 2, 0, false, threshold(), vec![]);
+        let first = advance(first, vec!["1".into()]);
+        let first = advance(first, vec!["3".into()]);
+
+        let second = next_round(first, photos, false, threshold(), vec![]).unwrap();
+        assert_eq!(second.ratings["1"], 1);
+        assert_eq!(second.ratings["3"], 1);
+        // **落ちたものの星も消えない。** ★0 として残る。
+        assert_eq!(second.ratings["2"], 0);
+        assert_eq!(second.ratings["4"], 0);
+    }
+
+    #[test]
+    fn 畳まれた仲間の星も次のラウンドに残る() {
+        // 1.jpg と 2.jpg が連写。代表は 1.jpg。
+        let photos = vec![
+            photo("1.jpg", 0, "0000000000000000"),
+            photo("2.jpg", 1000, "0000000000000001"),
+            photo("3.jpg", 500_000, "ffffffffffffffff"),
+            photo("4.jpg", 600_000, "0f0f0f0f0f0f0f0f"),
+        ];
+        let first = start_round(photos.clone(), 2, 0, true, threshold(), vec![]);
+        assert_eq!(first.current, vec!["1.jpg", "3.jpg"]);
+        let first = advance(first, vec!["1.jpg".into()]);
+        let first = run_all(first);
+
+        let second = next_round(first, photos, true, threshold(), vec![]).unwrap();
+        // 仲間は画面に出ないが、星は代表と同じだけ動いている。
+        assert_eq!(second.ratings["2.jpg"], 1);
+        assert!(!second.queue.contains(&"2.jpg".to_string()));
+        assert!(!second.current.contains(&"2.jpg".to_string()));
+    }
+
+    #[test]
+    fn 通ったものが一枚なら次のラウンドは無い() {
+        let photos = plain(&["1", "2"]);
+        let first = start_round(photos.clone(), 2, 0, false, threshold(), vec![]);
+        let first = advance(first, vec!["1".into()]);
+        assert!(next_round(first, photos, false, threshold(), vec![]).is_none());
+    }
+
+    #[test]
+    fn 星が上限なら次のラウンドは無い() {
+        let photos = plain(&["1", "2", "3", "4"]);
+        // target_star が 4 なら次は 5。5 は上限なのでこれ以上は進めない。
+        let first = start_round(photos.clone(), 2, MAX_STAR - 1, false, threshold(), vec![]);
+        let first = run_all(first);
+        assert!(next_round(first, photos, false, threshold(), vec![]).is_none());
+    }
+
+    #[test]
+    fn 次のラウンドは撮影順を保つ() {
+        let photos = plain(&["1", "2", "3", "4", "5", "6"]);
+        let first = start_round(photos.clone(), 2, 0, false, threshold(), vec![]);
+        // わざと後ろから選び、survivors の並びを撮影順と食い違わせる。
+        let first = advance(first, vec!["2".into()]);
+        let first = advance(first, vec!["4".into()]);
+        let first = advance(first, vec!["5".into()]);
+
+        let second = next_round(first, photos, false, threshold(), vec![]).unwrap();
+        let order: Vec<String> = second
+            .current
+            .iter()
+            .chain(second.queue.iter())
+            .cloned()
+            .collect();
+        assert_eq!(order, vec!["2", "4", "5"]);
+    }
+
+    #[test]
+    fn 次のラウンドでは戻せない() {
+        let photos = plain(&["1", "2", "3", "4"]);
+        let first = start_round(photos.clone(), 2, 0, false, threshold(), vec![]);
+        let first = advance(first, vec!["1".into()]);
+        let first = advance(first, vec!["3".into()]);
+
+        let second = next_round(first, photos, false, threshold(), vec![]).unwrap();
+        // 前のラウンドの判断は残っていない。またぐと round と星が合わなくなる。
+        assert!(second.history.is_empty());
+    }
+
+    // ---- 升目平均での縮小 ----
+
+    /// 左半分が暗く右半分が明るい絵。横の差分は 1 か所だけ立つ。
+    fn split_image(width: u32, height: u32) -> Vec<u8> {
+        let mut out = Vec::with_capacity((width * height) as usize);
+        for _ in 0..height {
+            for x in 0..width {
+                out.push(if x < width / 2 { 20 } else { 200 });
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn 大きさが足りなければ作らない() {
+        assert!(d_hash_from_gray(vec![0; 8 * 8], 8, 8).is_none());
+        assert!(d_hash_from_gray(vec![0; 9 * 7], 9, 7).is_none());
+    }
+
+    #[test]
+    fn 画素数と大きさが合わなければ作らない() {
+        assert!(d_hash_from_gray(vec![0; 10], 9, 8).is_none());
+    }
+
+    #[test]
+    fn 同じ絵を違う大きさで渡しても同じ値になる() {
+        // **これが升目平均にした理由。** 縮小率が変わっても値が動かない。
+        let small = d_hash_from_gray(split_image(90, 80), 90, 80).unwrap();
+        let large = d_hash_from_gray(split_image(900, 800), 900, 800).unwrap();
+        assert_eq!(small, large);
+    }
+
+    #[test]
+    fn 一画素の汚れで値が動かない() {
+        // 大きな絵の 1 画素を反転させても、升目の平均はほとんど動かない。
+        let clean = split_image(180, 160);
+        let mut dirty = clean.clone();
+        dirty[100 * 180 + 100] = 255 - dirty[100 * 180 + 100];
+        let a = d_hash_from_gray(clean, 180, 160).unwrap();
+        let b = d_hash_from_gray(dirty, 180, 160).unwrap();
+        assert_eq!(hash_distance(a, b), 0);
+    }
+
+    #[test]
+    fn 全体が明るくなっても値が動かない() {
+        // 隣との差分を見ているので、明るさを一律に足しても変わらない。
+        let base = split_image(90, 80);
+        let brighter: Vec<u8> = base.iter().map(|v| v.saturating_add(40)).collect();
+        let a = d_hash_from_gray(base, 90, 80).unwrap();
+        let b = d_hash_from_gray(brighter, 90, 80).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn 違う絵は距離が開く() {
+        let split = d_hash_from_gray(split_image(90, 80), 90, 80).unwrap();
+        // 縞模様。升目ごとに明暗が入れ替わる。
+        let mut stripes = Vec::new();
+        for _ in 0..80 {
+            for x in 0..90 {
+                stripes.push(if (x / 10) % 2 == 0 { 20 } else { 200 });
+            }
+        }
+        let striped = d_hash_from_gray(stripes, 90, 80).unwrap();
+        assert!(hash_distance(split, striped) > 4);
     }
 }
