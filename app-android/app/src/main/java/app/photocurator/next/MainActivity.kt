@@ -149,16 +149,19 @@ private fun AlbumList(onPick: (Album) -> Unit) {
     }
 
     Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
-        Row(
-            Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 16.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text("Photo Curator", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
-            Spacer(Modifier.weight(1f))
-            Text(note, fontSize = 12.sp, color = Faint)
+        Reading {
+            Row(
+                Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 16.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Photo Curator", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.weight(1f))
+                Text(note, fontSize = 12.sp, color = Faint)
+            }
         }
         LazyColumn(Modifier.fillMaxSize()) {
             items(albums, key = { it.id }) { album ->
+                Reading {
                 Row(
                     Modifier.fillMaxWidth().clickable { onPick(album) }.padding(16.dp, 10.dp),
                     verticalAlignment = Alignment.CenterVertically
@@ -179,6 +182,7 @@ private fun AlbumList(onPick: (Album) -> Unit) {
                         Text(album.name, fontSize = 15.sp)
                         Text("${album.count} 枚", fontSize = 12.sp, color = Faint)
                     }
+                }
                 }
             }
         }

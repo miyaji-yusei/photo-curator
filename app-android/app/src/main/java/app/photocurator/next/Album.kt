@@ -49,6 +49,7 @@ fun AlbumScreen(
     }
 
     Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
+        Reading {
         Row(
             Modifier.fillMaxWidth().height(56.dp).padding(end = 16.dp),
             verticalAlignment = Alignment.CenterVertically
@@ -59,13 +60,14 @@ fun AlbumScreen(
                 Text("${album.count} 枚", fontSize = 12.sp, color = Faint)
             }
         }
+        }
 
         val live = session
         if (!loaded) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text("読み込み中…", color = Faint, fontSize = 13.sp)
             }
-        } else Column(Modifier.padding(horizontal = 16.dp)) {
+        } else Reading(Modifier.padding(horizontal = 16.dp)) {
             if (live == null) {
                 Card(
                     "まだ選別していません",
