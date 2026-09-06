@@ -64,3 +64,73 @@ object Store {
         Unit
     }
 }
+
+/**
+ * 1 枚ぶんの指紋と、それが**いつの原本のものか**。
+ *
+ * 大きさを控えるのは、写真が差し替わったときに古い指紋を使わないため。
+ * 版を控えるのは、作り方を変えたときに黙って混ざらないため。
+ */
+data class Fingerprint(val version: Int, val size: Long, val hash: String)
+
+/**
+ * 指紋の置き場。**一度作ったものは作り直さない。**
+ *
+ * Tauri 版はプロジェクトを開くたびに解析し直していて、
+ * 何が起きているのか誰にも分からなかった。作った結果は必ず残す。
+ */
+object Fingerprints {
+    private const val TAG = "Fingerprints"
+
+    private fun file(context: Context, albumId: String) =
+        File(context.filesDir, "fingerprints-$albumId.json")
+
+    suspend fun load(context: Context, albumId: String): Map<String, Fingerprint> =
+        withContext(Dispatchers.IO) {
+            val target = file(context, albumId)
+            if (!target.exists()) return@withContext emptyMap()
+            try {
+                val root = org.json.JSONObject(target.readText())
+                val out = HashMap<String, Fingerprint>(root.length())
+                for (path in root.keys()) {
+                    val entry = root.getJSONObject(path)
+                    out[path] = Fingerprint(
+                        version = entry.getInt("v"),
+                        size = entry.getLong("size"),
+                        hash = entry.getString("h")
+                    )
+                }
+                out
+            } catch (error: Exception) {
+                // 読めないものは無かったことにして作り直す。**部分的に読まない。**
+                Log.w(TAG, "指紋を読めなかった: $albumId", error)
+                emptyMap()
+            }
+        }
+
+    suspend fun save(context: Context, albumId: String, prints: Map<String, Fingerprint>) =
+        withContext(Dispatchers.IO) {
+            try {
+                val root = org.json.JSONObject()
+                for ((path, print) in prints) {
+                    root.put(
+                        path,
+                        org.json.JSONObject()
+                            .put("v", print.version)
+                            .put("size", print.size)
+                            .put("h", print.hash)
+                    )
+                }
+                val target = file(context, albumId)
+                val temporary = File(target.parentFile, "${target.name}.writing")
+                temporary.writeText(root.toString())
+                if (!temporary.renameTo(target)) {
+                    temporary.copyTo(target, overwrite = true)
+                    temporary.delete()
+                }
+                Unit
+            } catch (error: Exception) {
+                Log.w(TAG, "指紋を保存できなかった: $albumId", error)
+            }
+        }
+}

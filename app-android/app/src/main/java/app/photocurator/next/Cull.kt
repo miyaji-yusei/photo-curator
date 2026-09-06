@@ -29,6 +29,7 @@ import uniffi.photo_curator_core.BurstThreshold
 import uniffi.photo_curator_core.PhotoRef
 import uniffi.photo_curator_core.Session
 import uniffi.photo_curator_core.advance
+import uniffi.photo_curator_core.nextRound
 import uniffi.photo_curator_core.startRound
 import uniffi.photo_curator_core.undo
 
@@ -56,33 +57,70 @@ fun CullScreen(album: Album, onBack: () -> Unit) {
     val scope = rememberCoroutineScope()
 
     var photos by remember { mutableStateOf<List<Photo>>(emptyList()) }
+    // core に渡す形。**次のラウンドでも同じものを使う**ので持っておく。
+    var refs by remember { mutableStateOf<List<PhotoRef>>(emptyList()) }
     var session by remember { mutableStateOf<Session?>(null) }
     var selected by remember { mutableStateOf<Set<String>>(emptySet()) }
     var multi by remember { mutableStateOf(false) }
     var note by remember { mutableStateOf("読み込み中…") }
     var stageSize by remember { mutableStateOf(0 to 0) }
+    // 連写のまとめに使う指紋。**出来た分だけで始められる。**
+    var prepared by remember { mutableStateOf(0 to 0) }
 
     // 相対パスから写真を引く。core は相対パスしか知らない。
     val byPath = remember(photos) { photos.associateBy { it.relativePath } }
 
+    /**
+     * まとめる基準。**端末で測って決めた値。**
+     *
+     * Camera（694 枚）の 4 秒以内に並ぶ 173 組を測ると、距離は二山になった:
+     * 0-9 に 28 組（連写）、15 以上に 130 組（たまたま近い時刻に入った別の絵）。
+     * 10-14 はどちらとも言えない 15 組。指紋そのものの揺れは 1。
+     *
+     * 9 を採るのは、**間違えて繋ぐ方が高くつく**から。繋いでしまうと片方は
+     * 二度と画面に出ず、選んだ覚えのない星が付く。切りすぎたときは
+     * 両方見えるだけで、気付けるし直せる。
+     */
+    val threshold = remember {
+        BurstThreshold(windowMs = 4000, distance = 9u, dHashVersion = Analyse.VERSION)
+    }
+
     LaunchedEffect(album.id) {
+        note = "写真を読み込んでいます…"
         photos = Photos.photos(context, album.id)
+
+        // 指紋を作る。OS の縮小画像から作るので**原本を読まない**（1 枚 3.5ms）。
+        // **前に作った分は作り直さない。** 開くたびに解析し直すと、
+        // 何が起きているのか誰にも分からなくなる。
+        note = "似た写真を調べています…"
+        val cached = Fingerprints.load(context, album.id)
+        val prints = Analyse.fingerprints(context, photos, cached) { done, total ->
+            prepared = done to total
+        }
+        // 変わっていなければ書かない。書く回数はそのまま壊れる機会になる。
+        if (prints != cached) Fingerprints.save(context, album.id, prints)
+
+        refs = photos.map {
+            PhotoRef(
+                relativePath = it.relativePath,
+                capturedAt = it.takenAt,
+                // **作れなかったものは null のまま。** 0 を入れると
+                // 読めない写真どうしが同一に見えて誤ってまとまる。
+                dHash = prints[it.relativePath]?.hash,
+                dHashVersion = Analyse.VERSION
+            )
+        }
+        photos.firstOrNull()?.let { Analyse.selfCheck(context, it) }
+        Neighbours.log(refs, threshold)
+
         // **途中があれば続きから。** 無ければ新しく始める。
         val saved = Store.load(context, album.id)
         session = saved ?: startRound(
-            photos.map {
-                PhotoRef(
-                    relativePath = it.relativePath,
-                    capturedAt = it.takenAt,
-                    // dHash はまだ作っていない。いまは時間だけで切れる。
-                    dHash = null,
-                    dHashVersion = 2
-                )
-            },
+            refs,
             groupSize = 4u,
             targetStar = 0,
             groupBursts = true,
-            threshold = BurstThreshold(windowMs = 4000, distance = 6u, dHashVersion = 2),
+            threshold = threshold,
             overrides = emptyList()
         )
         note = if (saved != null) "続きから" else ""
@@ -90,8 +128,19 @@ fun CullScreen(album: Album, onBack: () -> Unit) {
 
     val live = session
     if (live == null) {
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Text(note, color = Faint)
+        Column(
+            Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(note, color = Faint, fontSize = 13.sp)
+            // **数が分かるものは done / total で出す。** 終わらないバーは出さない。
+            if (prepared.second > 0) {
+                Text(
+                    "${prepared.first} / ${prepared.second}",
+                    color = Lime, fontSize = 18.sp, fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(top = 8.dp)
+                )
+            }
         }
         return
     }
@@ -135,7 +184,21 @@ fun CullScreen(album: Album, onBack: () -> Unit) {
         )
 
         if (live.finished) {
-            RoundDone(live, onBack)
+            // **進めるかどうかを、聞かれる前に確かめておく。**
+            // 「次へ」を出しておいて何も起きない画面が、一番信用を失う。
+            val upcoming = remember(live, refs) {
+                nextRound(live, refs, true, threshold, emptyList())
+            }
+            RoundDone(
+                session = live,
+                upcoming = upcoming,
+                onNext = { next ->
+                    session = next
+                    selected = emptySet()
+                    scope.launch { Store.save(context, album.id, next) }
+                },
+                onBack = onBack
+            )
             return@Column
         }
 
@@ -214,8 +277,14 @@ private fun CullBar(
                 "★${session.targetStar} を選別中 · ROUND ${session.round}",
                 fontSize = 11.sp, color = Lime
             )
+            // **畳んだことを隠さない。** 人は枚数で考えているので、
+            // 代表の数だけを「残り」と言うと数が合わなくて不安になる。
+            val remainingGroups = session.queue.size + session.current.size
+            val remainingPhotos = (session.queue + session.current)
+                .sumOf { session.members[it]?.size ?: 1 }
             Text(
-                "残り ${session.queue.size + session.current.size} 枚",
+                if (remainingPhotos == remainingGroups) "残り $remainingGroups 枚"
+                else "残り $remainingGroups 組 · $remainingPhotos 枚",
                 fontSize = 13.sp
             )
         }
@@ -278,27 +347,67 @@ private fun Tile(number: Int, photo: Photo?, picked: Boolean, onTap: () -> Unit)
     }
 }
 
-/** ラウンドの終わり。**1 行目で何枚残ったかを答える。** */
+/**
+ * ラウンドの終わり。**1 行目で何枚残ったかを答える。**
+ *
+ * `upcoming` が null なら、これ以上は進めない。**なぜ進めないかを言う。**
+ * 押せないボタンだけ置いても、理由が分からない。
+ */
 @Composable
-private fun RoundDone(session: Session, onBack: () -> Unit) {
+private fun RoundDone(
+    session: Session,
+    upcoming: Session?,
+    onNext: (Session) -> Unit,
+    onBack: () -> Unit
+) {
     val kept = session.survivors.size
-    val seen = session.history.sumOf { it.group.size }
+    // 見たのは代表の数。**枚数で言うために仲間を足す。**
+    val seen = session.history.sumOf { decision ->
+        decision.group.sumOf { session.members[it]?.size ?: 1 }
+    }
+    val keptPhotos = session.survivors.sumOf { session.members[it]?.size ?: 1 }
     Column(
         Modifier.fillMaxSize().padding(24.dp),
         verticalArrangement = Arrangement.Center
     ) {
         Text("ROUND ${session.round} 完了", fontSize = 12.sp, color = Lime)
         Text(
-            "★${session.targetStar + 1} が $kept 枚残りました",
+            "★${session.targetStar + 1} が $keptPhotos 枚",
             fontSize = 22.sp, fontWeight = FontWeight.Bold
         )
         Text(
-            "$seen 枚から $kept 枚に絞られました。",
+            if (keptPhotos == kept) "$seen 枚から $kept 枚に絞られました。"
+            else "$seen 枚から $kept 組（$keptPhotos 枚）に絞られました。",
             fontSize = 13.sp, color = Faint, modifier = Modifier.padding(top = 6.dp)
         )
+
         Spacer(Modifier.height(24.dp))
-        Button(onClick = onBack, shape = androidx.compose.foundation.shape.RoundedCornerShape(50)) {
-            Text("アルバムへ戻る", fontWeight = FontWeight.Bold)
+
+        if (upcoming != null) {
+            Button(
+                onClick = { onNext(upcoming) },
+                shape = androidx.compose.foundation.shape.RoundedCornerShape(50)
+            ) {
+                Text(
+                    "★${upcoming.targetStar + 1} を選ぶ（${upcoming.queue.size + upcoming.current.size} 組）",
+                    fontWeight = FontWeight.Bold
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            TextButton(onClick = onBack) { Text("ここで終える") }
+        } else {
+            Text(
+                if (session.targetStar + 1 >= 4) "★5 まで来ました。これ以上は上げられません。"
+                else "残りが $kept 枚では、次のラウンドで比べる相手がいません。",
+                fontSize = 13.sp, color = Faint
+            )
+            Spacer(Modifier.height(16.dp))
+            Button(
+                onClick = onBack,
+                shape = androidx.compose.foundation.shape.RoundedCornerShape(50)
+            ) {
+                Text("アルバムへ戻る", fontWeight = FontWeight.Bold)
+            }
         }
     }
 }

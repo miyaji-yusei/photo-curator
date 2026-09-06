@@ -6,6 +6,7 @@ import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -38,7 +39,13 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         // 画面の端まで描き、余白はここではなく Compose の insets で取る。
-        enableEdgeToEdge()
+        // **明暗は端末の設定に合わせない。** 既定の enableEdgeToEdge() は
+        // 端末が明るいテーマだとナビゲーションバーに白い膜を敷く。この画面は
+        // 常に暗いので、下端だけ白く残って「見切れている」ように見えていた。
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+        )
         super.onCreate(savedInstanceState)
         requestPhotoPermissions()
         setContent { App() }
