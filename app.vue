@@ -146,14 +146,66 @@ const deleteTarget = ref<Project | null>(null)
 const deleteBusy = ref(false)
 
 /** 枚数に対する列数。1画面に収まりやすい並びを枚数ごとに決めてある。 */
-function columnsFor(count: number) {
-  const byCount: Record<number, number> = { 1: 1, 2: 2, 3: 3, 4: 2, 5: 3, 6: 3, 7: 4, 8: 4, 9: 3, 10: 5 }
-  return byCount[count] ?? Math.min(5, Math.max(1, Math.ceil(Math.sqrt(count))))
+/**
+ * 枚数から枠の行×列を決める。**表示領域の縦横比で入れ替える。**
+ *
+ * 表は横長の画面のときの [行, 列]。縦長ならそのまま入れ替える。
+ * Fold を開いて縦に持てば縦長の規則になる。
+ */
+const GRID: Record<number, [number, number]> = {
+  1: [1, 1], 2: [1, 2], 3: [1, 3], 4: [2, 2], 5: [2, 3],
+  6: [2, 3], 7: [2, 4], 8: [2, 4], 9: [3, 3], 10: [2, 5]
 }
-const tournamentColumns = computed(() => columnsFor(tournamentPhotos.value.length))
-const tournamentRows = computed(() =>
-  Math.max(1, Math.ceil(tournamentPhotos.value.length / tournamentColumns.value))
-)
+/** 横長の画面での列数だけが要る画面（連写の中身・まとめの帯）のための入口。 */
+function columnsFor(count: number) {
+  return gridFor(count, true).cols
+}
+
+function gridFor(count: number, landscape: boolean) {
+  const [rows, cols] = GRID[count] ?? [Math.ceil(count / 5), Math.min(5, Math.max(1, count))]
+  return landscape ? { rows, cols } : { rows: cols, cols: rows }
+}
+
+/**
+ * 写真を並べる場所の実寸。**縦横比で枠の並べ方が変わる**ので測る。
+ * 画面の縦横比で代用すると、バーのぶんだけずれて 4 枚が 2×2 にならない。
+ */
+const stageRef = ref<HTMLElement | null>(null)
+const stageSize = ref({ width: 0, height: 0 })
+const stageLandscape = computed(() => stageSize.value.width >= stageSize.value.height)
+const cullGrid = computed(() => gridFor(tournamentPhotos.value.length || 1, stageLandscape.value))
+let stageObserver: ResizeObserver | undefined
+watch(stageRef, element => {
+  stageObserver?.disconnect()
+  if (!element) return
+  stageObserver = new ResizeObserver(([entry]) => {
+    const box = entry?.contentRect
+    if (box) stageSize.value = { width: box.width, height: box.height }
+  })
+  stageObserver.observe(element)
+})
+
+/**
+ * 主ボタンの文言。**結果を枚数で言う。**
+ * 「選択なしで次へ」では、押した結果どうなるのかが読み取れない。
+ */
+const cullPrimaryLabel = computed(() => {
+  const picked = session.value?.selectedInGroup.length ?? 0
+  const shown = tournamentPhotos.value.length
+  if (!picked) {
+    return isNarrow.value ? '落として次へ' : `${shown} 枚とも落として次へ`
+  }
+  return isNarrow.value ? `${picked} 枚を残す` : `${picked} 枚を残して次へ`
+})
+
+/** 選別中の「…」。表示枚数・連写まとめ・表示用画像をまとめる。 */
+const optionsSheet = ref(false)
+/** 枚数の選択肢。環境の能力で上限が変わる（PC は 10、それ以外は 4）。 */
+const groupChoices = computed(() => {
+  const list: number[] = []
+  for (let n = groupLimits.min; n <= groupLimits.max; n += 1) list.push(n)
+  return list
+})
 /** 写真を見比べている画面かどうか。余白の詰め方を変える。 */
 const isSelecting = computed(() =>
   view.value === 'tournament' || view.value === 'burst-threshold' || view.value === 'burst-review'
@@ -821,9 +873,14 @@ async function toggleChoice(photoId: string) {
 }
 
 /**
- * このグループの判断を確定して次へ進む。
+ * このグループの判断を確定して次へ進む。**主ボタンはこれ 1 つ。**
+ *
  * `selectedInGroup` が空でも進める。良い写真が1枚も無いグループはあるので、
  * その場合は「1枚も通さない」という判断として記録する。
+ *
+ * 以前は「どれも選ばない」という別のボタンが並んでいたが、選択を空にして
+ * これを呼ぶだけで、単数選択では保留状態が存在しないため**常に同じ動作**
+ * だった。複数選択中に選択を捨てたいときは、バーの「解除」を使う。
  */
 async function confirmChoices() {
   if (!session.value) return
@@ -875,12 +932,6 @@ async function persistGroupResults(group: string[]) {
 }
 
 /** このグループからは1枚も通さない。 */
-async function skipGroup() {
-  if (!session.value) return
-  session.value.selectedInGroup = []
-  await confirmChoices()
-}
-
 /**
  * 迷う必要のない1枚を「確定」にする。最高レーティングを付けて通し、
  * 以降のラウンドでは判定に出さない。
@@ -1828,7 +1879,7 @@ onBeforeUnmount(() => {
   <!-- ステータスバーのぶんを空ける。**Android ではここを空けないと、
        アプリの中身がシステムの時刻・電池表示の下に潜り込む。**
        潜り込んだ部分はタップもシステム側に吸われて届かない（実機で確認）。 -->
-  <v-app class="app-root">
+  <v-app class="app-root" :class="{ 'is-culling': view === 'tournament' }">
     <!-- **狭い画面には共通のアプリバーを置かない。**
          ここに 110px を常時使っていたが、載っていたのはアプリ名と
          メニューボタンだけで、どの画面でも中身を押し下げていた。
@@ -1885,10 +1936,117 @@ onBeforeUnmount(() => {
     </v-navigation-drawer>
 
     <v-main class="app-shell">
+      <!-- 選別画面。**このアプリの本体で、利用者は何百回もここを操作する。**
+           コンテナの余白も横幅の上限も通さず、全面を写真に使う。
+           帯は上の 1 本だけ。下の帯は廃止した（主ボタンをバーへ移した）。 -->
+      <section v-if="view === 'tournament' && session" class="cull">
+        <header class="cull__bar" :class="{ 'is-wide': isWide }">
+          <div class="cull__side">
+            <v-btn icon="mdi-arrow-left" variant="text" aria-label="中断してプロジェクトへ戻る" @click="view = 'project'" />
+            <v-btn
+              class="cull__chip" variant="outlined" rounded="pill" size="small"
+              prepend-icon="mdi-undo" :disabled="!session.history.length" @click="undoChoice"
+            >
+              <span v-if="!isNarrow">1 つ戻す</span>
+              <kbd v-if="desktop.capabilities.keyboard" class="cull__kbd">⌫</kbd>
+            </v-btn>
+            <v-btn
+              class="cull__chip" variant="outlined" rounded="pill" size="small"
+              :color="session.multiSelect ? 'primary' : undefined"
+              prepend-icon="mdi-checkbox-multiple-outline"
+              @click="session.multiSelect = !session.multiSelect; session.selectedInGroup = []; saveSession()"
+            >
+              <span v-if="!isNarrow">{{ session.multiSelect ? '複数選択中' : '複数' }}</span>
+              <kbd v-if="desktop.capabilities.keyboard" class="cull__kbd">M</kbd>
+            </v-btn>
+            <v-btn
+              v-if="session.multiSelect && session.selectedInGroup.length"
+              variant="text" size="small"
+              @click="session.selectedInGroup = []; saveSession()"
+            >解除</v-btn>
+          </div>
+
+          <div class="cull__status">
+            <div class="cull__round">★{{ session.targetRating }} を選別中 &middot; ROUND {{ session.round }}</div>
+            <div class="cull__remain">残り <strong>{{ remainingPhotos.toLocaleString() }}</strong> 枚 / {{ remainingGroups.toLocaleString() }} グループ</div>
+          </div>
+
+          <div class="cull__side cull__side--end">
+            <v-btn
+              v-if="isWide" class="cull__chip" variant="outlined" rounded="pill" size="small"
+              @click="openGroupSizeDialog"
+            >{{ tournamentPhotos.length }} 枚</v-btn>
+            <v-btn icon="mdi-dots-horizontal" variant="text" aria-label="選別中の設定" @click="optionsSheet = true" />
+            <v-btn color="primary" rounded="pill" size="large" class="cull__primary" @click="confirmChoices">
+              {{ cullPrimaryLabel }}
+              <kbd v-if="desktop.capabilities.keyboard" class="cull__kbd ms-2">Enter</kbd>
+            </v-btn>
+          </div>
+        </header>
+
+        <!-- 進捗は 2px の線 1 本。数字はバー中央の 1 か所だけ。 -->
+        <div class="cull__progress" aria-hidden="true">
+          <i :style="{ width: session.groups.length ? (session.groupIndex / session.groups.length) * 100 + '%' : '100%' }" />
+        </div>
+
+        <div
+          ref="stageRef" class="cull__stage"
+          :style="{ '--cull-rows': cullGrid.rows, '--cull-cols': cullGrid.cols }"
+        >
+          <div
+            v-for="(photo, index) in tournamentPhotos"
+            :key="photo.id"
+            class="cull__cell"
+            :class="{
+              'is-selected': session.selectedInGroup.includes(photo.id),
+              'is-confirmed': isConfirmed(photo.id),
+              'is-burst': burstSizeOf(photo.id) > 1
+            }"
+            @click="toggleChoice(photo.id)"
+          >
+            <img :src="desktop.photoDisplayUrl(photo)" :alt="photo.name">
+
+            <span class="cull__num">
+              {{ index + 1 === 10 ? 0 : index + 1 }}
+              <v-icon v-if="session.selectedInGroup.includes(photo.id)" icon="mdi-check-bold" size="13" />
+            </span>
+
+            <!-- 連写は左上の記号そのものがまとめ編集の入口。 -->
+            <button
+              v-if="burstSizeOf(photo.id) > 1"
+              type="button" class="cull__stack"
+              :aria-label="`まとめられた ${burstSizeOf(photo.id)} 枚を開く`"
+              @click.stop="openBurst(photo)"
+            >⧉{{ burstSizeOf(photo.id) }}</button>
+
+            <!-- 写真の右上に縦並び。**写真の上に載るので半透明にして小さく保つ。** -->
+            <div class="cull__tools">
+              <v-btn
+                v-if="!isConfirmed(photo.id) || session.multiSelect"
+                :icon="isConfirmed(photo.id) ? 'mdi-star' : 'mdi-star-outline'"
+                size="small" variant="flat"
+                :color="isConfirmed(photo.id) ? 'secondary' : undefined"
+                :aria-label="`${photo.name} を★${MAX_RATING} で確定`"
+                @click.stop="confirmPhoto(photo.id)"
+              />
+              <v-btn
+                icon="mdi-magnify-plus-outline" size="small" variant="flat"
+                :aria-label="`${photo.name} を拡大`"
+                @click.stop="openZoom(photo, tournamentPhotos)"
+              />
+            </div>
+
+            <span v-if="isConfirmed(photo.id)" class="cull__confirmed">★{{ MAX_RATING }}</span>
+          </div>
+        </div>
+      </section>
+
+
       <!-- 選別中は写真の面積を優先し、余白と横幅の上限をゆるめる。 -->
       <v-container
+        v-else
         fluid
-        :class="isSelecting ? 'pa-3 pa-md-5' : 'pa-7 pa-md-10'"
+        :class="isSelecting ? 'pa-3 pa-md-5' : 'pa-5 pa-md-8'"
         :style="{ maxWidth: isSelecting ? '100%' : '1680px' }"
       >
         <v-alert v-if="error" type="error" closable class="mb-5" @click:close="error = ''">{{ error }}</v-alert>
@@ -2091,96 +2249,6 @@ onBeforeUnmount(() => {
               <v-btn color="primary" size="large" prepend-icon="mdi-play" :loading="previewBusy" @click="acceptBurstThreshold">この設定で選別を始める</v-btn>
             </div>
           </v-card>
-        </template>
-
-        <template v-else-if="view === 'tournament' && session">
-          <div class="d-flex align-center justify-space-between flex-wrap ga-3 mb-3">
-            <div>
-              <div class="text-overline text-primary">★{{ session.targetRating }} を選別中 &middot; Round {{ session.round }}</div>
-              <h1 class="text-h6 text-md-h5">残り {{ remainingPhotos.toLocaleString() }} 枚 / {{ remainingGroups.toLocaleString() }} グループ</h1>
-            </div>
-            <div class="d-flex flex-wrap ga-2">
-              <v-btn variant="text" prepend-icon="mdi-undo" :disabled="!session.history.length" @click="undoChoice">1つ戻す<span class="ms-1 text-caption">⌫</span></v-btn>
-              <v-btn variant="text" prepend-icon="mdi-view-grid-outline" @click="openGroupSizeDialog">表示枚数</v-btn>
-              <v-btn variant="text" prepend-icon="mdi-pause-circle-outline" @click="view = 'project'">中断して戻る</v-btn>
-            </div>
-          </div>
-          <v-progress-linear :model-value="session.groups.length ? (session.groupIndex / session.groups.length) * 100 : 100" color="primary" height="6" rounded class="mb-2" />
-          <div class="d-flex justify-space-between text-caption text-medium-emphasis mb-4"><span>選択済み {{ selectedCount }} 枚</span><span>このグループ {{ tournamentPhotos.length }} 枚</span></div>
-
-          <div
-            class="tournament-grid"
-            :style="{ '--tournament-columns': tournamentColumns, '--tournament-rows': tournamentRows }"
-          >
-            <v-card
-              v-for="(photo, index) in tournamentPhotos"
-              :key="photo.id"
-              class="tournament-card"
-              :class="{
-                'is-selected': session.selectedInGroup.includes(photo.id),
-                'is-confirmed': isConfirmed(photo.id),
-                'is-burst': burstSizeOf(photo.id) > 1
-              }"
-              @click="toggleChoice(photo.id)"
-            >
-              <span class="tournament-card__number">{{ index + 1 === 10 ? 0 : index + 1 }}</span>
-
-              <!-- 選択のクリックと切り分けるため、拡大と確定は右上に置く。 -->
-              <div class="tournament-card__tools">
-                <!-- 迷う必要のない1枚を、その場で★5にして以降の判定から外す。
-                     複数枚選択中はトグルなので、確定済みでも押せるように出し続ける
-                     （もう一度押すと確定を外せる）。単数選択では確定した時点で次へ
-                     進むため、確定済みの表示は残らない。 -->
-                <v-btn
-                  v-if="!isConfirmed(photo.id) || session.multiSelect"
-                  :icon="isConfirmed(photo.id) ? 'mdi-star' : 'mdi-star-outline'"
-                  size="x-small" variant="flat"
-                  :color="isConfirmed(photo.id) ? 'secondary' : undefined"
-                  :aria-label="isConfirmed(photo.id) ? `${photo.name} の★${MAX_RATING}確定を外す` : `${photo.name} を★${MAX_RATING} で確定`"
-                  @click.stop="confirmPhoto(photo.id)"
-                />
-                <v-btn
-                  icon="mdi-magnify-plus-outline" size="x-small" variant="flat"
-                  :aria-label="`${photo.name} を拡大`"
-                  @click.stop="openZoom(photo, tournamentPhotos)"
-                />
-              </div>
-
-              <!-- 連写の表示は左下の1か所だけ。ここ自体がまとめを開くボタン。
-                   以前は右上にも同じ操作があり、左下は押しても開かず選択されていた。 -->
-              <button
-                v-if="burstSizeOf(photo.id) > 1"
-                type="button" class="tournament-card__stackmark"
-                :aria-label="`まとめられた ${burstSizeOf(photo.id)} 枚を開く`"
-                @click.stop="openBurst(photo)"
-              >
-                <v-icon icon="mdi-layers-triple-outline" size="16" />
-                連写 {{ burstSizeOf(photo.id) }} 枚
-                <v-icon icon="mdi-chevron-right" size="16" />
-              </button>
-
-              <span v-if="session.selectedInGroup.includes(photo.id)" class="tournament-card__check">
-                <v-icon icon="mdi-check-bold" size="20" />
-              </span>
-              <span v-if="isConfirmed(photo.id)" class="tournament-card__confirmed">確定</span>
-
-              <img :src="desktop.photoDisplayUrl(photo)" :alt="photo.name">
-            </v-card>
-          </div>
-
-          <v-sheet class="d-flex align-center justify-space-between flex-wrap ga-3 mt-4 pa-3" color="surface-variant" rounded>
-            <v-checkbox v-model="session.multiSelect" density="compact" hide-details label="複数枚選択（M）" @update:model-value="session.selectedInGroup = []; saveSession()" />
-            <!-- キーボードが無い環境では案内しない。操作はカード上のボタンで完結する。 -->
-            <div v-if="!isTouchOnly" class="text-caption text-medium-emphasis">
-              1〜0 選ぶ ・ Ctrl+数字 拡大 ・ Shift+数字 ★{{ MAX_RATING }}で確定 ・ Alt+数字 まとめを開く ・ Enter 決定 ・ ⌫ 戻す
-            </div>
-            <div class="d-flex flex-wrap ga-2">
-              <v-btn variant="outlined" @click="skipGroup">どれも選ばない</v-btn>
-              <v-btn color="primary" @click="confirmChoices">
-                {{ session.selectedInGroup.length ? `${session.selectedInGroup.length} 枚を選択` : '選択なしで次へ' }}（Enter）
-              </v-btn>
-            </div>
-          </v-sheet>
         </template>
 
         <template v-else-if="view === 'results'">
@@ -2475,6 +2543,53 @@ onBeforeUnmount(() => {
     <v-dialog v-model="taskDialog" persistent max-width="520"><v-card><v-card-title>写真を読み込み中</v-card-title><v-card-text class="pt-5"><div class="d-flex justify-space-between text-body-2 mb-3"><span>{{ taskProgress?.message }}</span><span v-if="taskProgress?.total">{{ taskProgress.processed.toLocaleString() }} / {{ taskProgress.total.toLocaleString() }}</span></div><v-progress-linear :model-value="progressValue" :indeterminate="!taskProgress?.total" color="primary" height="10" rounded /><p class="text-caption text-medium-emphasis mt-5 mb-0">読み込みのあと、連写の解析はバックグラウンドで少しずつ進みます。キャンセルしても、完了済みの読み込み結果は保持されます。</p></v-card-text><v-card-actions class="pa-5 pt-2"><v-spacer /><v-btn variant="outlined" @click="cancelTask">キャンセル</v-btn></v-card-actions></v-card></v-dialog>
 
     <!-- 選別の途中で1グループの表示枚数を変える。済んだぶんはそのまま残る。 -->
+    <!-- 選別中の「…」。**選別を止めずに変えられるものだけ**をここに置く。
+         下から出すのは、親指で届く位置にあるため。 -->
+    <v-bottom-sheet v-model="optionsSheet" :inset="isWide" max-width="560">
+      <v-card v-if="session" title="選別中の設定">
+        <v-card-text class="pt-4">
+          <div class="text-body-2 mb-2">一度に見比べる枚数</div>
+          <v-btn-toggle
+            :model-value="tournamentPhotos.length" density="comfortable" variant="outlined" divided mandatory
+            @update:model-value="applyGroupSize($event as number)"
+          >
+            <v-btn v-for="n in groupChoices" :key="n" :value="n">{{ n }}</v-btn>
+          </v-btn-toggle>
+          <p class="text-caption text-medium-emphasis mt-2 mb-5">
+            いまのグループにすぐ効きます。ここまでの選択と「1 つ戻す」の履歴はそのまま残ります。
+          </p>
+
+          <v-switch
+            v-model="session.settings.groupBursts" color="primary" density="comfortable" hide-details
+            label="似た連写をまとめて 1 枚として見る"
+          />
+          <p class="text-caption text-medium-emphasis mt-1 mb-5">
+            以降のグループから変わります。判定が済んだものはそのままです。
+          </p>
+
+          <template v-if="displaySettings && displaySettings.choices.length > 1">
+            <div class="text-body-2 mb-2">選別に出す画像の大きさ</div>
+            <v-btn-toggle
+              :model-value="displayEdge" density="comfortable" variant="outlined" divided mandatory
+              @update:model-value="applyDisplayEdge($event as number)"
+            >
+              <v-btn v-for="choice in displaySettings.choices" :key="choice" :value="choice" :disabled="displayBusy">
+                {{ choice }}
+              </v-btn>
+            </v-btn-toggle>
+            <p class="text-caption text-medium-emphasis mt-2 mb-0">
+              小さくするのは一瞬です。<strong>大きくするときは写真を読み直す</strong>ので、
+              できたものから順に差し替わります。
+            </p>
+          </template>
+        </v-card-text>
+        <v-card-actions class="pa-4 pt-0">
+          <v-spacer />
+          <v-btn variant="outlined" @click="optionsSheet = false">閉じる</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-bottom-sheet>
+
     <v-dialog v-model="groupSizeDialog" max-width="520">
       <v-card title="1グループの表示枚数">
         <v-card-text class="pt-5">

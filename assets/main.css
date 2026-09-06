@@ -244,3 +244,96 @@ body { margin: 0; }
   padding-left: env(safe-area-inset-left, 0px);
   padding-right: env(safe-area-inset-right, 0px);
 }
+
+/* ---------------------------------------------------------------------------
+   選別画面。**このアプリの本体。**
+
+   帯は上の 1 本だけで、残りはすべて写真に使う。以前は上 340px ＋ 下 180px
+   （物理）で画面の 28% を帯が占め、写真 1 枚は面積比で 7% しかなかった。
+   --------------------------------------------------------------------------- */
+.cull { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+
+.cull__bar {
+  display: flex; align-items: center; gap: 8px;
+  height: 56px; padding: 0 8px; flex: none;
+  background: rgb(var(--v-theme-surface));
+}
+.cull__bar.is-wide { height: 64px; padding: 0 12px; }
+.cull__side { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.cull__side--end { margin-left: auto; }
+/* 中央の状態。**数字はここ 1 か所だけ。** 幅が足りなければ落とす。 */
+.cull__status { text-align: center; min-width: 0; overflow: hidden; }
+.cull__round { font-size: 12px; color: rgb(var(--v-theme-primary)); letter-spacing: .04em; white-space: nowrap; }
+.cull__remain { font-size: 14px; white-space: nowrap; }
+@media (max-width: 720px) { .cull__status { display: none; } }
+.cull__chip { border-color: #3a3e47 !important; }
+.cull__primary { font-weight: 700; }
+/* キー案内は capabilities.keyboard のときだけ描く。小さく、控えめに。 */
+.cull__kbd {
+  font-size: 11px; line-height: 1; padding: 2px 4px; border: 1px solid #3a3e47;
+  border-radius: 4px; opacity: .75; font-family: inherit;
+}
+
+.cull__progress { height: 2px; flex: none; background: #24272d; }
+.cull__progress i { display: block; height: 100%; background: rgb(var(--v-theme-primary)); transition: width .2s; }
+
+/* 枠は等間隔のマス目。**行×列は枚数と表示領域の縦横比で決まる。** */
+.cull__stage {
+  flex: 1; min-height: 0; display: grid; gap: 6px; padding: 6px;
+  grid-template-columns: repeat(var(--cull-cols, 2), 1fr);
+  grid-template-rows: repeat(var(--cull-rows, 2), 1fr);
+}
+
+.cull__cell {
+  position: relative; overflow: hidden; border-radius: 8px;
+  background: #16181d; cursor: pointer; min-width: 0; min-height: 0;
+  border: 3px solid transparent;
+}
+/* **写真は枠の幅か高さに接する大きさで、切らずに全部見せる。**
+   以前は正方形のタイルに横位置の写真を入れていたため、上下に黒帯ができて
+   実際の表示面積が枠よりずっと小さかった。 */
+.cull__cell img {
+  width: 100%; height: 100%; object-fit: contain; display: block;
+}
+.cull__cell.is-selected { outline: 3px solid rgb(var(--v-theme-primary)); outline-offset: -3px; }
+/* 連写は白い枠と重ね影で「複数枚ある」ことを示す。 */
+.cull__cell.is-burst { border-color: #fff; box-shadow: 3px 3px 0 #3a3e47, 6px 6px 0 #2f333b; }
+
+.cull__num {
+  position: absolute; top: 6px; left: 6px; z-index: 2;
+  display: inline-flex; align-items: center; gap: 2px;
+  min-width: 22px; height: 22px; padding: 0 6px; border-radius: 6px;
+  background: rgba(16,17,20,.7); font-size: 12px; font-weight: 600; justify-content: center;
+}
+.cull__cell.is-selected .cull__num {
+  background: rgb(var(--v-theme-primary)); color: #000;
+}
+.cull__stack {
+  position: absolute; top: 6px; left: 34px; z-index: 2;
+  height: 22px; padding: 0 7px; border-radius: 6px;
+  background: rgba(16,17,20,.7); border: 1px solid #fff;
+  font-size: 12px; font-weight: 600; cursor: pointer; color: inherit;
+}
+.cull__tools {
+  position: absolute; top: 6px; right: 6px; z-index: 2;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.cull__tools .v-btn { background: rgba(16,17,20,.55) !important; }
+/* PC はホバーのときだけ出す。写真の上に常時載せない。 */
+@media (hover: hover) and (pointer: fine) {
+  .cull__tools { opacity: 0; transition: opacity .12s; }
+  .cull__cell:hover .cull__tools, .cull__cell:focus-within .cull__tools { opacity: 1; }
+  .cull__cell:hover { outline: 3px solid rgba(214,255,115,.75); outline-offset: 2px; }
+}
+.cull__confirmed {
+  position: absolute; bottom: 6px; left: 6px; z-index: 2;
+  padding: 2px 8px; border-radius: 6px; font-size: 12px; font-weight: 600;
+  background: rgb(var(--v-theme-secondary)); color: #000;
+}
+
+/* 選別中だけ、画面の高さを配ってはみ出させない。
+   **高さの連鎖が切れていると `flex: 1` の枠が中身なりに伸びる。**
+   実測で 704px の画面に 1362px のステージができていた。
+   選別以外の画面は今までどおり縦に伸ばして良いので、ここだけ効かせる。 */
+.app-root.is-culling { height: 100vh; height: 100dvh; box-sizing: border-box; overflow: hidden; }
+.app-root.is-culling .app-shell { height: 100%; min-height: 0; box-sizing: border-box; overflow: hidden; }
