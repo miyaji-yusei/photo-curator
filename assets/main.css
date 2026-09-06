@@ -337,3 +337,55 @@ body { margin: 0; }
    選別以外の画面は今までどおり縦に伸ばして良いので、ここだけ効かせる。 */
 .app-root.is-culling { height: 100vh; height: 100dvh; box-sizing: border-box; overflow: hidden; }
 .app-root.is-culling .app-shell { height: 100%; min-height: 0; box-sizing: border-box; overflow: hidden; }
+
+/* ---------------------------------------------------------------------------
+   各画面のバー。**共通のアプリバーを外したぶん、ここが戻り先と主操作を持つ。**
+   --------------------------------------------------------------------------- */
+.screen-bar {
+  display: flex; align-items: center; gap: 8px;
+  min-height: 56px; margin: -4px 0 16px;
+}
+.screen-bar__title { font-size: 18px; font-weight: 600; letter-spacing: -.01em; margin: 0; }
+.screen-bar__end { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+@media (min-width: 1100px) {
+  .screen-bar { min-height: 64px; }
+  .screen-bar__title { font-size: 22px; }
+}
+
+/* 一覧のカード。幅で列数が変わる。 */
+.card-grid { display: grid; gap: 12px; grid-template-columns: 1fr; }
+@media (min-width: 600px) { .card-grid { grid-template-columns: repeat(2, 1fr); } }
+@media (min-width: 1100px) { .card-grid { grid-template-columns: repeat(3, 1fr); } }
+.card-grid--settings { align-items: start; }
+
+/* プロジェクトカード。**状態と次の一手を、名前と同じ高さで見せる。** */
+.pcard {
+  background: rgb(var(--v-theme-surface)); border-radius: 12px;
+  padding: 14px 16px; cursor: pointer; display: flex; flex-direction: column; gap: 6px;
+  border: 1px solid transparent; transition: border-color .12s, transform .12s;
+}
+.pcard:hover, .pcard:focus-visible {
+  border-color: rgba(214,255,115,.5); outline: none; transform: translateY(-1px);
+}
+.pcard__head { display: flex; align-items: center; gap: 8px; }
+.pcard__name {
+  font-size: 17px; font-weight: 600; flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.pcard__source {
+  display: flex; align-items: center; gap: 5px;
+  font-size: 12px; color: rgba(255,255,255,.6);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.pcard__state { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; font-weight: 600; }
+.pcard__foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 2px; }
+
+/* 接続の状態を示す丸。色だけに頼らず、文字も並べて出す。 */
+.dot { width: 10px; height: 10px; border-radius: 50%; background: #5f6572; flex: none; }
+.dot--on { background: rgb(var(--v-theme-primary)); }
+
+/* 準備カードの 1 行。数字は必ず done / total で右端に揃える。 */
+.prep-row { display: flex; align-items: center; gap: 10px; padding: 5px 0; font-size: 13px; }
+.prep-row__name { flex: 1; min-width: 0; }
+.prep-row__count { color: rgba(255,255,255,.6); font-variant-numeric: tabular-nums; }
+.min-w-0 { min-width: 0; }

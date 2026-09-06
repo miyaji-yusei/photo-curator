@@ -42,7 +42,7 @@ import {
   skipPair
 } from '~/utils/burstThreshold'
 
-type View = 'home' | 'project' | 'method' | 'settings' | 'burst-threshold' | 'burst-preview' | 'tournament' | 'result' | 'results' | 'burst-review'
+type View = 'home' | 'project' | 'method' | 'settings' | 'settings-app' | 'burst-threshold' | 'burst-preview' | 'tournament' | 'result' | 'results' | 'burst-review'
 
 const desktop = useDesktop()
 const projects = ref<Project[]>([])
@@ -200,6 +200,89 @@ const cullPrimaryLabel = computed(() => {
 
 /** 選別中の「…」。表示枚数・連写まとめ・表示用画像をまとめる。 */
 const optionsSheet = ref(false)
+
+/**
+ * 選別を始める前に設定を確認するか。**既定は確認しない。**
+ *
+ * 枚数も連写まとめも選別中に「…」から変えられるので、毎回止める理由がない。
+ * 通路の画面を 1 つ減らすと、2,000 枚を捌く作業では効いてくる。
+ */
+const confirmBeforeStart = ref(false)
+
+/**
+ * 準備の 3 本立て。**プロジェクトごとに取り直す。**
+ *
+ * 以前は前に開いていたプロジェクトの残数がそのまま残り、187 枚の
+ * プロジェクトで「残り 4 枚」と出ていた。
+ */
+const prep = ref<Prep | null>(null)
+const prepDone = computed(() =>
+  !!prep.value && ['scan', 'meta', 'preview'].every(
+    key => prep.value![key as 'scan'].state === 'done'
+  )
+)
+
+/** 準備カードの 3 行。**数字は必ず done / total で出す。** */
+const prepRows = computed(() => {
+  const current = prep.value
+  if (!current) return []
+  const row = (key: 'scan' | 'meta' | 'preview', name: string) => {
+    const stage = current[key]
+    const running = stage.state === 'running'
+    return {
+      key,
+      name,
+      icon: stage.state === 'done' ? 'mdi-check-circle' : running ? 'mdi-sync' : 'mdi-circle-outline',
+      color: stage.state === 'done' ? 'primary' : running ? 'secondary' : undefined,
+      // 走査中は総数が確定しない。**分からないものを数字で装わない。**
+      count: `${stage.done.toLocaleString()} / ${stage.total === null ? '?' : stage.total.toLocaleString()}`
+    }
+  }
+  return [
+    row('scan', '写真の走査'),
+    row('meta', '撮影時刻・サムネイル'),
+    row('preview', `表示用画像（${current.previewEdge}px）`)
+  ]
+})
+
+async function refreshPrep() {
+  if (!activeProject.value) { prep.value = null; return }
+  try {
+    prep.value = await desktop.getProjectPrep(activeProject.value.id)
+  } catch {
+    // 準備の様子が読めなくても選別はできる。カードを出さないだけ。
+    prep.value = null
+  }
+}
+
+/** 詳細画面の「…」。 */
+const projectMenu = ref(false)
+
+/** 主ボタンの文言。**押したときに起きることをそのまま名前にする。** */
+const primaryActionLabel = computed(() => {
+  if (scanRunning.value) return '読み込み中…'
+  if (session.value) return '選別を続ける'
+  return '選別を開始'
+})
+
+/** 設定画面を開く。**全体の設定はプロジェクトに依らない**ので、その場で読む。 */
+function openSettingsScreen() {
+  view.value = 'settings-app'
+  void refreshDisplayState()
+}
+
+/** 全体の既定として表示用画像の大きさを保存する。 */
+async function saveDefaultDisplayEdge(edge: number) {
+  displayBusy.value = true
+  try {
+    await desktop.saveDisplayEdge(edge)
+    displaySettings.value = await desktop.getDisplaySettings()
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : '表示用の既定を変えられませんでした。'
+  } finally {
+    displayBusy.value = false
+  }
+}
 /** 枚数の選択肢。環境の能力で上限が変わる（PC は 10、それ以外は 4）。 */
 const groupChoices = computed(() => {
   const list: number[] = []
@@ -385,6 +468,41 @@ function statusLabel(project: Project) {
   return '未読み込み'
 }
 
+/**
+ * 原本についての約束。**3 か所で同じ文を出す。**
+ * 言い回しが揺れると「本当に触らないのか」が伝わらない。
+ */
+const ORIGINAL_PROMISE = '選別中は原本を読むだけ。取り出すときだけ、確認のうえで変更します'
+
+/** 出所のアイコン。生パスを読ませずに、どこの写真かを一目で分かるようにする。 */
+function sourceIcon(kind: SourceKind) {
+  if (kind === 'nas') return 'mdi-nas'
+  if (kind === 'album') return 'mdi-cellphone'
+  if (kind === 'imported') return 'mdi-import'
+  return 'mdi-folder-outline'
+}
+
+/** カードの状態文。**次に何をすればいいかが分かる言葉にする。** */
+function statusHeadline(project: Project) {
+  if (project.status === 'scanning') return '準備中'
+  if (project.status === 'missing') return '写真が見つかりません'
+  if (!project.photoCount) return '写真がまだありません'
+  return '準備完了'
+}
+
+function statusColor(project: Project) {
+  if (project.status === 'missing') return 'rgb(var(--v-theme-error))'
+  if (project.status === 'scanning') return 'rgb(var(--v-theme-secondary))'
+  return 'rgba(255,255,255,.7)'
+}
+
+/** カード右下の「次の一手」。押したときに起きることをそのまま名前にする。 */
+function nextStepLabel(project: Project) {
+  if (project.status === 'missing') return '確認する'
+  if (!project.photoCount) return '開く'
+  return '開く'
+}
+
 async function refreshProjects() {
   // デスクトップは PC の DB、ブラウザは端末内の DB。どちらも一覧を返す。
   projects.value = await desktop.listProjects()
@@ -407,6 +525,8 @@ async function loadCurrentPhotos(ids = currentGroup.value) {
 async function openProject(project: Project) {
   activeProject.value = project
   view.value = 'project'
+  // **前のプロジェクトの値を残さない。** 読み直すまで出さない。
+  prep.value = null
   loading.value = true
   try {
     await Promise.all([
@@ -436,6 +556,7 @@ async function openProject(project: Project) {
     // 表示用画像は走査とは別に溜める。**走査に混ぜると解析が桁で遅くなる**
     // （EXIF サムネイル経路 1.72ms/枚 に対しフルデコード 132ms/枚）。
     await refreshDisplayState()
+    await refreshPrep()
     if (displayBacklog.value > 0) {
       desktop.startDisplayGeneration(project.id).catch(() => undefined)
     }
@@ -1909,6 +2030,7 @@ onBeforeUnmount(() => {
       <v-divider />
       <v-list nav class="pt-3">
         <v-list-item prepend-icon="mdi-home-outline" title="ホーム" :active="view === 'home'" @click="view = 'home'" />
+        <v-list-item prepend-icon="mdi-cog-outline" title="設定" :active="view === 'settings-app'" @click="openSettingsScreen" />
         <!-- rail では入れ子のリストが開けないので、畳んだときは1項目にまとめる。 -->
         <v-list-item
           v-if="drawerRail"
@@ -2068,46 +2190,203 @@ onBeforeUnmount(() => {
         </v-alert>
 
         <template v-if="view === 'home'">
-          <div class="d-flex align-start justify-space-between flex-wrap ga-4 mb-8">
-            <div><div class="text-overline text-primary">Photo selection workspace</div><h1 class="text-h3 font-weight-bold">写真を、選びやすい形へ。</h1><p class="text-medium-emphasis mt-2">プロジェクトを作成して、直感的な選択を始めましょう。</p></div>
-            <v-btn color="primary" size="large" prepend-icon="mdi-plus" @click="openCreateDialog">プロジェクトを作成</v-btn>
+          <!-- **キャッチコピーは置かない。** 2 回目以降の利用者には情報が無く、
+               画面の上 1/3 を使って一番使うプロジェクト一覧を押し下げていた。 -->
+          <header class="screen-bar">
+            <h1 class="screen-bar__title">Photo Curator</h1>
+            <div class="screen-bar__end">
+              <v-btn icon="mdi-cog-outline" variant="text" aria-label="設定" @click="openSettingsScreen" />
+              <v-btn color="primary" rounded="pill" size="large" prepend-icon="mdi-plus" @click="openCreateDialog">
+                <span v-if="!isNarrow">プロジェクトを作成</span>
+                <span v-else>作成</span>
+              </v-btn>
+            </div>
+          </header>
+
+          <div class="d-flex align-center justify-space-between flex-wrap ga-2 mb-3">
+            <span class="text-caption text-medium-emphasis">
+              プロジェクト {{ projects.length }} 件 &middot; 更新順
+            </span>
+            <span class="text-caption text-medium-emphasis d-flex align-center ga-1">
+              <v-icon icon="mdi-lock-outline" size="14" />{{ ORIGINAL_PROMISE }}
+            </span>
           </div>
-          <v-row>
-            <v-col cols="12"><v-card><v-card-title class="pt-5 px-5">プロジェクト</v-card-title><v-card-subtitle class="px-5">選別の状況をここから確認できます。</v-card-subtitle><v-list v-if="projects.length" lines="two" class="mt-3"><v-list-item v-for="project in projects" :key="project.id" :title="project.name" :subtitle="shortPath(project.folderPath)" @click="openProject(project)"><template #prepend><v-avatar color="surface-variant"><v-icon icon="mdi-folder-image" /></v-avatar></template><template #append><div class="d-flex align-center ga-4"><div class="text-right"><div class="text-body-2">{{ statusLabel(project) }}</div><div class="text-caption text-medium-emphasis">更新 {{ formatDate(project.updatedAt) }}</div></div><v-btn icon="mdi-delete-outline" variant="text" size="small" :aria-label="`${project.name} を削除`" @click.stop="askDeleteProject(project)" /></div></template></v-list-item></v-list><v-card-text v-else class="py-12 text-center text-medium-emphasis">まだプロジェクトがありません。</v-card-text></v-card></v-col>
-          </v-row>
+
+          <div v-if="projects.length" class="card-grid">
+            <article
+              v-for="project in projects" :key="project.id"
+              class="pcard" role="button" tabindex="0"
+              @click="openProject(project)" @keydown.enter="openProject(project)"
+            >
+              <div class="pcard__head">
+                <span class="pcard__name">{{ project.name }}</span>
+                <v-btn
+                  icon="mdi-dots-vertical" variant="text" size="small"
+                  :aria-label="`${project.name} の操作`"
+                  @click.stop="askDeleteProject(project)"
+                />
+              </div>
+              <div class="pcard__source">
+                <v-icon :icon="sourceIcon(project.sourceKind)" size="14" />
+                {{ project.sourceLabel }}
+              </div>
+              <div class="pcard__state">
+                <span :style="{ color: statusColor(project) }">{{ statusHeadline(project) }}</span>
+                <span class="text-medium-emphasis">{{ statusLabel(project) }}</span>
+              </div>
+              <div class="pcard__foot">
+                <span class="text-caption text-medium-emphasis">更新 {{ formatDate(project.updatedAt) }}</span>
+                <v-btn
+                  size="small" rounded="pill"
+                  :variant="project.status === 'ready' ? 'outlined' : 'text'"
+                  @click.stop="openProject(project)"
+                >{{ nextStepLabel(project) }}</v-btn>
+              </div>
+            </article>
+          </div>
+
+          <v-card v-else class="pa-10 text-center">
+            <div class="text-body-1 mb-2">まだプロジェクトがありません</div>
+            <p class="text-body-2 text-medium-emphasis mb-6">
+              写真のフォルダを選ぶと、原本には触らずに選別を始められます。
+            </p>
+            <v-btn color="primary" rounded="pill" size="large" prepend-icon="mdi-plus" @click="openCreateDialog">
+              プロジェクトを作成
+            </v-btn>
+          </v-card>
+        </template>
+
+        <!-- 全体の設定。**ここまで NAS の接続は「プロジェクトを作成」の中に
+             しか無く**、切れた NAS のプロジェクトを開き直すのに新しい
+             プロジェクトを作りに行かせていた。 -->
+        <template v-else-if="view === 'settings-app'">
+          <header class="screen-bar">
+            <v-btn icon="mdi-arrow-left" variant="text" aria-label="ホームへ戻る" @click="view = 'home'" />
+            <h1 class="screen-bar__title">設定</h1>
+          </header>
+
+          <div class="card-grid card-grid--settings">
+            <v-card v-if="usesNas" class="pa-5">
+              <div class="d-flex align-center justify-space-between mb-1">
+                <div class="text-subtitle-1 font-weight-medium">NAS</div>
+                <v-btn size="small" variant="text" prepend-icon="mdi-plus" @click="openNasDialog">
+                  {{ nasConnected ? '切り替える' : '追加' }}
+                </v-btn>
+              </div>
+              <div v-if="nasConnected" class="d-flex align-center ga-3 py-3">
+                <span class="dot dot--on" />
+                <div class="flex-grow-1 min-w-0">
+                  <div class="text-body-2">{{ nasHost }}</div>
+                  <div class="text-caption text-medium-emphasis">
+                    {{ nasShare }}<template v-if="nasUser"> &middot; {{ nasUser }}</template>
+                    <template v-if="nasRemember"> &middot; パスワード保存あり</template>
+                  </div>
+                </div>
+                <v-btn size="small" variant="text" @click="disconnectNas">切断</v-btn>
+              </div>
+              <div v-else class="d-flex align-center ga-3 py-3">
+                <span class="dot" />
+                <span class="text-body-2 text-medium-emphasis">繋がっていません</span>
+              </div>
+              <p class="text-caption text-medium-emphasis mb-0">
+                写真は端末にコピーしません。必要な部分だけ NAS から読みます。
+              </p>
+            </v-card>
+
+            <v-card v-if="displaySettings && displaySettings.choices.length > 1" class="pa-5">
+              <div class="text-subtitle-1 font-weight-medium mb-1">選別に出す画像の大きさ</div>
+              <p class="text-caption text-medium-emphasis mb-4">
+                新しいプロジェクトに使います。既存のものはプロジェクトの「…」から変えられます。
+              </p>
+              <v-btn-toggle
+                :model-value="displaySettings.defaultEdge" density="comfortable" variant="outlined" divided mandatory
+                @update:model-value="saveDefaultDisplayEdge($event as number)"
+              >
+                <v-btn v-for="choice in displaySettings.choices" :key="choice" :value="choice" :disabled="displayBusy">
+                  {{ choice }}
+                </v-btn>
+              </v-btn-toggle>
+              <p class="text-caption text-medium-emphasis mt-3 mb-0">
+                標準は {{ displaySettings.defaultEdge }}px。2 枚を並べて見比べるときは
+                {{ displaySettings.largeEdge }}px 以上あると引き伸ばされません（実機計測）。
+              </p>
+            </v-card>
+
+            <v-card class="pa-5">
+              <div class="text-subtitle-1 font-weight-medium mb-4">選別の既定</div>
+              <div class="text-body-2 mb-2">一度に見比べる枚数</div>
+              <v-btn-toggle
+                v-model="settings.groupSize" density="comfortable" variant="outlined" divided mandatory
+              >
+                <v-btn v-for="n in groupChoices" :key="n" :value="n">{{ n }}</v-btn>
+              </v-btn-toggle>
+              <v-switch
+                v-model="settings.groupBursts" color="primary" density="comfortable" hide-details class="mt-4"
+                label="似た連写をまとめて 1 枚として見る"
+              />
+              <v-switch
+                v-model="confirmBeforeStart" color="primary" density="comfortable" hide-details
+                label="選別を始める前に、毎回この設定を確認する"
+              />
+            </v-card>
+          </div>
+
+          <p class="text-caption text-medium-emphasis mt-6 d-flex align-center ga-1">
+            <v-icon icon="mdi-lock-outline" size="14" />{{ ORIGINAL_PROMISE }}
+          </p>
         </template>
 
         <template v-else-if="view === 'project' && activeProject">
-          <div class="d-flex align-center justify-space-between flex-wrap ga-4 mb-7"><div><v-btn variant="text" prepend-icon="mdi-arrow-left" class="px-0" @click="view = 'home'">ホーム</v-btn><h1 class="text-h4 font-weight-bold">{{ activeProject.name }}</h1><p class="text-body-2 text-medium-emphasis mt-1">{{ activeProject.folderPath }}</p></div><div class="d-flex flex-wrap ga-2"><v-btn variant="text" prepend-icon="mdi-delete-outline" @click="askDeleteProject(activeProject)">削除</v-btn><v-btn v-if="hasSelectionData" variant="text" prepend-icon="mdi-star-outline" @click="openResults">選別結果を見る</v-btn><v-btn v-if="canImportPhotos" variant="outlined" prepend-icon="mdi-image-plus" :loading="scanRunning" @click="openPhotoPicker">写真を追加</v-btn><v-btn v-if="usesNas && activeProjectOnNas" variant="outlined" prepend-icon="mdi-nas" :loading="nasBusy" @click="openNasDialog">{{ nasConnected ? 'NAS を切り替える' : 'NAS に繋ぐ' }}</v-btn><v-btn v-if="!canImportPhotos" variant="outlined" prepend-icon="mdi-refresh" :loading="scanRunning" @click="startScan">写真を再読み込み</v-btn><v-btn color="primary" prepend-icon="mdi-play" :disabled="!activeProject.photoCount" @click="session ? resumeSession() : enterMethod()">{{ session ? '選別を再開' : '選別を開始' }}</v-btn></div></div>
-          <v-card class="mb-6"><v-card-text class="d-flex align-center ga-5"><v-avatar color="primary" size="50"><v-icon color="black" icon="mdi-image-multiple" /></v-avatar><div><div class="text-h6">{{ activeProject.photoCount.toLocaleString() }} 枚の写真</div><div class="text-body-2 text-medium-emphasis">{{ canImportPhotos ? '星とサムネイルはこの端末に保存されます。写真ライブラリは変更しません。' : 'サブフォルダも含めて参照します。写真ファイルは変更しません。' }}</div></div></v-card-text></v-card>
-          <!-- 選別画面に出す画像の大きさ。**解析を起こす場所の隣に置く**ので
-               対応が分かりやすい。設定画面では全体の既定を決められる。 -->
-          <v-card v-if=displaySettings class="mb-6">
-            <v-card-text>
-              <div class="d-flex align-center flex-wrap ga-4">
-                <v-switch
-                  v-model="largeDisplay" color="primary" hide-details density="comfortable"
-                  :disabled="displayBusy || displaySettings.choices.length < 2"
-                  label="大きな画像で選別する"
-                />
-                <span class="text-caption text-medium-emphasis">
-                  いま長辺 <strong>{{ displayEdge }}px</strong>
-                  <template v-if="displayBacklog > 0">・残り {{ displayBacklog.toLocaleString() }} 枚を作成中</template>
-                </span>
-                <v-spacer />
-                <v-btn
-                  size="small" variant="text" prepend-icon="mdi-refresh"
-                  :loading="displayBusy" :disabled="displaySettings.choices.length < 2"
-                  @click="regenerateDisplayImages"
-                >作り直す</v-btn>
+          <!-- バーは 1 本。**主ボタンも 1 つ。**
+               以前は削除・NAS・再読み込み・開始が同じ列に並んでいて、
+               どれが主要な操作か分からなかった。 -->
+          <header class="screen-bar">
+            <v-btn icon="mdi-arrow-left" variant="text" aria-label="ホームへ戻る" @click="view = 'home'" />
+            <div class="min-w-0">
+              <h1 class="screen-bar__title text-truncate">{{ activeProject.name }}</h1>
+              <div class="text-caption text-medium-emphasis d-flex align-center ga-1">
+                <v-icon :icon="sourceIcon(activeProject.sourceKind)" size="13" />
+                {{ activeProject.sourceLabel }}
               </div>
-              <p class="text-caption text-medium-emphasis mt-2 mb-0">
-                2 枚並べて見比べるときだけ大きさが要ります。3〜4 枚なら既定で十分です。
-                <strong>大きくするときは写真を読み直す</strong>ので時間がかかります（小さくするときは一瞬です）。
-              </p>
-              <v-progress-linear v-if="displayBacklog > 0" indeterminate color="primary" class="mt-3" />
-            </v-card-text>
+            </div>
+            <div class="screen-bar__end">
+              <v-btn icon="mdi-dots-horizontal" variant="text" aria-label="このプロジェクトの操作" @click="projectMenu = true" />
+              <v-btn
+                v-if="canImportPhotos && !activeProject.photoCount"
+                color="primary" rounded="pill" size="large" prepend-icon="mdi-image-plus"
+                :loading="scanRunning" @click="openPhotoPicker"
+              >写真を追加</v-btn>
+              <v-btn
+                v-else color="primary" rounded="pill" size="large" prepend-icon="mdi-play"
+                :disabled="!activeProject.photoCount || scanRunning"
+                @click="session ? resumeSession() : enterMethod()"
+              >{{ primaryActionLabel }}</v-btn>
+            </div>
+          </header>
+
+          <!-- 準備の 3 本。**ここ 1 か所だけに出す。**
+               以前は走査の進捗と表示用画像の残数が別々に出ていて、
+               片方はプロジェクトを切り替えても前の値が残っていた。 -->
+          <v-card v-if="prep" class="mb-4 pa-4">
+            <div class="d-flex align-center justify-space-between mb-3">
+              <span class="text-subtitle-2">準備</span>
+              <span class="text-caption text-medium-emphasis">{{ prepDone ? '完了' : '進行中' }}</span>
+            </div>
+            <div v-for="row in prepRows" :key="row.key" class="prep-row">
+              <v-icon :icon="row.icon" :color="row.color" size="18" />
+              <span class="prep-row__name">{{ row.name }}</span>
+              <span class="prep-row__count">{{ row.count }}</span>
+            </div>
+            <v-progress-linear
+              v-if="prep.preview.state === 'running' && prep.preview.total"
+              :model-value="(prep.preview.done / prep.preview.total) * 100"
+              color="secondary" height="3" rounded class="mt-3"
+            />
+            <p class="text-caption text-medium-emphasis mt-3 mb-0">
+              できた写真から選別に出ます。{{ activeProject.sourceKind === 'nas' ? 'NAS から読むので Wi-Fi 推奨です。' : '' }}
+            </p>
           </v-card>
+
 
           <div v-if="previewPhotos.length" class="d-flex align-center justify-end ga-3 mb-4">
             <v-btn-toggle v-model="previewDensity" density="comfortable" variant="outlined" divided mandatory>
@@ -2587,6 +2866,60 @@ onBeforeUnmount(() => {
           <v-spacer />
           <v-btn variant="outlined" @click="optionsSheet = false">閉じる</v-btn>
         </v-card-actions>
+      </v-card>
+    </v-bottom-sheet>
+
+    <!-- プロジェクトの「…」。**主ボタン以外はすべてここへ落とす。** -->
+    <v-bottom-sheet v-model="projectMenu" :inset="isWide" max-width="520">
+      <v-card v-if="activeProject">
+        <v-list>
+          <v-list-item
+            v-if="!canImportPhotos" prepend-icon="mdi-refresh" title="写真を再読み込み"
+            :disabled="scanRunning" @click="projectMenu = false; startScan()"
+          />
+          <v-list-item
+            v-if="canImportPhotos" prepend-icon="mdi-image-plus" title="写真を追加"
+            @click="projectMenu = false; openPhotoPicker()"
+          />
+          <v-list-item
+            v-if="hasSelectionData" prepend-icon="mdi-star-outline" title="選別結果を見る"
+            @click="projectMenu = false; openResults()"
+          />
+          <v-list-item
+            v-if="usesNas && activeProjectOnNas" prepend-icon="mdi-nas"
+            :title="nasConnected ? 'NAS を切り替える' : 'NAS に繋ぐ'"
+            @click="projectMenu = false; openNasDialog()"
+          />
+          <template v-if="displaySettings && displaySettings.choices.length > 1">
+            <v-divider class="my-2" />
+            <v-list-item>
+              <v-list-item-title class="text-body-2 mb-2">選別に出す画像の大きさ</v-list-item-title>
+              <v-btn-toggle
+                :model-value="displayEdge" density="comfortable" variant="outlined" divided mandatory
+                @update:model-value="applyDisplayEdge($event as number)"
+              >
+                <v-btn v-for="choice in displaySettings.choices" :key="choice" :value="choice" :disabled="displayBusy">
+                  {{ choice }}
+                </v-btn>
+              </v-btn-toggle>
+              <div class="text-caption text-medium-emphasis mt-2">
+                小さくするのは一瞬です。<strong>大きくするときは写真を読み直します。</strong>
+              </div>
+              <v-btn
+                size="small" variant="text" prepend-icon="mdi-refresh" class="mt-2 px-0"
+                :loading="displayBusy" @click="regenerateDisplayImages"
+              >作り直す</v-btn>
+            </v-list-item>
+          </template>
+
+          <v-divider class="my-2" />
+          <!-- 生パスはここだけに出す。普段の画面には人の言葉を出す。 -->
+          <v-list-item prepend-icon="mdi-information-outline" title="技術情報" :subtitle="activeProject.folderPath" />
+          <v-list-item
+            prepend-icon="mdi-delete-outline" title="削除" base-color="error"
+            @click="projectMenu = false; askDeleteProject(activeProject)"
+          />
+        </v-list>
       </v-card>
     </v-bottom-sheet>
 
