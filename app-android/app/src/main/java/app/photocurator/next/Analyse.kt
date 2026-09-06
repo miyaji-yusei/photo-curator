@@ -1,3 +1,5 @@
+@file:OptIn(kotlin.ExperimentalUnsignedTypes::class)
+
 package app.photocurator.next
 
 import android.content.Context
@@ -120,23 +122,43 @@ object Analyse {
         context: Context,
         photos: List<Photo>,
         cached: Map<String, Fingerprint>,
-        onProgress: (done: Int, total: Int) -> Unit
+        onProgress: (done: Int, total: Int) -> Unit,
+        onPartial: suspend (Map<String, Fingerprint>) -> Unit = {}
     ): Map<String, Fingerprint> = withContext(Dispatchers.IO) {
-        val out = HashMap<String, Fingerprint>(photos.size)
+        // **既に分かっている分から始める。** 途中で止まったときにここを空から
+        // 始めていると、まだ見ていない写真の指紋まで消してしまう。
+        val out = HashMap(cached)
+        var madeSinceSave = 0
         photos.forEachIndexed { index, photo ->
             val known = cached[photo.relativePath]
-            if (known != null && known.version == VERSION && known.size == photo.size) {
-                out[photo.relativePath] = known
-            } else {
-                // 作れなかったものは控えない。**次に開いたときにもう一度試す。**
-                hash(context, photo)?.let {
-                    out[photo.relativePath] = Fingerprint(VERSION, photo.size, it)
+            val usable = known != null && known.version == VERSION && known.size == photo.size
+            if (!usable) {
+                val made = hash(context, photo)
+                if (made != null) {
+                    out[photo.relativePath] = Fingerprint(VERSION, photo.size, made)
+                } else {
+                    // 作れなかったものは控えない。**次に開いたときにもう一度試す。**
+                    // 古い（大きさの違う）値が残っていたら消す。合わない値は
+                    // 持っているより無い方がよい。
+                    out.remove(photo.relativePath)
                 }
+                madeSinceSave += 1
             }
             if (index % 10 == 9 || index == photos.lastIndex) {
                 onProgress(index + 1, photos.size)
             }
+            // **途中でやめても、作った分は残す。**
+            // 919 枚のアルバムを 800 枚まで数えて戻ったときに全部やり直しでは、
+            // 二度と最後までたどり着けない。
+            if (madeSinceSave >= 200) {
+                onPartial(HashMap(out))
+                madeSinceSave = 0
+            }
         }
+        // 最後まで来たときだけ、アルバムに無くなったものを片付ける。
+        // 途中で刈ると、まだ見ていない写真を「消えた」と誤解する。
+        val living = photos.mapTo(HashSet()) { it.relativePath }
+        out.keys.retainAll(living)
         out
     }
 }

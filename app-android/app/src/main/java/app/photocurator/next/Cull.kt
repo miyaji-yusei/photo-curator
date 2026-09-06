@@ -99,9 +99,12 @@ fun CullScreen(album: Album, onBack: () -> Unit) {
         // 何が起きているのか誰にも分からなくなる。
         note = "似た写真を調べています…"
         val cached = Fingerprints.load(context, album.id)
-        val prints = Analyse.fingerprints(context, photos, cached) { done, total ->
-            prepared = done to total
-        }
+        val prints = Analyse.fingerprints(
+            context, photos, cached,
+            onProgress = { done, total -> prepared = done to total },
+            // 途中経過も書く。ここで戻られても作った分は残る。
+            onPartial = { Fingerprints.save(context, album.id, it) }
+        )
         // 変わっていなければ書かない。書く回数はそのまま壊れる機会になる。
         if (prints != cached) Fingerprints.save(context, album.id, prints)
 
@@ -133,18 +136,30 @@ fun CullScreen(album: Album, onBack: () -> Unit) {
 
     val live = session
     if (live == null) {
-        Column(
-            Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center,
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Text(note, color = Faint, fontSize = 13.sp)
-            // **数が分かるものは done / total で出す。** 終わらないバーは出さない。
-            if (prepared.second > 0) {
-                Text(
-                    "${prepared.first} / ${prepared.second}",
-                    color = Lime, fontSize = 18.sp, fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(top = 8.dp)
-                )
+        Box(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
+            // **待っている間も出口を残す。** 919 枚のアルバムでは 1 分近くかかる。
+            // 戻れない画面に入れてしまうと、待つ以外に何もできなくなる。
+            IconButton(onClick = onBack, modifier = Modifier.align(Alignment.TopStart)) {
+                Icon(Icons.Filled.ArrowBack, "やめて戻る")
+            }
+            Column(
+                Modifier.align(Alignment.Center),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text(note, color = Faint, fontSize = 13.sp)
+                // **数が分かるものは done / total で出す。** 終わらないバーは出さない。
+                if (prepared.second > 0) {
+                    Text(
+                        "${prepared.first} / ${prepared.second}",
+                        color = Lime, fontSize = 18.sp, fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(top = 8.dp)
+                    )
+                    Text(
+                        "ここで戻っても、調べた分はとってあります",
+                        color = Faint, fontSize = 11.sp,
+                        modifier = Modifier.padding(top = 6.dp)
+                    )
+                }
             }
         }
         return
