@@ -1,6 +1,8 @@
 #[cfg(target_os = "android")]
 mod android_photos;
 #[cfg(target_os = "android")]
+mod android_secret;
+#[cfg(target_os = "android")]
 mod android_smb;
 
 use exif::{In, Reader, Tag, Value};
@@ -1074,6 +1076,16 @@ fn read_capture_time_from(source: &dyn PhotoSource) -> Option<CaptureTime> {
         })
 }
 
+/// ローカルのファイルから撮影時刻を読む。**テストと計測ハーネス専用。**
+///
+/// 本番の経路は `PhotoRef` から `PhotoSource` を得て
+/// `read_capture_time_from` を呼ぶ。Android では写真が content:// や
+/// smb:// を指すので、ここを本番で使うと**全部が「撮影時刻を読み取れません」
+/// になる**（実際にそうなっていた）。
+///
+/// **本番ビルドには存在させない。** これは書き忘れではなく、同じ間違いを
+/// 二度としないための仕掛け。うっかり本番から呼ぶとコンパイルが通らない。
+#[cfg(any(test, feature = "bench"))]
 fn read_capture_time(path: &Path) -> Option<CaptureTime> {
     read_capture_time_from(&LocalPhoto(path))
 }
@@ -1893,6 +1905,17 @@ struct ScanEntry {
 /// 走査の入口をここで分け、以降は同じ形を扱う。
 const MEDIASTORE_PREFIX: &str = "mediastore://";
 
+/// 走査元が「この端末のフォルダ」を指しているか。
+///
+/// Android では `mediastore://` や `smb://` のような形になるので、
+/// **ここをディレクトリだと決めつけると必ず「見つかりません」になる。**
+///
+/// 前置きを並べるのではなく `://` の有無で見るのは、出所が増えたときに
+/// ここを直し忘れないため。フォルダのパスに `://` は現れない。
+fn is_local_folder(folder: &str) -> bool {
+    !folder.contains("://")
+}
+
 fn collect_scan_entries(folder: &str) -> Result<Vec<ScanEntry>, String> {
     if let Some(bucket) = folder.strip_prefix(MEDIASTORE_PREFIX) {
         return collect_mediastore_entries(bucket);
@@ -2117,6 +2140,131 @@ fn failed_photo_count(conn: &Connection, project_id: &str) -> Result<usize, Stri
     .map_err(|error| error.to_string())
 }
 
+/// 解析 1 枚ぶんを DB へ書き戻す。**クロージャから出してあるのはテストのため。**
+///
+/// ここは「読めなかったときに前の結果を消さない」という約束を持っている。
+/// その約束が破れるのは原本が一時的に読めないときだけで、実機の NAS でしか
+/// 起きない。単体で突けるようにしておかないと、また気づかずに壊す。
+fn apply_analysis(tx: &Connection, item: &PhotoWork) -> Result<(), String> {
+    // 据え置きで済んだ1枚は、書き込む理由が無い。
+    if item.hash_reused {
+        return Ok(());
+    }
+    // metadata が読めない場合は fingerprint を NULL のままにする。(0,0) を
+    // 入れると、読めないファイル同士が同じ fingerprint に見えてキャッシュが
+    // 誤ヒットする。
+    let (mtime, size) = match item.fingerprint {
+        Some((mtime, size)) => (Some(mtime), Some(size)),
+        None => (None, None),
+    };
+    // サムネイルを保存できたときだけ、それを作った時点の fingerprint を
+    // 控える。次回の無効化判定はこの一致で行う。
+    let (thumb_mtime, thumb_size) = match item.thumbnail_path {
+        Some(_) => (mtime, size),
+        None => (None, None),
+    };
+    // **読めなかったときは、前に作れていたものを消さない。**
+    //
+    // 原本が一瞬読めないことは普通に起きる（NAS が落ちた、Wi-Fi が切れた、
+    // SMB のセッションが切れた）。そのたびに解析済みのサムネイルと dHash を
+    // NULL で塗り潰すと、**作り終えた結果が失われて連写のまとまりも消える。**
+    // 実機で 187 枚中 172 枚がこれで消えた。ファイルは残っているのに DB
+    // からは消えている、という状態になる。
+    //
+    // 成功したときは上書きが正しい（原本が変わっていれば作り直すべき）。
+    // なので COALESCE ではなく「失敗したときだけ据え置く」と書く。
+    // 失敗は analysis_error に残るので、利用者には見えなくならない。
+    let keep = item.d_hash.is_none() && item.thumbnail_path.is_none();
+    tx.execute(
+        "UPDATE photos SET
+           d_hash=CASE WHEN ?13 THEN d_hash ELSE ?1 END,
+           d_hash_version=CASE WHEN ?13 THEN d_hash_version ELSE ?2 END,
+           thumbnail_path=CASE WHEN ?13 THEN thumbnail_path ELSE ?3 END,
+           thumbnail_mtime=CASE WHEN ?13 THEN thumbnail_mtime ELSE ?4 END,
+           thumbnail_size=CASE WHEN ?13 THEN thumbnail_size ELSE ?5 END,
+           thumbnail_source=COALESCE(?6,thumbnail_source),
+           thumbnail_version=CASE WHEN ?13 THEN thumbnail_version ELSE ?7 END,
+           fingerprint_mtime=CASE WHEN ?13 THEN fingerprint_mtime ELSE ?8 END,
+           fingerprint_size=CASE WHEN ?13 THEN fingerprint_size ELSE ?9 END,
+           analysis_error=?10,analysis_error_at=?11
+         WHERE id=?12",
+        params![
+            item.d_hash,
+            item.d_hash.as_ref().map(|_| D_HASH_VERSION),
+            item.thumbnail_path,
+            thumb_mtime,
+            thumb_size,
+            item.thumbnail_source,
+            // 版はサムネイルを保存できたときだけ立てる。パスが NULL のまま
+            // 版だけ残ると、次回「使える」と誤判定する。
+            item.thumbnail_path.as_ref().map(|_| THUMBNAIL_VERSION),
+            mtime,
+            size,
+            item.error,
+            item.error.as_ref().map(|_| now()),
+            item.photo_id,
+            keep
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// `photo://` に来た URI から、写真の指し先を取り出す。
+///
+/// `convertFileSrc` は指し先を **encodeURIComponent** して URL に載せる。
+/// つまり `/` も `:` も `%XX` になり、URL のパスは
+/// 「区切りの `/` ひとつ ＋ 符号化された指し先」だけになる。
+/// **外すのはその 1 つだけ。** 減らし過ぎると Unix の絶対パスが相対になり、
+/// 増やし過ぎると Windows のドライブ文字の前に `/` が残る。
+fn photo_scheme_target(path: &str, query: Option<&str>) -> String {
+    let raw = query
+        .and_then(|query| {
+            query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("path="))
+        })
+        .unwrap_or_else(|| path.strip_prefix('/').unwrap_or(path));
+    percent_decode(raw)
+}
+
+/// %XX を戻す。URI に載る写真のパスは日本語も含むので必要。
+fn percent_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok();
+            if let Some(value) = hex.and_then(|hex| u8::from_str_radix(hex, 16).ok()) {
+                out.push(value);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 原本のバイト列を返す。**読めなければ None**（呼び出し側が 404 にする）。
+fn photo_scheme_response(target: &str) -> Option<tauri::http::Response<Vec<u8>>> {
+    let reference = PhotoRef::parse(target);
+    let bytes = reference.source().all()?;
+    let mime = match target.rsplit('.').next().map(str::to_ascii_lowercase).as_deref() {
+        Some("png") => "image/png",
+        Some("webp") => "image/webp",
+        _ => "image/jpeg",
+    };
+    tauri::http::Response::builder()
+        .header("Content-Type", mime)
+        // 同じ写真を何度も開くので、画面側に持たせる。
+        .header("Cache-Control", "max-age=3600")
+        .body(bytes)
+        .ok()
+}
+
 fn run_burst_analysis(
     app: AppHandle,
     registry: &TaskRegistry,
@@ -2201,7 +2349,9 @@ fn run_burst_analysis(
             // worker はファイルを読むだけ。DB には触れない。
             |index, job: &MetadataJob| {
                 let mut result = PhotoWork::new(index, &job.id);
-                match read_capture_time(Path::new(&job.path)) {
+                // ローカルのパスでも content:// でも、ここから先は同じ経路を通る。
+                let reference = PhotoRef::parse(&job.path);
+                match read_capture_time_from(reference.source().as_ref()) {
                     Some(capture) => {
                         result.captured_at = Some(capture.at);
                         result.timestamp_source = Some(capture.source);
@@ -2348,52 +2498,7 @@ fn run_burst_analysis(
     let interval = progress_interval(needed_total.max(1));
     let mut pending: Vec<PhotoWork> = Vec::with_capacity(ANALYSIS_CHUNK_SIZE);
     let mut committed = 0usize;
-    let apply = |tx: &Connection, item: &PhotoWork| -> Result<(), String> {
-        // 据え置きで済んだ1枚は、書き込む理由が無い。
-        if item.hash_reused {
-            return Ok(());
-        }
-        // metadata が読めない場合は fingerprint を NULL のままにする。(0,0) を
-        // 入れると、読めないファイル同士が同じ fingerprint に見えてキャッシュが
-        // 誤ヒットする。
-        let (mtime, size) = match item.fingerprint {
-            Some((mtime, size)) => (Some(mtime), Some(size)),
-            None => (None, None),
-        };
-        // サムネイルを保存できたときだけ、それを作った時点の fingerprint を
-        // 控える。次回の無効化判定はこの一致で行う。
-        let (thumb_mtime, thumb_size) = match item.thumbnail_path {
-            Some(_) => (mtime, size),
-            None => (None, None),
-        };
-        tx.execute(
-            "UPDATE photos SET d_hash=?1,d_hash_version=?2,thumbnail_path=?3,
-               thumbnail_mtime=?4,thumbnail_size=?5,
-               thumbnail_source=COALESCE(?6,thumbnail_source),
-               thumbnail_version=?7,
-               fingerprint_mtime=?8,fingerprint_size=?9,
-               analysis_error=?10,analysis_error_at=?11
-             WHERE id=?12",
-            params![
-                item.d_hash,
-                item.d_hash.as_ref().map(|_| D_HASH_VERSION),
-                item.thumbnail_path,
-                thumb_mtime,
-                thumb_size,
-                item.thumbnail_source,
-                // 版はサムネイルを保存できたときだけ立てる。パスが NULL のまま
-                // 版だけ残ると、次回「使える」と誤判定する。
-                item.thumbnail_path.as_ref().map(|_| THUMBNAIL_VERSION),
-                mtime,
-                size,
-                item.error,
-                item.error.as_ref().map(|_| now()),
-                item.photo_id
-            ],
-        )
-        .map_err(|error| error.to_string())?;
-        Ok(())
-    };
+    let apply = apply_analysis;
     let thumbnails_for_workers = thumbnails.clone();
     let outcome = run_in_parallel(
         Arc::new(needed_records),
@@ -2505,7 +2610,9 @@ fn list_projects(app: AppHandle) -> Result<Vec<Project>, String> {
 
 #[tauri::command]
 fn create_project(app: AppHandle, name: String, folder_path: String) -> Result<Project, String> {
-    if !Path::new(&folder_path).is_dir() {
+    // 端末のフォルダのときだけ実在を確かめる。アルバムや NAS は
+    // パスではないので、ここで弾いてはいけない。
+    if is_local_folder(&folder_path) && !Path::new(&folder_path).is_dir() {
         return Err(
             "選択した写真フォルダが見つかりません。フォルダの場所を確認してください。".into(),
         );
@@ -3527,6 +3634,91 @@ struct PhotoAlbum {
 /// NAS へ繋ぐ。**認証情報は保存しない。** メモリにしか置かないので、
 /// アプリを終了すると消え、次に開くときにもう一度入れてもらう。
 /// 「NAS に繋がっているときだけ使えればよい」という方針なので、保存する理由がない。
+/// 前回の繋ぎ先。**パスワードだけは別の置き場から来る。**
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NasSettings {
+    host: String,
+    share: String,
+    user: String,
+    remember_password: bool,
+    /// 覚えていれば入っている。覚えていなければ空。
+    password: String,
+    /// この環境でパスワードを預かれるか。**駄目ならトグルを出さない。**
+    can_remember_password: bool,
+}
+
+/// 繋ぎ先を読み出す。ダイアログを開くたびに呼ぶ。
+///
+/// ホスト・共有名・利用者名は毎回入れ直すのが煩わしいだけで、秘密ではない。
+/// **パスワードだけは扱いが違う**ので、覚えると選んだときに限り、
+/// 端末の鍵で包んで別に預ける（SecretStore.kt）。
+#[tauri::command]
+fn get_nas_settings(app: AppHandle) -> Result<NasSettings, String> {
+    let conn = connection(&app)?;
+    let remember = read_setting(&conn, SETTING_NAS_REMEMBER).as_deref() == Some("1");
+    Ok(NasSettings {
+        host: read_setting(&conn, SETTING_NAS_HOST).unwrap_or_default(),
+        share: read_setting(&conn, SETTING_NAS_SHARE).unwrap_or_default(),
+        user: read_setting(&conn, SETTING_NAS_USER).unwrap_or_default(),
+        remember_password: remember,
+        password: if remember { load_nas_password() } else { String::new() },
+        can_remember_password: cfg!(target_os = "android"),
+    })
+}
+
+/// 繋ぎ先を覚える。remember_password が false なら**預けてあるものも消す。**
+#[tauri::command]
+fn save_nas_settings(
+    app: AppHandle,
+    host: String,
+    share: String,
+    user: String,
+    remember_password: bool,
+    password: String,
+) -> Result<(), String> {
+    let conn = connection(&app)?;
+    for (key, value) in [
+        (SETTING_NAS_HOST, host),
+        (SETTING_NAS_SHARE, share),
+        (SETTING_NAS_USER, user),
+        (
+            SETTING_NAS_REMEMBER,
+            if remember_password { "1" } else { "0" }.to_string(),
+        ),
+    ] {
+        conn.execute(
+            "INSERT INTO app_settings (key,value) VALUES (?1,?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, value],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    // 覚えないときは空文字を渡す。預けてあるものは SecretStore 側で消える。
+    save_nas_password(if remember_password { &password } else { "" })
+}
+
+#[cfg(target_os = "android")]
+fn load_nas_password() -> String {
+    android_secret::load_password().unwrap_or_default()
+}
+
+#[cfg(not(target_os = "android"))]
+fn load_nas_password() -> String {
+    String::new()
+}
+
+#[cfg(target_os = "android")]
+fn save_nas_password(password: &str) -> Result<(), String> {
+    android_secret::save_password(password)
+}
+
+#[cfg(not(target_os = "android"))]
+fn save_nas_password(_password: &str) -> Result<(), String> {
+    // この環境では NAS に直接繋がない（OS が共有をマウントする）。
+    Ok(())
+}
+
 #[tauri::command]
 fn connect_nas(
     host: String,
@@ -3586,6 +3778,12 @@ fn list_photo_albums() -> Result<Vec<PhotoAlbum>, String> {
 // ---------------------------------------------------------------------------
 
 const SETTING_DISPLAY_EDGE: &str = "display_edge";
+
+// NAS の繋ぎ先。**パスワードはここに入れない。**
+const SETTING_NAS_HOST: &str = "nas_host";
+const SETTING_NAS_SHARE: &str = "nas_share";
+const SETTING_NAS_USER: &str = "nas_user";
+const SETTING_NAS_REMEMBER: &str = "nas_remember_password";
 
 fn read_setting(conn: &Connection, key: &str) -> Option<String> {
     conn.query_row(
@@ -3751,7 +3949,10 @@ fn run_display_generation(
             (Some(p), Some(e)) if e > 0 => Some((Path::new(p), e as u32)),
             _ => None,
         };
-        let built = build_display(&LocalPhoto(Path::new(&path)), edge, existing);
+        // `existing` は保存済みの表示用画像で、そちらは常にローカル。
+        // **原本の方は content:// や smb:// のことがある。**
+        let reference = PhotoRef::parse(&path);
+        let built = build_display(reference.source().as_ref(), edge, existing);
         let file = display_file(&dir, &photo_id);
         let saved = built.and_then(|bytes| fs::write(&file, &bytes).ok().map(|_| ()));
         {
@@ -4180,6 +4381,24 @@ pub mod bench_api {
 pub fn run() {
     tauri::Builder::default()
         .manage(TaskRegistry::default())
+        // 原本を画面へ渡す口。**convertFileSrc ではファイルしか渡せない。**
+        //
+        // 拡大表示は原本を出すが、Android では原本が content:// や smb:// で、
+        // ファイルパスではない。asset プロトコルに渡しても解決できず、画面には
+        // 壊れた画像が出る（実機で確認）。ここを通せば、指し先の種類に関わらず
+        // PhotoSource が読んでくれる。
+        .register_asynchronous_uri_scheme_protocol("photo", |_app, request, responder| {
+            let target = photo_scheme_target(request.uri().path(), request.uri().query());
+            std::thread::spawn(move || {
+                responder.respond(match photo_scheme_response(&target) {
+                    Some(response) => response,
+                    None => tauri::http::Response::builder()
+                        .status(404)
+                        .body(Vec::new())
+                        .expect("404 は必ず組める"),
+                });
+            });
+        })
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             list_projects,
@@ -4197,6 +4416,8 @@ pub fn run() {
             write_ratings_to_files,
             list_photo_albums,
             connect_nas,
+            get_nas_settings,
+            save_nas_settings,
             disconnect_nas,
             get_display_settings,
             save_display_edge,
@@ -5234,6 +5455,27 @@ mod tests {
     // -----------------------------------------------------------------------
     // Routine 11: 写真の指し先
     // -----------------------------------------------------------------------
+
+    /// 走査元は「フォルダ」だけではない。
+    ///
+    /// **実機で最初に踏んだ穴がこれ。** `create_project` が `folder_path` を
+    /// ディレクトリだと決めつけて `is_dir()` で検査しており、Android で
+    /// アルバムを選ぶと必ず「写真フォルダが見つかりません」になっていた。
+    /// 走査側は前置きを見分けていたのに、入口の検査だけが取り残されていた。
+    #[test]
+    fn a_scan_source_is_not_always_a_directory_on_disk() {
+        // 端末のフォルダ。ここは実在を確かめてよい。
+        assert!(is_local_folder(r"C:UsersmiyajPictures"));
+        assert!(is_local_folder("/home/user/photos"));
+        // UNC も「フォルダ」。Windows が解決する。
+        assert!(is_local_folder(r"\LS710DBD2Sharephotos"));
+
+        // 以下はパスではないので、実在を確かめてはいけない。
+        assert!(!is_local_folder("mediastore://12345"));
+        assert!(!is_local_folder("smb://192.168.11.8/Share/photos"));
+        // まだ無い出所（SAF）も、前置きを足さずに通る。
+        assert!(!is_local_folder("tree://content%3A%2F%2Fcom.example"));
+    }
 
     /// **既存の行を壊さないことが要点。** DB には絶対パスがそのまま入っており、
     /// 判別を間違えると全部が「読めない写真」になる。
@@ -6383,6 +6625,105 @@ mod tests {
     }
 
     // 削除は写真原本に触れてはいけない。DB とサムネイルだけを消す。
+    /// `photo://` の URI から指し先を取り出せる。
+    ///
+    /// **ここは環境ごとに形が変わる。** Tauri は `photo://localhost/<path>` に
+    /// したり `http://photo.localhost/<path>` にしたりする。取り違えると
+    /// 拡大表示が全部 404 になるが、デスクトップでは原本がローカルなので
+    /// 気づきにくい。
+    #[test]
+    fn the_photo_scheme_recovers_the_original_reference() {
+        // 届くのは encodeURIComponent された形。区切りの / は 1 つだけ。
+        assert_eq!(
+            photo_scheme_target("/C%3A%5CUsers%5Cmiyaji%5CPictures%5Ca.jpg", None),
+            r"C:\Users\miyaji\Pictures\a.jpg"
+        );
+        // Unix の絶対パス。**先頭の / を落とすと相対になって読めない。**
+        assert_eq!(
+            photo_scheme_target("/%2Fhome%2Fuser%2Fa.jpg", None),
+            "/home/user/a.jpg"
+        );
+        // Android の指し先。**ここが壊れていた。**
+        assert_eq!(
+            photo_scheme_target("/content%3A%2F%2Fmedia%2Fexternal%2Fimages%2Fmedia%2F18779", None),
+            "content://media/external/images/media/18779"
+        );
+        assert_eq!(
+            photo_scheme_target("/smb%3A%2F%2F192.168.11.8%2FShare%2F2021%2Fa.jpg", None),
+            "smb://192.168.11.8/Share/2021/a.jpg"
+        );
+        // クエリで渡す形も受ける。パスより優先する。
+        assert_eq!(
+            photo_scheme_target("/ignored", Some("path=%2Fhome%2Fuser%2Fb.jpg")),
+            "/home/user/b.jpg"
+        );
+        // 日本語のフォルダ名。
+        assert_eq!(
+            photo_scheme_target("/smb%3A%2F%2Fhost%2FShare%2F%E5%86%99%E7%9C%9F%2Fa.jpg", None),
+            "smb://host/Share/写真/a.jpg"
+        );
+    }
+
+    /// 原本が一時的に読めなくても、**前に作れていた解析結果を消さない。**
+    ///
+    /// NAS が落ちた・Wi-Fi が切れた・SMB のセッションが切れた、はどれも普通に
+    /// 起きる。そのたびにサムネイルと dHash を NULL で塗り潰すと、作り終えた
+    /// 結果が失われて連写のまとまりまで消える。実機の NAS で 187 枚中 172 枚が
+    /// これで消えた（ファイルは残っているのに DB からは消えている状態）。
+    #[test]
+    fn a_failed_read_keeps_the_analysis_we_already_had() {
+        let directory = test_directory("keep-analysis");
+        let conn = open_database(&directory.join("keep.sqlite3")).expect("open database");
+        conn.execute(
+            "INSERT INTO projects (id,name,folder_path,photo_count,status,created_at,updated_at)
+             VALUES ('p','p','smb://host/share',1,'ready',1,1)",
+            [],
+        )
+        .expect("insert project");
+        conn.execute(
+            "INSERT INTO photos (id,project_id,path,relative_path,name,captured_at,d_hash,rating,
+               fingerprint_mtime,fingerprint_size,is_missing,thumbnail_path,thumbnail_version,d_hash_version)
+             VALUES ('photo','p','smb://host/share/a.jpg','a.jpg','a.jpg',1,'ffffffffffffffff',0,
+               10,20,0,'/thumbs/photo.jpg',?1,?2)",
+            params![THUMBNAIL_VERSION, D_HASH_VERSION],
+        )
+        .expect("insert photo");
+
+        // 読めなかった1枚。fingerprint も取れていない。
+        let mut failure = PhotoWork::new(0, "photo");
+        failure.error = Some("ファイルを開けませんでした（移動・削除・権限）。".into());
+        apply_analysis(&conn, &failure).expect("apply failure");
+
+        let (hash, thumb, error): (Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT d_hash,thumbnail_path,analysis_error FROM photos WHERE id='photo'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read back");
+        assert_eq!(hash.as_deref(), Some("ffffffffffffffff"), "dHash が消えている");
+        assert_eq!(thumb.as_deref(), Some("/thumbs/photo.jpg"), "サムネイルが消えている");
+        assert!(error.is_some(), "失敗したことは残す");
+
+        // 読めた1枚は上書きする。**据え置きは失敗のときだけ。**
+        let mut success = PhotoWork::new(1, "photo");
+        success.d_hash = Some("0000000000000000".into());
+        success.thumbnail_path = Some("/thumbs/new.jpg".into());
+        success.fingerprint = Some((30, 40));
+        apply_analysis(&conn, &success).expect("apply success");
+
+        let (hash, thumb, error): (Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT d_hash,thumbnail_path,analysis_error FROM photos WHERE id='photo'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read back");
+        assert_eq!(hash.as_deref(), Some("0000000000000000"), "新しい結果に入れ替わらない");
+        assert_eq!(thumb.as_deref(), Some("/thumbs/new.jpg"));
+        assert!(error.is_none(), "成功したら失敗の記録は消える");
+    }
+
     #[test]
     fn deleting_a_project_removes_only_app_owned_data() {
         let directory = test_directory("delete-project");
