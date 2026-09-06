@@ -75,15 +75,49 @@ val Tile = androidx.compose.ui.graphics.Color(0xFF16181D)
 val Lime = androidx.compose.ui.graphics.Color(0xFFD6FF73)
 val Faint = androidx.compose.ui.graphics.Color(0xFF9AA0AA)
 
+/**
+ * いまどの画面か。**一覧 → アルバム → 選別 / 結果** の 1 本道。
+ *
+ * アルバム画面を挟むのは、選別を終えた星の行き先を作るため。
+ * 前は選別が終わっても戻る先が一覧しか無く、付けた星がどこへ行ったのか
+ * 画面から確かめようが無かった。
+ */
+private sealed interface Screen {
+    data object List : Screen
+    data class Detail(val album: Album) : Screen
+    data class Cull(val album: Album) : Screen
+    data class Results(val album: Album, val star: Int) : Screen
+}
+
 @Composable
 private fun App() {
     MaterialTheme(colorScheme = darkColorScheme(primary = Lime, background = Ink, surface = Surface)) {
-        var album by remember { mutableStateOf<Album?>(null) }
+        var screen by remember { mutableStateOf<Screen>(Screen.List) }
         Surface(color = Ink, modifier = Modifier.fillMaxSize()) {
-            if (album == null) {
-                AlbumList(onPick = { album = it })
-            } else {
-                CullScreen(album = album!!, onBack = { album = null })
+            when (val here = screen) {
+                is Screen.List -> AlbumList(onPick = { screen = Screen.Detail(it) })
+
+                is Screen.Detail -> AlbumScreen(
+                    album = here.album,
+                    onBack = { screen = Screen.List },
+                    onCull = { screen = Screen.Cull(here.album) },
+                    // やり直した直後は、その場に留まって新しい状態を見せる。
+                    onRestart = { screen = Screen.Detail(here.album) },
+                    onOpenStar = { screen = Screen.Results(here.album, it) }
+                )
+
+                is Screen.Cull -> CullScreen(
+                    album = here.album,
+                    // **選別から戻る先はアルバム画面。** 一覧まで飛ばすと、
+                    // いま何枚残ったのかを確かめる前に見失う。
+                    onBack = { screen = Screen.Detail(here.album) }
+                )
+
+                is Screen.Results -> ResultsScreen(
+                    album = here.album,
+                    star = here.star,
+                    onBack = { screen = Screen.Detail(here.album) }
+                )
             }
         }
     }
