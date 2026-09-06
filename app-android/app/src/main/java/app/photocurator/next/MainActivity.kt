@@ -127,6 +127,8 @@ private fun App() {
 private fun AlbumList(onPick: (Album) -> Unit) {
     val context = LocalContext.current
     var albums by remember { mutableStateOf<List<Album>>(emptyList()) }
+    // アルバムごとの一言。**どれに手を付けたかが一覧で分かるように。**
+    var marks by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
     var note by remember { mutableStateOf("読み込み中…") }
     // **前面に戻るたびに読み直す。**
     // 権限のダイアログは別の Activity なので、許可した直後にここへ戻ってくる。
@@ -146,6 +148,10 @@ private fun AlbumList(onPick: (Album) -> Unit) {
         albums = Photos.albums(context)
         note = if (albums.isEmpty()) "写真が見つかりません（権限を確認してください）"
         else "アルバム ${albums.size} 件"
+        // 一覧を出してから足す。**印のために一覧を待たせない。**
+        marks = albums.mapNotNull { album ->
+            Store.summary(context, album.id)?.let { album.id to it }
+        }.toMap()
     }
 
     Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
@@ -180,7 +186,13 @@ private fun AlbumList(onPick: (Album) -> Unit) {
                     Spacer(Modifier.width(14.dp))
                     Column(Modifier.weight(1f)) {
                         Text(album.name, fontSize = 15.sp)
-                        Text("${album.count} 枚", fontSize = 12.sp, color = Faint)
+                        val mark = marks[album.id]
+                        Text(
+                            if (mark == null) "${album.count} 枚"
+                            else "${album.count} 枚 · $mark",
+                            fontSize = 12.sp,
+                            color = if (mark == null) Faint else Lime
+                        )
                     }
                 }
                 }

@@ -59,6 +59,21 @@ object Store {
             }
         }
 
+    /**
+     * 一覧に出すための、ごく短い言い方。**中身は読まずに済ませたい**ので、
+     * ここだけは丸ごと読んで畳む。アルバムの数だけ小さな JSON を読む。
+     */
+    suspend fun summary(context: Context, albumId: String): String? {
+        val session = load(context, albumId) ?: return null
+        val stars = session.ratings.values.count { it > 0 }
+        return when {
+            !session.finished ->
+                "ROUND ${session.round} の途中 · 残り ${session.queue.size + session.current.size} 組"
+            stars > 0 -> "★1 以上が $stars 枚"
+            else -> "選別ずみ"
+        }
+    }
+
     suspend fun clear(context: Context, albumId: String) = withContext(Dispatchers.IO) {
         file(context, albumId).delete()
         Unit
