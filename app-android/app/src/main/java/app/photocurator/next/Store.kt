@@ -134,3 +134,27 @@ object Fingerprints {
             }
         }
 }
+
+/**
+ * 覚えておく設定。**次に開いたときに同じ状態から始められるように。**
+ *
+ * 選別の途中（Session）とは別。あちらはアルバムごとの進み具合で、
+ * こちらは「いつもこうしたい」というその人の好み。
+ */
+object Prefs {
+    private const val FILE = "prefs"
+    private const val GROUP_SIZE = "group_size"
+
+    /** 一度に並べる枚数。2〜10。 */
+    fun groupSize(context: Context): Int =
+        context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+            .getInt(GROUP_SIZE, 4)
+            .coerceIn(2, 10)
+
+    fun setGroupSize(context: Context, size: Int) {
+        context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+            .edit()
+            .putInt(GROUP_SIZE, size.coerceIn(2, 10))
+            .apply()
+    }
+}

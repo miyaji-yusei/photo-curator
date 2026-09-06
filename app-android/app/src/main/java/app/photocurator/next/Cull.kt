@@ -125,7 +125,7 @@ fun CullScreen(album: Album, onBack: () -> Unit) {
         val saved = Store.load(context, album.id)
         session = saved ?: startRound(
             refs,
-            groupSize = 4u,
+            groupSize = Prefs.groupSize(context).toUInt(),
             targetStar = 0,
             groupBursts = true,
             threshold = threshold,
@@ -170,7 +170,8 @@ fun CullScreen(album: Album, onBack: () -> Unit) {
         val next = advance(live, picked.toList())
         session = next
         selected = emptySet()
-        multi = false
+        // **複数モードは切らない。** 複数で選ぶ人はずっと複数で選ぶので、
+        // 毎回押し直させるのは 1 グループにつき 1 タップ増えるのと同じ。
         scope.launch { Store.save(context, album.id, next) }
     }
 
@@ -246,6 +247,8 @@ fun CullScreen(album: Album, onBack: () -> Unit) {
                                     number = at + 1,
                                     photo = byPath[path],
                                     picked = path in selected,
+                                    // この 1 枚が何枚ぶんの代表か。
+                                    stands = live.members[path]?.size ?: 1,
                                     onHold = { zooming = byPath[path] },
                                     onTap = {
                                         if (multi) {
@@ -344,6 +347,7 @@ private fun Tile(
     number: Int,
     photo: Photo?,
     picked: Boolean,
+    stands: Int,
     onTap: () -> Unit,
     onHold: () -> Unit
 ) {
@@ -390,6 +394,22 @@ private fun Tile(
                 fontSize = 12.sp, fontWeight = FontWeight.SemiBold,
                 color = if (picked) Color.Black else Color.White
             )
+        }
+
+        // **畳んだことを画面でも言う。** 694 枚が 666 組になった理由が
+        // どこにも出ていないと、消えたのではないかと思われる。
+        // 残せば仲間にも同じ星が付くので、そのことも読み取れる必要がある。
+        if (stands > 1) {
+            Box(
+                Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(6.dp)
+                    .clip(androidx.compose.foundation.shape.RoundedCornerShape(6.dp))
+                    .background(Color(0xB3101114))
+                    .padding(horizontal = 7.dp, vertical = 2.dp)
+            ) {
+                Text("連写 $stands 枚", fontSize = 11.sp, color = Lime)
+            }
         }
     }
 }
