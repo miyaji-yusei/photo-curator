@@ -47,7 +47,6 @@ jpeg-decoder = "0.3"
 # 必要なのが「一覧を返す」「バイト列を返す」の 2 つだけで、Activity の
 # やりとりが要らないため。
 [target.'cfg(target_os = "android")'.dependencies]
+# JavaVM は JNI_OnLoad で受け取る（android_photos.rs）。
+# ndk-context は NativeActivity 系でしか埋まらないので使わない。
 jni = "0.21"
-# JavaVM は Android のランタイムが ndk-context に登録している。
-# Tauri の AppHandle からは取れないので、こちらから引く。
-ndk-context = "0.1"
