@@ -140,6 +140,186 @@ fn finish(current: &mut Vec<String>) -> BurstGroup {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 選別
+// ---------------------------------------------------------------------------
+
+use std::collections::HashMap;
+
+/// 星の上限。これに達した写真は以降のラウンドに出ない。
+const MAX_STAR: i32 = 5;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Decision {
+    pub group: Vec<String>,
+    pub chosen: Vec<String>,
+}
+
+/// 選別の途中。**丸ごと保存して、丸ごと読み戻す。**
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Session {
+    pub group_size: u32,
+    pub target_star: i32,
+    pub round: u32,
+    pub queue: Vec<String>,
+    pub current: Vec<String>,
+    pub survivors: Vec<String>,
+    pub ratings: HashMap<String, i32>,
+    pub members: HashMap<String, Vec<String>>,
+    pub history: Vec<Decision>,
+    pub finished: bool,
+}
+
+/// ラウンドを始める。
+///
+/// 連写をまとめる場合、**画面に出るのは代表だけ**。仲間は members に控え、
+/// 代表が通れば同じ星を配る。畳まないと、同じ構図を何度も見ることになる。
+pub fn start_round(
+    photos: Vec<PhotoRef>,
+    group_size: u32,
+    target_star: i32,
+    group_bursts_on: bool,
+    threshold: BurstThreshold,
+    overrides: Vec<PairOverride>,
+) -> Session {
+    let mut ratings = HashMap::new();
+    for photo in &photos {
+        ratings.insert(photo.relative_path.clone(), target_star);
+    }
+
+    let (queue, members) = if group_bursts_on {
+        let groups = group_bursts(photos, threshold, overrides);
+        let mut members = HashMap::new();
+        let mut queue = Vec::with_capacity(groups.len());
+        for group in groups {
+            queue.push(group.representative.clone());
+            // 単独の写真は控えない。**持たないものは食い違わない。**
+            if group.members.len() > 1 {
+                members.insert(group.representative.clone(), group.members);
+            }
+        }
+        (queue, members)
+    } else {
+        (
+            photos.iter().map(|p| p.relative_path.clone()).collect(),
+            HashMap::new(),
+        )
+    };
+
+    let mut session = Session {
+        group_size: group_size.max(2),
+        target_star,
+        round: 1,
+        queue,
+        current: Vec::new(),
+        survivors: Vec::new(),
+        ratings,
+        members,
+        history: Vec::new(),
+        finished: false,
+    };
+    fill(&mut session);
+    session
+}
+
+/// 次に見せる分を queue から取り出す。取り出せなければ終わり。
+fn fill(session: &mut Session) {
+    let take = (session.group_size as usize).min(session.queue.len());
+    session.current = session.queue.drain(..take).collect();
+    session.finished = session.current.is_empty();
+}
+
+/// 星を配る。まとまりの仲間にも同じだけ動かす。
+fn shift_star(session: &mut Session, id: &str, delta: i32) {
+    let star = session.ratings.get(id).copied().unwrap_or(0);
+    session
+        .ratings
+        .insert(id.to_string(), (star + delta).clamp(0, MAX_STAR));
+    let Some(mates) = session.members.get(id).cloned() else {
+        return;
+    };
+    for mate in mates {
+        if mate == id {
+            continue;
+        }
+        let mate_star = session.ratings.get(&mate).copied().unwrap_or(0);
+        session
+            .ratings
+            .insert(mate, (mate_star + delta).clamp(0, MAX_STAR));
+    }
+}
+
+/// いまのグループを確定して次へ。
+///
+/// **選ばれたものだけ星が 1 つ上がる。** 選ばれなかったものは据え置きで、
+/// そのラウンドから外れる。「落とす」は星を下げることではない。
+pub fn advance(session: Session, selected: Vec<String>) -> Session {
+    let mut next = session;
+    let group = next.current.clone();
+    // 画面に無いものが渡ってきても無視する。**呼び出し側を信用しない。**
+    let chosen: Vec<String> = selected
+        .into_iter()
+        .filter(|id| group.contains(id))
+        .collect();
+
+    for id in &chosen {
+        next.survivors.push(id.clone());
+        // 仲間には星だけ配り、survivors には入れない。
+        // 入れると次のラウンドで仲間が全部出てきて、畳んだ意味が消える。
+        shift_star(&mut next, id, 1);
+    }
+
+    next.history.push(Decision { group, chosen });
+    fill(&mut next);
+    next
+}
+
+/// 直前の判断を取り消す。**星も戻す。**
+///
+/// 戻せるのは「進んだこと」と「上げた星」の両方。星だけ残ると、
+/// 次のラウンドに出てくる顔ぶれが変わってしまう。
+pub fn undo(session: Session) -> Session {
+    let mut next = session;
+    let Some(last) = next.history.pop() else {
+        return next;
+    };
+
+    // いま出している分を queue の先頭へ戻す。
+    let mut queue = last.group.clone();
+    queue.append(&mut next.current);
+    queue.append(&mut next.queue);
+    next.queue = queue;
+
+    for id in &last.chosen {
+        if let Some(position) = next.survivors.iter().rposition(|s| s == id) {
+            next.survivors.remove(position);
+        }
+        shift_star(&mut next, id, -1);
+    }
+
+    fill(&mut next);
+    next
+}
+
+
+// ---------------------------------------------------------------------------
+// 保存
+// ---------------------------------------------------------------------------
+
+/// 選別の途中を文字列にする。**形は core が持つ。**
+///
+/// 各環境が独自に組み立てると、端末をまたいだときに読めない。
+/// サイドカー（NAS で共有する catalog.json）もこの形をそのまま入れる。
+pub fn session_to_json(session: Session) -> String {
+    serde_json::to_string(&session).unwrap_or_else(|_| "{}".into())
+}
+
+/// 読み戻す。**形が違えば null を返す。**
+/// 中途半端に読むより、読まずに最初からやり直す方が安全。
+pub fn session_from_json(json: String) -> Option<Session> {
+    serde_json::from_str(&json).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,6 +339,167 @@ mod tests {
             distance: 6,
             d_hash_version: 2,
         }
+    }
+
+
+    fn plain(names: &[&str]) -> Vec<PhotoRef> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| PhotoRef {
+                relative_path: (*name).into(),
+                // まとめが起きないよう、わざと離す。
+                captured_at: Some(index as i64 * 100_000),
+                d_hash: Some("0000000000000000".into()),
+                d_hash_version: 2,
+            })
+            .collect()
+    }
+
+    fn round(names: &[&str], size: u32) -> Session {
+        start_round(plain(names), size, 0, false, threshold(), vec![])
+    }
+
+    #[test]
+    fn 始めると最初のグループが出ている() {
+        let session = round(&["1", "2", "3", "4", "5"], 2);
+        assert_eq!(session.current, vec!["1", "2"]);
+        assert_eq!(session.queue, vec!["3", "4", "5"]);
+        assert!(!session.finished);
+    }
+
+    #[test]
+    fn 選ばれたものだけ星が上がる() {
+        let session = round(&["1", "2", "3", "4"], 2);
+        let after = advance(session, vec!["1".into()]);
+        assert_eq!(after.ratings["1"], 1);
+        // **落ちたものは下がらない。** 据え置きでラウンドから外れるだけ。
+        assert_eq!(after.ratings["2"], 0);
+        assert_eq!(after.survivors, vec!["1"]);
+        assert_eq!(after.current, vec!["3", "4"]);
+    }
+
+    #[test]
+    fn 一枚も選ばなくても進める() {
+        // 良い写真が 1 枚も無いグループはある。
+        let session = round(&["1", "2", "3", "4"], 2);
+        let after = advance(session, vec![]);
+        assert!(after.survivors.is_empty());
+        assert_eq!(after.current, vec!["3", "4"]);
+    }
+
+    #[test]
+    fn 画面に無いものを渡しても無視する() {
+        let session = round(&["1", "2", "3", "4"], 2);
+        let after = advance(session, vec!["3".into()]);
+        assert!(after.survivors.is_empty(), "見えていない写真は通さない");
+    }
+
+    #[test]
+    fn 最後まで進むと終わる() {
+        let session = round(&["1", "2"], 2);
+        let after = advance(session, vec!["1".into()]);
+        assert!(after.finished);
+        assert!(after.current.is_empty());
+    }
+
+    #[test]
+    fn 一つ戻すと星も戻る() {
+        let session = round(&["1", "2", "3", "4"], 2);
+        let after = advance(session, vec!["1".into()]);
+        let back = undo(after);
+        assert_eq!(back.ratings["1"], 0, "星が戻らないと次の顔ぶれが変わる");
+        assert!(back.survivors.is_empty());
+        assert_eq!(back.current, vec!["1", "2"], "同じグループに戻る");
+        assert_eq!(back.queue, vec!["3", "4"]);
+    }
+
+    #[test]
+    fn 履歴が無ければ戻しても壊れない() {
+        let session = round(&["1", "2"], 2);
+        let back = undo(session.clone());
+        assert_eq!(back.current, session.current);
+    }
+
+    #[test]
+    fn まとめた仲間にも星が配られる() {
+        // 時間も見た目も近い 3 枚 ＋ 離れた 1 枚。
+        let photos = vec![
+            photo("a1.jpg", 1000, "0000000000000000"),
+            photo("a2.jpg", 2000, "0000000000000001"),
+            photo("a3.jpg", 3000, "0000000000000003"),
+            photo("b1.jpg", 500_000, "ffffffffffffffff"),
+        ];
+        let session = start_round(photos, 2, 0, true, threshold(), vec![]);
+        // 画面に出るのは代表だけ。
+        assert_eq!(session.current, vec!["a1.jpg", "b1.jpg"]);
+
+        let after = advance(session, vec!["a1.jpg".into()]);
+        // **仲間にも同じ星が付く。**
+        assert_eq!(after.ratings["a1.jpg"], 1);
+        assert_eq!(after.ratings["a2.jpg"], 1);
+        assert_eq!(after.ratings["a3.jpg"], 1);
+        // **仲間は survivors に入れない。** 入れると次のラウンドで全員出てくる。
+        assert_eq!(after.survivors, vec!["a1.jpg"]);
+    }
+
+    #[test]
+    fn まとめを戻すと仲間の星も戻る() {
+        let photos = vec![
+            photo("a1.jpg", 1000, "0000000000000000"),
+            photo("a2.jpg", 2000, "0000000000000001"),
+            photo("b1.jpg", 500_000, "ffffffffffffffff"),
+        ];
+        let session = start_round(photos, 2, 0, true, threshold(), vec![]);
+        let after = advance(session, vec!["a1.jpg".into()]);
+        let back = undo(after);
+        assert_eq!(back.ratings["a1.jpg"], 0);
+        assert_eq!(back.ratings["a2.jpg"], 0, "仲間だけ星が残ると辻褄が合わない");
+    }
+
+
+    #[test]
+    fn 保存して読み戻すと同じ状態になる() {
+        let session = round(&["1", "2", "3", "4"], 2);
+        let after = advance(session, vec!["1".into()]);
+        let json = session_to_json(after.clone());
+        let back = session_from_json(json).expect("読み戻せる");
+        assert_eq!(back.current, after.current);
+        assert_eq!(back.queue, after.queue);
+        assert_eq!(back.survivors, after.survivors);
+        assert_eq!(back.ratings["1"], 1);
+        assert_eq!(back.history.len(), 1);
+    }
+
+    #[test]
+    fn 形が違う保存は読まない() {
+        // **中途半端に読むより、読まずに最初からやり直す方が安全。**
+        assert!(session_from_json("{}".into()).is_none());
+        assert!(session_from_json("こわれている".into()).is_none());
+        assert!(session_from_json(r#"{"groupSize":4}"#.into()).is_none());
+    }
+
+    #[test]
+    fn 読み戻したものから選別を続けられる() {
+        let session = round(&["1", "2", "3", "4", "5", "6"], 2);
+        let after = advance(session, vec!["1".into()]);
+        let back = session_from_json(session_to_json(after)).expect("読み戻せる");
+        // **保存を挟んでも、戻すところまで含めて同じように動く。**
+        let next = advance(back, vec!["3".into()]);
+        assert_eq!(next.survivors, vec!["1", "3"]);
+        let undone = undo(next);
+        assert_eq!(undone.survivors, vec!["1"]);
+        assert_eq!(undone.current, vec!["3", "4"]);
+    }
+
+    #[test]
+    fn 星は上限で頭打ちになる() {
+        let mut photos = plain(&["1", "2"]);
+        photos[0].relative_path = "1".into();
+        let mut session = start_round(photos, 2, 5, false, threshold(), vec![]);
+        session.ratings.insert("1".into(), 5);
+        let after = advance(session, vec!["1".into()]);
+        assert_eq!(after.ratings["1"], 5);
     }
 
     #[test]

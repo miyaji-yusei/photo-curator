@@ -16,6 +16,10 @@ crate-type = ["cdylib", "lib"]
 
 [dependencies]
 uniffi = { version = "0.28", features = ["cli"] }
+# 保存の形は core が持つ。**各環境が独自に組み立てない。**
+# サイドカー（NAS で共有する catalog.json）もこの形をそのまま使う。
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [build-dependencies]
 uniffi = { version = "0.28", features = ["build"] }

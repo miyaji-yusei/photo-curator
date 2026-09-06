@@ -16,6 +16,28 @@ namespace photo_curator_core {
 
     // dHash どうしの距離。**0 が同一。** 版が違うものは比べない。
     u32 hash_distance(string left, string right);
+
+    // ---- 選別 ----
+    // ラウンドを始める。連写のまとめは中で済ませる。
+    Session start_round(
+        sequence<PhotoRef> photos,
+        u32 group_size,
+        i32 target_star,
+        boolean group_bursts,
+        BurstThreshold threshold,
+        sequence<PairOverride> overrides
+    );
+
+    // いまのグループを確定して次へ。**選ばれたものは星が 1 つ上がる。**
+    Session advance(Session session, sequence<string> selected);
+
+    // 直前の判断を取り消す。星も戻る。
+    Session undo(Session session);
+
+    // ---- 保存 ----
+    // 保存の形は core が持つ。各環境が独自に組み立てない。
+    string session_to_json(Session session);
+    Session? session_from_json(string json);
 };
 
 // 選別に出す 1 枚。**端末ごとの指し先は持たない。**
@@ -56,4 +78,35 @@ dictionary BurstGroup {
     sequence<string> members;
     // 代表。既定は先頭だが、人が変えられる。
     string representative;
+};
+
+// ---------------------------------------------------------------------------
+// 選別。**3 環境で同じ答えでなければ困るので core に置く。**
+// ---------------------------------------------------------------------------
+
+// 選別の途中。**丸ごと保存して、丸ごと読み戻す。**
+// どこで止めても失わないよう、確定のたびにこれを書く。
+dictionary Session {
+    u32 group_size;
+    i32 target_star;
+    u32 round;
+    // まだ見ていない代表。撮影順。
+    sequence<string> queue;
+    // いま画面に出ている代表。
+    sequence<string> current;
+    // このラウンドを通ったもの。
+    sequence<string> survivors;
+    // 星。代表だけでなく、まとまりの仲間も含む。
+    record<DOMString, i32> ratings;
+    // まとまり。キーが代表、値が仲間（代表を含む）。
+    record<DOMString, sequence<string>> members;
+    // 1 つ戻す用。**ラウンドをまたげる形にしてある。**
+    sequence<Decision> history;
+    // 全部見終わったか。
+    boolean finished;
+};
+
+dictionary Decision {
+    sequence<string> group;
+    sequence<string> chosen;
 };
