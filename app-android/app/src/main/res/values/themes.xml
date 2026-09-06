@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 地の色をテーマ側で決める。**ここを決めないと、セーフエリアの外に
+         白が出る**（Tauri 版で実際に起きた）。 -->
+    <style name="Theme.PhotoCurator" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#101114</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>
