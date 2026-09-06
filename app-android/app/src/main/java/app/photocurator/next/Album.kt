@@ -42,6 +42,8 @@ fun AlbumScreen(
     var confirmRestart by remember { mutableStateOf(false) }
     // 戻ってくるたびに読み直す。**選別してきた結果が古いまま残らないように。**
     var reloads by remember { mutableStateOf(0) }
+    // 一度に並べる枚数。**覚えておく。** 毎回選ばせるほどのことではない。
+    var groupSize by remember { mutableStateOf(Prefs.groupSize(context)) }
 
     LaunchedEffect(album.id, reloads) {
         session = Store.load(context, album.id)
@@ -71,9 +73,35 @@ fun AlbumScreen(
             if (live == null) {
                 Card(
                     "まだ選別していません",
-                    "似た写真をまとめてから、4 枚ずつ見比べます。途中でやめても続きから戻れます。"
+                    "似た写真をまとめてから、$groupSize 枚ずつ見比べます。" +
+                        "途中でやめても続きから戻れます。"
                 )
-                Spacer(Modifier.height(12.dp))
+                Spacer(Modifier.height(16.dp))
+
+                // **始める前にだけ選ばせる。** 途中で変えると、同じラウンドの
+                // 中で見比べる枚数が変わってしまい、比べた条件が揃わなくなる。
+                Text("一度に並べる枚数", fontSize = 12.sp, color = Faint)
+                Spacer(Modifier.height(6.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    for (size in listOf(2, 3, 4, 6, 9)) {
+                        FilterChip(
+                            selected = size == groupSize,
+                            onClick = {
+                                groupSize = size
+                                Prefs.setGroupSize(context, size)
+                            },
+                            label = { Text("$size 枚", fontSize = 13.sp) },
+                            // 選んだものはこのアプリの色で示す。既定の紫は
+                            // 他の場所で使っていないので、別の意味に見える。
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = Lime,
+                                selectedLabelColor = Color.Black
+                            )
+                        )
+                    }
+                }
+
+                Spacer(Modifier.height(16.dp))
                 Button(
                     onClick = onCull, shape = RoundedCornerShape(50),
                     modifier = Modifier.fillMaxWidth().height(48.dp)
