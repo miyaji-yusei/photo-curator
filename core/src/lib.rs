@@ -6,7 +6,7 @@
 //! いまは連写のまとめ方が Rust（PC）と TypeScript（Web）に二重実装されていて、
 //! 片方だけ直る不具合が実際に起きた。作り直しでここを 1 つに畳む。
 
-uniffi::include_scaffolding!("core");
+uniffi::include_scaffolding!("photo_curator_core");
 
 #[derive(Debug, Clone)]
 pub struct PhotoRef {

@@ -3,7 +3,7 @@
 // バイトを読む・画像をデコードする・画面に出すのは各環境の仕事。
 // ここに置くのは「同じ入力なら同じ答えでなければ困るもの」だけ。
 
-namespace core {
+namespace photo_curator_core {
     // 2 枚が同じ連写か。**時間の近さと見た目の近さの両方**で決める。
     boolean is_same_burst(BurstPair pair, BurstThreshold threshold);
 

@@ -16,7 +16,17 @@ const CORE = join(ROOT, 'core')
 const APP = join(ROOT, 'app-android', 'app', 'src', 'main')
 const TARGET = 'aarch64-linux-android'
 const ABI = 'arm64-v8a'
-const LIB = 'libphoto_curator_core.so'
+// namespace ＝ クレート名 ＝ ライブラリ名。合わせないと実機で落ちる。
+const NAMESPACE = 'photo_curator_core'
+// cargo が出すファイル名。[lib] name から決まる。
+const BUILT_LIB = `lib${NAMESPACE}.so`
+// **UniFFI が実機で探す名前は違う。**
+//
+// 生成された Kotlin は libuniffi_<namespace>.so を dlopen し、記号は
+// uniffi_<クレート名>_... を引く。**ファイル名と記号で規則が別。**
+// クレート名を uniffi_ 付きにすると記号が二重前置きになって合わなくなるので、
+// クレートはそのままにして、置くときに名前を付け替える。
+const INSTALLED_LIB = `libuniffi_${NAMESPACE}.so`
 const MIN_SDK = 24
 
 const release = !process.argv.includes('--debug')
@@ -81,22 +91,25 @@ function run(command, args, options = {}) {
 run('cargo', ['build', '--target', TARGET, ...(release ? ['--release'] : [])])
 
 // 2. Kotlin のバインディングを作る。**版のずれを避けるため同じクレートの bin から。**
-run('cargo', ['run', '--bin', 'uniffi-bindgen', '--', 'generate', 'src/core.udl',
+run('cargo', ['run', '--bin', 'uniffi-bindgen', '--', 'generate', `src/${NAMESPACE}.udl`,
   '--language', 'kotlin', '--out-dir', 'bindings'], { env: process.env })
 
 // 3. app-android へ置く
-const built = join(CORE, 'target', TARGET, profileDir, LIB)
+const built = join(CORE, 'target', TARGET, profileDir, BUILT_LIB)
 if (!existsSync(built)) {
   console.error(`ビルド結果が見つかりません: ${built}`)
   process.exit(1)
 }
 const jniDir = join(APP, 'jniLibs', ABI)
 mkdirSync(jniDir, { recursive: true })
-copyFileSync(built, join(jniDir, LIB))
+copyFileSync(built, join(jniDir, INSTALLED_LIB))
 
-const bindingsDir = join(APP, 'java', 'uniffi', 'core')
+const bindingsDir = join(APP, 'java', 'uniffi', NAMESPACE)
 mkdirSync(bindingsDir, { recursive: true })
-copyFileSync(join(CORE, 'bindings', 'uniffi', 'core', 'core.kt'), join(bindingsDir, 'core.kt'))
+copyFileSync(
+  join(CORE, 'bindings', 'uniffi', NAMESPACE, `${NAMESPACE}.kt`),
+  join(bindingsDir, `${NAMESPACE}.kt`)
+)
 
-console.log(`\n置いた: ${ABI}/${LIB} (${(statSync(built).size / 1024).toFixed(0)} KB)`)
-console.log(`置いた: uniffi/core/core.kt`)
+console.log(`\n置いた: ${ABI}/${INSTALLED_LIB} (${(statSync(built).size / 1024).toFixed(0)} KB)`)
+console.log(`置いた: uniffi/${NAMESPACE}/${NAMESPACE}.kt`)

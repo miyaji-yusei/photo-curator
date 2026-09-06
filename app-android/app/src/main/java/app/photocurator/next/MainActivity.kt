@@ -26,14 +26,17 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import coil.compose.AsyncImage
-import uniffi.core.BurstThreshold
-import uniffi.core.PhotoRef
-import uniffi.core.groupBursts
+import uniffi.photo_curator_core.BurstThreshold
+import uniffi.photo_curator_core.PhotoRef
+import uniffi.photo_curator_core.groupBursts
 import coil.request.ImageRequest
 import kotlinx.coroutines.launch
 
@@ -92,10 +95,23 @@ private fun AlbumList(onPick: (Album) -> Unit) {
     val context = LocalContext.current
     var albums by remember { mutableStateOf<List<Album>>(emptyList()) }
     var note by remember { mutableStateOf("読み込み中…") }
+    // **前面に戻るたびに読み直す。**
+    // 権限のダイアログは別の Activity なので、許可した直後にここへ戻ってくる。
+    // 起動時に 1 回だけ問い合わせると、許可前の「0 件」がそのまま残る。
+    var reloads by remember { mutableStateOf(0) }
+    val owner = LocalLifecycleOwner.current
+    DisposableEffect(owner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) reloads += 1
+        }
+        owner.lifecycle.addObserver(observer)
+        onDispose { owner.lifecycle.removeObserver(observer) }
+    }
 
-    LaunchedEffect(Unit) {
+    LaunchedEffect(reloads) {
+        note = "読み込み中…"
         albums = Photos.albums(context)
-        note = if (albums.isEmpty()) "写真が見つかりません（権限を許可してください）"
+        note = if (albums.isEmpty()) "写真が見つかりません（権限を確認してください）"
         else "アルバム ${albums.size} 件"
     }
 
