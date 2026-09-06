@@ -404,3 +404,8 @@ body { margin: 0; }
   align-items: center; justify-content: center; gap: 6px;
   font-size: 11px; color: rgba(255,255,255,.55);
 }
+
+/* 星の内訳。**数字の羅列より、比が目に入る方が次の判断が早い。** */
+.star-bar { display: flex; height: 8px; border-radius: 4px; overflow: hidden; background: #24272d; }
+.star-bar span { display: block; height: 100%; }
+.star-dot { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }

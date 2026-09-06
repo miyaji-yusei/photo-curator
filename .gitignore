@@ -25,3 +25,6 @@ src-tauri/gen/schemas/
 .vscode/
 
 .claude/tmp/
+
+# 実機へ入れる APK の置き場。生成物なので追わない。
+build-out/

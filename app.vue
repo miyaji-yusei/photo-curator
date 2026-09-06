@@ -353,6 +353,26 @@ const hasSelectionData = computed(() => {
 })
 const ratingCount = (rating: number) => selectionSummary.value?.counts[rating] ?? 0
 
+/**
+ * 星の内訳。**「いま全体がどうなっているか」を 1 本の帯で見せる。**
+ * 数字の羅列より、比が目に入る方が次の判断が早い。
+ */
+const STAR_COLORS = ['#2a2d34', '#5f6a3a', '#8fa84f', '#8fa84f', '#b7d95f', '#d6ff73']
+const starBreakdown = computed(() => {
+  const total = selectionSummary.value?.total ?? 0
+  if (!total) return []
+  // 高い星を左に置く。残したものが先に目に入る。
+  return [5, 4, 3, 2, 1, 0]
+    .map(rating => ({ rating, count: ratingCount(rating), color: STAR_COLORS[rating]! }))
+    .filter(part => part.count > 0)
+    .map(part => ({ ...part, percent: (part.count / total) * 100 }))
+})
+
+/** 次のラウンドが何回で終わりそうか。**待つ時間の見当が付く。** */
+function roundsAhead(count: number, groupSize: number) {
+  return Math.max(1, Math.ceil(count / Math.max(2, groupSize)))
+}
+
 // レートの移動
 const moveDialog = ref(false)
 const moveFrom = ref(0)
@@ -2762,35 +2782,55 @@ onBeforeUnmount(() => {
         </template>
 
         <template v-else-if="view === 'result' && session">
-          <div class="text-overline text-primary">★{{ session.targetRating }} の選別が終わりました</div>
-          <h1 class="text-h5 text-md-h4">{{ session.survivors.length.toLocaleString() }} 枚が ★{{ Math.min(MAX_RATING, session.targetRating + 1) }} に上がりました</h1>
-          <p class="text-medium-emphasis mt-2">
-            選ばれなかった写真は ★{{ session.targetRating }} のまま残っています。次はどの星を選別するか、レーティング画面から選べます。
-          </p>
-          <v-alert v-if="!session.survivors.length" type="warning" variant="tonal" class="mt-5" max-width="680">
-            1枚も選ばれませんでした。厳しく見すぎた場合は「1つ戻す」で直前のグループからやり直せます。
-          </v-alert>
-          <v-card max-width="720" class="mt-6 pa-6">
-            <div class="text-body-1 mb-5">
-              ★{{ Math.min(MAX_RATING, session.targetRating + 1) }}: <strong>{{ ratingCount(Math.min(MAX_RATING, session.targetRating + 1)).toLocaleString() }} 枚</strong>
-              ／ ★{{ session.targetRating }}: <strong>{{ ratingCount(session.targetRating).toLocaleString() }} 枚</strong>
+          <header class="screen-bar">
+            <v-btn icon="mdi-arrow-left" variant="text" aria-label="プロジェクトへ戻る" @click="view = 'project'" />
+            <h1 class="screen-bar__title">ROUND {{ session.round }} 完了</h1>
+          </header>
+
+          <v-card max-width="640" class="pa-6">
+            <!-- **1 行目が答え。** 何枚残ったのかを最初に言う。 -->
+            <div class="text-h5 mb-1">
+              ★{{ Math.min(MAX_RATING, session.targetRating + 1) }} が
+              <strong>{{ session.survivors.length.toLocaleString() }} 枚</strong>残りました
             </div>
-            <div class="d-flex flex-wrap ga-3">
+            <p class="text-body-2 text-medium-emphasis mb-5">
+              {{ (session.survivors.length + ratingCount(session.targetRating)).toLocaleString() }} 枚から
+              {{ session.survivors.length.toLocaleString() }} 枚に絞られました。
+            </p>
+
+            <div v-if="starBreakdown.length" class="star-bar mb-2">
+              <span
+                v-for="part in starBreakdown" :key="part.rating"
+                :style="{ width: part.percent + '%', background: part.color }"
+                :title="`★${part.rating} ${part.count} 枚`"
+              />
+            </div>
+            <div class="d-flex flex-wrap ga-3 mb-6">
+              <span v-for="part in starBreakdown" :key="part.rating" class="text-caption text-medium-emphasis">
+                <i class="star-dot" :style="{ background: part.color }" />★{{ part.rating }} {{ part.count.toLocaleString() }} 枚
+              </span>
+            </div>
+
+            <v-alert v-if="!session.survivors.length" type="warning" variant="tonal" density="comfortable" class="mb-5">
+              1 枚も選ばれませんでした。厳しく見すぎた場合は「1 つ戻す」で直前のグループからやり直せます。
+            </v-alert>
+            <p v-else class="text-body-2 text-medium-emphasis mb-6">
+              次は ★{{ Math.min(MAX_RATING, session.targetRating + 1) }} の
+              {{ session.survivors.length.toLocaleString() }} 枚を
+              {{ session.settings.groupSize }} 枚ずつ見比べます（約
+              {{ roundsAhead(session.survivors.length, session.settings.groupSize) }} 回）。
+              ここで終えても、結果はいつでも開けます。
+            </p>
+
+            <div class="d-flex align-center flex-wrap ga-3">
+              <v-btn variant="text" @click="openResults">ここで終えて結果へ</v-btn>
+              <v-btn variant="text" prepend-icon="mdi-undo" :disabled="!session.history.length" @click="undoChoice">1 つ戻す</v-btn>
+              <v-spacer />
               <v-btn
-                color="primary" size="large" prepend-icon="mdi-tournament"
+                color="primary" rounded="pill" size="large" append-icon="mdi-arrow-right"
                 :disabled="ratingCount(Math.min(MAX_RATING, session.targetRating + 1)) < 2"
                 @click="openNextRoundDialog(Math.min(MAX_RATING, session.targetRating + 1))"
-              >★{{ Math.min(MAX_RATING, session.targetRating + 1) }} をさらに選別</v-btn>
-              <v-btn
-                variant="outlined" size="large" prepend-icon="mdi-refresh"
-                :disabled="ratingCount(session.targetRating) < 2"
-                @click="openNextRoundDialog(session.targetRating)"
-              >★{{ session.targetRating }} をもう一度見直す</v-btn>
-            </div>
-            <div class="d-flex flex-wrap ga-3 mt-4">
-              <v-btn variant="text" prepend-icon="mdi-star-outline" @click="openResults">レーティングを見る</v-btn>
-              <v-btn variant="text" prepend-icon="mdi-undo" :disabled="!session.history.length" @click="undoChoice">1つ戻す</v-btn>
-              <v-btn variant="text" prepend-icon="mdi-check" @click="view = 'project'">選別を終了する</v-btn>
+              >★{{ Math.min(MAX_RATING, session.targetRating + 1) }} を選別する</v-btn>
             </div>
           </v-card>
         </template>
