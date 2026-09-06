@@ -1,0 +1,19 @@
+[package]
+name = "photo-curator-core"
+version = "0.1.0"
+edition = "2021"
+
+# **判断が絡むものは全部ここに置く。** 画面と入出力は各環境に任せる。
+# cdylib は Android と Web、lib は PC（Tauri から直接使う）向け。
+[lib]
+name = "photo_curator_core"
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+uniffi = { version = "0.28", features = ["cli"] }
+
+[build-dependencies]
+uniffi = { version = "0.28", features = ["build"] }
+
+[dev-dependencies]
+uniffi = { version = "0.28", features = ["bindgen-tests"] }

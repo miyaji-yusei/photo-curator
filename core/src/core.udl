@@ -1,0 +1,59 @@
+// Photo Curator の中核。**判断が絡むものだけを置く。**
+//
+// バイトを読む・画像をデコードする・画面に出すのは各環境の仕事。
+// ここに置くのは「同じ入力なら同じ答えでなければ困るもの」だけ。
+
+namespace core {
+    // 2 枚が同じ連写か。**時間の近さと見た目の近さの両方**で決める。
+    boolean is_same_burst(BurstPair pair, BurstThreshold threshold);
+
+    // 撮影順に並んだ写真を、連写のまとまりへ畳む。
+    sequence<BurstGroup> group_bursts(
+        sequence<PhotoRef> photos,
+        BurstThreshold threshold,
+        sequence<PairOverride> overrides
+    );
+
+    // dHash どうしの距離。**0 が同一。** 版が違うものは比べない。
+    u32 hash_distance(string left, string right);
+};
+
+// 選別に出す 1 枚。**端末ごとの指し先は持たない。**
+dictionary PhotoRef {
+    // 共有の鍵。フォルダ内の相対パス。
+    string relative_path;
+    // 撮影時刻（ミリ秒）。読めなかったものは連写のまとめに出さない。
+    i64? captured_at;
+    // 64bit を 16 桁の 16 進で。読めなかったものは null。
+    string? d_hash;
+    i32 d_hash_version;
+};
+
+dictionary BurstPair {
+    PhotoRef left;
+    PhotoRef right;
+};
+
+// まとめる基準。**利用者が学習させた値がここに入る。**
+dictionary BurstThreshold {
+    // これ以内なら「時間が近い」。既定 4 秒。
+    i64 window_ms;
+    // これ以内なら「見た目が近い」。小さいほど厳しい。
+    u32 distance;
+    // 比べてよい dHash の版。合わないものは比べない。
+    i32 d_hash_version;
+};
+
+// 人が手で直したまとめ方。**まとまりそのものは閾値から導くので持たない。**
+dictionary PairOverride {
+    string left;
+    string right;
+    // "split" は切る、"join" は繋ぐ。
+    string decision;
+};
+
+dictionary BurstGroup {
+    sequence<string> members;
+    // 代表。既定は先頭だが、人が変えられる。
+    string representative;
+};
