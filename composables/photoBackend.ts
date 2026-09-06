@@ -34,8 +34,7 @@ export interface DisplaySettings {
   largeEdge: number
 }
 import type {
-  BurstGroup, BurstPair, ExportReport, Photo, PhotoPage, PhotoSort, Project,
-  ProjectProgress, ProjectTask, SelectionResult, SelectionSeed, SelectionSession, SelectionSummary
+  BurstGroup, BurstPair, ExportReport, Photo, PhotoPage, PhotoSort, Prep, Project, ProjectProgress, ProjectTask, SelectionResult, SelectionSeed, SelectionSession, SelectionSummary, SourceKind
 } from '~/types/photo'
 
 /**
@@ -87,7 +86,13 @@ export interface PhotoBackend {
   onProjectProgress: (callback: (progress: ProjectProgress) => void) => Promise<() => void>
 
   listProjects: () => Promise<Project[]>
-  createProject: (name: string, folderPath: string) => Promise<Project>
+  createProject: (
+    name: string,
+    folderPath: string,
+    source?: { kind: SourceKind; label: string }
+  ) => Promise<Project>
+  /** 準備の 3 本立て。プロジェクトごとに取り直す。 */
+  getProjectPrep: (projectId: string) => Promise<Prep>
   /** 写真原本は消さない。DB の行とサムネイルだけ。 */
   deleteProject: (projectId: string) => Promise<void>
 

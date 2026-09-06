@@ -83,6 +83,40 @@ export interface Project {
   /** このプロジェクトで学習済みの連写まとめ閾値。未学習なら null。 */
   burstThreshold: number | null
   burstThresholdLearnedAt: number | null
+  /**
+   * 写真の出所。**画面はこれだけを見る。**
+   *
+   * `folderPath` は `smb://192.168.11.8/Share/2021_06_13` のような機械の
+   * 言葉で、そのまま出すと読みにくい。人の言葉は `sourceLabel`、生パスは
+   * 「技術情報」にだけ出す。
+   */
+  sourceKind: SourceKind
+  sourceLabel: string
+}
+
+/** 写真の出所の種類。画面のアイコンと、できることの分岐に使う。 */
+export type SourceKind = 'folder' | 'album' | 'nas' | 'imported'
+
+/** 裏で進む 1 本ぶんの状態。 */
+export interface PrepStage {
+  state: 'idle' | 'running' | 'done' | 'error'
+  done: number
+  /** 走査中は枚数が確定しないので null。画面は「120 / ?」と出す。 */
+  total: number | null
+}
+
+/**
+ * プロジェクトの準備状況。**3 本を 1 か所で持つ。**
+ *
+ * 以前は走査の進捗と表示用画像の残数が別々の仕組みで出ていて、画面の
+ * 2 か所に違う進捗が並び、しかもプロジェクトを切り替えても前の値が残っていた。
+ */
+export interface Prep {
+  projectId: string
+  scan: PrepStage
+  meta: PrepStage
+  preview: PrepStage
+  previewEdge: number
 }
 
 export interface TournamentSettings {
@@ -146,6 +180,14 @@ export type SelectionStage =
   | 'burst-final'
 
 export interface SelectionSession {
+  /**
+   * セッションの形の版。**合わない保存は捨てる。**
+   *
+   * 星もサムネイルも写真の側に持っているので、捨てて困るのは
+   * 「いまどこまで選んだか」だけ。形を変えるたびに移行を書くより、
+   * 最初からやり直してもらう方が確実で、失うものも小さい。
+   */
+  version?: number
   projectId: string
   settings: TournamentSettings
   candidates: string[]

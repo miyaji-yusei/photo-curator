@@ -40,6 +40,7 @@ export function makeSession(
   const sorted = sortPairsByDistance(burstPairs)
   const usesBursts = settings.groupBursts && sorted.length > 0
   return {
+    version: SESSION_VERSION,
     projectId,
     settings,
     candidates: photos.map(photo => photo.id),
@@ -72,6 +73,17 @@ export function makeSession(
  * 保存済みセッションを現在の形へ寄せる。閾値学習を入れる前に保存された JSON は
  * burstPairs を持たない。連写まわりだけ初期化し、rating と survivors は残す。
  */
+/**
+ * いまのセッションの形の版。**形を変えたら上げる。**
+ * 上げると、それ以前に保存されたセッションは読まずに捨てられる。
+ */
+export const SESSION_VERSION = 2
+
+/** 読めるセッションか。版が合わなければ捨てる。 */
+export function isCurrentSession(session: SelectionSession | null): boolean {
+  return !!session && session.version === SESSION_VERSION
+}
+
 export function normalizeSession(session: SelectionSession): SelectionSession {
   // 後から足したフィールドは、既存セッションでは欠けている。
   const patched = {

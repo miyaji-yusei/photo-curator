@@ -16,8 +16,7 @@ function originalUrl(path: string): string {
 import { capabilitiesFor, detectPlatform } from '~/utils/capabilities'
 import { open } from '@tauri-apps/plugin-dialog'
 import type {
-  BurstGroup, BurstPair, ExportReport, Photo, PhotoPage, PhotoSort, Project,
-  ProjectProgress, ProjectTask, SelectionResult, SelectionSeed, SelectionSession, SelectionSummary
+  BurstGroup, BurstPair, ExportReport, Photo, PhotoPage, PhotoSort, Prep, Project, ProjectProgress, ProjectTask, SelectionResult, SelectionSeed, SelectionSession, SelectionSummary, SourceKind
 } from '~/types/photo'
 import { normalizeSession } from '~/utils/tournament'
 import type { DisplaySettings, NasCredentials, NasSettings, PhotoAlbum, PhotoBackend } from '~/composables/photoBackend'
@@ -63,7 +62,11 @@ export function createTauriBackend(): PhotoBackend {
       return listen<ProjectProgress>('project-progress', event => callback(event.payload))
     },
     listProjects: () => invokeDesktop<Project[]>('list_projects'),
-    createProject: (name: string, folderPath: string) => invokeDesktop<Project>('create_project', { name, folderPath }),
+    createProject: (name: string, folderPath: string, source?: { kind: SourceKind; label: string }) =>
+      invokeDesktop<Project>('create_project', {
+        name, folderPath, sourceKind: source?.kind ?? null, sourceLabel: source?.label ?? null
+      }),
+    getProjectPrep: (projectId: string) => invokeDesktop<Prep>('get_project_prep', { projectId }),
     deleteProject: (projectId: string) => invokeDesktop<void>('delete_project', { projectId }),
     getProjectPhotoPage: (projectId: string, offset = 0, limit = 80, rating: number | null = null, sort: PhotoSort = 'name') =>
       invokeDesktop<PhotoPage>('get_project_photo_page', { projectId, offset, limit, rating, sort }),

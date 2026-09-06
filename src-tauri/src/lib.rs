@@ -202,6 +202,13 @@ struct Project {
     /// 連写まとめの学習済み閾値。未学習なら None。
     burst_threshold: Option<i64>,
     burst_threshold_learned_at: Option<i64>,
+    /// 写真の出所。**画面はこれだけを見る。**
+    ///
+    /// `folder_path` は `smb://192.168.11.8/Share/2021_06_13` のような
+    /// 機械の言葉で、そのまま画面に出すと読みにくい。種類とラベルを別に持ち、
+    /// 画面には `source_label` を、技術情報には `folder_path` を出す。
+    source_kind: String,
+    source_label: String,
 }
 
 #[derive(Serialize)]
@@ -436,6 +443,10 @@ fn open_database(path: &Path) -> Result<Connection, String> {
     // 連写まとめの閾値はプロジェクトごとに学習する。固定値
     // HASH_DISTANCE_LIMIT は実データの距離分布の最も密な領域に当たっており、
     // どのフォルダでも同じ値が正しいという前提が成り立たない。
+    // 出所の種類とラベル。既存の行は NULL のままで、読むときに
+    // folder_path から導く（下の source_of）。移行の書き込みはしない。
+    add_column_if_missing(&conn, "projects", "source_kind", "TEXT")?;
+    add_column_if_missing(&conn, "projects", "source_label", "TEXT")?;
     add_column_if_missing(&conn, "projects", "burst_threshold", "INTEGER")?;
     add_column_if_missing(&conn, "projects", "burst_threshold_learned_at", "INTEGER")?;
 
@@ -2583,11 +2594,146 @@ fn run_burst_analysis(
     Ok(())
 }
 
+impl Project {
+    /// 保存済みの種類とラベルを入れる。無ければ `folder_path` から導く。
+    fn with_source(mut self, kind: Option<String>, label: Option<String>) -> Self {
+        let (kind, label) = source_of(&self.folder_path, kind, label);
+        self.source_kind = kind;
+        self.source_label = label;
+        self
+    }
+}
+
+/// 保存されていない古い行のために、`folder_path` から出所を導く。
+///
+/// **既存の行を書き換えないための逃げ道。** 新しく作る行には作成時に
+/// 種類とラベルを入れるので、ここを通るのは今までに作られた行だけ。
+fn source_of(
+    folder_path: &str,
+    kind: Option<String>,
+    label: Option<String>,
+) -> (String, String) {
+    let kind = kind.unwrap_or_else(|| {
+        if folder_path.starts_with(SMB_PREFIX) {
+            "nas".into()
+        } else if folder_path.starts_with(MEDIASTORE_PREFIX) {
+            "album".into()
+        } else if folder_path.is_empty() {
+            "imported".into()
+        } else {
+            "folder".into()
+        }
+    });
+    let label = label.unwrap_or_else(|| {
+        // 末尾の名前だけ拾う。アルバムは ID しか無いので、それがそのまま出る。
+        // 新しく作る行には作成時に本当の名前が入るので、ここは古い行の保険。
+        folder_path
+            .trim_end_matches(['/', '\\'])
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(folder_path)
+            .to_string()
+    });
+    (kind, label)
+}
+
+/// 裏で進む 1 本ぶんの状態。**画面は done / total だけを出す。**
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrepStage {
+    /// idle | running | done | error
+    state: String,
+    done: i64,
+    /// 走査中は枚数が確定しないので None。画面は「120 / ?」と出す。
+    total: Option<i64>,
+}
+
+/// プロジェクトの準備状況。走査・撮影時刻とサムネイル・表示用画像の 3 本。
+///
+/// **1 か所にまとめて返す。** 以前は走査の進捗イベントと表示用画像の残数が
+/// 別々の仕組みで出ていて、画面の 2 か所に違う進捗が並び、しかも片方は
+/// プロジェクトを切り替えても前の値が残っていた。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Prep {
+    project_id: String,
+    scan: PrepStage,
+    meta: PrepStage,
+    preview: PrepStage,
+    /// いま作っている表示用画像の長辺。
+    preview_edge: u32,
+}
+
+#[tauri::command]
+fn get_project_prep(
+    app: AppHandle,
+    registry: State<'_, TaskRegistry>,
+    project_id: String,
+) -> Result<Prep, String> {
+    let scanning = registry.is_running(&format!("scan:{project_id}"));
+    let analysing = registry.is_running(&format!("burst:{project_id}"))
+        || registry.is_running(&format!("background:{project_id}"));
+    let generating = registry.is_running(&format!("display:{project_id}"));
+    let edge = resolve_display_edge(&app, &project_id)?;
+    let conn = connection(&app)?;
+
+    let count = |sql: &str| -> Result<i64, String> {
+        conn.query_row(sql, params![project_id], |row| row.get(0))
+            .map_err(|error| error.to_string())
+    };
+    let total = count("SELECT COUNT(*) FROM photos WHERE project_id=?1 AND is_missing=0")?;
+    let with_meta = count(
+        "SELECT COUNT(*) FROM photos WHERE project_id=?1 AND is_missing=0
+           AND captured_at IS NOT NULL AND thumbnail_path IS NOT NULL",
+    )?;
+    let with_preview = conn
+        .query_row(
+            "SELECT COUNT(*) FROM photos
+             WHERE project_id=?1 AND is_missing=0
+               AND display_path IS NOT NULL AND display_edge=?2",
+            params![project_id, edge as i64],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+
+    // 走っていないのに揃っていなければ idle。「止まっている」ことが分かる。
+    let settle = |running: bool, done: i64, total: i64| PrepStage {
+        state: if running {
+            "running".into()
+        } else if total > 0 && done >= total {
+            "done".into()
+        } else {
+            "idle".into()
+        },
+        done,
+        total: Some(total),
+    };
+
+    Ok(Prep {
+        scan: PrepStage {
+            state: if scanning {
+                "running".into()
+            } else if total > 0 {
+                "done".into()
+            } else {
+                "idle".into()
+            },
+            done: total,
+            // 走査中は「これから何枚見つかるか」が分からない。
+            total: if scanning { None } else { Some(total) },
+        },
+        meta: settle(analysing, with_meta, total),
+        preview: settle(generating, with_preview, total),
+        preview_edge: edge,
+        project_id,
+    })
+}
+
 #[tauri::command]
 fn list_projects(app: AppHandle) -> Result<Vec<Project>, String> {
     let conn = connection(&app)?;
     let mut statement = conn
-        .prepare("SELECT id,name,folder_path,photo_count,status,created_at,updated_at,burst_threshold,burst_threshold_learned_at FROM projects ORDER BY updated_at DESC")
+        .prepare("SELECT id,name,folder_path,photo_count,status,created_at,updated_at,burst_threshold,burst_threshold_learned_at,source_kind,source_label FROM projects ORDER BY updated_at DESC")
         .map_err(|error| error.to_string())?;
     let rows = statement
         .query_map([], |row| {
@@ -2601,7 +2747,10 @@ fn list_projects(app: AppHandle) -> Result<Vec<Project>, String> {
                 updated_at: row.get(6)?,
                 burst_threshold: row.get(7)?,
                 burst_threshold_learned_at: row.get(8)?,
-            })
+                source_kind: String::new(),
+                source_label: String::new(),
+            }
+            .with_source(row.get(9)?, row.get(10)?))
         })
         .map_err(|error| error.to_string())?;
     rows.collect::<Result<Vec<_>, _>>()
@@ -2609,7 +2758,13 @@ fn list_projects(app: AppHandle) -> Result<Vec<Project>, String> {
 }
 
 #[tauri::command]
-fn create_project(app: AppHandle, name: String, folder_path: String) -> Result<Project, String> {
+fn create_project(
+    app: AppHandle,
+    name: String,
+    folder_path: String,
+    source_kind: Option<String>,
+    source_label: Option<String>,
+) -> Result<Project, String> {
     // 端末のフォルダのときだけ実在を確かめる。アルバムや NAS は
     // パスではないので、ここで弾いてはいけない。
     if is_local_folder(&folder_path) && !Path::new(&folder_path).is_dir() {
@@ -2627,11 +2782,19 @@ fn create_project(app: AppHandle, name: String, folder_path: String) -> Result<P
         updated_at: now(),
         burst_threshold: None,
         burst_threshold_learned_at: None,
-    };
+        source_kind: String::new(),
+        source_label: String::new(),
+    }
+    .with_source(source_kind, source_label);
     connection(&app)?
         .execute(
-            "INSERT INTO projects (id,name,folder_path,photo_count,status,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-            params![project.id, project.name, project.folder_path, project.photo_count, project.status, project.created_at, project.updated_at],
+            "INSERT INTO projects (id,name,folder_path,photo_count,status,created_at,updated_at,source_kind,source_label)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                project.id, project.name, project.folder_path, project.photo_count,
+                project.status, project.created_at, project.updated_at,
+                project.source_kind, project.source_label
+            ],
         )
         .map_err(|error| error.to_string())?;
     Ok(project)
@@ -4416,6 +4579,7 @@ pub fn run() {
             write_ratings_to_files,
             list_photo_albums,
             connect_nas,
+            get_project_prep,
             get_nas_settings,
             save_nas_settings,
             disconnect_nas,

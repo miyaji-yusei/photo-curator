@@ -65,7 +65,10 @@ function asProject(row: StoredProject): Project {
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
     burstThreshold: row.burstThreshold,
-    burstThresholdLearnedAt: row.burstThresholdLearnedAt
+    burstThresholdLearnedAt: row.burstThresholdLearnedAt,
+    // ブラウザは取り込んだ写真しか持たない。出所は 1 種類しかない。
+    sourceKind: 'imported',
+    sourceLabel: 'この端末に取り込んだ写真'
   }
 }
 
@@ -173,6 +176,21 @@ export function createLocalBackend(): PhotoBackend {
         putOne(transaction, STORE_PROJECTS, row)
       )
       return asProject(row)
+    },
+
+    /**
+     * ブラウザ版の準備状況。
+     *
+     * 取り込みの時点でサムネイルと表示用画像を作り終えているので、
+     * **走査も生成も「済み」しかない。** 数だけ合わせて返す。
+     */
+    getProjectPrep: async (projectId: string) => {
+      const rows = await withStores([STORE_PHOTOS], 'readonly', transaction =>
+        photosOfProject(transaction, projectId)
+      )
+      const total = rows.length
+      const stage = { state: total ? ('done' as const) : ('idle' as const), done: total, total }
+      return { projectId, scan: stage, meta: stage, preview: stage, previewEdge: DISPLAY_EDGE_DEFAULT }
     },
 
     deleteProject: async (projectId: string) => {

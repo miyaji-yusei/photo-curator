@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type {
-  BurstGroup, BurstPair, ExportReport, Photo, PhotoSort, Project, ProjectProgress,
-  SelectionResult, SelectionSession, SelectionSummary, TournamentSettings
+  BurstGroup, BurstPair, ExportReport, Photo, PhotoSort, Prep, Project, ProjectProgress,
+  SelectionResult, SelectionSession, SelectionSummary, SourceKind, TournamentSettings
 } from '~/types/photo'
 import { MAX_RATING } from '~/types/photo'
 import type { DisplaySettings, PhotoAlbum } from '~/composables/photoBackend'
@@ -14,6 +14,8 @@ import {
 import {
   collapseBursts,
   insertIntoUpcoming,
+  isCurrentSession,
+  SESSION_VERSION,
   makeSession,
   prepareRound,
   regroupRemaining,
@@ -55,6 +57,13 @@ const error = ref('')
 const createDialog = ref(false)
 const projectName = ref('')
 const folderPath = ref('')
+/**
+ * 選んだ出所。**`folderPath` だけでは名前にならない。**
+ *
+ * Android のアルバムは `mediastore://1318273798` で、末尾を取ると内部 ID が
+ * そのままプロジェクト名になっていた。選んだときに人の言葉も一緒に覚える。
+ */
+const pickedSource = ref<{ kind: SourceKind; label: string } | null>(null)
 const taskProgress = ref<ProjectProgress | null>(null)
 const taskWarning = ref<string | null>(null)
 const taskDialog = ref(false)
@@ -328,7 +337,14 @@ async function openProject(project: Project) {
   view.value = 'project'
   loading.value = true
   try {
-    await Promise.all([loadPreview(project.id), desktop.loadSession(project.id).then(value => { session.value = value })])
+    await Promise.all([
+      loadPreview(project.id),
+      // **版が合わないセッションは読まない。** 星とサムネイルは写真の側に
+      // 残るので、失うのは「いまどこまで選んだか」だけ。
+      desktop.loadSession(project.id).then(value => {
+        session.value = isCurrentSession(value) ? value : null
+      })
+    ])
     // 開いた時点から少しずつ解析を進めておく。「選別を開始」で待たされないように。
     // ただし**やることが無いなら起動しない**。以前は無条件に呼んでいたため、
     // 解析済みのプロジェクトを開くたびに進捗イベントだけが飛び、解析中の帯が
@@ -402,6 +418,15 @@ const nasCanRemember = ref(false)
 const nasPasswordVisible = ref(false)
 const albumsBusy = ref(false)
 const usesAlbums = computed(() => photoAlbums.value.length > 0)
+
+/** 一覧から出所を選ぶ。**種類とラベルを一緒に控える。** */
+function pickAlbum(album: PhotoAlbum) {
+  folderPath.value = album.path
+  pickedSource.value = {
+    kind: album.path.startsWith('smb://') ? 'nas' : 'album',
+    label: album.name
+  }
+}
 
 function openCreateDialog() {
   createDialog.value = true
@@ -528,11 +553,21 @@ async function createProject() {
   if (!canImportPhotos.value && !folderPath.value) return
   loading.value = true
   try {
-    const fallbackName = folderPath.value ? fileName(folderPath.value) : '新しいプロジェクト'
-    const project = await desktop.createProject(projectName.value.trim() || fallbackName, folderPath.value)
+    // 名前の既定は**人の言葉**。アルバムの内部 ID を名前にしない。
+    const label = pickedSource.value?.label
+      ?? (folderPath.value ? fileName(folderPath.value) : '')
+    const fallbackName = label || '新しいプロジェクト'
+    const source = pickedSource.value
+      ?? (folderPath.value ? { kind: 'folder' as SourceKind, label } : undefined)
+    const project = await desktop.createProject(
+      projectName.value.trim() || fallbackName,
+      folderPath.value,
+      source
+    )
     createDialog.value = false
     projectName.value = ''
     folderPath.value = ''
+    pickedSource.value = null
     await refreshProjects()
     await openProject(project)
     // ここで写真ピッカーを自動で開かない。iOS はファイル選択を
@@ -2343,7 +2378,7 @@ onBeforeUnmount(() => {
           <v-list-item
             v-for="album in photoAlbums" :key="album.path"
             :active="folderPath === album.path" color="primary" rounded="lg"
-            @click="folderPath = album.path"
+            @click="pickAlbum(album)"
           >
             <template #prepend><v-icon icon="mdi-image-multiple-outline" /></template>
             <v-list-item-title>{{ album.name }}</v-list-item-title>
