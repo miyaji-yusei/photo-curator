@@ -388,12 +388,49 @@ const nasPassword = ref('')
 const nasBusy = ref(false)
 const nasError = ref('')
 const nasConnected = ref(false)
+/** この環境が NAS に直接繋ぐか。デスクトップは OS が共有をマウントするので繋がない。 */
+const usesNas = computed(() => desktop.capabilities.browseFolders && !canImportPhotos.value)
+/** いま開いているのが NAS 上のプロジェクトか。 */
+const activeProjectOnNas = computed(() =>
+  (activeProject.value?.folderPath ?? '').startsWith('smb://')
+)
+/** パスワードを覚えるか。**既定は覚えない。** */
+const nasRemember = ref(false)
+/** この環境でパスワードを預かれるか。駄目ならトグルを出さない。 */
+const nasCanRemember = ref(false)
+/** 目のアイコンでの表示切り替え。 */
+const nasPasswordVisible = ref(false)
 const albumsBusy = ref(false)
 const usesAlbums = computed(() => photoAlbums.value.length > 0)
 
 function openCreateDialog() {
   createDialog.value = true
   void loadPhotoAlbums()
+}
+
+/**
+ * NAS のダイアログを開く。**前回の繋ぎ先を先に入れておく。**
+ *
+ * 毎回ホストと共有名を打ち直すのは、同じ NAS を使い続ける限りただの手間。
+ * パスワードだけは「覚える」を選んだときにしか入らない。
+ */
+async function openNasDialog() {
+  nasError.value = ''
+  nasPasswordVisible.value = false
+  try {
+    const saved = await desktop.getNasSettings()
+    nasCanRemember.value = saved.canRememberPassword
+    nasRemember.value = saved.rememberPassword
+    // 入力途中のものがあれば残す。空のときだけ前回の値を入れる。
+    if (!nasHost.value) nasHost.value = saved.host
+    if (!nasShare.value) nasShare.value = saved.share
+    if (!nasUser.value) nasUser.value = saved.user
+    if (!nasPassword.value) nasPassword.value = saved.password
+  } catch {
+    // 読めなくても入力はできる。空のまま開く。
+    nasCanRemember.value = false
+  }
+  nasDialog.value = true
 }
 
 /**
@@ -410,8 +447,21 @@ async function connectNas() {
     )
     photoAlbums.value = folders
     nasConnected.value = true
-    // 使い終わったら消す。画面にも DB にも残さない。
-    nasPassword.value = ''
+    // 繋がった組み合わせだけ覚える。**失敗した値を覚えても役に立たない。**
+    try {
+      await desktop.saveNasSettings({
+        host: nasHost.value.trim(),
+        share: nasShare.value.trim(),
+        user: nasUser.value,
+        rememberPassword: nasRemember.value && nasCanRemember.value,
+        password: nasPassword.value
+      })
+    } catch {
+      // 覚えられなくても、この接続は成立している。先へ進める。
+    }
+    // 覚えないときは画面からも消す。
+    if (!(nasRemember.value && nasCanRemember.value)) nasPassword.value = ''
+    nasPasswordVisible.value = false
     nasDialog.value = false
   } catch (cause) {
     nasError.value = cause instanceof Error ? cause.message : 'NAS に接続できませんでした。'
@@ -1805,7 +1855,7 @@ onBeforeUnmount(() => {
         </template>
 
         <template v-else-if="view === 'project' && activeProject">
-          <div class="d-flex align-center justify-space-between flex-wrap ga-4 mb-7"><div><v-btn variant="text" prepend-icon="mdi-arrow-left" class="px-0" @click="view = 'home'">ホーム</v-btn><h1 class="text-h4 font-weight-bold">{{ activeProject.name }}</h1><p class="text-body-2 text-medium-emphasis mt-1">{{ activeProject.folderPath }}</p></div><div class="d-flex flex-wrap ga-2"><v-btn variant="text" prepend-icon="mdi-delete-outline" @click="askDeleteProject(activeProject)">削除</v-btn><v-btn v-if="hasSelectionData" variant="text" prepend-icon="mdi-star-outline" @click="openResults">選別結果を見る</v-btn><v-btn v-if="canImportPhotos" variant="outlined" prepend-icon="mdi-image-plus" :loading="scanRunning" @click="openPhotoPicker">写真を追加</v-btn><v-btn v-else variant="outlined" prepend-icon="mdi-refresh" :loading="scanRunning" @click="startScan">写真を再読み込み</v-btn><v-btn color="primary" prepend-icon="mdi-play" :disabled="!activeProject.photoCount" @click="session ? resumeSession() : enterMethod()">{{ session ? '選別を再開' : '選別を開始' }}</v-btn></div></div>
+          <div class="d-flex align-center justify-space-between flex-wrap ga-4 mb-7"><div><v-btn variant="text" prepend-icon="mdi-arrow-left" class="px-0" @click="view = 'home'">ホーム</v-btn><h1 class="text-h4 font-weight-bold">{{ activeProject.name }}</h1><p class="text-body-2 text-medium-emphasis mt-1">{{ activeProject.folderPath }}</p></div><div class="d-flex flex-wrap ga-2"><v-btn variant="text" prepend-icon="mdi-delete-outline" @click="askDeleteProject(activeProject)">削除</v-btn><v-btn v-if="hasSelectionData" variant="text" prepend-icon="mdi-star-outline" @click="openResults">選別結果を見る</v-btn><v-btn v-if="canImportPhotos" variant="outlined" prepend-icon="mdi-image-plus" :loading="scanRunning" @click="openPhotoPicker">写真を追加</v-btn><v-btn v-if="usesNas && activeProjectOnNas" variant="outlined" prepend-icon="mdi-nas" :loading="nasBusy" @click="openNasDialog">{{ nasConnected ? 'NAS を切り替える' : 'NAS に繋ぐ' }}</v-btn><v-btn v-if="!canImportPhotos" variant="outlined" prepend-icon="mdi-refresh" :loading="scanRunning" @click="startScan">写真を再読み込み</v-btn><v-btn color="primary" prepend-icon="mdi-play" :disabled="!activeProject.photoCount" @click="session ? resumeSession() : enterMethod()">{{ session ? '選別を再開' : '選別を開始' }}</v-btn></div></div>
           <v-card class="mb-6"><v-card-text class="d-flex align-center ga-5"><v-avatar color="primary" size="50"><v-icon color="black" icon="mdi-image-multiple" /></v-avatar><div><div class="text-h6">{{ activeProject.photoCount.toLocaleString() }} 枚の写真</div><div class="text-body-2 text-medium-emphasis">{{ canImportPhotos ? '星とサムネイルはこの端末に保存されます。写真ライブラリは変更しません。' : 'サブフォルダも含めて参照します。写真ファイルは変更しません。' }}</div></div></v-card-text></v-card>
           <!-- 選別画面に出す画像の大きさ。**解析を起こす場所の隣に置く**ので
                対応が分かりやすい。設定画面では全体の既定を決められる。 -->
@@ -1886,6 +1936,22 @@ onBeforeUnmount(() => {
                 既定は {{ displaySettings.defaultEdge }}px。2 枚を並べて見比べるときは {{ displaySettings.largeEdge }}px 以上あると
                 引き伸ばされません（実機計測）。
               </p>
+            </template>
+            <!-- NAS への接続。**作成画面だけに置くと、繋ぎ直したいときに
+                 新しいプロジェクトを作りに行くことになる。** -->
+            <template v-if="usesNas">
+              <v-divider class="my-7" />
+              <div class="text-subtitle-1 font-weight-medium mb-2">NAS への接続</div>
+              <p class="text-caption text-medium-emphasis mb-4">
+                <template v-if="nasConnected">{{ nasHost }} / {{ nasShare }} に繋がっています。</template>
+                <template v-else>繋がっていません。NAS の写真を選別するには接続が要ります。</template>
+              </p>
+              <div class="d-flex flex-wrap ga-2">
+                <v-btn variant="outlined" prepend-icon="mdi-nas" :loading="nasBusy" @click="openNasDialog">
+                  {{ nasConnected ? 'NAS を切り替える' : 'NAS に繋ぐ' }}
+                </v-btn>
+                <v-btn v-if="nasConnected" variant="text" @click="disconnectNas">切断する</v-btn>
+              </div>
             </template>
             <div class="d-flex justify-end mt-8"><v-btn color="primary" size="large" prepend-icon="mdi-play" @click="beginTournament">選別を開始</v-btn></div></v-card>
         </template>
@@ -2265,7 +2331,7 @@ onBeforeUnmount(() => {
       <div v-if="desktop.capabilities.browseFolders && !canImportPhotos" class="d-flex align-center flex-wrap ga-2 mb-4">
         <v-btn
           size="small" variant="outlined" prepend-icon="mdi-nas"
-          :loading="nasBusy" @click="nasDialog = true"
+          :loading="nasBusy" @click="openNasDialog"
         >{{ nasConnected ? 'NAS を切り替える' : 'NAS に繋ぐ' }}</v-btn>
         <v-btn v-if="nasConnected" size="small" variant="text" @click="disconnectNas">端末の写真に戻す</v-btn>
         <span v-if="nasConnected" class="text-caption text-medium-emphasis">{{ nasHost }} / {{ nasShare }}</span>
@@ -2307,12 +2373,29 @@ onBeforeUnmount(() => {
           <v-text-field v-model="nasHost" label="ホスト名または IP" placeholder="192.168.11.10" class="mb-3" hide-details="auto" />
           <v-text-field v-model="nasShare" label="共有名" placeholder="share" class="mb-3" hide-details="auto" />
           <v-text-field v-model="nasUser" label="ユーザー名（空ならゲスト）" class="mb-3" hide-details="auto" />
-          <v-text-field v-model="nasPassword" label="パスワード" type="password" hide-details="auto" />
+          <v-text-field
+            v-model="nasPassword" label="パスワード"
+            :type="nasPasswordVisible ? 'text' : 'password'"
+            :append-inner-icon="nasPasswordVisible ? 'mdi-eye-off' : 'mdi-eye'"
+            hide-details="auto"
+            @click:append-inner="nasPasswordVisible = !nasPasswordVisible"
+          />
+          <!-- 既定は覚えない。預かれない環境ではトグル自体を出さない。 -->
+          <v-switch
+            v-if="nasCanRemember" v-model="nasRemember" color="primary"
+            density="comfortable" hide-details class="mt-2"
+            label="パスワードをこの端末に保存する"
+          />
           <v-alert v-if="nasError" type="error" variant="tonal" density="comfortable" class="mt-4">
             {{ nasError }}
           </v-alert>
           <p class="text-caption text-medium-emphasis mt-4 mb-0">
-            <strong>パスワードは保存しません。</strong>アプリを終了すると消えます。
+            <template v-if="nasRemember && nasCanRemember">
+              パスワードは<strong>この端末の鍵で暗号化して</strong>保存します。他の端末へは移りません。
+            </template>
+            <template v-else>
+              <strong>パスワードは保存しません。</strong>アプリを終了すると消えます。
+            </template>
             写真は読むだけで、NAS 上の原本は変更しません。
           </p>
         </v-card-text>

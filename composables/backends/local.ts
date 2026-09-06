@@ -136,6 +136,12 @@ export function createLocalBackend(): PhotoBackend {
     // ブラウザから SMB へは届かない。
     connectNas: () => unsupported('NAS への接続'),
     disconnectNas: () => Promise.resolve(),
+    // ブラウザ版は NAS に繋がない。空の設定を返して画面を素直に閉じさせる。
+    getNasSettings: () => Promise.resolve({
+      host: '', share: '', user: '',
+      rememberPassword: false, password: '', canRememberPassword: false
+    }),
+    saveNasSettings: () => Promise.resolve(),
 
     onProjectProgress: (callback) => {
       listeners.add(callback)

@@ -8,6 +8,25 @@ export interface PhotoAlbum {
 }
 
 /** 表示用サイズの選択肢と、いまの既定。設定画面がそのまま使う。 */
+export interface NasSettings {
+  host: string
+  share: string
+  user: string
+  rememberPassword: boolean
+  /** 覚えていれば入っている。 */
+  password: string
+  /** この環境でパスワードを預かれるか。false ならトグルを出さない。 */
+  canRememberPassword: boolean
+}
+
+export interface NasCredentials {
+  host: string
+  share: string
+  user: string
+  rememberPassword: boolean
+  password: string
+}
+
 export interface DisplaySettings {
   edge: number
   choices: number[]
@@ -55,6 +74,14 @@ export interface PhotoBackend {
     host: string, share: string, user: string, password: string
   ) => Promise<PhotoAlbum[]>
   disconnectNas: () => Promise<void>
+  /**
+   * 前回の繋ぎ先。ダイアログを開くたびに読む。
+   *
+   * ホスト・共有名・利用者名は毎回入れ直すのが煩わしいだけで秘密ではない。
+   * パスワードは「覚える」を選んだときだけ、端末の鍵で包んで預けてある。
+   */
+  getNasSettings: () => Promise<NasSettings>
+  saveNasSettings: (settings: NasCredentials) => Promise<void>
 
   /** 解析の進捗。戻り値を呼ぶと購読を解除する。 */
   onProjectProgress: (callback: (progress: ProjectProgress) => void) => Promise<() => void>

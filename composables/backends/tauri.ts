@@ -1,4 +1,18 @@
 import { convertFileSrc } from '@tauri-apps/api/core'
+
+/**
+ * 原本の URL。**サムネイルや表示用と違い、原本はファイルとは限らない。**
+ *
+ * Android では `content://` や `smb://` を指す。`convertFileSrc` は
+ * ファイルパスを前提にしているので、そのまま渡すと画面には壊れた画像が出る。
+ * Rust 側に登録した `photo` スキームへ回すと、指し先の種類に関わらず読める。
+ *
+ * サムネイルと表示用はアプリのデータ領域にある実ファイルなので、
+ * これまでどおり asset プロトコルで足りる（そちらの方が速い）。
+ */
+function originalUrl(path: string): string {
+  return convertFileSrc(path, 'photo')
+}
 import { capabilitiesFor, detectPlatform } from '~/utils/capabilities'
 import { open } from '@tauri-apps/plugin-dialog'
 import type {
@@ -6,7 +20,7 @@ import type {
   ProjectProgress, ProjectTask, SelectionResult, SelectionSeed, SelectionSession, SelectionSummary
 } from '~/types/photo'
 import { normalizeSession } from '~/utils/tournament'
-import type { DisplaySettings, PhotoAlbum, PhotoBackend } from '~/composables/photoBackend'
+import type { DisplaySettings, NasCredentials, NasSettings, PhotoAlbum, PhotoBackend } from '~/composables/photoBackend'
 import { isTauriRuntime } from '~/composables/photoBackend'
 
 async function invokeDesktop<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -41,6 +55,8 @@ export function createTauriBackend(): PhotoBackend {
     connectNas: (host: string, share: string, user: string, password: string) =>
       invokeDesktop<PhotoAlbum[]>('connect_nas', { host, share, user, password }),
     disconnectNas: () => invokeDesktop<void>('disconnect_nas'),
+    getNasSettings: () => invokeDesktop<NasSettings>('get_nas_settings'),
+    saveNasSettings: (settings: NasCredentials) => invokeDesktop<void>('save_nas_settings', { ...settings }),
     onProjectProgress: async (callback: (progress: ProjectProgress) => void) => {
       if (!isTauriRuntime()) return () => undefined
       const { listen } = await import('@tauri-apps/api/event')
@@ -89,15 +105,16 @@ export function createTauriBackend(): PhotoBackend {
       // 閾値学習を入れる前に保存された JSON が残っていることがある。
       return normalizeSession(JSON.parse(raw) as SelectionSession)
     },
-    photoUrl: (path: string) => isTauriRuntime() ? convertFileSrc(path) : '',
+    photoUrl: (path: string) => isTauriRuntime() ? originalUrl(path) : '',
     photoThumbnailUrl: (photo: Photo) => {
       if (!isTauriRuntime()) return ''
-      return convertFileSrc(photo.thumbnailPath ?? photo.path)
+      return photo.thumbnailPath ? convertFileSrc(photo.thumbnailPath) : originalUrl(photo.path)
     },
     // 表示用 → サムネイル → 原本。原本まで落ちるのは生成が追いつく前だけ。
     photoDisplayUrl: (photo: Photo) => {
       if (!isTauriRuntime()) return ''
-      return convertFileSrc(photo.displayPath ?? photo.thumbnailPath ?? photo.path)
+      const derived = photo.displayPath ?? photo.thumbnailPath
+      return derived ? convertFileSrc(derived) : originalUrl(photo.path)
     },
     getDisplaySettings: () => invokeDesktop<DisplaySettings>('get_display_settings'),
     saveDisplayEdge: (edge: number) => invokeDesktop<number>('save_display_edge', { edge }),
