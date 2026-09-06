@@ -72,6 +72,11 @@ export interface PhotoBackend {
   connectNas: (
     host: string, share: string, user: string, password: string
   ) => Promise<PhotoAlbum[]>
+  /**
+   * いま繋いでいる NAS のフォルダ一覧。**繋ぎ直さずに取り直せる。**
+   * これが無いと、画面は connectNas の戻り値を持ち回るしかない。
+   */
+  listNasFolders: () => Promise<PhotoAlbum[]>
   disconnectNas: () => Promise<void>
   /**
    * 前回の繋ぎ先。ダイアログを開くたびに読む。

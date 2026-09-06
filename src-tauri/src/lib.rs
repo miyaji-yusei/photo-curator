@@ -3886,6 +3886,30 @@ fn save_nas_password(_password: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// いま繋いでいる NAS のフォルダ一覧。**繋ぎ直さずに取り直せる。**
+///
+/// これが無かったため、画面は `connect_nas` の戻り値を持ち回るしかなく、
+/// 作成ダイアログを開き直すと端末のアルバムで上書きされていた。
+#[tauri::command]
+fn list_nas_folders() -> Result<Vec<PhotoAlbum>, String> {
+    #[cfg(target_os = "android")]
+    {
+        Ok(android_smb::list_folders("")?
+            .into_iter()
+            .map(|folder| PhotoAlbum {
+                path: folder.path,
+                name: folder.name,
+                // 枚数は数えると全走査になる。選ぶ時点では出さない。
+                count: -1,
+            })
+            .collect())
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        Err("NAS はこの環境では読めません。".into())
+    }
+}
+
 #[tauri::command]
 fn connect_nas(
     host: String,
@@ -4583,6 +4607,7 @@ pub fn run() {
             write_ratings_to_files,
             list_photo_albums,
             connect_nas,
+            list_nas_folders,
             get_project_prep,
             get_nas_settings,
             save_nas_settings,

@@ -53,6 +53,7 @@ export function createTauriBackend(): PhotoBackend {
     listPhotoAlbums: () => invokeDesktop<PhotoAlbum[]>('list_photo_albums'),
     connectNas: (host: string, share: string, user: string, password: string) =>
       invokeDesktop<PhotoAlbum[]>('connect_nas', { host, share, user, password }),
+    listNasFolders: () => invokeDesktop<PhotoAlbum[]>('list_nas_folders'),
     disconnectNas: () => invokeDesktop<void>('disconnect_nas'),
     getNasSettings: () => invokeDesktop<NasSettings>('get_nas_settings'),
     saveNasSettings: (settings: NasCredentials) => invokeDesktop<void>('save_nas_settings', { ...settings }),

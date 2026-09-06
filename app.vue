@@ -670,7 +670,14 @@ const nasCanRemember = ref(false)
 /** 目のアイコンでの表示切り替え。 */
 const nasPasswordVisible = ref(false)
 const albumsBusy = ref(false)
-const usesAlbums = computed(() => photoAlbums.value.length > 0)
+/**
+ * 一覧から出所を選ぶ環境か。**一覧が空でも枠は出す。**
+ *
+ * 以前は「一覧が空でない」を条件にしていたため、NAS に繋がっていないときや
+ * 権限が無いときに、タブごと画面から消えて何も操作できなくなっていた。
+ * 空なら空と言う方が、利用者は次に何をすればいいか分かる。
+ */
+const usesAlbums = computed(() => desktop.capabilities.browseFolders && !canImportPhotos.value)
 
 /** 一覧から出所を選ぶ。**種類とラベルを一緒に控える。** */
 function pickAlbum(album: PhotoAlbum) {
@@ -725,6 +732,10 @@ async function connectNas() {
     )
     photoAlbums.value = folders
     nasConnected.value = true
+    // **繋いだら出所も NAS に移す。** 片方だけ変わると食い違う。
+    albumTab.value = 'nas'
+    folderPath.value = ''
+    pickedSource.value = null
     // 繋がった組み合わせだけ覚える。**失敗した値を覚えても役に立たない。**
     try {
       await desktop.saveNasSettings({
@@ -762,19 +773,49 @@ async function disconnectNas() {
     // 切断に失敗しても、画面上は繋がっていない扱いでよい。
   }
   nasConnected.value = false
+  albumTab.value = 'device'
+  folderPath.value = ''
+  pickedSource.value = null
   await loadPhotoAlbums()
 }
 
+/**
+ * いま一覧に出している出所。**「NAS に繋がっているか」とは別の状態にしない。**
+ *
+ * 以前は `nasConnected` だけが true のまま、一覧は `loadPhotoAlbums()` が
+ * 端末のアルバムで上書きしていた。その結果、ヘッダーに
+ * 「192.168.11.8 / Share に繋がっています」と出ているのに一覧は端末の
+ * アルバム、という食い違いが起きていた（実機で確認）。
+ *
+ * **ここを 1 つの状態にして、一覧は必ずこの値から取る。**
+ */
+const albumTab = ref<'device' | 'nas'>('device')
+
 async function loadPhotoAlbums() {
   albumsBusy.value = true
+  photoAlbums.value = []
   try {
-    photoAlbums.value = await desktop.listPhotoAlbums()
+    if (albumTab.value === 'nas') {
+      // 繋がっていなければ空。ここで端末のアルバムに落とさない。
+      photoAlbums.value = nasConnected.value ? await desktop.listNasFolders() : []
+    } else {
+      photoAlbums.value = await desktop.listPhotoAlbums()
+    }
   } catch {
-    // 権限が無い・端末が対応しない。フォルダ選択に落ちるだけ。
+    // 権限が無い・端末が対応しない・NAS が切れた。空にして理由は画面で出す。
     photoAlbums.value = []
   } finally {
     albumsBusy.value = false
   }
+}
+
+/** 出所のタブを切り替える。**切り替えたら必ず一覧を取り直す。** */
+async function selectAlbumTab(tab: 'device' | 'nas') {
+  if (albumTab.value === tab) return
+  albumTab.value = tab
+  folderPath.value = ''
+  pickedSource.value = null
+  await loadPhotoAlbums()
 }
 const photoInput = ref<HTMLInputElement | null>(null)
 
@@ -2851,19 +2892,46 @@ onBeforeUnmount(() => {
            デスクトップ … フォルダを参照する
            Android      … 走査できるフォルダが無いのでアルバムを選ぶ
            ブラウザ     … 作成後に写真ピッカーで選ぶ -->
-      <!-- NAS は端末のアルバムと同じ「出所」として並べる。
-           繋がると共有の直下のフォルダが一覧に差し替わる。 -->
-      <div v-if="desktop.capabilities.browseFolders && !canImportPhotos" class="d-flex align-center flex-wrap ga-2 mb-4">
+      <!-- **出所のタブ。選んでいるタブ ＝ 下の一覧の出所。**
+           以前は「NAS に繋がっているか」と「一覧に何が出ているか」が別々の
+           状態で、ヘッダーは NAS と言っているのに一覧は端末のアルバム、
+           という食い違いが起きていた。 -->
+      <div v-if="usesNas" class="d-flex align-center flex-wrap ga-2 mb-4">
         <v-btn
-          size="small" variant="outlined" prepend-icon="mdi-nas"
+          size="small" rounded="pill"
+          :variant="albumTab === 'device' ? 'flat' : 'outlined'"
+          :color="albumTab === 'device' ? 'primary' : undefined"
+          prepend-icon="mdi-cellphone" @click="selectAlbumTab('device')"
+        >この端末</v-btn>
+        <v-btn
+          size="small" rounded="pill"
+          :variant="albumTab === 'nas' ? 'flat' : 'outlined'"
+          :color="albumTab === 'nas' ? 'primary' : undefined"
+          prepend-icon="mdi-nas" @click="selectAlbumTab('nas')"
+        >{{ nasConnected ? `${nasHost} · ${nasShare}` : 'NAS' }}</v-btn>
+        <v-btn
+          v-if="albumTab === 'nas'" size="small" variant="text"
           :loading="nasBusy" @click="openNasDialog"
-        >{{ nasConnected ? 'NAS を切り替える' : 'NAS に繋ぐ' }}</v-btn>
-        <v-btn v-if="nasConnected" size="small" variant="text" @click="disconnectNas">端末の写真に戻す</v-btn>
-        <span v-if="nasConnected" class="text-caption text-medium-emphasis">{{ nasHost }} / {{ nasShare }}</span>
+        >{{ nasConnected ? '切り替える' : '繋ぐ' }}</v-btn>
       </div>
 
       <template v-if="usesAlbums">
-        <div class="text-body-2 mb-2">{{ nasConnected ? 'どのフォルダから選びますか？' : 'どのアルバムから選びますか？' }}</div>
+        <div class="text-body-2 mb-2">
+          {{ albumTab === 'nas' ? `${nasShare || 'NAS'} のフォルダ` : 'この端末のアルバム' }}
+          <span v-if="photoAlbums.length" class="text-medium-emphasis">&middot; {{ photoAlbums.length }} 件</span>
+        </div>
+
+        <!-- 空のときは理由と、できることを出す。**黙って空欄にしない。** -->
+        <v-alert
+          v-if="albumTab === 'nas' && !nasConnected && !albumsBusy"
+          type="info" variant="tonal" density="comfortable" class="mb-3"
+        >
+          <div class="text-body-2">NAS に繋がっていません。</div>
+          <v-btn size="small" variant="text" class="px-0 mt-1" @click="openNasDialog">接続を設定する</v-btn>
+        </v-alert>
+        <div v-else-if="!photoAlbums.length && !albumsBusy" class="text-body-2 text-medium-emphasis py-6 text-center">
+          {{ albumTab === 'nas' ? '共有の直下にフォルダがありません。' : 'この端末に写真のアルバムがありません。' }}
+        </div>
         <v-list density="compact" class="album-list" bg-color="transparent">
           <v-list-item
             v-for="album in photoAlbums" :key="album.path"

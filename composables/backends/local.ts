@@ -138,6 +138,8 @@ export function createLocalBackend(): PhotoBackend {
     listPhotoAlbums: () => Promise.resolve([]),
     // ブラウザから SMB へは届かない。
     connectNas: () => unsupported('NAS への接続'),
+    // ブラウザは NAS に繋がない。
+    listNasFolders: () => Promise.resolve([]),
     disconnectNas: () => Promise.resolve(),
     // ブラウザ版は NAS に繋がない。空の設定を返して画面を素直に閉じさせる。
     getNasSettings: () => Promise.resolve({
