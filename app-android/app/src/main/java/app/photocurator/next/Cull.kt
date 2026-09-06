@@ -1,8 +1,11 @@
+@file:OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+
+
 package app.photocurator.next
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
@@ -66,6 +69,8 @@ fun CullScreen(album: Album, onBack: () -> Unit) {
     var stageSize by remember { mutableStateOf(0 to 0) }
     // 連写のまとめに使う指紋。**出来た分だけで始められる。**
     var prepared by remember { mutableStateOf(0 to 0) }
+    // 長押しで大きく見ている 1 枚。**選別の判断はここでは動かさない。**
+    var zooming by remember { mutableStateOf<Photo?>(null) }
 
     // 相対パスから写真を引く。core は相対パスしか知らない。
     val byPath = remember(photos) { photos.associateBy { it.relativePath } }
@@ -161,6 +166,11 @@ fun CullScreen(album: Album, onBack: () -> Unit) {
         scope.launch { Store.save(context, album.id, next) }
     }
 
+    zooming?.let { photo ->
+        ZoomView(photo = photo, onClose = { zooming = null })
+        return
+    }
+
     Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
         CullBar(
             album = album,
@@ -221,6 +231,7 @@ fun CullScreen(album: Album, onBack: () -> Unit) {
                                     number = at + 1,
                                     photo = byPath[path],
                                     picked = path in selected,
+                                    onHold = { zooming = byPath[path] },
                                     onTap = {
                                         if (multi) {
                                             selected = if (path in selected) selected - path
@@ -314,14 +325,26 @@ private fun CullBar(
 }
 
 @Composable
-private fun Tile(number: Int, photo: Photo?, picked: Boolean, onTap: () -> Unit) {
+private fun Tile(
+    number: Int,
+    photo: Photo?,
+    picked: Boolean,
+    onTap: () -> Unit,
+    onHold: () -> Unit
+) {
     Box(
         Modifier
             .fillMaxSize()
             .clip(androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
             .background(Tile)
             .then(if (picked) Modifier.border(3.dp, Lime) else Modifier)
-            .clickable(enabled = photo != null, onClick = onTap)
+            // 押したら決まる、長押しなら大きく見る。**確定が 1 タップのまま**
+            // 残るように、拡大は別の動作に逃がす。
+            .combinedClickable(
+                enabled = photo != null,
+                onClick = onTap,
+                onLongClick = onHold
+            )
     ) {
         if (photo == null) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {

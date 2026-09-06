@@ -69,6 +69,7 @@ fun ResultsScreen(album: Album, star: Int, onBack: () -> Unit) {
     }
 
     Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
+        Reading {
         Row(
             Modifier.fillMaxWidth().height(56.dp).padding(end = 12.dp),
             verticalAlignment = Alignment.CenterVertically
@@ -88,6 +89,7 @@ fun ResultsScreen(album: Album, star: Int, onBack: () -> Unit) {
                     Text("解除", fontSize = 13.sp)
                 }
             }
+        }
         }
 
         note?.let {
@@ -151,8 +153,9 @@ fun ResultsScreen(album: Album, star: Int, onBack: () -> Unit) {
         // ---- 取り出す ----
         // **原本に触る操作なので、何枚に何をするかを文字で見せてから押させる。**
         if (picked.isNotEmpty()) {
+            Reading(Modifier.padding(12.dp)) {
             Row(
-                Modifier.fillMaxWidth().padding(12.dp),
+                Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 OutlinedButton(
@@ -163,6 +166,7 @@ fun ResultsScreen(album: Album, star: Int, onBack: () -> Unit) {
                 ) {
                     Text("${picked.size} 枚をお気に入りに", fontSize = 13.sp)
                 }
+            }
             }
         }
     }
