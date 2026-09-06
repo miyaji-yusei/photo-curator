@@ -1,0 +1,9 @@
+# Gradle と Android のビルド生成物。
+build/
+.gradle/
+local.properties
+.idea/
+*.iml
+# core からコピーしてくるもの。scripts/build-core.mjs が置く。
+app/src/main/jniLibs/
+app/src/main/java/uniffi/
