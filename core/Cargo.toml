@@ -6,6 +6,11 @@ edition = "2021"
 # **判断が絡むものは全部ここに置く。** 画面と入出力は各環境に任せる。
 # cdylib は Android と Web、lib は PC（Tauri から直接使う）向け。
 [lib]
+# **namespace ＝ クレート名 ＝ ライブラリ名で揃える。**
+#
+# 生成された Kotlin は lib<namespace>.so を読み込み、
+# uniffi_<クレート名>_... という記号を探す。3 つがずれると
+# 実機で「library not found」か「undefined symbol」で落ちる。
 name = "photo_curator_core"
 crate-type = ["cdylib", "lib"]
 

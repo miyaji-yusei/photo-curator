@@ -7,5 +7,8 @@
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>
         <item name="android:windowLightStatusBar">false</item>
+        <!-- **これを入れないと、下のジェスチャーバーが明るい帯になる。**
+             Tauri 版で「画面下部が白い」と言われたのと同じ現象。 -->
+        <item name="android:windowLightNavigationBar">false</item>
     </style>
 </resources>
