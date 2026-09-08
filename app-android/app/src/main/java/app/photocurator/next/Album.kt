@@ -45,7 +45,7 @@ import uniffi.photo_curator_core.Session
 fun ProjectScreen(
     project: Project,
     onBack: () -> Unit,
-    onCull: () -> Unit,
+    onCull: (learn: Boolean) -> Unit,
     onOpenStar: (Int) -> Unit
 ) {
     val context = LocalContext.current
@@ -90,7 +90,7 @@ fun ProjectScreen(
                 onClick = {
                     // 初回か、「毎回確認」が on のときだけ挟む。
                     if (live == null || Prefs.askBeforeStart(context)) starting = true
-                    else onCull()
+                    else onCull(false)
                 },
                 // **走査が終わるまで始められない。** 枚数と時間順が決まらないため。
                 enabled = scanned && photos.isNotEmpty(),
@@ -272,7 +272,16 @@ fun ProjectScreen(
         StartSheet(
             project = project,
             photoCount = photos.size,
-            onStart = { starting = false; onCull() },
+            onStart = {
+                starting = false
+                // 連写をまとめる設定で、まだ基準を決めていなければ学習へ。
+                // **一度決めたら二度は聞かない。**
+                scope.launch {
+                    val needsLearning = Prefs.groupBursts(context) &&
+                        Learning.learned(context, project.id) == null
+                    onCull(needsLearning)
+                }
+            },
             onDismiss = { starting = false }
         )
     }

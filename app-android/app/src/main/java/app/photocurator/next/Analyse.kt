@@ -164,6 +164,40 @@ object Analyse {
 }
 
 /**
+ * 選別・学習・確認のどれもが必要とする下ごしらえ。**1 か所にまとめる。**
+ *
+ * 写真を並べ、指紋を作り、core に渡す形にするところまで。
+ * 3 つの画面が別々にこれを書くと、片方だけ直る不具合がまた出る。
+ */
+object Prepare {
+    suspend fun run(
+        context: android.content.Context,
+        project: Project,
+        onProgress: (done: Int, total: Int) -> Unit
+    ): Pair<List<Photo>, List<uniffi.photo_curator_core.PhotoRef>> {
+        val photos = Photos.forSource(context, project.source)
+        val cached = Fingerprints.load(context, project.source.key)
+        val prints = Analyse.fingerprints(
+            context, photos, cached,
+            onProgress = onProgress,
+            onPartial = { Fingerprints.save(context, project.source.key, it) }
+        )
+        if (prints != cached) Fingerprints.save(context, project.source.key, prints)
+        val refs = photos.map {
+            uniffi.photo_curator_core.PhotoRef(
+                relativePath = it.relativePath,
+                capturedAt = it.takenAt,
+                // **作れなかったものは null のまま。** 0 を入れると
+                // 読めない写真どうしが同一に見えて誤ってまとまる。
+                dHash = prints[it.relativePath]?.hash,
+                dHashVersion = Analyse.VERSION
+            )
+        }
+        return photos to refs
+    }
+}
+
+/**
  * 連写がまとまらなかったときに、**どちらの条件で落ちたのか**を残す。
  *
  * 「まとまらない」には理由が 3 つある（指紋が無い・時間が離れている・
