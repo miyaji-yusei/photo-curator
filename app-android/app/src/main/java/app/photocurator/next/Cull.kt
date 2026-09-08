@@ -1,10 +1,14 @@
-@file:OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+@file:OptIn(
+    androidx.compose.foundation.ExperimentalFoundationApi::class,
+    androidx.compose.material3.ExperimentalMaterial3Api::class
+)
 
 
 package app.photocurator.next
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
@@ -33,6 +37,7 @@ import uniffi.photo_curator_core.PhotoRef
 import uniffi.photo_curator_core.Session
 import uniffi.photo_curator_core.advance
 import uniffi.photo_curator_core.nextRound
+import uniffi.photo_curator_core.setRepresentative
 import uniffi.photo_curator_core.startRound
 import uniffi.photo_curator_core.undo
 
@@ -71,6 +76,8 @@ fun CullScreen(album: Album, onBack: () -> Unit) {
     var prepared by remember { mutableStateOf(0 to 0) }
     // 長押しで大きく見ている 1 枚。**選別の判断はここでは動かさない。**
     var zooming by remember { mutableStateOf<Photo?>(null) }
+    // 開いている連写のまとまり（代表の相対パス）。
+    var editingBurst by remember { mutableStateOf<String?>(null) }
 
     // 相対パスから写真を引く。core は相対パスしか知らない。
     val byPath = remember(photos) { photos.associateBy { it.relativePath } }
@@ -182,6 +189,36 @@ fun CullScreen(album: Album, onBack: () -> Unit) {
         scope.launch { Store.save(context, album.id, next) }
     }
 
+    // 連写のまとまりを開いているとき。**選び直しても星は動かない**ので、
+    // 保存はするが判断としては何も進めない。
+    editingBurst?.let { rep ->
+        val mates = live.members[rep]
+        if (mates == null) {
+            editingBurst = null
+        } else {
+            BurstSheet(
+                members = mates,
+                shown = rep,
+                byPath = byPath,
+                onPick = { wanted ->
+                    val next = setRepresentative(live, rep, wanted)
+                    if (next != null) {
+                        session = next
+                        // 選ばれていた印は代表について回る。取り違えないよう外す。
+                        selected = emptySet()
+                        scope.launch { Store.save(context, album.id, next) }
+                    }
+                    editingBurst = null
+                },
+                onZoom = { photo ->
+                    editingBurst = null
+                    zooming = photo
+                },
+                onDismiss = { editingBurst = null }
+            )
+        }
+    }
+
     zooming?.let { photo ->
         ZoomView(photo = photo, onClose = { zooming = null })
         return
@@ -250,6 +287,7 @@ fun CullScreen(album: Album, onBack: () -> Unit) {
                                     // この 1 枚が何枚ぶんの代表か。
                                     stands = live.members[path]?.size ?: 1,
                                     onHold = { zooming = byPath[path] },
+                                    onOpenBurst = { editingBurst = path },
                                     onTap = {
                                         if (multi) {
                                             selected = if (path in selected) selected - path
@@ -349,7 +387,8 @@ private fun Tile(
     picked: Boolean,
     stands: Int,
     onTap: () -> Unit,
-    onHold: () -> Unit
+    onHold: () -> Unit,
+    onOpenBurst: () -> Unit
 ) {
     Box(
         Modifier
@@ -406,6 +445,10 @@ private fun Tile(
                     .padding(6.dp)
                     .clip(androidx.compose.foundation.shape.RoundedCornerShape(6.dp))
                     .background(Color(0xB3101114))
+                    // **バッジは押せる。** ここを押すと中身が開く。
+                    // タイル本体の「押したら確定」を邪魔しないよう、
+                    // この当たり判定が先に受け取る。
+                    .clickable(onClick = onOpenBurst)
                     .padding(horizontal = 7.dp, vertical = 2.dp)
             ) {
                 Text("連写 $stands 枚", fontSize = 11.sp, color = Lime)

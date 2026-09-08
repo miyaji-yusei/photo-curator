@@ -383,6 +383,46 @@ pub fn undo(session: Session) -> Session {
 }
 
 
+/// 連写のまとまりで、画面に出す 1 枚を選び直す。
+///
+/// 既定の代表は撮影順の先頭だが、**先頭がぶれていることは普通にある。**
+/// 代表 1 枚しか見えないと、その 1 枚の出来でまとまり全体の運命が決まる。
+/// 仲間を見て選び直せなければ、畳んだことがそのまま取りこぼしになる。
+///
+/// **星は動かさない。** これは「どれを見せるか」の話であって、
+/// 「どれを残すか」ではない。残すかどうかは今までどおり advance が決める。
+///
+/// 選び直せないときは None:
+/// - まとまりでない（仲間がいない）
+/// - 仲間でないものを指した
+/// - もう見終わった（history にある）まとまり。**済んだ判断は動かさない。**
+pub fn set_representative(session: Session, shown: String, wanted: String) -> Option<Session> {
+    let mates = session.members.get(&shown)?.clone();
+    if !mates.contains(&wanted) {
+        return None;
+    }
+    if shown == wanted {
+        return Some(session);
+    }
+    // まだ画面に出ていないか、いま出ているものだけ。
+    let in_current = session.current.iter().any(|id| id == &shown);
+    let in_queue = session.queue.iter().any(|id| id == &shown);
+    if !in_current && !in_queue {
+        return None;
+    }
+
+    let mut next = session;
+    for id in next.current.iter_mut().chain(next.queue.iter_mut()) {
+        if *id == shown {
+            *id = wanted.clone();
+        }
+    }
+    // 仲間の顔ぶれは変えない。鍵だけ差し替える。
+    next.members.remove(&shown);
+    next.members.insert(wanted, mates);
+    Some(next)
+}
+
 /// 次のラウンドへ。**前を通ったものだけが、星を持ったまま上がる。**
 ///
 /// 進めないときは None を返す。「まだ続けられます」と言っておいて
@@ -972,5 +1012,97 @@ mod tests {
         }
         let striped = d_hash_from_gray(stripes, 90, 80).unwrap();
         assert!(hash_distance(split, striped) > 4);
+    }
+
+    // ---- 代表の選び直し ----
+
+    /// 1.jpg と 2.jpg が連写、3.jpg と 4.jpg は別。
+    fn burst_photos() -> Vec<PhotoRef> {
+        vec![
+            photo("1.jpg", 0, "0000000000000000"),
+            photo("2.jpg", 1000, "0000000000000001"),
+            photo("3.jpg", 500_000, "ffffffffffffffff"),
+            photo("4.jpg", 900_000, "0f0f0f0f0f0f0f0f"),
+        ]
+    }
+
+    #[test]
+    fn 代表を仲間に差し替えられる() {
+        let session = start_round(burst_photos(), 2, 0, true, threshold(), vec![]);
+        assert_eq!(session.current, vec!["1.jpg", "3.jpg"]);
+
+        let after = set_representative(session, "1.jpg".into(), "2.jpg".into()).unwrap();
+        // 画面に出るのが入れ替わる。並びの位置は動かさない。
+        assert_eq!(after.current, vec!["2.jpg", "3.jpg"]);
+        // 仲間の顔ぶれはそのまま。鍵だけ変わる。
+        assert_eq!(after.members["2.jpg"], vec!["1.jpg", "2.jpg"]);
+        assert!(!after.members.contains_key("1.jpg"));
+    }
+
+    #[test]
+    fn 代表を変えても星は動かない() {
+        let session = start_round(burst_photos(), 2, 0, true, threshold(), vec![]);
+        let before = session.ratings.clone();
+        let after = set_representative(session, "1.jpg".into(), "2.jpg".into()).unwrap();
+        // **見せ方を変えただけ。** 残すかどうかは advance が決める。
+        assert_eq!(after.ratings, before);
+    }
+
+    #[test]
+    fn 差し替えた代表を残すと仲間にも星が付く() {
+        let session = start_round(burst_photos(), 2, 0, true, threshold(), vec![]);
+        let session = set_representative(session, "1.jpg".into(), "2.jpg".into()).unwrap();
+        let after = advance(session, vec!["2.jpg".into()]);
+        assert_eq!(after.ratings["2.jpg"], 1);
+        // 元の先頭も仲間として同じだけ動く。
+        assert_eq!(after.ratings["1.jpg"], 1);
+        // survivors に入るのは代表だけ。畳んだ意味が消えないように。
+        assert_eq!(after.survivors, vec!["2.jpg"]);
+    }
+
+    #[test]
+    fn まとまりでないものは差し替えられない() {
+        let session = start_round(burst_photos(), 2, 0, true, threshold(), vec![]);
+        assert!(set_representative(session, "3.jpg".into(), "4.jpg".into()).is_none());
+    }
+
+    #[test]
+    fn 仲間でないものは代表にできない() {
+        let session = start_round(burst_photos(), 2, 0, true, threshold(), vec![]);
+        assert!(set_representative(session, "1.jpg".into(), "3.jpg".into()).is_none());
+    }
+
+    #[test]
+    fn 見終わったまとまりは差し替えられない() {
+        let session = start_round(burst_photos(), 2, 0, true, threshold(), vec![]);
+        // 1.jpg と 3.jpg のグループを確定させて先へ進める。
+        let session = advance(session, vec!["1.jpg".into()]);
+        // **済んだ判断は動かさない。** 動かすと history と食い違う。
+        assert!(set_representative(session, "1.jpg".into(), "2.jpg".into()).is_none());
+    }
+
+    #[test]
+    fn 同じものを指しても壊れない() {
+        let session = start_round(burst_photos(), 2, 0, true, threshold(), vec![]);
+        let after = set_representative(session.clone(), "1.jpg".into(), "1.jpg".into()).unwrap();
+        assert_eq!(after.current, session.current);
+        assert_eq!(after.members["1.jpg"], session.members["1.jpg"]);
+    }
+
+    #[test]
+    fn まだ見ていないまとまりも差し替えられる() {
+        // group_size 1 相当にはできないので、後ろに連写を置く。
+        let photos = vec![
+            photo("1.jpg", 0, "ffffffffffffffff"),
+            photo("2.jpg", 500_000, "0f0f0f0f0f0f0f0f"),
+            photo("3.jpg", 900_000, "0000000000000000"),
+            photo("4.jpg", 901_000, "0000000000000001"),
+        ];
+        let session = start_round(photos, 2, 0, true, threshold(), vec![]);
+        assert_eq!(session.current, vec!["1.jpg", "2.jpg"]);
+        assert_eq!(session.queue, vec!["3.jpg"]);
+
+        let after = set_representative(session, "3.jpg".into(), "4.jpg".into()).unwrap();
+        assert_eq!(after.queue, vec!["4.jpg"]);
     }
 }
