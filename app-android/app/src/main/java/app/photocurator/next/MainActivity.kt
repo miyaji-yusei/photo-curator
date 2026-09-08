@@ -90,6 +90,7 @@ val Warn = androidx.compose.ui.graphics.Color(0xFFFFB4AB)
 private sealed interface Screen {
     data object Home : Screen
     data object Settings : Screen
+    data object Create : Screen
     data class Detail(val project: Project) : Screen
     data class Learn(val project: Project) : Screen
     data class Cull(val project: Project) : Screen
@@ -100,7 +101,6 @@ private sealed interface Screen {
 private fun App() {
     MaterialTheme(colorScheme = darkColorScheme(primary = Lime, background = Ink, surface = Surface)) {
         var screen by remember { mutableStateOf<Screen>(Screen.Home) }
-        var creating by remember { mutableStateOf(false) }
         // ホームへ戻るたびに一覧を読み直すための鍵。
         var homeKey by remember { mutableStateOf(0) }
 
@@ -109,13 +109,23 @@ private fun App() {
                 is Screen.Home -> key(homeKey) {
                     HomeScreen(
                         onOpen = { screen = Screen.Detail(it) },
-                        onCreate = { creating = true },
+                        onCreate = { screen = Screen.Create },
                         onSettings = { screen = Screen.Settings }
                     )
                 }
 
                 is Screen.Settings -> SettingsScreen(
                     onBack = { screen = Screen.Home; homeKey += 1 }
+                )
+
+                // **作成は画面。** 下から出るシートだと、フォルダ一覧を送る指で
+                // 閉じてしまう（実際に何度も起きた）。
+                is Screen.Create -> CreateScreen(
+                    onCreated = { project ->
+                        // 作ったらそのまま詳細へ。準備の様子が見える。
+                        screen = Screen.Detail(project)
+                    },
+                    onDismiss = { screen = Screen.Home; homeKey += 1 }
                 )
 
                 is Screen.Detail -> ProjectScreen(
@@ -150,15 +160,5 @@ private fun App() {
             }
         }
 
-        if (creating) {
-            CreateSheet(
-                onCreated = { project ->
-                    creating = false
-                    // 作ったらそのまま詳細へ。準備の様子が見える。
-                    screen = Screen.Detail(project)
-                },
-                onDismiss = { creating = false }
-            )
-        }
     }
 }

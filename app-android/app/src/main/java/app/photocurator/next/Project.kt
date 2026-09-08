@@ -126,9 +126,10 @@ object Projects {
      */
     suspend fun remove(context: Context, id: String) {
         save(context, all(context).filterNot { it.id == id })
+        // **プロジェクトごとのものは全部消す。** 星・手直し・学習した基準。
+        // 消し忘れると使われないファイルが端末に残り続ける（実際に残っていた）。
         Store.clear(context, id)
-        withContext(Dispatchers.IO) {
-            File(context.filesDir, "overrides-$id.json").delete()
-        }
+        Overrides.clear(context, id)
+        Learning.forget(context, id)
     }
 }

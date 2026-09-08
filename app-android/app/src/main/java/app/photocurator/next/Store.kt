@@ -276,6 +276,12 @@ object Overrides {
             }
         }
 
+    /** 手直しを全部消す。**やり直しのときだけ。** */
+    suspend fun clear(context: Context, albumId: String) = withContext(Dispatchers.IO) {
+        file(context, albumId).delete()
+        Unit
+    }
+
     suspend fun save(context: Context, albumId: String, list: List<PairOverride>) =
         withContext(Dispatchers.IO) {
             try {
