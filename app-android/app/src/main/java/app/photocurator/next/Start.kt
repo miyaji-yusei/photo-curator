@@ -32,6 +32,8 @@ import androidx.compose.ui.unit.sp
 fun StartSheet(
     project: Project,
     photoCount: Int,
+    /** 表示用画像ができている枚数。全部できていれば photoCount と同じ。 */
+    readyCount: Int = photoCount,
     onStart: () -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -57,10 +59,21 @@ fun StartSheet(
                 Column(Modifier.weight(1f)) {
                     Text("一度に見比べる枚数", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                     Spacer(Modifier.height(8.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        SizeCard("2", "大きく・遅い", groupSize == 2) { groupSize = 2 }
-                        SizeCard("3", "", groupSize == 3) { groupSize = 3 }
-                        SizeCard("4", "おすすめ", groupSize == 4) { groupSize = 4 }
+                    // 2〜10。**4 をおすすめとして真ん中に据える。**
+                    // 多いほど 1 回で絞れるが、1 枚が小さくなる。
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        for (size in 2..10) {
+                            SizeCard(
+                                number = "$size",
+                                note = when (size) {
+                                    2 -> "大きく"
+                                    4 -> "おすすめ"
+                                    10 -> "小さく"
+                                    else -> ""
+                                },
+                                selected = groupSize == size
+                            ) { groupSize = size }
+                        }
                     }
                     // **回数で言う。** 何回タップすることになるのかが、
                     // 枚数を選ぶときに一番知りたいこと。
@@ -107,6 +120,15 @@ fun StartSheet(
                 }
             }
 
+            // **まだ作っている途中でも始められる。** そう言っておく。
+            if (readyCount < photoCount) {
+                Spacer(Modifier.height(14.dp))
+                Text(
+                    "準備が終わった $readyCount 枚から始めます。残りは順次追加します",
+                    fontSize = 12.sp, color = Faint
+                )
+            }
+
             Row(
                 Modifier.fillMaxWidth().padding(top = 20.dp),
                 horizontalArrangement = Arrangement.End,
@@ -136,7 +158,7 @@ fun StartSheet(
 private fun SizeCard(number: String, note: String, selected: Boolean, onClick: () -> Unit) {
     Column(
         Modifier
-            .size(width = 84.dp, height = 72.dp)
+            .size(width = 60.dp, height = 66.dp)
             .clip(RoundedCornerShape(12.dp))
             .background(if (selected) Lime else Tile)
             .then(if (selected) Modifier else Modifier.border(1.dp, Color(0xFF24272D), RoundedCornerShape(12.dp)))
@@ -147,13 +169,13 @@ private fun SizeCard(number: String, note: String, selected: Boolean, onClick: (
     ) {
         Text(
             number,
-            fontSize = 22.sp, fontWeight = FontWeight.Bold,
+            fontSize = 20.sp, fontWeight = FontWeight.Bold,
             color = if (selected) Color.Black else Color.White
         )
         if (note.isNotEmpty()) {
             Text(
                 note,
-                fontSize = 10.sp,
+                fontSize = 9.sp,
                 color = if (selected) Color.Black else Faint
             )
         }

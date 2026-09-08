@@ -116,6 +116,8 @@ private fun App() {
                     project = here.project,
                     onBack = { screen = Screen.Home; homeKey += 1 },
                     onCull = { learn -> screen = if (learn) Screen.Learn(here.project) else Screen.Cull(here.project) },
+                    // 完了したプロジェクトは結果へ直行する。
+                    onResults = { screen = Screen.Results(here.project, -1) },
                     onOpenStar = { screen = Screen.Results(here.project, it) }
                 )
 

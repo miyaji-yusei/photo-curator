@@ -49,6 +49,10 @@ namespace photo_curator_core {
     // 選び直せないとき（まとまりでない・仲間でない・もう見終わった）は null。
     Session? set_representative(Session session, string shown, string wanted);
 
+    // 一度に見比べる枚数を変える。いまのグループにすぐ効く。
+    // 足りなければ次から補い、余れば次へ押し出す。
+    Session resize(Session session, u32 group_size);
+
     // まとめ方を変えて、いまのラウンドを組み直す。**その場で反映する。**
     // 組み直すのはまだ判断していない写真だけ。決めた分は星として残る。
     Session regroup(

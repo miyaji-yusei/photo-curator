@@ -14,6 +14,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -36,6 +37,7 @@ fun SettingsScreen(onBack: () -> Unit) {
     var groupBursts by remember { mutableStateOf(Prefs.groupBursts(context)) }
     var askBeforeStart by remember { mutableStateOf(Prefs.askBeforeStart(context)) }
     var displayEdge by remember { mutableStateOf(Prefs.displayEdge(context)) }
+    var detailing by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     var nasList by remember { mutableStateOf<List<Nas>>(emptyList()) }
     // 編集中のつなぎ先。null で新規、Nas で既存。
@@ -122,12 +124,16 @@ fun SettingsScreen(onBack: () -> Unit) {
                     Spacer(Modifier.height(8.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         // 実測 1024px で 1 枚 約 80KB。2,000 枚で約 160MB。
-                        EdgeChip("標準 1024px", "2,000 枚で約 160MB", displayEdge == 1024) {
+                        EdgeChip("標準 1024px", estimate(1024), displayEdge == 1024) {
                             displayEdge = 1024; Prefs.setDisplayEdge(context, 1024)
                         }
-                        EdgeChip("大きく 1536px", "約 340MB", displayEdge == 1536) {
+                        EdgeChip("大きく 1536px", estimate(1536), displayEdge == 1536) {
                             displayEdge = 1536; Prefs.setDisplayEdge(context, 1536)
                         }
+                        EdgeChip(
+                            "詳細…", "768–1920px",
+                            displayEdge != 1024 && displayEdge != 1536
+                        ) { detailing = true }
                     }
                     Spacer(Modifier.height(8.dp))
                     Text(
@@ -144,18 +150,18 @@ fun SettingsScreen(onBack: () -> Unit) {
 
                     Text("一度に見比べる枚数", fontSize = 13.sp)
                     Spacer(Modifier.height(6.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        for (size in listOf(2, 3, 4)) {
-                            FilterChip(
-                                selected = size == groupSize,
-                                onClick = { groupSize = size; Prefs.setGroupSize(context, size) },
-                                label = { Text("$size", fontSize = 13.sp) },
-                                colors = FilterChipDefaults.filterChipColors(
-                                    selectedContainerColor = Lime, selectedLabelColor = Color.Black
-                                )
-                            )
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        for (size in 2..10) {
+                            SizeDot(size, size == groupSize) {
+                                groupSize = size; Prefs.setGroupSize(context, size)
+                            }
                         }
                     }
+                    Text(
+                        "4 枚がおすすめ。多いほど 1 回で絞れますが、1 枚が小さくなります",
+                        fontSize = 11.sp, color = Faint,
+                        modifier = Modifier.padding(top = 6.dp)
+                    )
 
                     Spacer(Modifier.height(16.dp))
                     Toggle("連写を自動でまとめる", groupBursts) {
@@ -186,6 +192,85 @@ fun SettingsScreen(onBack: () -> Unit) {
             onSaved = { adding = false; editing = null; reloads += 1 },
             onRemoved = { adding = false; editing = null; reloads += 1 },
             onDismiss = { adding = false; editing = null }
+        )
+    }
+
+    // 表示用画像の大きさを細かく決める。**設計の「詳細…（768–1920）」。**
+    if (detailing) {
+        // 段は 01-方針と状態モデル の 768|1024|1280|1536|1920。
+        val steps = listOf(768, 1024, 1280, 1536, 1920)
+        var picked by remember { mutableStateOf(displayEdge) }
+        AlertDialog(
+            onDismissRequest = { detailing = false },
+            title = { Text("表示用画像の大きさ") },
+            text = {
+                Column {
+                    Text(
+                        "選別で見る絵の長辺です。大きいほどよく見えますが、" +
+                            "端末に置く量が増えます。",
+                        fontSize = 12.sp, color = Faint
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        for (edge in steps) {
+                            FilterChip(
+                                selected = edge == picked,
+                                onClick = { picked = edge },
+                                label = { Text("$edge", fontSize = 13.sp) },
+                                colors = FilterChipDefaults.filterChipColors(
+                                    selectedContainerColor = Lime, selectedLabelColor = Color.Black
+                                )
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    Text(estimate(picked), fontSize = 12.sp, color = Lime)
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    displayEdge = picked
+                    Prefs.setDisplayEdge(context, picked)
+                    detailing = false
+                }) { Text("これにする") }
+            },
+            dismissButton = { TextButton(onClick = { detailing = false }) { Text("やめる") } }
+        )
+    }
+}
+
+
+/**
+ * 2,000 枚ぶんのおおよその容量。
+ *
+ * 実測は 1024px で 1 枚 約 80KB。面積に比例するので、辺の比の 2 乗で見積もる。
+ * **数字だけでは選べない**ので、必ず容量を添える。
+ */
+private fun estimate(edge: Int): String {
+    val perPhoto = 80.0 * (edge.toDouble() / 1024).let { it * it }
+    val total = (perPhoto * 2000 / 1024).toInt()
+    return "2,000 枚で約 ${total}MB"
+}
+
+/** 一度に見比べる枚数。丸 1 つ。 */
+@Composable
+private fun SizeDot(size: Int, selected: Boolean, onClick: () -> Unit) {
+    Box(
+        Modifier
+            .size(36.dp)
+            .clip(RoundedCornerShape(18.dp))
+            .background(if (selected) Lime else Color.Transparent)
+            .then(
+                if (selected) Modifier
+                else Modifier.border(1.dp, Color(0xFF3A3E47), RoundedCornerShape(18.dp))
+            )
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            "$size", fontSize = 13.sp,
+            fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+            color = if (selected) Color.Black else Color.White
         )
     }
 }
