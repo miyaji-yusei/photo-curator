@@ -24,6 +24,10 @@ namespace photo_curator_core {
     // 各環境の縮小器に任せると値が揃わない（実測で距離 5 の差が出た）。
     string? d_hash_from_gray(sequence<u8> gray, u32 width, u32 height);
 
+    // 学習の答えから「見た目が近い」の境目を決める。答えが無ければ既定値。
+    // 食い違ったときは切る側に倒す（間違えて繋ぐ方が高くつくため）。
+    u32 learn_distance(sequence<BurstAnswer> answers, u32 fallback);
+
     // ---- 選別 ----
     // ラウンドを始める。連写のまとめは中で済ませる。
     Session start_round(
@@ -103,6 +107,12 @@ dictionary PairOverride {
     string right;
     // "split" は切る、"join" は繋ぐ。
     string decision;
+};
+
+// 学習の 1 問への答え。**距離と、人の判断だけ。**
+dictionary BurstAnswer {
+    u32 distance;
+    boolean same;
 };
 
 dictionary BurstGroup {

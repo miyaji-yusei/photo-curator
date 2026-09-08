@@ -221,6 +221,53 @@ pub fn d_hash_from_gray(gray: Vec<u8>, width: u32, height: u32) -> Option<String
     d_hash_from_luma(cells)
 }
 
+/// 学習の 1 問への答え。**距離と、人の判断だけ。**
+#[derive(Debug, Clone)]
+pub struct BurstAnswer {
+    pub distance: u32,
+    pub same: bool,
+}
+
+/// 答えから「見た目が近い」の境目を決める。
+///
+/// **人が「同じ」と言った一番遠いところと、「別」と言った一番近いところの
+/// あいだに置く。** 答えが 1 つも無ければ既定値のまま。
+///
+/// 答えが食い違ったとき（12 を同じ、8 を別、のような）は**切る側に倒す**。
+/// 間違えて繋ぐと片方が二度と画面に出ず、選んだ覚えのない星が付く。
+/// 切りすぎたときは両方見えるだけで、気付けるし直せる。
+pub fn learn_distance(answers: Vec<BurstAnswer>, fallback: u32) -> u32 {
+    let same_max = answers
+        .iter()
+        .filter(|answer| answer.same)
+        .map(|answer| answer.distance)
+        .max();
+    let different_min = answers
+        .iter()
+        .filter(|answer| !answer.same)
+        .map(|answer| answer.distance)
+        .min();
+
+    let learned = match (same_max, different_min) {
+        (None, None) => fallback,
+        // 「同じ」しか無い。少なくともそこまでは繋ぐ。
+        (Some(same), None) => same.max(fallback),
+        // 「別」しか無い。そのすぐ手前で切る。
+        (None, Some(different)) => different.saturating_sub(1),
+        (Some(same), Some(different)) => {
+            if same < different {
+                // 素直に境目がある。真ん中に置く。
+                same + (different - same) / 2
+            } else {
+                // 食い違っている。**切る側に倒す。**
+                different.saturating_sub(1)
+            }
+        }
+    };
+    // 極端な値は基準として使えない。0 は何も繋がらず、大きすぎると何でも繋がる。
+    learned.clamp(2, 24)
+}
+
 // ---------------------------------------------------------------------------
 // 選別
 // ---------------------------------------------------------------------------
@@ -1301,5 +1348,68 @@ mod tests {
         let after = regroup(session, photos, true, threshold(), vec![split("1.jpg", "2.jpg")]);
         assert_eq!(after.round, 1);
         assert_eq!(after.target_star, 2);
+    }
+
+    // ---- 基準の学習 ----
+
+    fn answer(distance: u32, same: bool) -> BurstAnswer {
+        BurstAnswer { distance, same }
+    }
+
+    #[test]
+    fn 答えが無ければ既定値のまま() {
+        assert_eq!(learn_distance(vec![], 9), 9);
+    }
+
+    #[test]
+    fn 同じと別のあいだに境目を置く() {
+        // 6 までは同じ、14 からは別 → あいだの 10
+        let answers = vec![answer(4, true), answer(6, true), answer(14, false), answer(18, false)];
+        assert_eq!(learn_distance(answers, 9), 10);
+    }
+
+    #[test]
+    fn 同じしか無ければそこまでは繋ぐ() {
+        let answers = vec![answer(5, true), answer(13, true)];
+        assert_eq!(learn_distance(answers, 9), 13);
+    }
+
+    #[test]
+    fn 別しか無ければその手前で切る() {
+        let answers = vec![answer(11, false), answer(20, false)];
+        assert_eq!(learn_distance(answers, 9), 10);
+    }
+
+    #[test]
+    fn 食い違ったら切る側に倒す() {
+        // 12 を「同じ」、8 を「別」と答えた。素直な境目が無い。
+        // **繋ぎすぎるより切りすぎる方が安全**なので 7。
+        let answers = vec![answer(12, true), answer(8, false)];
+        assert_eq!(learn_distance(answers, 9), 7);
+    }
+
+    #[test]
+    fn 極端な値は基準にしない() {
+        // 全部「別」と答えても 0 にはしない。何も繋がらない基準は基準でない。
+        assert_eq!(learn_distance(vec![answer(1, false)], 9), 2);
+        // 全部「同じ」でも上限で止める。何でも繋がると畳んだ意味が消える。
+        assert_eq!(learn_distance(vec![answer(60, true)], 9), 24);
+    }
+
+    #[test]
+    fn 学習した値がそのまままとめに効く() {
+        // 距離 10 の 2 枚。既定の 9 ではまとまらないが、学習で 10 になれば繋がる。
+        let photos = vec![
+            photo("1.jpg", 0, "0000000000000000"),
+            photo("2.jpg", 1000, "00000000000003ff"), // 10 ビット違い
+        ];
+        assert_eq!(hash_distance("0000000000000000".into(), "00000000000003ff".into()), 10);
+
+        let strict = BurstThreshold { window_ms: 4000, distance: 9, d_hash_version: 2 };
+        assert_eq!(group_bursts(photos.clone(), strict, vec![]).len(), 2);
+
+        let learned = learn_distance(vec![answer(6, true), answer(14, false)], 9);
+        let loose = BurstThreshold { window_ms: 4000, distance: learned, d_hash_version: 2 };
+        assert_eq!(group_bursts(photos, loose, vec![]).len(), 1);
     }
 }

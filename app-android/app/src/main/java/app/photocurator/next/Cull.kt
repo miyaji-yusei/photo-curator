@@ -82,57 +82,31 @@ fun CullScreen(project: Project, onResults: () -> Unit, onBack: () -> Unit) {
     var editingBurst by remember { mutableStateOf<String?>(null) }
     // 人が手で直したまとめ方。**基準より優先される。**
     var overrides by remember { mutableStateOf<List<PairOverride>>(emptyList()) }
+    // 学習した「見た目が近い」の境目。学習していなければ既定値。
+    var learnedDistance by remember { mutableStateOf(DEFAULT_DISTANCE) }
 
     // 相対パスから写真を引く。core は相対パスしか知らない。
     val byPath = remember(photos) { photos.associateBy { it.relativePath } }
 
-    /**
-     * まとめる基準。**端末で測って決めた値。**
-     *
-     * Camera（694 枚）の 4 秒以内に並ぶ 173 組を測ると、距離は二山になった:
-     * 0-9 に 28 組（連写）、15 以上に 130 組（たまたま近い時刻に入った別の絵）。
-     * 10-14 はどちらとも言えない 15 組。指紋そのものの揺れは 1。
-     *
-     * 9 を採るのは、**間違えて繋ぐ方が高くつく**から。繋いでしまうと片方は
-     * 二度と画面に出ず、選んだ覚えのない星が付く。切りすぎたときは
-     * 両方見えるだけで、気付けるし直せる。
-     */
-    val threshold = remember {
-        BurstThreshold(windowMs = 4000, distance = 9u, dHashVersion = Analyse.VERSION)
-    }
+    val threshold = remember(learnedDistance) { thresholdFor(learnedDistance) }
 
     LaunchedEffect(project.id) {
         note = "写真を読み込んでいます…"
-        photos = Photos.forSource(context, project.source)
-
-        // 指紋を作る。OS の縮小画像から作るので**原本を読まない**（1 枚 3.5ms）。
-        // **前に作った分は作り直さない。** 開くたびに解析し直すと、
-        // 何が起きているのか誰にも分からなくなる。
+        // 指紋は OS の縮小画像から作るので**原本を読まない**（1 枚 3ms）。
+        // **前に作った分は作り直さない。**
         note = "似た写真を調べています…"
-        val cached = Fingerprints.load(context, project.source.key)
-        val prints = Analyse.fingerprints(
-            context, photos, cached,
-            onProgress = { done, total -> prepared = done to total },
-            // 途中経過も書く。ここで戻られても作った分は残る。
-            onPartial = { Fingerprints.save(context, project.source.key, it) }
-        )
-        // 変わっていなければ書かない。書く回数はそのまま壊れる機会になる。
-        if (prints != cached) Fingerprints.save(context, project.source.key, prints)
-
-        refs = photos.map {
-            PhotoRef(
-                relativePath = it.relativePath,
-                capturedAt = it.takenAt,
-                // **作れなかったものは null のまま。** 0 を入れると
-                // 読めない写真どうしが同一に見えて誤ってまとまる。
-                dHash = prints[it.relativePath]?.hash,
-                dHashVersion = Analyse.VERSION
-            )
-        }
-        photos.firstOrNull()?.let { Analyse.selfCheck(context, it) }
-        Neighbours.log(refs, threshold)
-
-        overrides = Overrides.load(context, project.id)
+        val prepared0 = Prepare.run(context, project) { done, total -> prepared = done to total }
+        photos = prepared0.first
+        refs = prepared0.second
+        // **読んだ値はその場の変数で使う。**
+        // state に入れてから同じ効果の中で読むと、まだ再構成されていない
+        // 古い値を掴む。実際それで、学習した基準も手直しも効いていなかった。
+        val distance = Learning.learned(context, project.id) ?: DEFAULT_DISTANCE
+        val loadedThreshold = thresholdFor(distance)
+        val loadedOverrides = Overrides.load(context, project.id)
+        learnedDistance = distance
+        overrides = loadedOverrides
+        Neighbours.log(refs, loadedThreshold)
 
         // **途中があれば続きから。** 無ければ新しく始める。
         val saved = Store.load(context, project.id)
@@ -141,8 +115,8 @@ fun CullScreen(project: Project, onResults: () -> Unit, onBack: () -> Unit) {
             groupSize = Prefs.groupSize(context).toUInt(),
             targetStar = 0,
             groupBursts = Prefs.groupBursts(context),
-            threshold = threshold,
-            overrides = overrides
+            threshold = loadedThreshold,
+            overrides = loadedOverrides
         )
         note = if (saved != null) "続きから" else ""
     }

@@ -85,6 +85,7 @@ private sealed interface Screen {
     data object Home : Screen
     data object Settings : Screen
     data class Detail(val project: Project) : Screen
+    data class Learn(val project: Project) : Screen
     data class Cull(val project: Project) : Screen
     data class Results(val project: Project, val star: Int) : Screen
 }
@@ -114,8 +115,14 @@ private fun App() {
                 is Screen.Detail -> ProjectScreen(
                     project = here.project,
                     onBack = { screen = Screen.Home; homeKey += 1 },
-                    onCull = { screen = Screen.Cull(here.project) },
+                    onCull = { learn -> screen = if (learn) Screen.Learn(here.project) else Screen.Cull(here.project) },
                     onOpenStar = { screen = Screen.Results(here.project, it) }
+                )
+
+                is Screen.Learn -> LearnFlow(
+                    project = here.project,
+                    onStart = { screen = Screen.Cull(here.project) },
+                    onBack = { screen = Screen.Detail(here.project) }
                 )
 
                 is Screen.Cull -> CullScreen(
