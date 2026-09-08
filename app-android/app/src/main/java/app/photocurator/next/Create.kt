@@ -5,6 +5,8 @@ package app.photocurator.next
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -23,10 +25,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import kotlinx.coroutines.launch
 
 /**
@@ -58,14 +63,60 @@ fun CreateScreen(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
     var chosenFolder by remember { mutableStateOf<SmbFolder?>(null) }
     // パスワードを聞く必要があるつなぎ先。**保存していない人のための道。**
     var asking by remember { mutableStateOf<Nas?>(null) }
+    // 選んだフォルダの中身を少しだけ。**選ぶ前のフォルダは取りに行かない。**
+    var strip by remember { mutableStateOf<List<Any>>(emptyList()) }
+    // 取れた見本。**行の再構成はこれで起こす。**
+    // SmbFolder は取得の前後で同じ値なので、一覧を作り直しても行は更新されない
+    // （Compose は入力が等しければ省く）。取れたことを別の状態で伝える。
+    var covers by remember { mutableStateOf<Map<String, java.io.File>>(emptyMap()) }
+    var stripNote by remember { mutableStateOf("") }
 
     LaunchedEffect(Unit) { nasList = NasStore.all(context) }
+
+    // 選んだフォルダの中身を少しだけ出す。**選んだものだけ、最大 12 枚。**
+    LaunchedEffect(chosen?.id, chosenFolder?.path, tab) {
+        strip = emptyList()
+        stripNote = ""
+        val album = chosen
+        val folder = chosenFolder
+        when {
+            album != null -> {
+                // 端末は手元なので、そのまま並べてよい。
+                val inside = Photos.forSource(context, Source("album", album.name, album.id))
+                strip = inside.take(Covers.STRIP).map { it.thumbModel }
+                stripNote = if (inside.size > Covers.STRIP)
+                    "先頭の ${Covers.STRIP} 枚" else ""
+            }
+            folder != null -> {
+                val nas = nasList.firstOrNull { it.id == tab } ?: return@LaunchedEffect
+                val password = Session.password(context, nas) ?: return@LaunchedEffect
+                stripNote = "中身を読み込んでいます…"
+                val inside = (Smb.photos(nas, password, folder.path) as? SmbResult.Ok)?.value
+                if (inside == null) {
+                    // **選ぶ前の画面で失敗を並べない。** 出せなければ黙って出さない。
+                    stripNote = ""
+                    return@LaunchedEffect
+                }
+                val wanted = inside.take(Covers.STRIP).map { it.path }
+                Covers.warm(context, nas, password, wanted)
+                strip = wanted
+                    .filter { ThumbCache.has(context, nas.id, it) }
+                    .map { ThumbCache.file(context, nas.id, it) }
+                stripNote = when {
+                    strip.isEmpty() -> ""
+                    inside.size > Covers.STRIP -> "先頭の ${strip.size} 枚"
+                    else -> ""
+                }
+            }
+        }
+    }
 
     // **タブが変わったら必ず取り直す。** 前のタブの一覧が残っていると、
     // 見出しと中身が食い違う。
     LaunchedEffect(tab, nasList) {
         albums = emptyList()
         folders = emptyList()
+        covers = emptyMap()
         chosen = null
         chosenFolder = null
         name = ""
@@ -98,6 +149,15 @@ fun CreateScreen(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
                     .toSet()
                 note = if (folders.isEmpty())
                     "${nas.share} に写真のフォルダがありません" else ""
+                // 見本を**1 本の接続でまとめて**取る。1 枚ずつ繋ぎ直すと
+                // 1 枚 800ms かかる（実測）。取れた分は端末に残るので次は速い。
+                Covers.warm(context, nas, password, answer.value.mapNotNull { it.cover })
+                covers = answer.value.mapNotNull { folder ->
+                    val path = folder.cover ?: return@mapNotNull null
+                    ThumbCache.file(context, nas.id, path)
+                        .takeIf { it.exists() && it.length() > 0 }
+                        ?.let { folder.path to it }
+                }.toMap()
             }
             is SmbResult.Failed -> note = answer.reason
         }
@@ -183,7 +243,7 @@ fun CreateScreen(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
                                     .padding(horizontal = 10.dp, vertical = 12.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Icon(Icons.Filled.Folder, null, Modifier.size(18.dp), tint = Faint)
+                                FolderCover(covers[folder.path])
                                 Spacer(Modifier.width(10.dp))
                                 Text(folder.name, fontSize = 14.sp, modifier = Modifier.weight(1f))
                                 if (already) Text("作成済み", fontSize = 12.sp, color = Faint)
@@ -215,7 +275,12 @@ fun CreateScreen(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
                                     .padding(horizontal = 10.dp, vertical = 12.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Icon(Icons.Filled.Folder, null, Modifier.size(18.dp), tint = Faint)
+                                FolderCover(
+                                    android.content.ContentUris.withAppendedId(
+                                        android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                                        album.coverId
+                                    )
+                                )
                                 Spacer(Modifier.width(10.dp))
                                 Text(album.name, fontSize = 14.sp, modifier = Modifier.weight(1f))
                                 if (already) {
@@ -252,7 +317,8 @@ fun CreateScreen(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
                     chosenFolder?.let { folder ->
                         val nas = nasList.firstOrNull { it.id == tab }
                         Confirm("出所", nas?.label ?: "NAS")
-                        Confirm("フォルダ", "${nas?.share}\${folder.path}")
+                        // **どこにあるフォルダなのかを実際の道筋で見せる。**
+                        Confirm("フォルダ", (nas?.share ?: "") + " / " + folder.path)
                         Confirm("写真", "${folder.count} 枚")
                         Spacer(Modifier.height(12.dp))
                         Row(verticalAlignment = Alignment.Top) {
@@ -264,6 +330,43 @@ fun CreateScreen(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
                             )
                         }
                     }
+                    // **中身を少しだけ見せる。** 名前と枚数だけでは決められない。
+                    if (strip.isNotEmpty() || stripNote.isNotEmpty()) {
+                        Spacer(Modifier.height(14.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("中身", fontSize = 12.sp, color = Faint)
+                            Spacer(Modifier.weight(1f))
+                            if (stripNote.isNotEmpty()) {
+                                Text(stripNote, fontSize = 11.sp, color = Faint)
+                            }
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            for (item in strip) {
+                                Box(
+                                    Modifier
+                                        .size(64.dp)
+                                        .clip(RoundedCornerShape(6.dp))
+                                        .background(Tile)
+                                ) {
+                                    AsyncImage(
+                                        model = ImageRequest.Builder(context)
+                                            .data(item).size(160).build(),
+                                        contentDescription = null,
+                                        imageLoader = Images.loader(context),
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                }
+                            }
+                        }
+                    }
+
                     chosen?.let { album ->
                         Confirm("出所", "この端末")
                         Confirm("フォルダ", album.relativeDir.ifBlank { album.name })
@@ -393,5 +496,29 @@ private fun Confirm(label: String, value: String) {
     Row(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
         Text(label, fontSize = 12.sp, color = Faint, modifier = Modifier.width(64.dp))
         Text(value, fontSize = 12.sp)
+    }
+}
+
+/**
+ * フォルダ行の見本。**無ければフォルダのアイコンに戻す。**
+ * 選ぶ前の画面なので、読めなかったことを言葉で並べない。
+ */
+@Composable
+private fun FolderCover(model: Any?) {
+    Box(
+        Modifier.size(36.dp).clip(RoundedCornerShape(8.dp)).background(Tile),
+        contentAlignment = Alignment.Center
+    ) {
+        if (model == null) {
+            Icon(Icons.Filled.Folder, null, Modifier.size(18.dp), tint = Faint)
+        } else {
+            AsyncImage(
+                model = ImageRequest.Builder(LocalContext.current).data(model).size(120).build(),
+                contentDescription = null,
+                imageLoader = Images.loader(LocalContext.current),
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize()
+            )
+        }
     }
 }

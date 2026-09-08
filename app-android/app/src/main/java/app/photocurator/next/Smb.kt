@@ -12,7 +12,16 @@ import kotlinx.coroutines.withContext
 import java.util.EnumSet
 
 /** NAS の中のフォルダ 1 つ。 */
-data class SmbFolder(val name: String, val path: String, val count: Int)
+data class SmbFolder(
+    val name: String,
+    val path: String,
+    val count: Int,
+    /**
+     * 見本に出す 1 枚の道筋。**数えるついでに拾う**ので、これのために
+     * 網へ行く回数は増えない。写真が 1 枚も無ければ null。
+     */
+    val cover: String? = null
+)
 
 /** NAS の中の写真 1 枚。 */
 data class SmbPhoto(
@@ -193,14 +202,19 @@ object Smb {
                     false
                 }
                 if (!isDirectory) continue
-                val count = try {
-                    share.list(path).count { isPhoto(it.fileName) }
+                // 数えるのと見本を拾うのは**同じ一覧**で済ませる。
+                var count = -1
+                var cover: String? = null
+                try {
+                    val photos = share.list(path).filter { isPhoto(it.fileName) }
+                    count = photos.size
+                    // 区切りは SMB の "\"。**path と同じ組み立て方**にする。
+                    cover = photos.firstOrNull()?.let { path + "\\" + it.fileName }
                 } catch (error: Exception) {
                     // 数えられないフォルダは 0 にせず落とす。**嘘の数を出さない。**
                     Log.w(TAG, "数えられなかった: $path", error)
-                    -1
                 }
-                if (count > 0) found += SmbFolder(name, path, count)
+                if (count > 0) found += SmbFolder(name, path, count, cover)
             }
             found.sortedBy { it.name }
         }

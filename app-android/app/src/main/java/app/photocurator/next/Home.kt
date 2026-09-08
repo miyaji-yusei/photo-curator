@@ -12,7 +12,9 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Dns
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Smartphone
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
@@ -25,6 +27,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.layout.ContentScale
+import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import kotlinx.coroutines.launch
 
 /** カードに出す状態。**状態 1 行・進捗・次の一手**の 3 つに畳む。 */
@@ -53,6 +58,8 @@ fun HomeScreen(
     val scope = rememberCoroutineScope()
     var projects by remember { mutableStateOf<List<Project>>(emptyList()) }
     var standings by remember { mutableStateOf<Map<String, Standing>>(emptyMap()) }
+    // カードに出す見本の 1 枚。**端末にあるものだけ**なので、無ければ出さない。
+    var covers by remember { mutableStateOf<Map<String, Any>>(emptyMap()) }
     var loaded by remember { mutableStateOf(false) }
     var menuFor by remember { mutableStateOf<Project?>(null) }
     var renaming by remember { mutableStateOf<Project?>(null) }
@@ -65,6 +72,10 @@ fun HomeScreen(
         loaded = true
         // 状態は一覧を出してから足す。**印のために一覧を待たせない。**
         standings = projects.associate { it.id to standingOf(context, it) }
+        // 見本も同じく後から。**網へは行かない**ので、出なければ出ないまま。
+        covers = projects.mapNotNull { project ->
+            Covers.forProject(context, project)?.let { project.id to it }
+        }.toMap()
     }
 
     Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
@@ -125,6 +136,7 @@ fun HomeScreen(
                     ProjectCard(
                         project = project,
                         standing = standings[project.id],
+                        cover = covers[project.id],
                         onOpen = { onOpen(project) },
                         onMenu = { menuFor = project }
                     )
@@ -227,6 +239,8 @@ private fun MenuRow(label: String, danger: Boolean = false, onClick: () -> Unit)
 private fun ProjectCard(
     project: Project,
     standing: Standing?,
+    /** 見本の 1 枚。無ければ出所のアイコンだけ出す。 */
+    cover: Any?,
     onOpen: () -> Unit,
     onMenu: () -> Unit
 ) {
@@ -238,18 +252,47 @@ private fun ProjectCard(
             .padding(16.dp)
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(project.name, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
-            Spacer(Modifier.weight(1f))
+            // **どのフォルダだったかを思い出すための 1 枚。**
+            // 名前と枚数だけでは、開いて確かめることになる。
+            Box(
+                Modifier
+                    .size(52.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(Tile),
+                contentAlignment = Alignment.Center
+            ) {
+                if (cover != null) {
+                    AsyncImage(
+                        model = ImageRequest.Builder(LocalContext.current)
+                            .data(cover).size(160).build(),
+                        contentDescription = null,
+                        imageLoader = Images.loader(LocalContext.current),
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize()
+                    )
+                } else {
+                    // 見本が無いときは出所を薄く。**空白のまま置かない。**
+                    Icon(
+                        if (project.source.kind == "nas") Icons.Filled.Dns
+                        else Icons.Filled.Smartphone,
+                        null, Modifier.size(18.dp), tint = Color(0xFF3A3E47)
+                    )
+                }
+            }
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(project.name, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+                // 出所は人の言葉で。生パスは技術情報だけに出す。
+                Text(
+                    project.source.label,
+                    fontSize = 12.sp, color = Faint,
+                    modifier = Modifier.padding(top = 2.dp)
+                )
+            }
             IconButton(onClick = onMenu, modifier = Modifier.size(28.dp)) {
                 Icon(Icons.Filled.MoreVert, "その他", Modifier.size(18.dp), tint = Faint)
             }
         }
-        // 出所は人の言葉で。生パスは技術情報だけに出す。
-        Text(
-            project.source.label,
-            fontSize = 12.sp, color = Faint,
-            modifier = Modifier.padding(top = 2.dp)
-        )
 
         Spacer(Modifier.height(10.dp))
         Text(
