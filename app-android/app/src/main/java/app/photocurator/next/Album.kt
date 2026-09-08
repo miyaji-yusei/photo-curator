@@ -59,6 +59,8 @@ fun ProjectScreen(
     var menu by remember { mutableStateOf(false) }
     var confirmRestart by remember { mutableStateOf(false) }
     var reloads by remember { mutableStateOf(0) }
+    // 開始前の確認を出しているか。**初回は必ず出す。**
+    var starting by remember { mutableStateOf(false) }
 
     LaunchedEffect(project.id, reloads) {
         scanned = false
@@ -85,7 +87,11 @@ fun ProjectScreen(
             IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, "その他") }
             Spacer(Modifier.width(8.dp))
             Button(
-                onClick = onCull,
+                onClick = {
+                    // 初回か、「毎回確認」が on のときだけ挟む。
+                    if (live == null || Prefs.askBeforeStart(context)) starting = true
+                    else onCull()
+                },
                 // **走査が終わるまで始められない。** 枚数と時間順が決まらないため。
                 enabled = scanned && photos.isNotEmpty(),
                 shape = RoundedCornerShape(50)
@@ -260,6 +266,15 @@ fun ProjectScreen(
                 }
             }
         }
+    }
+
+    if (starting) {
+        StartSheet(
+            project = project,
+            photoCount = photos.size,
+            onStart = { starting = false; onCull() },
+            onDismiss = { starting = false }
+        )
     }
 
     if (menu) {

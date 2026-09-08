@@ -62,7 +62,7 @@ private fun gridFor(count: Int, landscape: Boolean): Pair<Int, Int> {
 }
 
 @Composable
-fun CullScreen(project: Project, onBack: () -> Unit) {
+fun CullScreen(project: Project, onResults: () -> Unit, onBack: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
@@ -332,6 +332,7 @@ fun CullScreen(project: Project, onBack: () -> Unit) {
                     selected = emptySet()
                     scope.launch { Store.save(context, project.id, next) }
                 },
+                onResults = onResults,
                 onBack = onBack
             )
             return@Column
@@ -538,7 +539,10 @@ private fun Tile(
 }
 
 /**
- * ラウンドの終わり。**1 行目で何枚残ったかを答える。**
+ * ラウンド完了。**1 行目で何枚残ったかを答える。**
+ *
+ * 星の内訳を添えるのは、「絞れた」だけでは**どこに溜まったのか**が
+ * 分からないため。次のラウンドで何を見るのかも先に言う。
  *
  * `upcoming` が null なら、これ以上は進めない。**なぜ進めないかを言う。**
  * 押せないボタンだけ置いても、理由が分からない。
@@ -548,6 +552,7 @@ private fun RoundDone(
     session: Session,
     upcoming: Session?,
     onNext: (Session) -> Unit,
+    onResults: () -> Unit,
     onBack: () -> Unit
 ) {
     val kept = session.survivors.size
@@ -556,50 +561,99 @@ private fun RoundDone(
         decision.group.sumOf { session.members[it]?.size ?: 1 }
     }
     val keptPhotos = session.survivors.sumOf { session.members[it]?.size ?: 1 }
+    val counts = IntArray(6)
+    for (star in session.ratings.values) counts[star.coerceIn(0, 5)] += 1
+    val total = session.ratings.size
+
     Column(
-        Modifier.fillMaxSize().padding(24.dp),
+        Modifier.fillMaxSize().padding(horizontal = 24.dp),
         verticalArrangement = Arrangement.Center
     ) {
-        Text("ROUND ${session.round} 完了", fontSize = 12.sp, color = Lime)
-        Text(
-            "★${session.targetStar + 1} が $keptPhotos 枚",
-            fontSize = 22.sp, fontWeight = FontWeight.Bold
-        )
-        Text(
-            // **単位を混ぜない。** 「3 組（4 枚）」は、どちらの数を読めばよいか
-            // 分からない。枚数で言い切って、まとめたことは後ろに添える。
-            if (keptPhotos == kept) "$seen 枚から $keptPhotos 枚に絞られました。"
-            else "$seen 枚から $keptPhotos 枚に絞られました（$kept 組にまとめて選びました）。",
-            fontSize = 13.sp, color = Faint, modifier = Modifier.padding(top = 6.dp)
-        )
+        Reading {
+            Text("ROUND ${session.round} 完了", fontSize = 12.sp, color = Lime)
+            Text(
+                "★${session.targetStar + 1} が $keptPhotos 枚残りました",
+                fontSize = 22.sp, fontWeight = FontWeight.Bold
+            )
+            Text(
+                // **単位を混ぜない。** 「3 組（4 枚）」は、どちらの数を読めばよいか
+                // 分からない。枚数で言い切って、まとめたことは後ろに添える。
+                if (keptPhotos == kept) "$seen 枚から $keptPhotos 枚に絞られました。"
+                else "$seen 枚から $keptPhotos 枚に絞られました（$kept 組にまとめて選びました）。",
+                fontSize = 13.sp, color = Faint, modifier = Modifier.padding(top = 6.dp)
+            )
 
-        Spacer(Modifier.height(24.dp))
-
-        if (upcoming != null) {
-            Button(
-                onClick = { onNext(upcoming) },
-                shape = androidx.compose.foundation.shape.RoundedCornerShape(50)
+            // ---- 星の内訳。**どこに溜まったかを 1 本の帯で。** ----
+            Spacer(Modifier.height(18.dp))
+            Row(
+                Modifier.fillMaxWidth().height(6.dp)
+                    .clip(androidx.compose.foundation.shape.RoundedCornerShape(3.dp))
             ) {
-                Text(
-                    "★${upcoming.targetStar + 1} を選ぶ（${upcoming.queue.size + upcoming.current.size} 組）",
-                    fontWeight = FontWeight.Bold
-                )
+                for (star in 5 downTo 0) {
+                    if (counts[star] == 0) continue
+                    Box(
+                        Modifier
+                            .weight(counts[star].toFloat())
+                            .fillMaxHeight()
+                            .background(if (star > 0) Lime.copy(alpha = 0.35f + star * 0.13f) else Color(0xFF2C3038))
+                    )
+                }
             }
             Spacer(Modifier.height(8.dp))
-            TextButton(onClick = onBack) { Text("ここで終える") }
-        } else {
             Text(
-                if (session.targetStar + 1 >= 4) "★5 まで来ました。これ以上は上げられません。"
-                else "残りが $kept 枚では、次のラウンドで比べる相手がいません。",
-                fontSize = 13.sp, color = Faint
+                (5 downTo 0).filter { counts[it] > 0 }
+                    .joinToString(" · ") { "★$it ${counts[it]} 枚" },
+                fontSize = 12.sp, color = Faint
             )
-            Spacer(Modifier.height(16.dp))
-            Button(
-                onClick = onBack,
-                shape = androidx.compose.foundation.shape.RoundedCornerShape(50)
-            ) {
-                Text("アルバムへ戻る", fontWeight = FontWeight.Bold)
+
+            Spacer(Modifier.height(18.dp))
+
+            if (upcoming != null) {
+                val nextGroups = upcoming.queue.size + upcoming.current.size
+                val turns = (nextGroups + upcoming.groupSize.toInt() - 1) /
+                    maxOf(1, upcoming.groupSize.toInt())
+                Text(
+                    "次は ★${session.targetStar + 1} の $keptPhotos 枚を " +
+                        "${upcoming.groupSize} 枚ずつ見比べます（約 $turns 回）。" +
+                        "ここで終えても、結果はいつでも開けます。",
+                    fontSize = 13.sp, color = Faint
+                )
+                Spacer(Modifier.height(16.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    TextButton(onClick = onResults) { Text("ここで終えて結果へ") }
+                    Spacer(Modifier.weight(1f))
+                    Button(
+                        onClick = { onNext(upcoming) },
+                        shape = androidx.compose.foundation.shape.RoundedCornerShape(50)
+                    ) {
+                        Text(
+                            "★${upcoming.targetStar} を選別する（ROUND ${upcoming.round}）",
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+            } else {
+                Text(
+                    if (session.targetStar + 1 >= MAX_ROUND_STAR)
+                        "★$MAX_ROUND_STAR まで来ました。これ以上は上げられません。"
+                    else "残りが $kept 枚では、次のラウンドで比べる相手がいません。",
+                    fontSize = 13.sp, color = Faint
+                )
+                Spacer(Modifier.height(16.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    TextButton(onClick = onBack) { Text("プロジェクトへ戻る") }
+                    Spacer(Modifier.weight(1f))
+                    Button(
+                        onClick = onResults,
+                        shape = androidx.compose.foundation.shape.RoundedCornerShape(50)
+                    ) {
+                        Text("結果を見る", fontWeight = FontWeight.Bold)
+                    }
+                }
             }
         }
     }
 }
+
+/** 星の上限。core の MAX_STAR と揃える。 */
+private const val MAX_ROUND_STAR = 5
