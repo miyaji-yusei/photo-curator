@@ -466,7 +466,7 @@ private fun Tile(
         } else {
             AsyncImage(
                 model = ImageRequest.Builder(LocalContext.current)
-                    .data(photo.uri)
+                    .data(photo.thumbModel)
                     // **要求した大きさでデコードする。** 原本を丸ごと載せない。
                     .size(1280)
                     .build(),

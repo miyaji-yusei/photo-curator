@@ -69,11 +69,12 @@ fun ZoomView(photo: Photo, onClose: () -> Unit) {
     ) {
         AsyncImage(
             model = ImageRequest.Builder(LocalContext.current)
-                .data(photo.uri)
+                .data(photo.fullModel)
                 // 拡大して見る画面なので、並びより大きく読む。
                 .size(2048)
                 .build(),
             contentDescription = photo.name,
+            imageLoader = Images.loader(LocalContext.current),
             contentScale = ContentScale.Fit,
             modifier = Modifier
                 .fillMaxSize()

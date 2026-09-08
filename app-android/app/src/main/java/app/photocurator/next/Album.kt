@@ -17,6 +17,7 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Dns
 import androidx.compose.material.icons.filled.Smartphone
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material3.*
@@ -62,12 +63,20 @@ fun ProjectScreen(
     // 開始前の確認を出しているか。**初回は必ず出す。**
     var starting by remember { mutableStateOf(false) }
 
+    // **開いたら準備が動き出す。** カードに数が出ているのに何も進まないと、
+    // 止まっているのか終わっているのか分からない。
+    var preparing by remember { mutableStateOf(0 to 0) }
+
     LaunchedEffect(project.id, reloads) {
         scanned = false
-        photos = Photos.forSource(context, project.source)
         session = Store.load(context, project.id)
         prints = Fingerprints.load(context, project.source.key)
+        photos = Photos.forSource(context, project.source)
         scanned = true
+        // 走査が終わってから指紋。**できた分から選別に出せる。**
+        val ready = Prepare.run(context, project) { done, total -> preparing = done to total }
+        photos = ready.first
+        prints = Fingerprints.load(context, project.source.key)
     }
 
     val live = session
@@ -115,7 +124,11 @@ fun ProjectScreen(
             Column(Modifier.width(340.dp).verticalScrollable()) {
                 Card {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Filled.Smartphone, null, Modifier.size(16.dp), tint = Faint)
+                        Icon(
+                            if (project.source.kind == "nas") Icons.Filled.Dns
+                            else Icons.Filled.Smartphone,
+                            null, Modifier.size(16.dp), tint = Faint
+                        )
                         Spacer(Modifier.width(8.dp))
                         Text(project.source.label, fontSize = 13.sp)
                     }
@@ -152,7 +165,12 @@ fun ProjectScreen(
                     PrepRow("撮影時刻・サムネイル", if (scanned) photos.size else 0, photos.size, scanned)
                     // Tauri 版の「表示用画像」に当たる段。ネイティブでは OS の縮小画像を
                     // そのまま使うので、実際に作るのは連写のまとめに使う指紋だけ。
-                    PrepRow("連写の指紋", prints.size, photos.size, prints.size >= photos.size)
+                    PrepRow(
+                        "連写の指紋",
+                        maxOf(prints.size, preparing.first),
+                        photos.size,
+                        prints.size >= photos.size && photos.isNotEmpty()
+                    )
                     Text(
                         "できた写真から選別に出ます",
                         fontSize = 11.sp, color = Faint,
@@ -243,8 +261,9 @@ fun ProjectScreen(
                         ) {
                             AsyncImage(
                                 model = ImageRequest.Builder(LocalContext.current)
-                                    .data(photo.uri).size(256).build(),
+                                    .data(photo.thumbModel).size(256).build(),
                                 contentDescription = photo.name,
+                                imageLoader = Images.loader(LocalContext.current),
                                 contentScale = ContentScale.Crop,
                                 modifier = Modifier.fillMaxSize()
                             )

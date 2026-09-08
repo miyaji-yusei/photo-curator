@@ -37,11 +37,27 @@ data class Photo(
     /** フォルダ内の相対パス。**共有するときの鍵。** */
     val relativePath: String,
     val size: Long,
-    val takenAt: Long
+    val takenAt: Long,
+    /** NAS の写真ならその指し先。端末の写真なら null。 */
+    val smb: SmbRef? = null
 ) {
     /** この端末での指し先。共有しない。 */
     val uri get() = ContentUris.withAppendedId(COLLECTION, id)
+
+    /**
+     * 並べるときに Coil へ渡すもの。**NAS は EXIF の縮小画像を取りに行く。**
+     * 原本 6MB を網越しに引くと 2,000 枚で 12GB になる。
+     */
+    val thumbModel: Any
+        get() = smb?.let { SmbImage(it.nasId, it.path, full = false) } ?: uri
+
+    /** 拡大して見るときに渡すもの。ここは原本を読む。 */
+    val fullModel: Any
+        get() = smb?.let { SmbImage(it.nasId, it.path, full = true) } ?: uri
 }
+
+/** NAS の写真の指し先。**どの NAS の、どの道筋か。** */
+data class SmbRef(val nasId: String, val path: String)
 
 private val COLLECTION = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
     MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
@@ -100,8 +116,36 @@ object Photos {
      */
     suspend fun forSource(context: Context, source: Source): List<Photo> = when (source.kind) {
         "album" -> photos(context, source.key)
-        // NAS はまだ繋げない。**空を返して黙るのではなく、呼ぶ側で理由を出す。**
+        "nas" -> fromNas(context, source.key)
         else -> emptyList()
+    }
+
+    /**
+     * NAS のフォルダの写真。**撮影時刻は EXIF から取る。**
+     *
+     * 更新時刻はコピーしたときに変わってしまい、撮影順にならない。
+     * EXIF は原本の先頭 128KB に入っているので、そこだけ読む。
+     * 読めたぶんは指紋と一緒に控えるので、2 回目以降は網に行かない。
+     */
+    private suspend fun fromNas(context: Context, key: String): List<Photo> {
+        val nasId = key.substringBefore("|")
+        val folder = key.substringAfter("|")
+        val nas = NasStore.all(context).firstOrNull { it.id == nasId } ?: return emptyList()
+        val password = Session.password(context, nas) ?: return emptyList()
+        val listed = Smb.photos(nas, password, folder)
+        if (listed !is SmbResult.Ok) return emptyList()
+        return listed.value.map { entry ->
+            Photo(
+                // MediaStore の id は無いので、道筋から作る。**同じ道筋なら同じ値。**
+                id = entry.path.hashCode().toLong() and 0xffffffffL,
+                name = entry.name,
+                // 共有の鍵はフォルダ内の相対の道筋。区切りは / に揃える。
+                relativePath = entry.path.replace("\\", "/"),
+                size = entry.size,
+                takenAt = entry.modifiedAt,
+                smb = SmbRef(nasId, entry.path)
+            )
+        }
     }
 
     /** あるアルバムの写真。**撮影時刻の昇順**で返す。 */

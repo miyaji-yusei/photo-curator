@@ -87,7 +87,17 @@ object Store {
  * 大きさを控えるのは、写真が差し替わったときに古い指紋を使わないため。
  * 版を控えるのは、作り方を変えたときに黙って混ざらないため。
  */
-data class Fingerprint(val version: Int, val size: Long, val hash: String)
+data class Fingerprint(
+    val version: Int,
+    val size: Long,
+    val hash: String,
+    /**
+     * 撮影時刻。**NAS のときだけ入る。**
+     * 端末は MediaStore が持っているが、NAS は EXIF を読まないと分からない。
+     * 指紋と同じ 1 回の読みで取れるので、一緒に控える。
+     */
+    val takenAt: Long? = null
+)
 
 /**
  * 指紋の置き場。**一度作ったものは作り直さない。**
@@ -98,8 +108,13 @@ data class Fingerprint(val version: Int, val size: Long, val hash: String)
 object Fingerprints {
     private const val TAG = "Fingerprints"
 
-    private fun file(context: Context, albumId: String) =
-        File(context.filesDir, "fingerprints-$albumId.json")
+    /**
+     * 出所の鍵をそのままファイル名にしない。
+     * NAS の鍵は "nasId|フォルダ道筋" の形で、区切り記号がそのまま入ると
+     * **扱いにくい名前のファイル**ができる。英数字以外は _ に潰す。
+     */
+    private fun file(context: Context, key: String) =
+        File(context.filesDir, "fingerprints-${key.replace(Regex("[^A-Za-z0-9_-]"), "_")}.json")
 
     suspend fun load(context: Context, albumId: String): Map<String, Fingerprint> =
         withContext(Dispatchers.IO) {
@@ -113,7 +128,8 @@ object Fingerprints {
                     out[path] = Fingerprint(
                         version = entry.getInt("v"),
                         size = entry.getLong("size"),
-                        hash = entry.getString("h")
+                        hash = entry.getString("h"),
+                        takenAt = if (entry.has("t")) entry.getLong("t") else null
                     )
                 }
                 out
@@ -135,6 +151,7 @@ object Fingerprints {
                             .put("v", print.version)
                             .put("size", print.size)
                             .put("h", print.hash)
+                            .apply { print.takenAt?.let { put("t", it) } }
                     )
                 }
                 val target = file(context, albumId)

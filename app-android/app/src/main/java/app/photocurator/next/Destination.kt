@@ -79,6 +79,7 @@ fun DestinationSheet(
                                     )
                                 ).size(160).build(),
                             contentDescription = null,
+                            imageLoader = Images.loader(LocalContext.current),
                             contentScale = ContentScale.Crop,
                             modifier = Modifier.size(44.dp).clip(RoundedCornerShape(8.dp)).background(Tile)
                         )

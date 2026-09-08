@@ -149,8 +149,9 @@ fun PreviewScreen(
                     if (photo != null) {
                         AsyncImage(
                             model = ImageRequest.Builder(LocalContext.current)
-                                .data(photo.uri).size(160).build(),
+                                .data(photo.thumbModel).size(160).build(),
                             contentDescription = photo.name,
+                            imageLoader = Images.loader(LocalContext.current),
                             contentScale = ContentScale.Crop,
                             modifier = Modifier.fillMaxSize()
                         )
