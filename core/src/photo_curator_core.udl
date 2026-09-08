@@ -77,6 +77,17 @@ namespace photo_curator_core {
         sequence<PairOverride> overrides
     );
 
+    // 同じ星の写真だけで、もう一度ラウンドを作る。**終わったあとでも呼べる。**
+    // 星が上限か、その星が 2 枚未満なら null。
+    Session? round_for(
+        Session previous,
+        sequence<PhotoRef> photos,
+        i32 star,
+        boolean group_bursts,
+        BurstThreshold threshold,
+        sequence<PairOverride> overrides
+    );
+
     // ---- 保存 ----
     // 保存の形は core が持つ。各環境が独自に組み立てない。
     string session_to_json(Session session);

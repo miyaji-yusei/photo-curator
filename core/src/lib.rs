@@ -632,6 +632,55 @@ pub fn regroup(
 /// 進めないのは 2 つ:
 /// - 通ったものが 2 枚未満（比べる相手がいない）
 /// - 星が上限（これ以上つけられない）
+/// **同じ星の写真だけで、もう一度ラウンドを作る。**
+///
+/// 「選別は終わったが、★1 の 46 枚をもう一度見比べたい」に応える。
+/// 次のラウンド（`next_round`）は「直前に通ったもの」を対象にするが、
+/// こちらは**星で選ぶ**ので、終わったあとでも何度でも呼べる。
+///
+/// 星の動き方は選別と同じ。選ばれたら +1、選ばれなければ据え置き。
+/// だから ★5 からは始められない（それ以上は上がらない）。
+///
+/// 始められないときは None:
+/// - 星が上限（★5）
+/// - その星の写真が 2 枚未満（見比べる相手がいない）
+pub fn round_for(
+    previous: Session,
+    photos: Vec<PhotoRef>,
+    star: i32,
+    group_bursts_on: bool,
+    threshold: BurstThreshold,
+    overrides: Vec<PairOverride>,
+) -> Option<Session> {
+    if star >= MAX_STAR {
+        return None;
+    }
+    // 渡された写真の並び（撮影順）を保つ。連写は隣どうしで畳むので、
+    // 順が崩れるとまとまらなくなる。
+    let chosen: Vec<PhotoRef> = photos
+        .into_iter()
+        .filter(|photo| {
+            previous.ratings.get(&photo.relative_path).copied().unwrap_or(0) == star
+        })
+        .collect();
+    if chosen.len() < 2 {
+        return None;
+    }
+
+    let mut session = start_round(
+        chosen,
+        previous.group_size,
+        star,
+        group_bursts_on,
+        threshold,
+        overrides,
+    );
+    session.round = previous.round + 1;
+    // **星は全部引き継ぐ。** ここで選び直さない写真の星が消えてはいけない。
+    session.ratings = previous.ratings;
+    Some(session)
+}
+
 pub fn next_round(
     previous: Session,
     photos: Vec<PhotoRef>,
@@ -730,6 +779,34 @@ mod tests {
 
     fn round(names: &[&str], size: u32) -> Session {
         start_round(plain(names), size, 0, false, threshold(), vec![])
+    }
+
+    #[test]
+    fn 星を指定してもう一度ラウンドを作れる() {
+        let session = round(&["1", "2", "3", "4"], 2);
+        let after = advance(session, vec!["1".into()]);
+        let after = advance(after, vec!["3".into()]);
+        // ★1 が 2 枚（1 と 3）。そこだけでもう一度。
+        let again = round_for(after, plain(&["1", "2", "3", "4"]), 1, false, threshold(), vec![])
+            .expect("★1 は 2 枚あるので始められる");
+        assert_eq!(again.target_star, 1);
+        assert_eq!(again.current, vec!["1", "3"]);
+        // **選び直さない写真の星も残る。**
+        assert_eq!(again.ratings.get("2").copied().unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn 星5からは再選別できない() {
+        let session = round(&["1", "2", "3", "4"], 2);
+        assert!(round_for(session, plain(&["1", "2"]), 5, false, threshold(), vec![]).is_none());
+    }
+
+    #[test]
+    fn 星が1枚しかなければ再選別できない() {
+        let session = round(&["1", "2", "3", "4"], 2);
+        let after = advance(session, vec!["1".into()]);
+        // ★1 は 1 枚だけ。見比べる相手がいない。
+        assert!(round_for(after, plain(&["1", "2", "3", "4"]), 1, false, threshold(), vec![]).is_none());
     }
 
     #[test]

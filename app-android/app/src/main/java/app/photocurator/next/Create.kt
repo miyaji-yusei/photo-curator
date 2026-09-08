@@ -64,6 +64,9 @@ fun CreateScreen(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
     // パスワードを聞く必要があるつなぎ先。**保存していない人のための道。**
     var asking by remember { mutableStateOf<Nas?>(null) }
     // 選んだフォルダの中身を少しだけ。**選ぶ前のフォルダは取りに行かない。**
+    // いま開いている NAS のフォルダ（"" は共有の直下）。**潜れるようにする。**
+    // 直下に写真が無くても、中のフォルダに写真があることは普通にある。
+    var here by remember { mutableStateOf("") }
     var strip by remember { mutableStateOf<List<Any>>(emptyList()) }
     // 取れた見本。**行の再構成はこれで起こす。**
     // SmbFolder は取得の前後で同じ値なので、一覧を作り直しても行は更新されない
@@ -113,7 +116,7 @@ fun CreateScreen(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
 
     // **タブが変わったら必ず取り直す。** 前のタブの一覧が残っていると、
     // 見出しと中身が食い違う。
-    LaunchedEffect(tab, nasList) {
+    LaunchedEffect(tab, nasList, here) {
         albums = emptyList()
         folders = emptyList()
         covers = emptyMap()
@@ -140,7 +143,7 @@ fun CreateScreen(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
             return@LaunchedEffect
         }
         note = "${nas.label} に接続しています…"
-        when (val answer = Smb.folders(nas, password)) {
+        when (val answer = Smb.folders(nas, password, here)) {
             is SmbResult.Ok -> {
                 folders = answer.value
                 taken = Projects.all(context)
@@ -207,12 +210,28 @@ fun CreateScreen(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
             Row(Modifier.weight(1f)) {
                 // ---- 左: フォルダ一覧 ----
                 Column(Modifier.weight(1f)) {
-                    Text(
-                        if (tab == "album") "この端末のフォルダ · ${albums.size} 件"
-                        else "${nasList.firstOrNull { it.id == tab }?.share ?: ""} のフォルダ · ${folders.size} 件",
-                        fontSize = 12.sp, color = Faint,
-                        modifier = Modifier.padding(bottom = 6.dp)
-                    )
+                    Row(
+                        Modifier.fillMaxWidth().padding(bottom = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        // **いまどこを見ているかを出す。** 潜ったまま迷子にしない。
+                        if (tab != "album" && here.isNotEmpty()) {
+                            TextButton(onClick = {
+                                here = here.substringBeforeLast('\\', "")
+                                chosenFolder = null
+                            }) { Text("← 上へ", fontSize = 12.sp) }
+                            Spacer(Modifier.width(8.dp))
+                        }
+                        Text(
+                            when {
+                                tab == "album" -> "この端末のフォルダ · ${albums.size} 件"
+                                here.isEmpty() ->
+                                    "${nasList.firstOrNull { it.id == tab }?.share ?: ""} のフォルダ · ${folders.size} 件"
+                                else -> here.replace('\\', '/') + " · ${folders.size} 件"
+                            },
+                            fontSize = 12.sp, color = Faint
+                        )
+                    }
                     if (note.isNotEmpty()) {
                         Text(
                             note, fontSize = 13.sp, color = Faint,
@@ -221,7 +240,7 @@ fun CreateScreen(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
                     }
                     LazyColumn {
                         items(folders, key = { it.path }) { folder ->
-                            val here = chosenFolder?.path == folder.path
+                            val chosenHere = chosenFolder?.path == folder.path
                             val nasId = tab
                             val already = "$nasId|${folder.path}" in taken
                             Row(
@@ -229,12 +248,17 @@ fun CreateScreen(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
                                     .fillMaxWidth()
                                     .clip(RoundedCornerShape(10.dp))
                                     .then(
-                                        if (here) Modifier
+                                        if (chosenHere) Modifier
                                             .background(Color(0x24D6FF73))
                                             .border(1.dp, Lime, RoundedCornerShape(10.dp))
                                         else Modifier
                                     )
                                     .clickable {
+                                        // 写真が無いフォルダは選べない（中へ入る）。
+                                        if (folder.count == 0 && folder.folders > 0) {
+                                            here = folder.path
+                                            return@clickable
+                                        }
                                         chosenFolder = folder
                                         chosen = null
                                         // 名前の既定はフォルダ名。**ID や道筋は入れない。**
@@ -247,10 +271,20 @@ fun CreateScreen(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
                                 Spacer(Modifier.width(10.dp))
                                 Text(folder.name, fontSize = 14.sp, modifier = Modifier.weight(1f))
                                 if (already) Text("作成済み", fontSize = 12.sp, color = Faint)
-                                else Text("${folder.count} 枚", fontSize = 12.sp, color = Faint)
-                                if (here) {
+                                else if (folder.count > 0) {
+                                    Text("${folder.count} 枚", fontSize = 12.sp, color = Faint)
+                                }
+                                if (chosenHere) {
                                     Spacer(Modifier.width(8.dp))
                                     Icon(Icons.Filled.Check, null, Modifier.size(16.dp), tint = Lime)
+                                }
+                                // **中にフォルダがあれば入れる。** 写真が無くても
+                                // 入り口を出す（入れ子に置いた写真へ辿り着けるように）。
+                                if (folder.folders > 0) {
+                                    Spacer(Modifier.width(8.dp))
+                                    TextButton(onClick = { here = folder.path; chosenFolder = null }) {
+                                        Text("中へ（${folder.folders}）", fontSize = 12.sp)
+                                    }
                                 }
                             }
                         }

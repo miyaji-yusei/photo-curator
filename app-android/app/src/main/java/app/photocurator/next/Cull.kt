@@ -42,6 +42,7 @@ import uniffi.photo_curator_core.keepTop
 import uniffi.photo_curator_core.PairOverride
 import uniffi.photo_curator_core.nextRound
 import uniffi.photo_curator_core.regroup
+import uniffi.photo_curator_core.roundFor
 import uniffi.photo_curator_core.resize
 import uniffi.photo_curator_core.setRepresentative
 import uniffi.photo_curator_core.startRound
@@ -66,7 +67,16 @@ internal fun gridFor(count: Int, landscape: Boolean): Pair<Int, Int> {
 }
 
 @Composable
-fun CullScreen(project: Project, onResults: () -> Unit, onBack: () -> Unit) {
+fun CullScreen(
+    project: Project,
+    /**
+     * この星だけでもう一度ラウンドを作る。**結果画面から来たときだけ入る。**
+     * 途中の続きではなく、**その星の写真を集めて作り直す**（core の round_for）。
+     */
+    againFromStar: Int? = null,
+    onResults: () -> Unit,
+    onBack: () -> Unit
+) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
@@ -126,7 +136,26 @@ fun CullScreen(project: Project, onResults: () -> Unit, onBack: () -> Unit) {
         // **途中があれば続きから。** 無ければ新しく始める。
         val saved = Store.load(context, project.id)
         val wantedSize = Prefs.groupSize(context)
+
+        // 結果から「もう一度選別する」で来たとき。**その星だけで作り直す。**
+        // 選ばれたら +1、選ばれなければ据え置き。星は全部引き継ぐ（core）。
+        val again = if (againFromStar != null && saved != null) {
+            roundFor(
+                saved, refs, againFromStar,
+                groupBursts = Prefs.groupBursts(context),
+                threshold = loadedThreshold,
+                overrides = loadedOverrides
+            )?.let { made ->
+                val sized = if (made.groupSize.toInt() != wantedSize) {
+                    resize(made, wantedSize.toUInt())
+                } else made
+                Store.save(context, project.id, sized)
+                sized
+            }
+        } else null
+
         val opened = when {
+            again != null -> again
             saved == null -> startRound(
                 refs,
                 groupSize = wantedSize.toUInt(),

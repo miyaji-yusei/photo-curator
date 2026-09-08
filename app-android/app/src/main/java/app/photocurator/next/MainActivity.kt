@@ -93,7 +93,7 @@ private sealed interface Screen {
     data object Create : Screen
     data class Detail(val project: Project) : Screen
     data class Learn(val project: Project) : Screen
-    data class Cull(val project: Project) : Screen
+    data class Cull(val project: Project, val againFromStar: Int? = null) : Screen
     data class Results(val project: Project, val star: Int) : Screen
 }
 
@@ -145,6 +145,7 @@ private fun App() {
 
                 is Screen.Cull -> CullScreen(
                     project = here.project,
+                    againFromStar = here.againFromStar,
                     // ラウンド完了から結果へ直行できるように。
                     onResults = { screen = Screen.Results(here.project, -1) },
                     // **選別から戻る先はプロジェクト詳細。** 一覧まで飛ばすと、
@@ -155,6 +156,8 @@ private fun App() {
                 is Screen.Results -> ResultsScreen(
                     project = here.project,
                     star = here.star,
+                    // **その星だけで作り直して選別へ。** 終わったら結果へ戻る。
+                    onCullAgain = { again -> screen = Screen.Cull(here.project, again) },
                     onBack = { screen = Screen.Detail(here.project) }
                 )
             }

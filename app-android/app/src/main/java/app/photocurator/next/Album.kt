@@ -23,6 +23,7 @@ import androidx.compose.material.icons.filled.Smartphone
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -93,6 +94,20 @@ fun ProjectScreen(
     // 一覧の列数。**0 は「おまかせ」**（幅から決める）。
     var columns by remember { mutableStateOf(Prefs.gridColumns(context)) }
 
+    // 準備の進みを見る。**持ち主はアプリなので、画面はただ映すだけ。**
+    val prepared by Preparations.watch().collectAsState()
+    LaunchedEffect(prepared, project.id) {
+        val mine = prepared[project.id] ?: return@LaunchedEffect
+        preparing = mine.meta
+        rendering = mine.display
+        if (mine.trouble != null) trouble = mine.trouble to mine.trouble
+        // 進んでいるあいだも、できた分を読み直して一覧に出す。
+        if (!mine.running) {
+            photos = Listing.load(context, project.source.key) ?: photos
+            prints = Fingerprints.load(context, project.source.key)
+        }
+    }
+
     LaunchedEffect(project.id, reloads) {
         scanned = false
         trouble = null
@@ -104,22 +119,16 @@ fun ProjectScreen(
             ?: if (noted != null) emptyList() else Photos.forSource(context, project.source)
         scanned = true
         try {
-            // 走査が終わってから指紋。**できた分から選別に出せる。**
-            val ready = Prepare.run(context, project, rescan) { done, total ->
-                preparing = done to total
-            }
-            rescan = false
-            photos = ready.first
-            prints = Fingerprints.load(context, project.source.key)
-
-            // 3 段目。**原本を読むのはここだけ。** できた分から選別に出せる。
-            if (project.source.kind == "nas") {
-                Prepare.renders(context, project, ready.first, displayEdge) { done, total ->
-                    rendering = done to total
+            // 準備は**アプリが持つ**（Preparations）。画面を離れても止まらないので、
+            // 別のプロジェクトを選別しているあいだにも進む。
+            Preparations.ensure(context, project, rescan, displayEdge) {
+                // 終わったら顔ぶれと指紋を読み直す。
+                scope.launch {
+                    photos = Listing.load(context, project.source.key) ?: photos
+                    prints = Fingerprints.load(context, project.source.key)
                 }
             }
-            // 通ったら**前の転びは消す**。古い赤字を出し続けない。
-            Trouble.clear(context, project.source.key)
+            rescan = false
 
             // ---- サイドカー ----
             // **開いたときに 1 回だけ見る。** 時刻の大小では決めない。

@@ -48,7 +48,13 @@ import uniffi.photo_curator_core.Session
  * 押す前にボタンの文字だけで読み取れるようにする。
  */
 @Composable
-fun ResultsScreen(project: Project, star: Int, onBack: () -> Unit) {
+fun ResultsScreen(
+    project: Project,
+    star: Int,
+    /** 「もう一度選別する」。**その星だけで新しいラウンドを始める。** */
+    onCullAgain: (Int) -> Unit,
+    onBack: () -> Unit
+) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     // 星の確認と取り出しの判断をする場所なので、選別と同じ絵を使う。
@@ -458,6 +464,20 @@ fun ResultsScreen(project: Project, star: Int, onBack: () -> Unit) {
                         outputMenu = false; confirmFavourite = targets
                     }
                 }
+                // ---- もう一度選別する ----
+                // **選別が終わっても、★1 の中をもう一度見比べたいことがある。**
+                // 星ごとにしか始められない（何を +1 するのかが決まらないため）。
+                val againStar = filter.removePrefix("star:").toIntOrNull()
+                if (againStar != null && againStar < 5 && counts[againStar] >= 2) {
+                    OutputRow(
+                        "★$againStar をもう一度選別する",
+                        "選ばれた写真が ★${againStar + 1} に上がります"
+                    ) {
+                        outputMenu = false
+                        onCullAgain(againStar)
+                    }
+                }
+
                 // ---- 星を直す ----
                 // **ここだけは選別を通さずに星を動かす。** 結果を見てから
                 // 「これは違った」と思ったときに直せる道が要る。
