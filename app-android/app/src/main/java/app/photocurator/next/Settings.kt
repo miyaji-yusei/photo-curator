@@ -79,7 +79,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                     Text("一度に見比べる枚数", fontSize = 13.sp)
                     Spacer(Modifier.height(6.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        for (size in listOf(2, 3, 4, 6, 9)) {
+                        for (size in listOf(2, 3, 4)) {
                             FilterChip(
                                 selected = size == groupSize,
                                 onClick = { groupSize = size; Prefs.setGroupSize(context, size) },

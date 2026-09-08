@@ -165,7 +165,9 @@ object Prefs {
     fun groupSize(context: Context): Int =
         context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
             .getInt(GROUP_SIZE, 4)
-            .coerceIn(2, 10)
+            // **設計に合わせて Android は 2〜4。** 前に 6/9 を選んでいた人が
+            // どのチップも選ばれていない画面に落ちないよう、ここで丸める。
+            .coerceIn(2, 4)
 
     /** 連写を自動でまとめるか。既定 on。 */
     fun groupBursts(context: Context): Boolean =
