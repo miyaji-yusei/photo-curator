@@ -114,6 +114,15 @@ class SmbFetcher(
             )
         }
 
+        // **置いてあれば網に行かない。** 準備のときに読んだものが残っている。
+        ThumbCache.read(context, image.nasId, image.path)?.let { cached ->
+            return SourceResult(
+                source = ImageSource(Buffer().apply { write(cached) }, context),
+                mimeType = null,
+                dataSource = DataSource.DISK
+            )
+        }
+
         val head = (Smb.head(nas, password, image.path, SmbExifReader.HEAD_BYTES)
             as? SmbResult.Ok)?.value ?: return null
         val exif = SmbExifReader.parse(head, 0L)
@@ -134,6 +143,8 @@ class SmbFetcher(
         val bitmap = android.graphics.BitmapFactory
             .decodeByteArray(thumbnail, 0, thumbnail.size) ?: return null
         val turned = SmbExifReader.applyOrientation(bitmap, exif.orientation)
+        // 次からは網に行かなくて済むように置いておく。
+        ThumbCache.write(context, image.nasId, image.path, turned)
         return DrawableResult(
             drawable = android.graphics.drawable.BitmapDrawable(context.resources, turned),
             isSampled = true,
@@ -159,10 +170,37 @@ object Images {
 
     fun loader(context: Context): ImageLoader = loader ?: synchronized(this) {
         loader ?: ImageLoader.Builder(context.applicationContext)
-            .components { add(SmbFetcher.Factory(context.applicationContext)) }
-            // 網越しの読みは高い。**一度取ったものはディスクに置く。**
+            .components {
+                add(SmbFetcher.Factory(context.applicationContext))
+                // **鍵が無いと Coil は同じ写真だと分からない。**
+                // 分からなければ覚えられず、毎回網に行くことになる。
+                // 実際これが無いあいだ、一覧はスクロールのたびに読み直していた。
+                add(SmbKeyer())
+            }
+            .memoryCache {
+                coil.memory.MemoryCache.Builder(context.applicationContext)
+                    .maxSizePercent(0.25)
+                    .build()
+            }
+            .diskCache {
+                coil.disk.DiskCache.Builder()
+                    .directory(context.applicationContext.cacheDir.resolve("images"))
+                    .maxSizeBytes(512L * 1024 * 1024)
+                    .build()
+            }
             .respectCacheHeaders(false)
             .build()
             .also { loader = it }
     }
+}
+
+/**
+ * 同じ写真を同じものだと分からせる。
+ *
+ * **大きさで別の鍵にする。** 一覧の縮小画像と拡大の原本は別物なので、
+ * 同じ鍵にすると小さい絵を拡大表示に使ってしまう。
+ */
+class SmbKeyer : coil.key.Keyer<SmbImage> {
+    override fun key(data: SmbImage, options: coil.request.Options): String =
+        "smb:${data.nasId}:${data.path}:${if (data.full) "full" else "thumb"}"
 }

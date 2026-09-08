@@ -281,3 +281,79 @@ object Overrides {
         return existing.filterNot { (it.left to it.right) in replaced } + added
     }
 }
+
+/**
+ * 写真の顔ぶれを控えておく。
+ *
+ * **開くたびに数え直さない。** NAS では一覧を取るだけで網の往復が要る。
+ * 中身が変わっていなければ前の結果でよい。
+ *
+ * 変わったかどうかは、こちらからは分からない。だから**自動では見に行かず**、
+ * 「写真を再読み込み」を押されたときだけ取り直す。勝手に取り直すと、
+ * 開くたびに待たされる理由が誰にも分からなくなる。
+ */
+object Listing {
+    private const val TAG = "Listing"
+
+    private fun file(context: Context, key: String) =
+        File(context.filesDir, "listing-${key.replace(Regex("[^A-Za-z0-9_-]"), "_")}.json")
+
+    suspend fun load(context: Context, key: String): List<Photo>? = withContext(Dispatchers.IO) {
+        val target = file(context, key)
+        if (!target.exists()) return@withContext null
+        try {
+            val array = org.json.JSONArray(target.readText())
+            (0 until array.length()).map { at ->
+                val entry = array.getJSONObject(at)
+                Photo(
+                    id = entry.getLong("id"),
+                    name = entry.getString("name"),
+                    relativePath = entry.getString("rel"),
+                    size = entry.getLong("size"),
+                    takenAt = entry.getLong("at"),
+                    smb = if (entry.has("nas")) {
+                        SmbRef(entry.getString("nas"), entry.getString("path"))
+                    } else null
+                )
+            }
+        } catch (error: Exception) {
+            Log.w(TAG, "顔ぶれを読めなかった: $key", error)
+            null
+        }
+    }
+
+    suspend fun save(context: Context, key: String, photos: List<Photo>) =
+        withContext(Dispatchers.IO) {
+            try {
+                val array = org.json.JSONArray()
+                for (photo in photos) {
+                    array.put(
+                        org.json.JSONObject()
+                            .put("id", photo.id)
+                            .put("name", photo.name)
+                            .put("rel", photo.relativePath)
+                            .put("size", photo.size)
+                            .put("at", photo.takenAt)
+                            .apply {
+                                photo.smb?.let { put("nas", it.nasId); put("path", it.path) }
+                            }
+                    )
+                }
+                val target = file(context, key)
+                val temporary = File(target.parentFile, "${target.name}.writing")
+                temporary.writeText(array.toString())
+                if (!temporary.renameTo(target)) {
+                    temporary.copyTo(target, overwrite = true)
+                    temporary.delete()
+                }
+                Unit
+            } catch (error: Exception) {
+                Log.w(TAG, "顔ぶれを保存できなかった: $key", error)
+            }
+        }
+
+    suspend fun clear(context: Context, key: String) = withContext(Dispatchers.IO) {
+        file(context, key).delete()
+        Unit
+    }
+}
