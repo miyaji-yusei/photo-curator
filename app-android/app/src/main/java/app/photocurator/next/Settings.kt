@@ -14,6 +14,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.filled.ChevronRight
+import kotlinx.coroutines.launch
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -30,6 +35,14 @@ fun SettingsScreen(onBack: () -> Unit) {
     var groupSize by remember { mutableStateOf(Prefs.groupSize(context)) }
     var groupBursts by remember { mutableStateOf(Prefs.groupBursts(context)) }
     var askBeforeStart by remember { mutableStateOf(Prefs.askBeforeStart(context)) }
+    val scope = rememberCoroutineScope()
+    var nasList by remember { mutableStateOf<List<Nas>>(emptyList()) }
+    // 編集中のつなぎ先。null で新規、Nas で既存。
+    var editing by remember { mutableStateOf<Nas?>(null) }
+    var adding by remember { mutableStateOf(false) }
+    var reloads by remember { mutableStateOf(0) }
+
+    LaunchedEffect(reloads) { nasList = NasStore.all(context) }
 
     Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
         Row(
@@ -49,20 +62,44 @@ fun SettingsScreen(onBack: () -> Unit) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text("NAS", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                         Spacer(Modifier.weight(1f))
-                        TextButton(onClick = { }, enabled = false) {
+                        TextButton(onClick = { adding = true }) {
                             Icon(Icons.Filled.Add, null, Modifier.size(16.dp))
                             Spacer(Modifier.width(4.dp))
                             Text("追加", fontSize = 13.sp)
                         }
                     }
                     Spacer(Modifier.height(8.dp))
-                    // **「作る予定」ではなく「まだできない」と書く。**
-                    // 押せるのに何も起きないボタンを置くより、理由を出す。
-                    Text(
-                        "まだ繋げません。接続の確認に実機の NAS が要るため、" +
-                            "繋いだ状態で一緒に作ります。",
-                        fontSize = 12.sp, color = Faint
-                    )
+                    if (nasList.isEmpty()) {
+                        Text(
+                            "まだ登録がありません。「追加」から、ホスト名・共有名・" +
+                                "ユーザー名を入れてください。",
+                            fontSize = 12.sp, color = Faint
+                        )
+                    }
+                    LazyColumn(Modifier.heightIn(max = 260.dp)) {
+                        items(nasList, key = { it.id }) { nas ->
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .clickable { editing = nas }
+                                    .padding(vertical = 10.dp, horizontal = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(nas.label, fontSize = 14.sp)
+                                    // **ホストは人には見せない…のではなく、**
+                                    // ここは設定なので出す。普段の画面には出さない。
+                                    Text(
+                                        "${nas.host} · ${nas.share} · ${nas.user}" +
+                                            if (nas.remember) " · パスワード保存あり" else "",
+                                        fontSize = 12.sp, color = Faint
+                                    )
+                                }
+                                Icon(Icons.Filled.ChevronRight, null, Modifier.size(18.dp), tint = Faint)
+                            }
+                        }
+                    }
                     Spacer(Modifier.height(8.dp))
                     Text(
                         "写真は端末にコピーしません。必要な部分だけ NAS から読みます",
@@ -112,6 +149,15 @@ fun SettingsScreen(onBack: () -> Unit) {
                 }
             }
         }
+    }
+
+    if (adding || editing != null) {
+        NasEditSheet(
+            existing = editing,
+            onSaved = { adding = false; editing = null; reloads += 1 },
+            onRemoved = { adding = false; editing = null; reloads += 1 },
+            onDismiss = { adding = false; editing = null }
+        )
     }
 }
 

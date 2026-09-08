@@ -18,6 +18,16 @@ android {
         ndk { abiFilters += "arm64-v8a" }
     }
 
+    packaging {
+        resources {
+            // smbj が持ち込む重複メタデータ。**入れても意味がないので落とす。**
+            excludes += setOf(
+                "META-INF/DEPENDENCIES", "META-INF/LICENSE*", "META-INF/NOTICE*",
+                "META-INF/*.kotlin_module"
+            )
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -50,6 +60,12 @@ dependencies {
     // Coil はメモリとディスクのキャッシュ、要求サイズでのデコード、
     // 画面から消えたときの取り消しまで面倒を見る。
     implementation("io.coil-kt:coil-compose:2.7.0")
+
+    // **NAS（SMB）。** smbj は純 Java で、Android でもそのまま動く。
+    // ログは SLF4J 越しに出るので、Android の Log に流す実装を入れる。
+    implementation("com.hierynomus:smbj:0.13.0")
+    implementation("org.slf4j:slf4j-api:1.7.36")
+    implementation("uk.uuid.slf4j:slf4j-android:1.7.30-0")
 
     // UniFFI が生成した Kotlin は JNA を使う。
     implementation("net.java.dev.jna:jna:5.14.0@aar")
