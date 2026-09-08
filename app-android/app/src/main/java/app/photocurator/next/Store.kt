@@ -200,6 +200,21 @@ object Prefs {
             .edit().putInt("display_edge", edge.coerceIn(768, 1920)).apply()
     }
 
+    /**
+     * プロジェクトごとの長辺。**設定の値は「新しいプロジェクトの既定」**で、
+     * 途中で大きさを変えたいのは目の前の 1 つだけ、ということが多い。
+     * 決めていなければ既定に従う。
+     */
+    fun projectEdge(context: Context, projectId: String): Int =
+        context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+            .getInt("display_edge_" + projectId, displayEdge(context))
+            .coerceIn(768, 1920)
+
+    fun setProjectEdge(context: Context, projectId: String, edge: Int) {
+        context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+            .edit().putInt("display_edge_" + projectId, edge.coerceIn(768, 1920)).apply()
+    }
+
     /** 連写を自動でまとめるか。既定 on。 */
     fun groupBursts(context: Context): Boolean =
         context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
@@ -368,6 +383,48 @@ object Listing {
 
     suspend fun clear(context: Context, key: String) = withContext(Dispatchers.IO) {
         file(context, key).delete()
+        Unit
+    }
+}
+
+/**
+ * 準備でつまずいたことを控える。**ホームで理由を出すため。**
+ *
+ * ホームは開いても網へ行かない（行くと一覧が出るまで待たされる）ので、
+ * 「NAS に届きません」を自分で確かめる術がない。だから**転んだ側が
+ * 書き残す**。次に準備が通ったら消す。
+ */
+object Trouble {
+    private const val TAG = "Trouble"
+
+    private fun file(context: Context, key: String) =
+        File(context.filesDir, "trouble-${key.replace(Regex("[^A-Za-z0-9_-]"), "_")}.txt")
+
+    suspend fun note(context: Context, key: String, message: String) =
+        withContext(Dispatchers.IO) {
+            try {
+                file(context, key).writeText(message)
+            } catch (error: Exception) {
+                Log.w(TAG, "困りごとを書けなかった: $key", error)
+            }
+        }
+
+    suspend fun load(context: Context, key: String): String? = withContext(Dispatchers.IO) {
+        val target = file(context, key)
+        if (!target.exists()) return@withContext null
+        try {
+            target.readText().takeIf { it.isNotBlank() }
+        } catch (error: Exception) {
+            null
+        }
+    }
+
+    suspend fun clear(context: Context, key: String) = withContext(Dispatchers.IO) {
+        try {
+            file(context, key).delete()
+        } catch (error: Exception) {
+            Log.w(TAG, "困りごとを消せなかった: $key", error)
+        }
         Unit
     }
 }

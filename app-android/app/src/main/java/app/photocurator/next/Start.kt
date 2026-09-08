@@ -1,4 +1,7 @@
-@file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+@file:OptIn(
+    androidx.compose.material3.ExperimentalMaterial3Api::class,
+    androidx.compose.foundation.layout.ExperimentalLayoutApi::class
+)
 
 package app.photocurator.next
 
@@ -61,7 +64,15 @@ fun StartSheet(
                     Spacer(Modifier.height(8.dp))
                     // 2〜10。**4 をおすすめとして真ん中に据える。**
                     // 多いほど 1 回で絞れるが、1 枚が小さくなる。
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    //
+                    // **折り返す。** 9 枚を 1 行に並べると 588dp 必要で、
+                    // 左カラムに入りきらず 6 以降が画面外に消える（実機で確認）。
+                    // Row は溢れても切るだけでスクロールもしない。
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                        maxItemsInEachRow = 5
+                    ) {
                         for (size in 2..10) {
                             SizeCard(
                                 number = "$size",

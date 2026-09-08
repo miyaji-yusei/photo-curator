@@ -45,6 +45,11 @@ fun SettingsScreen(onBack: () -> Unit) {
     var adding by remember { mutableStateOf(false) }
     var reloads by remember { mutableStateOf(0) }
 
+    // つなぎ先ごとの状態。**開いた瞬間には試さない**（試すと設定を開くたびに
+    // 網の往復が要る）。「接続を確認」を押したときと、確かめ終わったときだけ動く。
+    var health by remember { mutableStateOf<Map<String, Boolean?>>(emptyMap()) }
+    var checking by remember { mutableStateOf<String?>(null) }
+
     LaunchedEffect(reloads) { nasList = NasStore.all(context) }
 
     Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
@@ -89,6 +94,20 @@ fun SettingsScreen(onBack: () -> Unit) {
                                     .padding(vertical = 10.dp, horizontal = 4.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
+                                // 状態の丸: 届いた primary ／ 試していない 灰 ／ 届かない error
+                                Box(
+                                    Modifier
+                                        .size(9.dp)
+                                        .clip(RoundedCornerShape(5.dp))
+                                        .background(
+                                            when (health[nas.id]) {
+                                                true -> Lime
+                                                false -> Warn
+                                                else -> Color(0xFF3A3E47)
+                                            }
+                                        )
+                                )
+                                Spacer(Modifier.width(10.dp))
                                 Column(Modifier.weight(1f)) {
                                     Text(nas.label, fontSize = 14.sp)
                                     // **ホストは人には見せない…のではなく、**
@@ -99,6 +118,32 @@ fun SettingsScreen(onBack: () -> Unit) {
                                         fontSize = 12.sp, color = Faint
                                     )
                                 }
+                                Text(
+                                    when {
+                                        checking == nas.id -> "確かめています…"
+                                        health[nas.id] == true -> "届きます"
+                                        health[nas.id] == false -> "届きません"
+                                        else -> ""
+                                    },
+                                    fontSize = 11.sp,
+                                    color = if (health[nas.id] == false) Warn else Faint
+                                )
+                                TextButton(
+                                    onClick = {
+                                        checking = nas.id
+                                        scope.launch {
+                                            // **保存していないパスワードは訊かない。**
+                                            // 入っていないなら「届かない」ではなく、
+                                            // 何も言わずに編集シートで入れてもらう。
+                                            val secret = Session.password(context, nas)
+                                            val ok = secret != null &&
+                                                Smb.check(nas, secret) is SmbResult.Ok
+                                            health = health + (nas.id to ok)
+                                            checking = null
+                                        }
+                                    },
+                                    enabled = checking == null
+                                ) { Text("確認", fontSize = 12.sp) }
                                 Icon(Icons.Filled.ChevronRight, null, Modifier.size(18.dp), tint = Faint)
                             }
                         }
@@ -181,6 +226,13 @@ fun SettingsScreen(onBack: () -> Unit) {
                             fontSize = 11.sp, color = Faint
                         )
                     }
+                    // **版を出す。** 「直したはずのものが直っていない」と
+                    // 言われたときに、まず確かめるのがここ。
+                    Text(
+                        "バージョン ${appVersion(context)}",
+                        fontSize = 11.sp, color = Faint,
+                        modifier = Modifier.padding(top = 10.dp)
+                    )
                 }
             }
         }
@@ -322,4 +374,14 @@ private fun Toggle(label: String, on: Boolean, onChange: (Boolean) -> Unit) {
             )
         )
     }
+}
+
+/** 「1.0 (3)」。名前と番号の両方を出す。 */
+private fun appVersion(context: android.content.Context): String = try {
+    val info = context.packageManager.getPackageInfo(context.packageName, 0)
+    val code = if (android.os.Build.VERSION.SDK_INT >= 28) info.longVersionCode
+    else @Suppress("DEPRECATION") info.versionCode.toLong()
+    "${info.versionName} ($code)"
+} catch (error: Exception) {
+    "不明"
 }

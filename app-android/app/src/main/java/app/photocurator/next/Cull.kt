@@ -16,6 +16,7 @@ import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.MoreHoriz
 import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.filled.ZoomIn
 import androidx.compose.material.icons.filled.Undo
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -36,6 +37,7 @@ import uniffi.photo_curator_core.BurstThreshold
 import uniffi.photo_curator_core.PhotoRef
 import uniffi.photo_curator_core.Session
 import uniffi.photo_curator_core.advance
+import uniffi.photo_curator_core.keepTop
 import uniffi.photo_curator_core.PairOverride
 import uniffi.photo_curator_core.nextRound
 import uniffi.photo_curator_core.regroup
@@ -57,7 +59,7 @@ private val GRID = mapOf(
     6 to (2 to 3), 7 to (2 to 4), 8 to (2 to 4), 9 to (3 to 3), 10 to (2 to 5)
 )
 
-private fun gridFor(count: Int, landscape: Boolean): Pair<Int, Int> {
+internal fun gridFor(count: Int, landscape: Boolean): Pair<Int, Int> {
     val (rows, cols) = GRID[count] ?: ((count + 4) / 5 to minOf(5, maxOf(1, count)))
     return if (landscape) rows to cols else cols to rows
 }
@@ -77,10 +79,13 @@ fun CullScreen(project: Project, onResults: () -> Unit, onBack: () -> Unit) {
     var stageSize by remember { mutableStateOf(0 to 0) }
     // 連写のまとめに使う指紋。**出来た分だけで始められる。**
     var prepared by remember { mutableStateOf(0 to 0) }
-    // 長押しで大きく見ている 1 枚。**選別の判断はここでは動かさない。**
-    var zooming by remember { mutableStateOf<Photo?>(null) }
+    // 大きく見ている並びと、その何枚目か。**左右で前後に送れる**ので
+    // 1 枚ではなく並びで持つ。拡大からは「残す」だけができる。
+    var zooming by remember { mutableStateOf<Pair<List<Photo>, Int>?>(null) }
     // 開いている連写のまとまり（代表の相対パス）。
     var editingBurst by remember { mutableStateOf<String?>(null) }
+    // 長押しで開いた献立（拡大／★5／まとまり）。細いタイルではここが唯一の入口。
+    var holding by remember { mutableStateOf<String?>(null) }
     // 人が手で直したまとめ方。**基準より優先される。**
     var overrides by remember { mutableStateOf<List<PairOverride>>(emptyList()) }
     // 学習した「見た目が近い」の境目。学習していなければ既定値。
@@ -115,7 +120,8 @@ fun CullScreen(project: Project, onResults: () -> Unit, onBack: () -> Unit) {
         learnedDistance = distance
         overrides = loadedOverrides
         groupBursts = Prefs.groupBursts(context)
-        edge = Prefs.displayEdge(context)
+        // **大きさはプロジェクトごと。** 設定の値はその既定。
+        edge = Prefs.projectEdge(context, project.id)
         Neighbours.log(refs, loadedThreshold)
 
         // **途中があれば続きから。** 無ければ新しく始める。
@@ -169,6 +175,17 @@ fun CullScreen(project: Project, onResults: () -> Unit, onBack: () -> Unit) {
         selected = emptySet()
         // **複数モードは切らない。** 複数で選ぶ人はずっと複数で選ぶので、
         // 毎回押し直させるのは 1 グループにつき 1 タップ増えるのと同じ。
+        scope.launch { Store.save(context, project.id, next) }
+    }
+
+    /**
+     * ★5 で確定する。**「これは決まり」を 5 回選ばせない。**
+     * 以降のラウンドには出ない。1 つ戻すで元の星に返る（判断は core）。
+     */
+    fun keepTop(path: String) {
+        val next = keepTop(live, path)
+        session = next
+        selected = emptySet()
         scope.launch { Store.save(context, project.id, next) }
     }
 
@@ -299,10 +316,31 @@ fun CullScreen(project: Project, onResults: () -> Unit, onBack: () -> Unit) {
             },
             onDisplayEdge = { value ->
                 edge = value
-                Prefs.setDisplayEdge(context, value)
+                Prefs.setProjectEdge(context, project.id, value)
             },
             onDismiss = { options = false }
         )
+    }
+
+    // 長押しの献立。**右上のボタンが出ない細いタイルのための道。**
+    holding?.let { path ->
+        ModalBottomSheet(onDismissRequest = { holding = null }, containerColor = Surface) {
+            Column(Modifier.padding(horizontal = 8.dp).padding(bottom = 24.dp)) {
+                DetailRow("大きく見る") {
+                    holding = null
+                    val line = live.current.mapNotNull { byPath[it] }
+                    val idx = line.indexOfFirst { it.relativePath == path }
+                    if (idx >= 0) zooming = line to idx
+                }
+                DetailRow("★5 で確定する（以降のラウンドに出ません）") {
+                    holding = null
+                    keepTop(path)
+                }
+                if ((live.members[path]?.size ?: 1) > 1) {
+                    DetailRow("まとまりを編集する") { holding = null; editingBurst = path }
+                }
+            }
+        }
     }
 
     // まとまり編集。**対象はいまの組の写真と、その前後の未判定の写真。**
@@ -344,15 +382,41 @@ fun CullScreen(project: Project, onResults: () -> Unit, onBack: () -> Unit) {
                 },
                 onZoom = { photo ->
                     editingBurst = null
-                    zooming = photo
+                    // **編集シートの並びのまま前後へ送れる。**
+                    zooming = subject to subject.indexOf(photo).coerceAtLeast(0)
                 },
                 onDismiss = { editingBurst = null }
             )
         }
     }
 
-    zooming?.let { photo ->
-        ZoomView(photo = photo, onClose = { zooming = null })
+    zooming?.let { (line, index) ->
+        ZoomView(
+            photos = line,
+            startAt = index,
+            displayEdge = displayEdge,
+            // **拡大したまま決められる。** 迷って開いた 1 枚を、
+            // 閉じてから探し直させない。
+            onKeep = { picked ->
+                zooming = null
+                val path = picked.relativePath
+                // 連写の中の 1 枚を見ていたなら、**その組をこの 1 枚で残す。**
+                // いま並んでいるのは代表なので、代表を移してから確定する。
+                val head = live.current.firstOrNull { it == path }
+                    ?: live.current.firstOrNull { live.members[it]?.contains(path) == true }
+                if (head != null) {
+                    // **代表の付け替えと確定は 1 回で書く。** state に入れてから
+                    // 同じ組で読み直すと、まだ再構成されていない古い方を掴む。
+                    val base =
+                        if (head != path) setRepresentative(live, head, path) ?: live else live
+                    val next = advance(base, listOf(head))
+                    session = next
+                    selected = emptySet()
+                    scope.launch { Store.save(context, project.id, next) }
+                }
+            },
+            onClose = { zooming = null }
+        )
         return
     }
 
@@ -423,8 +487,15 @@ fun CullScreen(project: Project, onResults: () -> Unit, onBack: () -> Unit) {
                                     // この 1 枚が何枚ぶんの代表か。
                                     stands = live.members[path]?.size ?: 1,
                                     displayEdge = displayEdge,
-                                    onHold = { zooming = byPath[path] },
+                                    onZoom = {
+                                        // **いまの組の中を左右で見比べられる。**
+                                        val line = live.current.mapNotNull { byPath[it] }
+                                        val idx = line.indexOfFirst { it.relativePath == path }
+                                        if (idx >= 0) zooming = line to idx
+                                    },
+                                    onHold = { holding = path },
                                     onOpenBurst = { editingBurst = path },
+                                    onTop = { keepTop(path) },
                                     onTap = {
                                         if (multi) {
                                             selected = if (path in selected) selected - path
@@ -521,9 +592,15 @@ private fun CullBar(
                 shape = androidx.compose.foundation.shape.RoundedCornerShape(50)
             ) {
                 // **結果を枚数で言う。** 押すと何が起きるかが読み取れるように。
+                // カバー画面（<600dp）は横幅が無いので、設計どおり短くする。
+                val narrow = androidx.compose.ui.platform.LocalConfiguration
+                    .current.screenWidthDp < 600
                 Text(
-                    if (selectedCount == 0) "${session.current.size} 枚とも落とす"
-                    else "$selectedCount 枚を残す",
+                    when {
+                        selectedCount > 0 -> "$selectedCount 枚を残す"
+                        narrow -> "落として次へ"
+                        else -> "${session.current.size} 枚とも落とす"
+                    },
                     fontWeight = FontWeight.Bold, fontSize = 13.sp
                 )
             }
@@ -532,19 +609,28 @@ private fun CullBar(
 }
 
 @Composable
-private fun Tile(
+internal fun Tile(
     number: Int,
     photo: Photo?,
     picked: Boolean,
     stands: Int,
     displayEdge: Int,
     onTap: () -> Unit,
+    /** 右上のボタン。**待たずに大きく見る。** */
+    onZoom: () -> Unit,
+    /** 長押し。細いタイルではボタンを出さないので、**ここが唯一の入口**。 */
     onHold: () -> Unit,
-    onOpenBurst: () -> Unit
+    onOpenBurst: () -> Unit,
+    /** ★5 で確定する。連写の中身選別のように**使えない場所では null**。 */
+    onTop: (() -> Unit)? = null
 ) {
+    // 小さい枠にボタンを重ねると写真が見えなくなる。**120dp 未満では出さない。**
+    // その場合は長押しから同じことができる。
+    var wide by remember { mutableStateOf(true) }
     Box(
         Modifier
             .fillMaxSize()
+            .onSizeChanged { wide = it.width > 120 * 3 }
             .clip(androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
             .background(Tile)
             .then(if (picked) Modifier.border(3.dp, Lime) else Modifier)
@@ -598,8 +684,8 @@ private fun Tile(
         if (stands > 1) {
             Box(
                 Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(6.dp)
+                    .align(Alignment.TopStart)
+                    .padding(start = 40.dp, top = 6.dp)
                     .clip(androidx.compose.foundation.shape.RoundedCornerShape(6.dp))
                     .background(Color(0xB3101114))
                     // **バッジは押せる。** ここを押すと中身が開く。
@@ -611,6 +697,41 @@ private fun Tile(
                 Text("連写 $stands 枚", fontSize = 11.sp, color = Lime)
             }
         }
+
+        // ---- 右上: 拡大 と ★5。**押したらすぐ効く。** ----
+        // 長押しでも同じことができるが、長押しは 300ms 待つ。何百回も
+        // 触る画面なので、待たずに押せる場所を置く。
+        if (wide && photo != null) {
+            Column(
+                Modifier.align(Alignment.TopEnd).padding(6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                RoundButton(Icons.Filled.ZoomIn, "大きく見る", onZoom)
+                if (onTop != null) {
+                    RoundButton(Icons.Filled.Star, "★5 で確定", onTop, tint = Lime)
+                }
+            }
+        }
+    }
+}
+
+/** タイルに重ねる 40dp の丸ボタン。**写真を隠しすぎない濃さで。** */
+@Composable
+private fun RoundButton(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    onClick: () -> Unit,
+    tint: Color = Color.White
+) {
+    Box(
+        Modifier
+            .size(40.dp)
+            .clip(androidx.compose.foundation.shape.RoundedCornerShape(20.dp))
+            .background(Color(0x8C101114))
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Icon(icon, label, Modifier.size(20.dp), tint = tint)
     }
 }
 
@@ -733,3 +854,17 @@ private fun RoundDone(
 
 /** 星の上限。core の MAX_STAR と揃える。 */
 private const val MAX_ROUND_STAR = 5
+
+/** 献立の 1 行。**押す場所は行いっぱい。** */
+@Composable
+private fun DetailRow(label: String, onClick: () -> Unit) {
+    Text(
+        label,
+        fontSize = 15.sp,
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(androidx.compose.foundation.shape.RoundedCornerShape(10.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 14.dp)
+    )
+}

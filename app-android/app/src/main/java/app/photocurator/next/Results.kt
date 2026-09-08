@@ -37,6 +37,7 @@ import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import kotlinx.coroutines.launch
+import uniffi.photo_curator_core.Session
 
 /**
  * 選別結果。**星ごとに確かめて、取り出す。**
@@ -49,9 +50,11 @@ fun ResultsScreen(project: Project, star: Int, onBack: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     // 星の確認と取り出しの判断をする場所なので、選別と同じ絵を使う。
-    val displayEdge = remember { Prefs.displayEdge(context) }
+    val displayEdge = remember { Prefs.projectEdge(context, project.id) }
 
     var photos by remember { mutableStateOf<List<Photo>>(emptyList()) }
+    // 選別の途中そのもの。**星を書き戻すので、抜き出した写しでは足りない。**
+    var session by remember { mutableStateOf<Session?>(null) }
     var ratings by remember { mutableStateOf<Map<String, Int>>(emptyMap()) }
     var members by remember { mutableStateOf<Map<String, List<String>>>(emptyMap()) }
     // 星チップの選択。-1 で来たら「すべて」から始める。
@@ -61,6 +64,11 @@ fun ResultsScreen(project: Project, star: Int, onBack: () -> Unit) {
     var note by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
     var reloads by remember { mutableStateOf(0) }
+
+    // 大きく見ている並びと、その何枚目か。**ここは見るだけ。**
+    var zooming by remember { mutableStateOf<Pair<List<Photo>, Int>?>(null) }
+    // 中身を選別している連写の代表。
+    var reviewing by remember { mutableStateOf<String?>(null) }
 
     var outputMenu by remember { mutableStateOf(false) }
     var confirmFavourite by remember { mutableStateOf<List<Photo>?>(null) }
@@ -99,9 +107,10 @@ fun ResultsScreen(project: Project, star: Int, onBack: () -> Unit) {
 
     LaunchedEffect(project.id, reloads) {
         photos = Photos.forSource(context, project.source)
-        val session = Store.load(context, project.id)
-        ratings = session?.ratings ?: emptyMap()
-        members = session?.members ?: emptyMap()
+        val loaded = Store.load(context, project.id)
+        session = loaded
+        ratings = loaded?.ratings ?: emptyMap()
+        members = loaded?.members ?: emptyMap()
         picked = emptySet()
         selecting = false
     }
@@ -126,6 +135,48 @@ fun ResultsScreen(project: Project, star: Int, onBack: () -> Unit) {
             else -> "${filter.removePrefix("star:").let { "★$it" }} ${shown.size} 枚"
         }
     } else "選んだ ${picked.size} 枚"
+
+    // 連写の中身を選別。**選別画面と同じ部品**を使う別画面。
+    reviewing?.let { head ->
+        val order = photos.map { it.relativePath }
+        val inside = (members[head] ?: listOf(head))
+            .mapNotNull { path -> photos.firstOrNull { it.relativePath == path } }
+            .sortedBy { order.indexOf(it.relativePath) }
+        val base = ratings[head] ?: 0
+        if (inside.size < 2) {
+            reviewing = null
+        } else {
+            BurstReviewScreen(
+                photos = inside,
+                baseStar = base,
+                displayEdge = displayEdge,
+                onApply = { next ->
+                    val current = session
+                    if (current != null) {
+                        // **まとまりはそのまま、星だけ動かす。**
+                        val moved = current.copy(ratings = current.ratings + next)
+                        session = moved
+                        ratings = moved.ratings
+                        scope.launch { Store.save(context, project.id, moved) }
+                    }
+                    reviewing = null
+                },
+                onZoom = { at -> zooming = inside to at },
+                onBack = { reviewing = null }
+            )
+            return
+        }
+    }
+
+    zooming?.let { (line, index) ->
+        ZoomView(
+            photos = line,
+            startAt = index,
+            displayEdge = displayEdge,
+            onClose = { zooming = null }
+        )
+        return
+    }
 
     Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
         // ---- バー ----
@@ -228,6 +279,15 @@ fun ResultsScreen(project: Project, star: Int, onBack: () -> Unit) {
                                     if (selecting) {
                                         picked = if (on) picked - photo.relativePath
                                         else picked + photo.relativePath
+                                    } else if (burst > 1) {
+                                        // **連写の組は中身を選別できる。**
+                                        // 代表が通ると仲間も同じ星になるので、
+                                        // その差をつけ直す場所がここにしかない。
+                                        reviewing = photo.relativePath
+                                    } else {
+                                        // **選んでいないときのタップは拡大。**
+                                        // ここは見るだけなので「残す」は出さない。
+                                        zooming = shown to shown.indexOf(photo)
                                     }
                                 },
                                 // **長押しで選択に入る。** 普段のタップは選択にしない。
@@ -237,14 +297,25 @@ fun ResultsScreen(project: Project, star: Int, onBack: () -> Unit) {
                                 }
                             )
                     ) {
-                        AsyncImage(
-                            model = ImageRequest.Builder(LocalContext.current)
-                                .data(photo.displayModel(displayEdge)).size(400).build(),
-                            contentDescription = photo.name,
-                            imageLoader = Images.loader(LocalContext.current),
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier.fillMaxSize()
-                        )
+                        val format = remember(photo.id) { unsupportedFormat(photo.name) }
+                        var state by remember(photo.id) {
+                            mutableStateOf(
+                                if (format != null) Preview.Unsupported else Preview.Generating
+                            )
+                        }
+                        EmptyTile(state, format)
+                        if (state != Preview.Unsupported) {
+                            AsyncImage(
+                                model = ImageRequest.Builder(LocalContext.current)
+                                    .data(photo.displayModel(displayEdge)).size(400).build(),
+                                contentDescription = photo.name,
+                                imageLoader = Images.loader(LocalContext.current),
+                                contentScale = ContentScale.Crop,
+                                onSuccess = { state = Preview.Ready },
+                                onError = { state = Preview.Failed },
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        }
                         val value = ratings[photo.relativePath] ?: 0
                         if (value > 0) {
                             Text(
@@ -328,31 +399,24 @@ fun ResultsScreen(project: Project, star: Int, onBack: () -> Unit) {
     // 持っていると MediaProvider は黙って通す。実機で確認したとき、
     // 画面が出ないまま 4 枚に印が付いた。
     confirmFavourite?.let { list ->
-        AlertDialog(
-            onDismissRequest = { confirmFavourite = null },
-            title = { Text("${list.size} 枚にお気に入りを付けます") },
-            text = {
-                Text(
-                    "端末の写真に印が付きます（Google フォトなどからも見えます）。" +
-                        "写真そのものは動かしませんし、消えません。後から外せます。"
-                )
+        ConfirmDialog(
+            title = "${list.size} 枚にお気に入りを付けます",
+            body = "端末の写真に印が付きます（Google フォトなどからも見えます）。" +
+                "写真そのものは動かしませんし、消えません。後から外せます。",
+            confirmLabel = "付ける",
+            touchesOriginals = true,
+            onConfirm = {
+                confirmFavourite = null
+                val sender = Take.favouriteRequest(context, list)
+                if (sender == null) {
+                    note = "この端末ではお気に入りを付けられません"
+                } else {
+                    pendingCount = list.size
+                    busy = true
+                    consent.launch(IntentSenderRequest.Builder(sender).build())
+                }
             },
-            confirmButton = {
-                TextButton(onClick = {
-                    confirmFavourite = null
-                    val sender = Take.favouriteRequest(context, list)
-                    if (sender == null) {
-                        note = "この端末ではお気に入りを付けられません"
-                    } else {
-                        pendingCount = list.size
-                        busy = true
-                        consent.launch(IntentSenderRequest.Builder(sender).build())
-                    }
-                }) { Text("付ける") }
-            },
-            dismissButton = {
-                TextButton(onClick = { confirmFavourite = null }) { Text("やめる") }
-            }
+            onDismiss = { confirmFavourite = null }
         )
     }
 
@@ -367,31 +431,26 @@ fun ResultsScreen(project: Project, star: Int, onBack: () -> Unit) {
 
     // **移すのは戻しにくい。** お気に入りより強い言い方で確かめる。
     confirmingMove?.let { destination ->
-        AlertDialog(
-            onDismissRequest = { confirmingMove = null },
-            title = { Text("${targets.size} 枚を「${destination.name}」へ移します") },
-            text = {
-                Text(
-                    "端末の中の置き場所が ${destination.relativeDir} に変わります。" +
-                        "写真は消えませんが、元のアルバムからは無くなります。" +
-                        "この操作にアプリ側の取り消しはありません。"
-                )
+        ConfirmDialog(
+            title = "${targets.size} 枚を「${destination.name}」へ移します",
+            body = "端末の中の置き場所が ${destination.relativeDir} に変わります。" +
+                "写真は消えませんが、元のアルバムからは無くなります。" +
+                "この操作にアプリ側の取り消しはありません。",
+            confirmLabel = "移す",
+            touchesOriginals = true,
+            onConfirm = {
+                val list = targets
+                confirmingMove = null
+                val sender = Take.moveRequest(context, list)
+                if (sender == null) {
+                    note = "この端末では移せません"
+                } else {
+                    pendingMove = destination to list
+                    busy = true
+                    consent.launch(IntentSenderRequest.Builder(sender).build())
+                }
             },
-            confirmButton = {
-                TextButton(onClick = {
-                    val list = targets
-                    confirmingMove = null
-                    val sender = Take.moveRequest(context, list)
-                    if (sender == null) {
-                        note = "この端末では移せません"
-                    } else {
-                        pendingMove = destination to list
-                        busy = true
-                        consent.launch(IntentSenderRequest.Builder(sender).build())
-                    }
-                }) { Text("移す") }
-            },
-            dismissButton = { TextButton(onClick = { confirmingMove = null }) { Text("やめる") } }
+            onDismiss = { confirmingMove = null }
         )
     }
 }

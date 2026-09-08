@@ -65,34 +65,54 @@ fun ProjectScreen(
     var rescan by remember { mutableStateOf(false) }
     // 開始前の確認を出しているか。**初回は必ず出す。**
     var starting by remember { mutableStateOf(false) }
+    // 準備でつまずいたこと。（人の言葉, 技術文言）。**詳細は開いたときだけ出す。**
+    var trouble by remember { mutableStateOf<Pair<String, String>?>(null) }
+    var troubleDetail by remember { mutableStateOf(false) }
+    // 大きく見ている並びと、その何枚目か。**ここは見るだけ**なので星は動かない。
+    var zooming by remember { mutableStateOf<Pair<List<Photo>, Int>?>(null) }
 
     // **開いたら準備が動き出す。** カードに数が出ているのに何も進まないと、
     // 止まっているのか終わっているのか分からない。
     var preparing by remember { mutableStateOf(0 to 0) }
     // 表示用画像の進み。**NAS のときだけ動く。**
     var rendering by remember { mutableStateOf(0 to 0) }
-    val displayEdge = remember { Prefs.displayEdge(context) }
+    var displayEdge by remember { mutableStateOf(Prefs.projectEdge(context, project.id)) }
+    // 「…」から大きさを選んでいるか。
+    var choosingEdge by remember { mutableStateOf(false) }
 
     LaunchedEffect(project.id, reloads) {
         scanned = false
+        trouble = null
         session = Store.load(context, project.id)
         prints = Fingerprints.load(context, project.source.key)
+        // **転んだままなら、まずそれを出す。** 準備をやり直すのは押されたとき。
+        val noted = Trouble.load(context, project.source.key)
         photos = Listing.load(context, project.source.key)
-            ?: Photos.forSource(context, project.source)
+            ?: if (noted != null) emptyList() else Photos.forSource(context, project.source)
         scanned = true
-        // 走査が終わってから指紋。**できた分から選別に出せる。**
-        val ready = Prepare.run(context, project, rescan) { done, total ->
-            preparing = done to total
-        }
-        rescan = false
-        photos = ready.first
-        prints = Fingerprints.load(context, project.source.key)
-
-        // 3 段目。**原本を読むのはここだけ。** できた分から選別に出せる。
-        if (project.source.kind == "nas") {
-            Prepare.renders(context, project, ready.first, displayEdge) { done, total ->
-                rendering = done to total
+        try {
+            // 走査が終わってから指紋。**できた分から選別に出せる。**
+            val ready = Prepare.run(context, project, rescan) { done, total ->
+                preparing = done to total
             }
+            rescan = false
+            photos = ready.first
+            prints = Fingerprints.load(context, project.source.key)
+
+            // 3 段目。**原本を読むのはここだけ。** できた分から選別に出せる。
+            if (project.source.kind == "nas") {
+                Prepare.renders(context, project, ready.first, displayEdge) { done, total ->
+                    rendering = done to total
+                }
+            }
+            // 通ったら**前の転びは消す**。古い赤字を出し続けない。
+            Trouble.clear(context, project.source.key)
+        } catch (error: Exception) {
+            // **黙って落とさない。** 何が起きたかを 1 文にして、ホームにも残す。
+            val said = Smb.describe(error)
+            trouble = said to (error.message ?: error.javaClass.name)
+            Trouble.note(context, project.source.key, said)
+            rescan = false
         }
     }
 
@@ -100,6 +120,17 @@ fun ProjectScreen(
     val ratings = live?.ratings ?: emptyMap()
     val starred = photos.count { (ratings[it.relativePath] ?: 0) > 0 }
     val bursts = live?.members?.size ?: 0
+
+    // 拡大は画面を覆う。**開いているあいだ下は組まない。**
+    zooming?.let { (line, index) ->
+        ZoomView(
+            photos = line,
+            startAt = index,
+            displayEdge = displayEdge,
+            onClose = { zooming = null }
+        )
+        return
+    }
 
     Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
         // ---- バー: ← / 名前 / … / 主ボタン（状態で 1 つ） ----
@@ -141,9 +172,8 @@ fun ProjectScreen(
             }
         }
 
-        Row(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
-            // ---- 左: 出所 / 準備 / 選別 ----
-            Column(Modifier.width(340.dp).verticalScrollable()) {
+        // ---- 左: 出所 / 準備 / 選別 ----
+        val cards: @Composable () -> Unit = {
                 Card {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(
@@ -155,7 +185,9 @@ fun ProjectScreen(
                         Text(project.source.label, fontSize = 13.sp)
                     }
                     Text(
-                        "${photos.size} 枚",
+                        // **いつ撮ったものかを 1 行で。** 同じ名前のフォルダが
+                        // 並んだとき、枚数だけでは見分けがつかない。
+                        "${photos.size} 枚" + span(photos)?.let { " · $it" }.orEmpty(),
                         fontSize = 12.sp, color = Faint,
                         modifier = Modifier.padding(top = 6.dp)
                     )
@@ -178,12 +210,55 @@ fun ProjectScreen(
                         Text("準備", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
                         Spacer(Modifier.weight(1f))
                         Text(
-                            if (scanned && prints.size >= photos.size &&
-                                (project.source.kind != "nas" ||
-                                    (rendering.second > 0 && rendering.first >= rendering.second))
-                            ) "完了" else "進行中",
-                            fontSize = 12.sp, color = Lime
+                            when {
+                                trouble != null -> "止まっています"
+                                scanned && prints.size >= photos.size &&
+                                    (project.source.kind != "nas" ||
+                                        (rendering.second > 0 && rendering.first >= rendering.second))
+                                -> "完了"
+                                else -> "進行中"
+                            },
+                            fontSize = 12.sp, color = if (trouble != null) Warn else Lime
                         )
+                    }
+
+                    // **転んだ理由はその場に出す。** 上に赤い帯は出さない。
+                    trouble?.let { (said, technical) ->
+                        Spacer(Modifier.height(10.dp))
+                        Text(said, fontSize = 13.sp, color = Warn)
+                        Text(
+                            if (project.source.kind == "nas")
+                                "同じ Wi-Fi につながっているか、NAS の電源を確かめてください"
+                            else "写真へのアクセスが許可されているか確かめてください",
+                            fontSize = 12.sp, color = Faint,
+                            modifier = Modifier.padding(top = 2.dp)
+                        )
+                        Row(
+                            Modifier.padding(top = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            OutlinedButton(
+                                onClick = { trouble = null; reloads += 1 },
+                                shape = RoundedCornerShape(50)
+                            ) { Text("再試行", fontSize = 12.sp) }
+                            Spacer(Modifier.width(8.dp))
+                            TextButton(onClick = { troubleDetail = !troubleDetail }) {
+                                Text(if (troubleDetail) "詳細を閉じる" else "詳細", fontSize = 12.sp)
+                            }
+                        }
+                        if (troubleDetail) {
+                            // **技術文言は開いたときだけ。** 普段は人の言葉 1 文で足りる。
+                            Text(
+                                technical,
+                                fontSize = 11.sp, color = Faint,
+                                fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(Tile)
+                                    .padding(10.dp)
+                            )
+                        }
                     }
                     Spacer(Modifier.height(10.dp))
                     PrepRow("写真の走査", if (scanned) photos.size else 0, photos.size, scanned)
@@ -262,10 +337,8 @@ fun ProjectScreen(
                 }
             }
 
-            Spacer(Modifier.width(16.dp))
-
-            // ---- 右: 写真の一覧。走査と準備の結果を確かめる場所 ----
-            Column(Modifier.weight(1f)) {
+        // ---- 右: 写真の一覧。走査と準備の結果を確かめる場所 ----
+        val gallery: @Composable () -> Unit = {
                 Row(
                     Modifier.padding(bottom = 8.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -289,20 +362,45 @@ fun ProjectScreen(
                     horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
                     items(shown, key = { it.id }) { photo ->
+                        // **なぜ絵が無いのかを、タイルの中で言う。**
+                        // 読めない形式・まだ作っていない・作れなかった、を分ける。
+                        val format = remember(photo.id) { unsupportedFormat(photo.name) }
+                        var state by remember(photo.id) {
+                            mutableStateOf(
+                                when {
+                                    format != null -> Preview.Unsupported
+                                    // 指紋が出来ていれば、その 1 回の読みで
+                                    // サムネイルも取れている。
+                                    prints.containsKey(photo.relativePath) -> Preview.Ready
+                                    preparing.second > 0 -> Preview.Generating
+                                    else -> Preview.Queued
+                                }
+                            )
+                        }
                         Box(
                             Modifier
                                 .aspectRatio(1f)
                                 .clip(RoundedCornerShape(6.dp))
                                 .background(Tile)
+                                .clickable {
+                                    // **絞った並びのまま前後へ送れる。**
+                                    zooming = shown to shown.indexOf(photo)
+                                }
                         ) {
-                            AsyncImage(
-                                model = ImageRequest.Builder(LocalContext.current)
-                                    .data(photo.thumbModel).size(256).build(),
-                                contentDescription = photo.name,
-                                imageLoader = Images.loader(LocalContext.current),
-                                contentScale = ContentScale.Crop,
-                                modifier = Modifier.fillMaxSize()
-                            )
+                            EmptyTile(state, format)
+                            if (state != Preview.Unsupported) {
+                                AsyncImage(
+                                    model = ImageRequest.Builder(LocalContext.current)
+                                        .data(photo.thumbModel).size(256).build(),
+                                    contentDescription = photo.name,
+                                    imageLoader = Images.loader(LocalContext.current),
+                                    contentScale = ContentScale.Crop,
+                                    onSuccess = { state = Preview.Ready },
+                                    // **読めなかったことは黙らない。**
+                                    onError = { state = Preview.Failed },
+                                    modifier = Modifier.fillMaxSize()
+                                )
+                            }
                             val star = ratings[photo.relativePath] ?: 0
                             if (star > 0) {
                                 Text(
@@ -318,6 +416,24 @@ fun ProjectScreen(
                             }
                         }
                     }
+                }
+        }
+
+        // **<600dp（Fold のカバー）では横に 2 つ置けない。** 縦に積む。
+        // 設計の「<600 は縦積み」。写真の面積を最優先にして、上のカードは
+        // 高さを抑え、そこだけ中で送れるようにする。
+        BoxWithConstraints(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
+            if (maxWidth < 600.dp) {
+                Column(Modifier.fillMaxSize()) {
+                    Column(Modifier.heightIn(max = 300.dp).verticalScrollable()) { cards() }
+                    Spacer(Modifier.height(12.dp))
+                    Column(Modifier.weight(1f)) { gallery() }
+                }
+            } else {
+                Row(Modifier.fillMaxSize()) {
+                    Column(Modifier.width(340.dp).verticalScrollable()) { cards() }
+                    Spacer(Modifier.width(16.dp))
+                    Column(Modifier.weight(1f)) { gallery() }
                 }
             }
         }
@@ -346,6 +462,11 @@ fun ProjectScreen(
         ModalBottomSheet(onDismissRequest = { menu = false }, containerColor = Surface) {
             Column(Modifier.padding(horizontal = 8.dp).padding(bottom = 24.dp)) {
                 DetailMenuRow("写真を再読み込み") { menu = false; rescan = true; reloads += 1 }
+                if (project.source.kind == "nas") {
+                    DetailMenuRow("表示用画像の大きさ（${displayEdge}px）") {
+                        menu = false; choosingEdge = true
+                    }
+                }
                 DetailMenuRow("選別を最初からやり直す", danger = true) {
                     menu = false; confirmRestart = true
                 }
@@ -353,26 +474,45 @@ fun ProjectScreen(
         }
     }
 
-    if (confirmRestart) {
-        AlertDialog(
-            onDismissRequest = { confirmRestart = false },
-            title = { Text("選別を最初からやり直しますか") },
-            // **何が消えるかを具体的に言う。**「よろしいですか」では判断できない。
-            text = {
+    if (choosingEdge) {
+        ModalBottomSheet(onDismissRequest = { choosingEdge = false }, containerColor = Surface) {
+            Column(Modifier.padding(horizontal = 20.dp).padding(bottom = 24.dp)) {
+                Text("表示用画像の大きさ", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
                 Text(
-                    "これまでに付けた星と、どこまで見たかが消えます。" +
-                        "連写の手直しは残ります。写真そのものには手を触れません。"
+                    // **作り直しになることを先に言う。** 押してから 20 分待たせない。
+                    "このプロジェクトだけに効きます。まだ作っていない大きさは、" +
+                        "選んだあとに作り直します",
+                    fontSize = 12.sp, color = Faint,
+                    modifier = Modifier.padding(top = 4.dp, bottom = 12.dp)
                 )
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    confirmRestart = false
-                    scope.launch { Store.clear(context, project.id); reloads += 1 }
-                }) { Text("やり直す") }
-            },
-            dismissButton = {
-                TextButton(onClick = { confirmRestart = false }) { Text("やめる") }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    for (edge in listOf(768, 1024, 1280, 1536, 1920)) {
+                        Chip("${edge}px", edge == displayEdge) {
+                            displayEdge = edge
+                            Prefs.setProjectEdge(context, project.id, edge)
+                            choosingEdge = false
+                            rendering = 0 to 0
+                            reloads += 1
+                        }
+                    }
+                }
             }
+        }
+    }
+
+    if (confirmRestart) {
+        ConfirmDialog(
+            title = "選別を最初からやり直しますか",
+            // **何が消えるかを具体的に言う。**「よろしいですか」では判断できない。
+            body = "これまでに付けた星と、どこまで見たかが消えます。" +
+                "連写の手直しは残ります。写真そのものには手を触れません。",
+            confirmLabel = "やり直す",
+            // 原本には触らないので赤字は出さない。**赤を安売りしない。**
+            onConfirm = {
+                confirmRestart = false
+                scope.launch { Store.clear(context, project.id); reloads += 1 }
+            },
+            onDismiss = { confirmRestart = false }
         )
     }
 }
@@ -443,4 +583,20 @@ private fun DetailMenuRow(label: String, danger: Boolean = false, onClick: () ->
             .clickable(onClick = onClick)
             .padding(horizontal = 12.dp, vertical = 14.dp)
     )
+}
+
+/** 「2021/06/13 13:02 – 17:48」。**同じ日なら日付は 1 回だけ。** */
+private fun span(photos: List<Photo>): String? {
+    val times = photos.map { it.takenAt }.filter { it > 0 }
+    if (times.isEmpty()) return null
+    val day = java.text.SimpleDateFormat("yyyy/MM/dd HH:mm", java.util.Locale.JAPAN)
+    val clock = java.text.SimpleDateFormat("HH:mm", java.util.Locale.JAPAN)
+    val date = java.text.SimpleDateFormat("yyyy/MM/dd", java.util.Locale.JAPAN)
+    val from = java.util.Date(times.min())
+    val to = java.util.Date(times.max())
+    return if (date.format(from) == date.format(to)) {
+        "${day.format(from)} – ${clock.format(to)}"
+    } else {
+        "${day.format(from)} – ${day.format(to)}"
+    }
 }
