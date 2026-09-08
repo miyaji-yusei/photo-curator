@@ -27,6 +27,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
+import kotlinx.coroutines.launch
 
 /**
  * ある星の写真を並べる。**選別の答え合わせをする場所。**
@@ -38,6 +39,7 @@ import coil.request.ImageRequest
 @Composable
 fun ResultsScreen(album: Album, star: Int, onBack: () -> Unit) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
 
     var photos by remember { mutableStateOf<List<Photo>>(emptyList()) }
     var picked by remember { mutableStateOf<Set<String>>(emptySet()) }
@@ -48,15 +50,39 @@ fun ResultsScreen(album: Album, star: Int, onBack: () -> Unit) {
     var pending by remember { mutableStateOf(0) }
     // 取り出す前に自分で確認を出す。理由は下の AlertDialog に書いた。
     var confirming by remember { mutableStateOf<List<Photo>?>(null) }
+    // 移し先を選んでいる最中か。
+    var choosingDestination by remember { mutableStateOf(false) }
+    // 移す確認を出している相手（行き先と枚数）。
+    var confirmingMove by remember { mutableStateOf<Album?>(null) }
+    // 許可が下りたあと、どこへ何枚移すかを覚えておく。
+    var pendingMove by remember { mutableStateOf<Pair<Album, List<Photo>>?>(null) }
 
     // 取り出しの同意は OS の画面で取る。**戻ってきた結果を必ず言葉にする。**
     val consent = rememberLauncherForActivityResult(
         ActivityResultContracts.StartIntentSenderForResult()
     ) { result ->
-        note = Take.describe(result.resultCode, pending)
-        busy = false
-        picked = emptySet()
-        reloads += 1
+        val move = pendingMove
+        if (move == null) {
+            note = Take.describe(result.resultCode, pending)
+            busy = false
+            picked = emptySet()
+            reloads += 1
+        } else {
+            pendingMove = null
+            if (result.resultCode != android.app.Activity.RESULT_OK) {
+                // **「失敗」と「やめた」を混ぜない。**
+                note = "移していません（取り消されました）"
+                busy = false
+            } else {
+                scope.launch {
+                    val done = Take.move(context, move.second, move.first.relativeDir)
+                    note = done.describe(move.first.name)
+                    busy = false
+                    picked = emptySet()
+                    reloads += 1
+                }
+            }
+        }
     }
 
     LaunchedEffect(album.id, star, reloads) {
@@ -166,6 +192,14 @@ fun ResultsScreen(album: Album, star: Int, onBack: () -> Unit) {
                 ) {
                     Text("${picked.size} 枚をお気に入りに", fontSize = 13.sp)
                 }
+                OutlinedButton(
+                    onClick = { choosingDestination = true },
+                    enabled = !busy,
+                    shape = RoundedCornerShape(50),
+                    modifier = Modifier.weight(1f).height(46.dp)
+                ) {
+                    Text("別のアルバムへ移す", fontSize = 13.sp)
+                }
             }
             }
         }
@@ -204,6 +238,51 @@ fun ResultsScreen(album: Album, star: Int, onBack: () -> Unit) {
             },
             dismissButton = {
                 TextButton(onClick = { confirming = null }) { Text("やめる") }
+            }
+        )
+    }
+    // 移し先を選ぶ。ここではまだ何も書かない。
+    if (choosingDestination) {
+        DestinationSheet(
+            from = album,
+            count = picked.size,
+            onPick = { destination ->
+                choosingDestination = false
+                confirmingMove = destination
+            },
+            onDismiss = { choosingDestination = false }
+        )
+    }
+
+    // **移すのは戻しにくい。** お気に入りより強い言い方で確かめる。
+    // OS の同意画面は出ないことがあるので、ここが最後の関門になる。
+    confirmingMove?.let { destination ->
+        val targets = photos.filter { it.relativePath in picked }
+        AlertDialog(
+            onDismissRequest = { confirmingMove = null },
+            title = { Text("${targets.size} 枚を「${destination.name}」へ移します") },
+            text = {
+                Text(
+                    "端末の中の置き場所が ${destination.relativeDir} に変わります。" +
+                        "写真は消えませんが、元のアルバムからは無くなります。" +
+                        "この操作にアプリ側の取り消しはありません。"
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmingMove = null
+                    val sender = Take.moveRequest(context, targets)
+                    if (sender == null) {
+                        note = "この端末では移せません"
+                    } else {
+                        pendingMove = destination to targets
+                        busy = true
+                        consent.launch(IntentSenderRequest.Builder(sender).build())
+                    }
+                }) { Text("移す") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmingMove = null }) { Text("やめる") }
             }
         )
     }

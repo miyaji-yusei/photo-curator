@@ -22,7 +22,13 @@ data class Album(
     val name: String,
     val count: Int,
     /** 一覧の見出しに出す 1 枚。 */
-    val coverId: Long
+    val coverId: Long,
+    /**
+     * 端末の中での置き場所（"Pictures/Camera/" のような形）。
+     * **写真を移すときの行き先。** 表示名だけでは、同じ名前の別フォルダと
+     * 区別できないし、どこへ移るのかを人に見せられない。
+     */
+    val relativeDir: String
 )
 
 data class Photo(
@@ -60,7 +66,8 @@ object Photos {
         val projection = arrayOf(
             MediaStore.Images.Media._ID,
             MediaStore.Images.Media.BUCKET_ID,
-            MediaStore.Images.Media.BUCKET_DISPLAY_NAME
+            MediaStore.Images.Media.BUCKET_DISPLAY_NAME,
+            MediaStore.Images.Media.RELATIVE_PATH
         )
         // bucket ごとの枚数は SQL の GROUP BY が使えないので、数えながら畳む。
         val found = LinkedHashMap<String, Album>()
@@ -71,13 +78,14 @@ object Photos {
             val idColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
             val bucketColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.BUCKET_ID)
             val nameColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.BUCKET_DISPLAY_NAME)
+            val dirColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.RELATIVE_PATH)
             while (cursor.moveToNext()) {
                 val bucket = cursor.getString(bucketColumn) ?: continue
                 val name = cursor.getString(nameColumn) ?: bucket
                 val photoId = cursor.getLong(idColumn)
                 val prior = found[bucket]
                 found[bucket] = if (prior == null) {
-                    Album(bucket, name, 1, photoId)
+                    Album(bucket, name, 1, photoId, cursor.getString(dirColumn) ?: "")
                 } else {
                     prior.copy(count = prior.count + 1)
                 }
