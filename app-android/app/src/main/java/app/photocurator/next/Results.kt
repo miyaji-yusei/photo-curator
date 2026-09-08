@@ -48,6 +48,8 @@ import kotlinx.coroutines.launch
 fun ResultsScreen(project: Project, star: Int, onBack: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    // 星の確認と取り出しの判断をする場所なので、選別と同じ絵を使う。
+    val displayEdge = remember { Prefs.displayEdge(context) }
 
     var photos by remember { mutableStateOf<List<Photo>>(emptyList()) }
     var ratings by remember { mutableStateOf<Map<String, Int>>(emptyMap()) }
@@ -237,7 +239,7 @@ fun ResultsScreen(project: Project, star: Int, onBack: () -> Unit) {
                     ) {
                         AsyncImage(
                             model = ImageRequest.Builder(LocalContext.current)
-                                .data(photo.thumbModel).size(320).build(),
+                                .data(photo.displayModel(displayEdge)).size(400).build(),
                             contentDescription = photo.name,
                             imageLoader = Images.loader(LocalContext.current),
                             contentScale = ContentScale.Crop,

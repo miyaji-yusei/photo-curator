@@ -46,6 +46,10 @@ fun PreviewScreen(
     onStart: (Int) -> Unit,
     onBack: () -> Unit
 ) {
+    val context = LocalContext.current
+    // まとまりの良し悪しを見る場所なので、選別と同じ絵を使う。
+    val displayEdge = remember { Prefs.displayEdge(context) }
+
     // スライダーは距離そのもの。**目盛りの数字は見せない。**
     var distance by remember { mutableStateOf(learned.coerceIn(2, 24)) }
 
@@ -149,7 +153,7 @@ fun PreviewScreen(
                     if (photo != null) {
                         AsyncImage(
                             model = ImageRequest.Builder(LocalContext.current)
-                                .data(photo.thumbModel).size(160).build(),
+                                .data(photo.displayModel(displayEdge)).size(240).build(),
                             contentDescription = photo.name,
                             imageLoader = Images.loader(LocalContext.current),
                             contentScale = ContentScale.Crop,

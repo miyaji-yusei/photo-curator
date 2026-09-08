@@ -470,6 +470,22 @@ pub fn set_representative(session: Session, shown: String, wanted: String) -> Op
     Some(next)
 }
 
+/// 一度に見比べる枚数を変える。**いまのグループにすぐ効く。**
+///
+/// 足りなければ次のグループから補い、余れば次のグループへ押し出す。
+/// 見終わった分（history）は動かさない。選別の途中で「4 枚では多い」と
+/// 気づいたときに、いったんやめて設定に戻る必要をなくすため。
+pub fn resize(session: Session, group_size: u32) -> Session {
+    let mut next = session;
+    // いま出している分と、まだ見ていない分を 1 本に戻してから取り直す。
+    let mut line = std::mem::take(&mut next.current);
+    line.append(&mut next.queue);
+    next.group_size = group_size.max(2);
+    next.queue = line;
+    fill(&mut next);
+    next
+}
+
 /// まとめ方を変えて、いまのラウンドを組み直す。
 ///
 /// **その場で組み直し、進んだ分は星として残す。** 手で直したのに次のラウンド
@@ -1411,5 +1427,46 @@ mod tests {
         let learned = learn_distance(vec![answer(6, true), answer(14, false)], 9);
         let loose = BurstThreshold { window_ms: 4000, distance: learned, d_hash_version: 2 };
         assert_eq!(group_bursts(photos, loose, vec![]).len(), 1);
+    }
+
+    // ---- 枚数の変更 ----
+
+    #[test]
+    fn 枚数を増やすと次から補う() {
+        let session = round(&["1", "2", "3", "4", "5", "6"], 2);
+        assert_eq!(session.current, vec!["1", "2"]);
+        let after = resize(session, 4);
+        assert_eq!(after.current, vec!["1", "2", "3", "4"]);
+        assert_eq!(after.queue, vec!["5", "6"]);
+        assert_eq!(after.group_size, 4);
+    }
+
+    #[test]
+    fn 枚数を減らすと次へ押し出す() {
+        let session = round(&["1", "2", "3", "4", "5", "6"], 4);
+        assert_eq!(session.current, vec!["1", "2", "3", "4"]);
+        let after = resize(session, 2);
+        assert_eq!(after.current, vec!["1", "2"]);
+        // **押し出した分は捨てない。** 次のグループの先頭に戻る。
+        assert_eq!(after.queue, vec!["3", "4", "5", "6"]);
+    }
+
+    #[test]
+    fn 枚数を変えても見終わった分は動かない() {
+        let session = round(&["1", "2", "3", "4", "5", "6"], 2);
+        let session = advance(session, vec!["1".into()]);
+        let after = resize(session, 3);
+        assert_eq!(after.history.len(), 1);
+        assert_eq!(after.survivors, vec!["1"]);
+        // 残りは 3,4,5,6 の 4 枚。3 枚ずつなので 3,4,5 が出る。
+        assert_eq!(after.current, vec!["3", "4", "5"]);
+        assert_eq!(after.queue, vec!["6"]);
+    }
+
+    #[test]
+    fn 枚数は二枚を下回らない() {
+        let session = round(&["1", "2", "3", "4"], 4);
+        let after = resize(session, 1);
+        assert_eq!(after.group_size, 2);
     }
 }

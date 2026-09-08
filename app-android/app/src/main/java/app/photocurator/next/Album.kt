@@ -47,6 +47,7 @@ fun ProjectScreen(
     project: Project,
     onBack: () -> Unit,
     onCull: (learn: Boolean) -> Unit,
+    onResults: () -> Unit,
     onOpenStar: (Int) -> Unit
 ) {
     val context = LocalContext.current
@@ -113,9 +114,14 @@ fun ProjectScreen(
             Spacer(Modifier.width(8.dp))
             Button(
                 onClick = {
-                    // 初回か、「毎回確認」が on のときだけ挟む。
-                    if (live == null || Prefs.askBeforeStart(context)) starting = true
-                    else onCull(false)
+                    when {
+                        // **終わっているなら結果へ直行。** 見るだけなのに
+                        // 「選別を始める前に」を挟むのは筋が通らない。
+                        live?.finished == true -> onResults()
+                        // 初回か、「毎回確認」が on のときだけ挟む。
+                        live == null || Prefs.askBeforeStart(context) -> starting = true
+                        else -> onCull(false)
+                    }
                 },
                 // **走査が終わるまで始められない。** 枚数と時間順が決まらないため。
                 enabled = scanned && photos.isNotEmpty(),
@@ -321,6 +327,7 @@ fun ProjectScreen(
         StartSheet(
             project = project,
             photoCount = photos.size,
+            readyCount = if (project.source.kind == "nas") rendering.first else photos.size,
             onStart = {
                 starting = false
                 // 連写をまとめる設定で、まだ基準を決めていなければ学習へ。

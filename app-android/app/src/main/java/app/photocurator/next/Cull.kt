@@ -39,6 +39,7 @@ import uniffi.photo_curator_core.advance
 import uniffi.photo_curator_core.PairOverride
 import uniffi.photo_curator_core.nextRound
 import uniffi.photo_curator_core.regroup
+import uniffi.photo_curator_core.resize
 import uniffi.photo_curator_core.setRepresentative
 import uniffi.photo_curator_core.startRound
 import uniffi.photo_curator_core.undo
@@ -84,12 +85,16 @@ fun CullScreen(project: Project, onResults: () -> Unit, onBack: () -> Unit) {
     var overrides by remember { mutableStateOf<List<PairOverride>>(emptyList()) }
     // 学習した「見た目が近い」の境目。学習していなければ既定値。
     var learnedDistance by remember { mutableStateOf(DEFAULT_DISTANCE) }
+    // 選別中の「…」を開いているか。
+    var options by remember { mutableStateOf(false) }
+    var groupBursts by remember { mutableStateOf(true) }
+    var edge by remember { mutableStateOf(1024) }
 
     // 相対パスから写真を引く。core は相対パスしか知らない。
     val byPath = remember(photos) { photos.associateBy { it.relativePath } }
 
-    // 選別で見る絵の大きさ。設定から。
-    val displayEdge = remember { Prefs.displayEdge(context) }
+    // 選別で見る絵の大きさ。設定から読み、「…」で変えられる。
+    val displayEdge = edge
 
     val threshold = remember(learnedDistance) { thresholdFor(learnedDistance) }
 
@@ -109,6 +114,8 @@ fun CullScreen(project: Project, onResults: () -> Unit, onBack: () -> Unit) {
         val loadedOverrides = Overrides.load(context, project.id)
         learnedDistance = distance
         overrides = loadedOverrides
+        groupBursts = Prefs.groupBursts(context)
+        edge = Prefs.displayEdge(context)
         Neighbours.log(refs, loadedThreshold)
 
         // **途中があれば続きから。** 無ければ新しく始める。
@@ -182,7 +189,43 @@ fun CullScreen(project: Project, onResults: () -> Unit, onBack: () -> Unit) {
         if (added.isEmpty()) return
         val merged = Overrides.merged(overrides, added)
         overrides = merged
-        val next = regroup(live, refs, true, threshold, merged)
+        val next = regroup(live, refs, groupBursts, threshold, merged)
+        session = next
+        selected = emptySet()
+        scope.launch {
+            Overrides.save(context, project.id, merged)
+            Store.save(context, project.id, next)
+        }
+    }
+
+    /**
+     * 編集シートの結果をまとめ方に落とす。
+     *
+     * シートは「区間の切れ目」で答えを返す。隣どうし 1 組ずつの
+     * 「切る／繋ぐ」に直せば、あとは core が組み直してくれる。
+     * **人が触った境目はすべて記録する。** 触っていない境目まで固定すると、
+     * 基準を学び直したときに何も変わらなくなる。
+     */
+    fun applyCuts(order: List<String>, cuts: Set<Int>, leaders: Map<Int, Int>) {
+        val decisions = (1 until order.size).map { at ->
+            PairOverride(
+                left = order[at - 1],
+                right = order[at],
+                decision = if (at in cuts) "split" else "join"
+            )
+        }
+        val merged = Overrides.merged(overrides, decisions)
+        overrides = merged
+        var next = regroup(live, refs, groupBursts, threshold, merged)
+
+        // 代表は組み直したあとに移す。組み直す前の鍵はもう無い。
+        for ((start, wanted) in leaders) {
+            val head = order.getOrNull(start) ?: continue
+            val pick = order.getOrNull(wanted) ?: continue
+            if (head == pick) continue
+            setRepresentative(next, head, pick)?.let { next = it }
+        }
+
         session = next
         selected = emptySet()
         scope.launch {
@@ -232,34 +275,76 @@ fun CullScreen(project: Project, onResults: () -> Unit, onBack: () -> Unit) {
         order.size >= 2 && order.last() - order.first() == order.size - 1
     }
 
-    // 連写のまとまりを開いているとき。**選び直しても星は動かない**ので、
-    // 保存はするが判断としては何も進めない。
+    if (options) {
+        OptionsSheet(
+            groupSize = live.groupSize.toInt(),
+            groupBursts = groupBursts,
+            displayEdge = edge,
+            showDisplayEdge = project.source.kind == "nas",
+            onGroupSize = { size ->
+                Prefs.setGroupSize(context, size)
+                val next = resize(live, size.toUInt())
+                session = next
+                // 画面から外れた写真の印は落とす。**残っていると数が合わない。**
+                selected = selected.filter { it in next.current }.toSet()
+                scope.launch { Store.save(context, project.id, next) }
+            },
+            onGroupBursts = { on ->
+                groupBursts = on
+                Prefs.setGroupBursts(context, on)
+                val next = regroup(live, refs, on, threshold, overrides)
+                session = next
+                selected = emptySet()
+                scope.launch { Store.save(context, project.id, next) }
+            },
+            onDisplayEdge = { value ->
+                edge = value
+                Prefs.setDisplayEdge(context, value)
+            },
+            onDismiss = { options = false }
+        )
+    }
+
+    // まとまり編集。**対象はいまの組の写真と、その前後の未判定の写真。**
+    // 前後を含めるのは、隣の単独写真を取り込めるようにするため。
     editingBurst?.let { rep ->
-        val mates = live.members[rep]
-        if (mates == null) {
+        val line = live.current + live.queue
+        val at = line.indexOf(rep)
+        if (at < 0) {
             editingBurst = null
         } else {
-            BurstSheet(
-                members = mates,
-                shown = rep,
-                byPath = byPath,
-                onPick = { wanted ->
-                    val next = setRepresentative(live, rep, wanted)
-                    if (next != null) {
-                        session = next
-                        // 選ばれていた印は代表について回る。取り違えないよう外す。
-                        selected = emptySet()
-                        scope.launch { Store.save(context, project.id, next) }
+            // 代表を仲間へ展開して、撮影順のひと続きに戻す。
+            val around = (maxOf(0, at - 2)..minOf(line.lastIndex, at + 2))
+                .flatMap { live.members[line[it]] ?: listOf(line[it]) }
+            val subject = around.mapNotNull { byPath[it] }
+
+            // いまのまとまりを「区切りの位置」に直す。
+                val cuts = HashSet<Int>()
+                val leaders = HashMap<Int, Int>()
+                var index = 0
+                for (path in around) {
+                    val owner = live.members.entries
+                        .firstOrNull { it.value.contains(path) }
+                    val head = owner?.value?.first() ?: path
+                    if (path == head && index > 0) cuts += index
+                    if (owner != null && owner.key == path) {
+                        leaders[around.indexOf(head)] = index
                     }
+                    index += 1
+                }
+
+            BurstEditSheet(
+                photos = subject,
+                initialCuts = cuts,
+                initialLeaders = leaders,
+                displayEdge = displayEdge,
+                onApply = { newCuts, newLeaders ->
+                    applyCuts(around, newCuts, newLeaders)
                     editingBurst = null
                 },
                 onZoom = { photo ->
                     editingBurst = null
                     zooming = photo
-                },
-                onSplit = {
-                    editingBurst = null
-                    splitBurst(rep)
                 },
                 onDismiss = { editingBurst = null }
             )
@@ -283,6 +368,7 @@ fun CullScreen(project: Project, onResults: () -> Unit, onBack: () -> Unit) {
             onClear = { selected = emptySet() },
             canJoin = canJoin,
             onJoin = { joinSelected() },
+            onOptions = { options = true },
             onCommit = { commit(selected) }
         )
 
@@ -299,7 +385,7 @@ fun CullScreen(project: Project, onResults: () -> Unit, onBack: () -> Unit) {
             // **進めるかどうかを、聞かれる前に確かめておく。**
             // 「次へ」を出しておいて何も起きない画面が、一番信用を失う。
             val upcoming = remember(live, refs) {
-                nextRound(live, refs, true, threshold, overrides)
+                nextRound(live, refs, groupBursts, threshold, overrides)
             }
             RoundDone(
                 session = live,
@@ -371,6 +457,7 @@ private fun CullBar(
     onClear: () -> Unit,
     canJoin: Boolean,
     onJoin: () -> Unit,
+    onOptions: () -> Unit,
     onCommit: () -> Unit
 ) {
     Row(
@@ -424,6 +511,11 @@ private fun CullBar(
         }
 
         if (!session.finished) {
+            // **手を止めずに設定を変えられる場所。**
+            IconButton(onClick = onOptions) {
+                Icon(Icons.Filled.MoreHoriz, "設定")
+            }
+            Spacer(Modifier.width(4.dp))
             Button(
                 onClick = onCommit,
                 shape = androidx.compose.foundation.shape.RoundedCornerShape(50)

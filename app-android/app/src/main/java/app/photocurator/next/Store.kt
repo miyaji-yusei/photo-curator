@@ -182,9 +182,9 @@ object Prefs {
     fun groupSize(context: Context): Int =
         context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
             .getInt(GROUP_SIZE, 4)
-            // **設計に合わせて Android は 2〜4。** 前に 6/9 を選んでいた人が
-            // どのチップも選ばれていない画面に落ちないよう、ここで丸める。
-            .coerceIn(2, 4)
+            // 2〜10。既定は 4。設計は Android 2〜4 だが、開いた状態は 933px あり
+            // 実際に 10 枚を使うので広げる（設計自身も「幅と能力で決める」）。
+            .coerceIn(2, 10)
 
     /**
      * 表示用画像の長辺。**選別で見る絵の大きさ。**
