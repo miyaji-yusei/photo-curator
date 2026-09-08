@@ -1,9 +1,9 @@
 package app.photocurator.next
 
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
@@ -11,70 +11,55 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import uniffi.photo_curator_core.BurstThreshold
-import uniffi.photo_curator_core.PhotoRef
-import uniffi.photo_curator_core.advance
-import uniffi.photo_curator_core.startRound
-import uniffi.photo_curator_core.undo
 
 /**
  * 連写の中身を選別する。**まとまりで 1 つに畳んだ中を、あとから開き直す場所。**
  *
  * 選別では代表しか見えない。代表が通ると仲間も同じ星をもらうので、
  * 「この組の中では 3 枚目が一番いい」という違いは残らない。ここはその
- * 差をつけ直すためだけの画面で、**部品は選別画面と同じ**（同じ並べ方、
- * 同じタイル、同じ「複数」）。覚え直すことを増やさない。
+ * 差をつけ直すためだけの画面。
  *
- * **決めるまで星は動かない。** 結果を文で出してから確定させる。
+ * **ラウンドにしない。** 組の中身はもともと数枚しかなく、勝ち抜きにすると
+ * 同じ写真を何度も見ることになる。**全部を 1 画面に並べて、良いものを選ぶ。**
+ * 一度に見比べる枚数より多ければ、下へ送って見る。
+ *
+ * 星の決まり:
+ * - 選んだ写真は **いまの星 ＋ 1**（★5 が上限）
+ * - 選ばなかった写真は **いまの星のまま**
+ * - **決めるまでデータは変えない。** 何が起きるかを先に文で出す
  */
 @Composable
 fun BurstReviewScreen(
     /** まとまりの中身（撮影順）。代表を含む。 */
     photos: List<Photo>,
-    /** このまとまりが今持っている星。ここを土台に上げ下げする。 */
+    /** このまとまりが今持っている星。ここを土台に上げる。 */
     baseStar: Int,
     displayEdge: Int,
+    /** 一度に見比べる枚数。**枠の大きさを決めるだけ**で、区切りではない。 */
+    groupSize: Int,
     /** 相対パス → 新しい星。押されたときだけ呼ぶ。 */
     onApply: (Map<String, Int>) -> Unit,
     onZoom: (Int) -> Unit,
     onBack: () -> Unit
 ) {
-    // 連写の中は「似ているもの同士」なので、**まとめ直さない**。
-    // 1 枚ずつ並べて見比べる場所であって、畳む場所ではない。
-    val refs = remember(photos) {
-        photos.map { PhotoRef(it.relativePath, it.takenAt.takeIf { at -> at > 0 }, null, 0) }
-    }
-    val size = remember(photos) { photos.size.coerceIn(2, 10) }
-    var session by remember(photos) {
-        mutableStateOf(
-            startRound(
-                refs,
-                groupSize = size.toUInt(),
-                targetStar = 0,
-                groupBursts = false,
-                threshold = BurstThreshold(
-                    windowMs = 0, distance = 0u, dHashVersion = Analyse.VERSION
-                ),
-                overrides = emptyList()
-            )
-        )
-    }
-    var selected by remember { mutableStateOf<Set<String>>(emptySet()) }
-    var multi by remember { mutableStateOf(false) }
+    var picked by remember(photos) { mutableStateOf<Set<String>>(emptySet()) }
     var stageSize by remember { mutableStateOf(0 to 0) }
+    val density = LocalDensity.current
 
-    val byPath = remember(photos) { photos.associateBy { it.relativePath } }
-    val live = session
-
-    fun commit(picked: Set<String>) {
-        session = advance(live, picked.toList())
-        selected = emptySet()
+    val landscape = stageSize.first >= stageSize.second
+    val (rows, cols) = gridFor(groupSize.coerceIn(2, 10), landscape)
+    // 1 枚の高さは「一度に見比べる枚数」で決める。**はみ出した分は下へ送る。**
+    val tileHeight = with(density) {
+        if (stageSize.second > 0) (stageSize.second / rows).toDp() else 200.dp
+    }
+    val next = photos.associate {
+        it.relativePath to
+            (if (it.relativePath in picked) baseStar + 1 else baseStar).coerceIn(0, 5)
     }
 
     Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
@@ -83,11 +68,6 @@ fun BurstReviewScreen(
             verticalAlignment = Alignment.CenterVertically
         ) {
             IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, "戻る") }
-            if (live.history.isNotEmpty() && !live.finished) {
-                TextButton(onClick = { session = undo(live); selected = emptySet() }) {
-                    Text("1 つ戻す", fontSize = 12.sp)
-                }
-            }
             Column(Modifier.weight(1f)) {
                 Text("連写の中身を選別", fontSize = 13.sp, color = Lime)
                 Text(
@@ -95,106 +75,56 @@ fun BurstReviewScreen(
                     fontSize = 12.sp, color = Faint
                 )
             }
-            if (!live.finished) {
-                OutlinedButton(
-                    onClick = { multi = !multi; selected = emptySet() },
-                    shape = RoundedCornerShape(50)
-                ) { Text(if (multi) "単数" else "複数", fontSize = 12.sp) }
-                Spacer(Modifier.width(10.dp))
-                Button(
-                    onClick = { commit(selected) },
-                    shape = RoundedCornerShape(50)
-                ) {
-                    Text(
-                        if (selected.isEmpty()) "${live.current.size} 枚とも据え置き"
-                        else "選んだ ${selected.size} 枚を上げる",
-                        fontWeight = FontWeight.Bold, fontSize = 13.sp
-                    )
-                }
-            }
+            // **押す前に何が起きるかを言う。**
+            Text(
+                if (picked.isEmpty()) "選ぶと ★${(baseStar + 1).coerceAtMost(5)} に上がります"
+                else "${picked.size} 枚が ★${(baseStar + 1).coerceAtMost(5)} に上がります",
+                fontSize = 12.sp, color = Faint,
+                modifier = Modifier.padding(end = 12.dp)
+            )
+            Button(
+                onClick = { onApply(next) },
+                enabled = picked.isNotEmpty(),
+                shape = RoundedCornerShape(50)
+            ) { Text("この結果にする", fontWeight = FontWeight.Bold, fontSize = 13.sp) }
         }
 
-        if (live.finished) {
-            // **結果を先に文で出す。** 押す前に何が起きるか分かるように。
-            val next = photos.associate {
-                it.relativePath to
-                    (baseStar + (live.ratings[it.relativePath] ?: 0)).coerceIn(0, 5)
-            }
-            val risen = next.count { (_, star) -> star > baseStar }
-            Column(
-                Modifier.fillMaxSize().padding(24.dp),
-                verticalArrangement = Arrangement.Center,
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                Text("この組の中で $risen 枚が上がります", fontSize = 20.sp, fontWeight = FontWeight.Bold)
-                Text(
-                    if (risen == 0) "全部 ★$baseStar のままです"
-                    else "上がった写真は ★${(baseStar + 1).coerceAtMost(5)}、" +
-                        "残りは ★$baseStar のままです",
-                    fontSize = 13.sp, color = Faint,
-                    modifier = Modifier.padding(top = 8.dp)
-                )
-                Row(Modifier.padding(top = 24.dp), verticalAlignment = Alignment.CenterVertically) {
-                    TextButton(onClick = onBack) { Text("やめる") }
-                    Spacer(Modifier.width(12.dp))
-                    Button(
-                        onClick = { onApply(next) },
-                        shape = RoundedCornerShape(50)
-                    ) { Text("この結果にする", fontWeight = FontWeight.Bold) }
-                }
-            }
-            return@Column
-        }
-
-        val landscape = stageSize.first >= stageSize.second
-        val (rows, cols) = gridFor(live.current.size, landscape)
-
-        Column(
-            Modifier
+        LazyVerticalGrid(
+            columns = GridCells.Fixed(cols),
+            modifier = Modifier
                 .weight(1f)
                 .padding(6.dp)
-                .onSizeChanged { stageSize = it.width to it.height }
+                .onSizeChanged { stageSize = it.width to it.height },
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            for (row in 0 until rows) {
-                Row(Modifier.weight(1f).fillMaxWidth()) {
-                    for (col in 0 until cols) {
-                        val at = row * cols + col
-                        Box(Modifier.weight(1f).fillMaxHeight().padding(3.dp)) {
-                            live.current.getOrNull(at)?.let { path ->
-                                Tile(
-                                    number = at + 1,
-                                    photo = byPath[path],
-                                    picked = path in selected,
-                                    // ここは畳まないので、1 枚は必ず 1 枚。
-                                    stands = 1,
-                                    displayEdge = displayEdge,
-                                    onZoom = {
-                                        onZoom(photos.indexOfFirst { it.relativePath == path })
-                                    },
-                                    // ここは ★5 を出さない。**この画面は組の中の上下だけ。**
-                                    onHold = {
-                                        onZoom(photos.indexOfFirst { it.relativePath == path })
-                                    },
-                                    onOpenBurst = {},
-                                    onTap = {
-                                        if (multi) {
-                                            selected = if (path in selected) selected - path
-                                            else selected + path
-                                        } else {
-                                            commit(setOf(path))
-                                        }
-                                    }
-                                )
-                            }
+            items(photos, key = { it.id }) { photo ->
+                Box(Modifier.height(tileHeight)) {
+                    Tile(
+                        number = photos.indexOf(photo) + 1,
+                        photo = photo,
+                        picked = photo.relativePath in picked,
+                        // ここは畳まないので、1 枚は必ず 1 枚。
+                        stands = 1,
+                        displayEdge = displayEdge,
+                        onZoom = { onZoom(photos.indexOf(photo)) },
+                        onHold = { onZoom(photos.indexOf(photo)) },
+                        onOpenBurst = {},
+                        // **ここは 1 タップで確定しない。** 組の中は見比べて
+                        // 選ぶ場所なので、選んでから確定する。
+                        onTap = {
+                            picked = if (photo.relativePath in picked) {
+                                picked - photo.relativePath
+                            } else picked + photo.relativePath
                         }
-                    }
+                    )
                 }
             }
         }
 
         Text(
             "選んだ写真だけ ★${(baseStar + 1).coerceAtMost(5)} に上がります。" +
-                "選ばなければ ★$baseStar のまま",
+                "選ばなければ ★$baseStar のまま。一度に見比べる枚数より多い分は下へ送って見られます",
             fontSize = 11.sp, color = Faint,
             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)
         )

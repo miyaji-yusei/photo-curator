@@ -146,7 +146,13 @@ fun HomeScreen(
     }
 
     menuFor?.let { project ->
-        ModalBottomSheet(onDismissRequest = { menuFor = null }, containerColor = Surface) {
+        ModalBottomSheet(
+        onDismissRequest = { menuFor = null },
+        containerColor = Surface,
+        // **下の帯まで自分の色で塗る。** 既定だとナビゲーションバーの
+        // ところが白く残り、一番下のボタンに被る。
+        contentWindowInsets = { WindowInsets(0) }
+    ) {
             Column(Modifier.padding(horizontal = 8.dp).padding(bottom = 24.dp)) {
                 Text(
                     project.name,

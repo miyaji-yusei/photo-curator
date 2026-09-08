@@ -15,6 +15,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.MoreHoriz
+import androidx.compose.material.icons.filled.SelectAll
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.ZoomIn
 import androidx.compose.material.icons.filled.Undo
@@ -84,8 +85,6 @@ fun CullScreen(project: Project, onResults: () -> Unit, onBack: () -> Unit) {
     var zooming by remember { mutableStateOf<Pair<List<Photo>, Int>?>(null) }
     // 開いている連写のまとまり（代表の相対パス）。
     var editingBurst by remember { mutableStateOf<String?>(null) }
-    // 長押しで開いた献立（拡大／★5／まとまり）。細いタイルではここが唯一の入口。
-    var holding by remember { mutableStateOf<String?>(null) }
     // 人が手で直したまとめ方。**基準より優先される。**
     var overrides by remember { mutableStateOf<List<PairOverride>>(emptyList()) }
     // 学習した「見た目が近い」の境目。学習していなければ既定値。
@@ -340,27 +339,6 @@ fun CullScreen(project: Project, onResults: () -> Unit, onBack: () -> Unit) {
         )
     }
 
-    // 長押しの献立。**右上のボタンが出ない細いタイルのための道。**
-    holding?.let { path ->
-        ModalBottomSheet(onDismissRequest = { holding = null }, containerColor = Surface) {
-            Column(Modifier.padding(horizontal = 8.dp).padding(bottom = 24.dp)) {
-                DetailRow("大きく見る") {
-                    holding = null
-                    val line = live.current.mapNotNull { byPath[it] }
-                    val idx = line.indexOfFirst { it.relativePath == path }
-                    if (idx >= 0) zooming = line to idx
-                }
-                DetailRow("★5 で確定する（以降のラウンドに出ません）") {
-                    holding = null
-                    keepTop(path)
-                }
-                if ((live.members[path]?.size ?: 1) > 1) {
-                    DetailRow("まとまりを編集する") { holding = null; editingBurst = path }
-                }
-            }
-        }
-    }
-
     // まとまり編集。**対象はいまの組の写真と、その前後の未判定の写真。**
     // 前後を含めるのは、隣の単独写真を取り込めるようにするため。
     editingBurst?.let { rep ->
@@ -512,7 +490,13 @@ fun CullScreen(project: Project, onResults: () -> Unit, onBack: () -> Unit) {
                                         val idx = line.indexOfFirst { it.relativePath == path }
                                         if (idx >= 0) zooming = line to idx
                                     },
-                                    onHold = { holding = path },
+                                    // **長押しも拡大。** 拡大・★5・まとまりは
+                                    // タイルのボタンにあるので、献立は作らない。
+                                    onHold = {
+                                        val line = live.current.mapNotNull { byPath[it] }
+                                        val idx = line.indexOfFirst { it.relativePath == path }
+                                        if (idx >= 0) zooming = line to idx
+                                    },
                                     onOpenBurst = { editingBurst = path },
                                     onTop = { keepTop(path) },
                                     onTap = {
@@ -561,12 +545,15 @@ private fun CullBar(
             IconButton(onClick = onUndo, enabled = session.history.isNotEmpty()) {
                 Icon(Icons.Filled.Undo, "1 つ戻す")
             }
+            // 設計どおりアイコンだけ。**帯の幅は写真に回す。**
             FilterChip(
                 selected = multi, onClick = onToggleMulti,
-                label = { Text("複数", fontSize = 12.sp) },
-                leadingIcon = if (multi) {
-                    { Icon(Icons.Filled.Check, null, Modifier.size(16.dp)) }
-                } else null
+                label = {
+                    Icon(
+                        if (multi) Icons.Filled.Check else Icons.Filled.SelectAll,
+                        "複数選択", Modifier.size(18.dp)
+                    )
+                }
             )
             if (multi && selectedCount > 0) {
                 TextButton(onClick = onClear) { Text("解除", fontSize = 12.sp) }
@@ -649,7 +636,9 @@ internal fun Tile(
     Box(
         Modifier
             .fillMaxSize()
-            .onSizeChanged { wide = it.width > 120 * 3 }
+            // **細いタイルでも出す。** 長押しは拡大に使うので、
+            // ★5 とまとまりに届く入口がここしか無い。
+            .onSizeChanged { wide = it.width > 80 * 3 }
             .clip(androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
             .background(Tile)
             .then(if (picked) Modifier.border(3.dp, Lime) else Modifier)
@@ -705,13 +694,14 @@ internal fun Tile(
                 Modifier
                     .align(Alignment.TopStart)
                     .padding(start = 40.dp, top = 6.dp)
-                    .clip(androidx.compose.foundation.shape.RoundedCornerShape(6.dp))
+                    .clip(androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
                     .background(Color(0xB3101114))
                     // **バッジは押せる。** ここを押すと中身が開く。
                     // タイル本体の「押したら確定」を邪魔しないよう、
-                    // この当たり判定が先に受け取る。
+                    // この当たり判定が先に受け取る。指で押せる高さにする
+                    // （小さすぎて押しにくかった）。
                     .clickable(onClick = onOpenBurst)
-                    .padding(horizontal = 7.dp, vertical = 2.dp)
+                    .padding(horizontal = 12.dp, vertical = 10.dp)
             ) {
                 Text("連写 $stands 枚", fontSize = 11.sp, color = Lime)
             }

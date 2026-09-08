@@ -100,7 +100,14 @@ fun BurstEditSheet(
     }
 
     val sheet = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheet, containerColor = Surface) {
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheet,
+        containerColor = Surface,
+        // **下の帯まで自分の色で塗る。** 既定だとナビゲーションバーのところが
+        // 白く残り、一番下のボタンに被る。
+        contentWindowInsets = { WindowInsets(0) }
+    ) {
         Column(Modifier.padding(horizontal = 16.dp).padding(bottom = 16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("連写のまとまりを編集", fontSize = 17.sp, fontWeight = FontWeight.SemiBold)

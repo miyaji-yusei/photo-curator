@@ -39,7 +39,14 @@ fun OptionsSheet(
     onDismiss: () -> Unit
 ) {
     val sheet = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheet, containerColor = Surface) {
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheet,
+        containerColor = Surface,
+        // **下の帯まで自分の色で塗る。** 既定だとナビゲーションバーのところが
+        // 白く残り、一番下のボタンに被る。
+        contentWindowInsets = { WindowInsets(0) }
+    ) {
         Column(Modifier.padding(horizontal = 20.dp).padding(bottom = 24.dp)) {
             Text("選別の設定", fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
 

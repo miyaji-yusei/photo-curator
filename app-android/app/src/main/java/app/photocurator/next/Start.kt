@@ -8,6 +8,8 @@ package app.photocurator.next
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -18,6 +20,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -47,8 +50,22 @@ fun StartSheet(
     var hideNext by remember { mutableStateOf(!Prefs.askBeforeStart(context)) }
 
     val sheet = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheet, containerColor = Surface) {
-        Column(Modifier.padding(horizontal = 20.dp).padding(bottom = 20.dp)) {
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheet,
+        containerColor = Surface,
+        // **下の帯まで自分の色で塗る。** 既定だとナビゲーションバーのところが
+        // 白く残り、一番下のボタンに被る。
+        contentWindowInsets = { WindowInsets(0) }
+    ) {
+        Column(
+            Modifier
+                .padding(horizontal = 20.dp)
+                .padding(bottom = 20.dp)
+                // **狭い画面では縦に送れるようにする。** カバー画面で
+                // 下のボタンが画面外に出て押せなくなっていた。
+                .verticalScroll(rememberScrollState())
+        ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("選別を始める前に", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.weight(1f))
@@ -57,9 +74,11 @@ fun StartSheet(
 
             Spacer(Modifier.height(18.dp))
 
-            Row {
+            // 幅が足りなければ縦に積む。**2 列は 620dp から。**
+            val narrow = LocalConfiguration.current.screenWidthDp < 620
+            FlowRow(maxItemsInEachRow = if (narrow) 1 else 2) {
                 // ---- 左: 一度に見比べる枚数 ----
-                Column(Modifier.weight(1f)) {
+                Column(if (narrow) Modifier.fillMaxWidth() else Modifier.weight(1f)) {
                     Text("一度に見比べる枚数", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                     Spacer(Modifier.height(8.dp))
                     // 2〜10。**4 をおすすめとして真ん中に据える。**
@@ -97,10 +116,10 @@ fun StartSheet(
                     )
                 }
 
-                Spacer(Modifier.width(20.dp))
+                Spacer(if (narrow) Modifier.height(18.dp) else Modifier.width(20.dp))
 
                 // ---- 右: まとめ方と次回の扱い ----
-                Column(Modifier.width(300.dp)) {
+                Column(if (narrow) Modifier.fillMaxWidth() else Modifier.width(300.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) {
                             Text("似た連写をまとめて 1 枚として見る", fontSize = 13.sp)

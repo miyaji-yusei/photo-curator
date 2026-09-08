@@ -12,6 +12,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -73,6 +75,11 @@ fun ResultsScreen(project: Project, star: Int, onBack: () -> Unit) {
     var reviewing by remember { mutableStateOf<String?>(null) }
 
     var outputMenu by remember { mutableStateOf(false) }
+    // NAS からの取り出し。**どちらもコピーで、原本は動かさない。**
+    var savingToGallery by remember { mutableStateOf<List<Photo>?>(null) }
+    var sortingOnNas by remember { mutableStateOf<List<Photo>?>(null) }
+    // 取り出しの進み。数で出す。
+    var taking by remember { mutableStateOf<Pair<Int, Int>?>(null) }
     var confirmFavourite by remember { mutableStateOf<List<Photo>?>(null) }
     var choosingDestination by remember { mutableStateOf(false) }
     var confirmingMove by remember { mutableStateOf<Album?>(null) }
@@ -121,14 +128,26 @@ fun ResultsScreen(project: Project, star: Int, onBack: () -> Unit) {
     for (photo in photos) counts[(ratings[photo.relativePath] ?: 0).coerceIn(0, 5)] += 1
     val atLeastOne = photos.count { (ratings[it.relativePath] ?: 0) > 0 }
 
-    // 連写の仲間は代表に畳む。**同じ組が 5 枚並ぶと、何を見ればいいのか分からない。**
-    // 中身は代表をタップして burst-review で見る。
-    val folded = remember(photos, members) {
-        val mates = members.entries
-            .filter { it.value.size > 1 }
-            .flatMap { entry -> entry.value.filter { it != entry.key } }
-            .toSet()
-        photos.filter { it.relativePath !in mates }
+    // 連写の仲間は 1 枚に畳む。**同じ組が 5 枚並ぶと、何を見ればいいのか分からない。**
+    //
+    // ただし出すのは代表ではなく、**その組で星が一番高い 1 枚**。連写の中身を
+    // 選別して上げた写真が代表でないと、一覧から消えてしまう（★2 が 1 枚ある
+    // のに「この星の写真はありません」と出た）。
+    val folded = remember(photos, members, ratings) {
+        val byPath = photos.associateBy { it.relativePath }
+        val groups = members.filterValues { it.size > 1 }
+        val hidden = HashSet<String>()
+        val shownFor = HashMap<String, String>()
+        for ((head, mates) in groups) {
+            val all = (mates + head).distinct()
+            val best = all
+                .mapNotNull { byPath[it] }
+                .maxByOrNull { ratings[it.relativePath] ?: 0 }
+                ?: continue
+            for (path in all) if (path != best.relativePath) hidden += path
+            shownFor[best.relativePath] = head
+        }
+        photos.filter { it.relativePath !in hidden }
     }
 
     val picking = when {
@@ -171,6 +190,8 @@ fun ResultsScreen(project: Project, star: Int, onBack: () -> Unit) {
                 photos = inside,
                 baseStar = base,
                 displayEdge = displayEdge,
+                // **枠の大きさは選別と同じ設定に従う。** 多い分は下へ送る。
+                groupSize = Prefs.groupSize(context),
                 onApply = { next ->
                     val current = session
                     if (current != null) {
@@ -233,7 +254,11 @@ fun ResultsScreen(project: Project, star: Int, onBack: () -> Unit) {
         Column(Modifier.padding(horizontal = 16.dp)) {
             // ---- 星チップ ----
             Row(
-                Modifier.fillMaxWidth(),
+                Modifier
+                    .fillMaxWidth()
+                    // **狭い画面では横に送る。** 入りきらないと 1 文字ずつ
+                    // 折り返されて、チップが縦長の帯になる（カバー画面で発生）。
+                    .horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -249,7 +274,7 @@ fun ResultsScreen(project: Project, star: Int, onBack: () -> Unit) {
                         filter = "star:$value"; picked = emptySet()
                     }
                 }
-                Spacer(Modifier.weight(1f))
+                Spacer(Modifier.width(8.dp))
                 // **並べ替えは 2 つだけ。** 星で選んだのか、撮った順で見たいのか。
                 StarChip("星が高い順", sort == "star") { sort = "star" }
                 StarChip("撮影順", sort == "time") { sort = "time" }
@@ -383,6 +408,15 @@ fun ResultsScreen(project: Project, star: Int, onBack: () -> Unit) {
             }
         }
 
+        // 取り出しの進み。**数で出す。** 終わらないバーは出さない。
+        taking?.let { (at, total) ->
+            Text(
+                "取り出しています… $at / $total 枚",
+                fontSize = 12.sp, color = Sky,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
+            )
+        }
+
         // 将来の同期状態の席。**いまは端末だけだと言い切る。**
         Text(
             "この端末だけの結果（NAS との同期は今後）",
@@ -393,20 +427,60 @@ fun ResultsScreen(project: Project, star: Int, onBack: () -> Unit) {
 
     // ---- 「[対象] を…」メニュー ----
     if (outputMenu) {
-        ModalBottomSheet(onDismissRequest = { outputMenu = false }, containerColor = Surface) {
+        ModalBottomSheet(
+        onDismissRequest = { outputMenu = false },
+        containerColor = Surface,
+        // **下の帯まで自分の色で塗る。** 既定だとナビゲーションバーの
+        // ところが白く残り、一番下のボタンに被る。
+        contentWindowInsets = { WindowInsets(0) }
+    ) {
             Column(Modifier.padding(horizontal = 8.dp).padding(bottom = 24.dp)) {
                 Text(
                     "$targetLabel を…",
                     fontSize = 15.sp, fontWeight = FontWeight.SemiBold,
                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
                 )
-                OutputRow("アルバムに移動", "原本を動かします") {
-                    outputMenu = false; choosingDestination = true
+                // **出所でできることが違う。** できないものを並べても押せないので、
+                // NAS のときは端末の写真にしかない操作（お気に入り・アルバムへ移動）を
+                // 出さない。代わりに NAS でできることを出す。
+                if (project.source.kind == "nas") {
+                    OutputRow("ギャラリーに保存", "NAS からコピーします。原本は動きません") {
+                        outputMenu = false; savingToGallery = targets
+                    }
+                    OutputRow("NAS で星ごとに分ける", "NAS の中にコピーします。原本は残ります") {
+                        outputMenu = false; sortingOnNas = targets
+                    }
+                } else {
+                    OutputRow("アルバムに移動", "原本を動かします") {
+                        outputMenu = false; choosingDestination = true
+                    }
+                    OutputRow("お気に入りに追加", "原本の属性を変えます") {
+                        outputMenu = false; confirmFavourite = targets
+                    }
                 }
-                OutputRow("お気に入りに追加", "原本の属性を変えます") {
-                    outputMenu = false; confirmFavourite = targets
+                // ---- 星を直す ----
+                // **ここだけは選別を通さずに星を動かす。** 結果を見てから
+                // 「これは違った」と思ったときに直せる道が要る。
+                OutputRow("★を 1 つ上げる", "★5 が上限です") {
+                    outputMenu = false
+                    shiftStars(context, scope, project, session, targets, +1) { moved, count ->
+                        session = moved
+                        ratings = moved.ratings
+                        note = "$count 枚の星を 1 つ上げました"
+                    }
                 }
-                OutputRow("共有", "端末の共有メニューへ") {
+                OutputRow("★を 1 つ下げる", "★0 が下限です") {
+                    outputMenu = false
+                    shiftStars(context, scope, project, session, targets, -1) { moved, count ->
+                        session = moved
+                        ratings = moved.ratings
+                        note = "$count 枚の星を 1 つ下げました"
+                    }
+                }
+
+                // NAS の写真は端末に無いので、共有に渡す URI が無い。
+                // **できないものは出さない**（保存してから共有してもらう）。
+                if (project.source.kind != "nas") OutputRow("共有", "端末の共有メニューへ") {
                     outputMenu = false
                     val send = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
                         type = "image/*"
@@ -420,6 +494,59 @@ fun ResultsScreen(project: Project, star: Int, onBack: () -> Unit) {
                 }
             }
         }
+    }
+
+    // ---- NAS から取り出す ----
+    // **どちらもコピー。** 原本は動かさないので赤字にはしない。ただし
+    // 網から 1 枚 6MB を読むので、何枚に何が起きるかと時間の見当を先に言う。
+    savingToGallery?.let { list ->
+        ConfirmDialog(
+            title = "${list.size} 枚を端末のギャラリーに保存します",
+            body = "NAS からコピーして、端末の「Pictures / ${project.name}」に入れます。" +
+                "NAS の写真は動かしませんし、消えません。" +
+                "1 枚 6MB ほどあるので、${list.size} 枚で数分かかることがあります。",
+            confirmLabel = "保存する",
+            onConfirm = {
+                savingToGallery = null
+                busy = true
+                taking = 0 to list.size
+                scope.launch {
+                    val done = TakeNas.saveToGallery(context, project, list, project.name) { at, total ->
+                        taking = at to total
+                    }
+                    note = done.describe("端末に保存しました")
+                    taking = null
+                    busy = false
+                    picked = emptySet(); selecting = false
+                }
+            },
+            onDismiss = { savingToGallery = null }
+        )
+    }
+
+    sortingOnNas?.let { list ->
+        ConfirmDialog(
+            title = "${list.size} 枚を NAS で星ごとに分けます",
+            body = "同じフォルダの中に star-5 / star-4 … を作って、そこへコピーします。" +
+                "**原本は元の場所に残ります**（移動ではありません）。" +
+                "1 枚 6MB ほどあるので、${list.size} 枚で数分かかることがあります。",
+            confirmLabel = "分ける",
+            onConfirm = {
+                sortingOnNas = null
+                busy = true
+                taking = 0 to list.size
+                scope.launch {
+                    val done = TakeNas.sortOnNas(context, project, list, ratings) { at, total ->
+                        taking = at to total
+                    }
+                    note = done.describe("NAS で分けました")
+                    taking = null
+                    busy = false
+                    picked = emptySet(); selecting = false
+                }
+            },
+            onDismiss = { sortingOnNas = null }
+        )
     }
 
     // **写真そのものに触る前に、必ずここを通す。**
@@ -509,4 +636,37 @@ private fun OutputRow(label: String, note: String, onClick: () -> Unit) {
         // **原本に触るものは、押す前にそう書く。**
         Text(note, fontSize = 11.sp, color = Faint)
     }
+}
+
+/**
+ * 選んだ写真の星を動かす。**連写のまとまりは道連れにしない。**
+ *
+ * まとまりの仲間は選別では同じ星になるが、ここは人が 1 枚ずつ見て直す場所
+ * なので、選んだ写真だけを動かす（そのために連写の中身選別がある）。
+ */
+private fun shiftStars(
+    context: android.content.Context,
+    scope: kotlinx.coroutines.CoroutineScope,
+    project: Project,
+    session: Session?,
+    targets: List<Photo>,
+    delta: Int,
+    onDone: (Session, Int) -> Unit
+) {
+    val live = session ?: return
+    if (targets.isEmpty()) return
+    val changed = HashMap(live.ratings)
+    var count = 0
+    for (photo in targets) {
+        val now = changed[photo.relativePath] ?: 0
+        val next = (now + delta).coerceIn(0, 5)
+        if (next != now) {
+            changed[photo.relativePath] = next
+            count += 1
+        }
+    }
+    if (count == 0) return
+    val moved = live.copy(ratings = changed)
+    scope.launch { Store.save(context, project.id, moved) }
+    onDone(moved, count)
 }

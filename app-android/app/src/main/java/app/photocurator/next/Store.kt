@@ -217,6 +217,19 @@ object Prefs {
             .edit().putInt("display_edge_" + projectId, edge.coerceIn(768, 1920)).apply()
     }
 
+    /**
+     * プロジェクト詳細の一覧の列数。**0 は「おまかせ」**（幅から決める）。
+     * 覚えておくのは、開くたびに選び直したくないため。
+     */
+    fun gridColumns(context: Context): Int =
+        context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+            .getInt("grid_columns", 0).coerceIn(0, 8)
+
+    fun setGridColumns(context: Context, columns: Int) {
+        context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+            .edit().putInt("grid_columns", columns.coerceIn(0, 8)).apply()
+    }
+
     /** 連写を自動でまとめるか。既定 on。 */
     fun groupBursts(context: Context): Boolean =
         context.getSharedPreferences(FILE, Context.MODE_PRIVATE)

@@ -48,7 +48,13 @@ fun DestinationSheet(
         note = if (albums.isEmpty()) "ほかに移せるフォルダがありません" else ""
     }
 
-    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = Surface) {
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        containerColor = Surface,
+        // **下の帯まで自分の色で塗る。** 既定だとナビゲーションバーの
+        // ところが白く残り、一番下のボタンに被る。
+        contentWindowInsets = { WindowInsets(0) }
+    ) {
         Column(Modifier.padding(horizontal = 16.dp).padding(bottom = 16.dp)) {
             Text("$count 枚の移し先", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
             Text(

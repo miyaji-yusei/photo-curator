@@ -4,6 +4,7 @@ package app.photocurator.next
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
@@ -27,6 +28,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -88,6 +90,8 @@ fun ProjectScreen(
     var displayEdge by remember { mutableStateOf(Prefs.projectEdge(context, project.id)) }
     // 「…」から大きさを選んでいるか。
     var choosingEdge by remember { mutableStateOf(false) }
+    // 一覧の列数。**0 は「おまかせ」**（幅から決める）。
+    var columns by remember { mutableStateOf(Prefs.gridColumns(context)) }
 
     LaunchedEffect(project.id, reloads) {
         scanned = false
@@ -385,14 +389,36 @@ fun ProjectScreen(
             }
 
         // ---- 右: 写真の一覧。走査と準備の結果を確かめる場所 ----
+        // おまかせが何列になるかを知るために、置かれた幅を測る。
+        var listWidth by remember { mutableStateOf(0) }
         val gallery: @Composable () -> Unit = {
+                // 幅からの既定を先に知る。**同じ数のボタンを 2 つ置かない**
+                // （「おまかせ」と「5 列」が同じ意味になってしまう）。
+                val auto = maxOf(2, (listWidth / 96).coerceAtMost(8))
                 Row(
-                    Modifier.padding(bottom = 8.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 8.dp)
+                        // **狭い画面では横に送る。** 入りきらないとチップが
+                        // 1 文字ずつ折り返されて縦長の帯になる（カバー画面で発生）。
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
                     Chip("すべて ${photos.size}", filter == "all") { filter = "all" }
                     if (starred > 0) Chip("★1 以上 $starred", filter == "star") { filter = "star" }
                     if (bursts > 0) Chip("連写 $bursts 組", filter == "burst") { filter = "burst" }
+                    Spacer(Modifier.width(16.dp))
+                    // 列数。**おまかせ＋その幅では選べない数**だけを出す。
+                    Chip("おまかせ", columns == 0) {
+                        columns = 0; Prefs.setGridColumns(context, 0)
+                    }
+                    for (n in 2..5) {
+                        if (n == auto) continue
+                        Chip("$n 列", columns == n) {
+                            columns = n; Prefs.setGridColumns(context, n)
+                        }
+                    }
                 }
 
                 val shown = when (filter) {
@@ -404,7 +430,8 @@ fun ProjectScreen(
                     else -> photos
                 }
                 LazyVerticalGrid(
-                    columns = GridCells.Adaptive(minSize = 96.dp),
+                    columns = if (columns > 0) GridCells.Fixed(columns)
+                    else GridCells.Adaptive(minSize = 96.dp),
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                     horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
@@ -474,13 +501,17 @@ fun ProjectScreen(
                 Column(Modifier.fillMaxSize()) {
                     Column(Modifier.heightIn(max = 300.dp).verticalScrollable()) { cards() }
                     Spacer(Modifier.height(12.dp))
-                    Column(Modifier.weight(1f)) { gallery() }
+                    Column(
+                        Modifier.weight(1f).onSizeChanged { listWidth = (it.width / 2.625f).toInt() }
+                    ) { gallery() }
                 }
             } else {
                 Row(Modifier.fillMaxSize()) {
                     Column(Modifier.width(340.dp).verticalScrollable()) { cards() }
                     Spacer(Modifier.width(16.dp))
-                    Column(Modifier.weight(1f)) { gallery() }
+                    Column(
+                        Modifier.weight(1f).onSizeChanged { listWidth = (it.width / 2.625f).toInt() }
+                    ) { gallery() }
                 }
             }
         }
@@ -506,7 +537,13 @@ fun ProjectScreen(
     }
 
     if (menu) {
-        ModalBottomSheet(onDismissRequest = { menu = false }, containerColor = Surface) {
+        ModalBottomSheet(
+        onDismissRequest = { menu = false },
+        containerColor = Surface,
+        // **下の帯まで自分の色で塗る。** 既定だとナビゲーションバーの
+        // ところが白く残り、一番下のボタンに被る。
+        contentWindowInsets = { WindowInsets(0) }
+    ) {
             Column(Modifier.padding(horizontal = 8.dp).padding(bottom = 24.dp)) {
                 DetailMenuRow("写真を再読み込み") { menu = false; rescan = true; reloads += 1 }
                 if (project.source.kind == "nas") {
@@ -537,7 +574,13 @@ fun ProjectScreen(
     }
 
     if (choosingEdge) {
-        ModalBottomSheet(onDismissRequest = { choosingEdge = false }, containerColor = Surface) {
+        ModalBottomSheet(
+        onDismissRequest = { choosingEdge = false },
+        containerColor = Surface,
+        // **下の帯まで自分の色で塗る。** 既定だとナビゲーションバーの
+        // ところが白く残り、一番下のボタンに被る。
+        contentWindowInsets = { WindowInsets(0) }
+    ) {
             Column(Modifier.padding(horizontal = 20.dp).padding(bottom = 24.dp)) {
                 Text("表示用画像の大きさ", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
                 Text(
