@@ -39,7 +39,10 @@ sealed interface SmbResult<out T> {
 }
 
 /**
- * NAS（SMB）を読む。**読むだけ。** 書き込みの経路はここに置かない。
+ * NAS（SMB）を読む。**原本は読むだけ。**
+ *
+ * 書けるのはサイドカー 1 ファイルだけ（`write`）。原本を書き換える経路は
+ * ここにも他にも置かない。
  *
  * **接続は「ひと仕事」ごとに張って閉じる。** アプリが持ち歩かないので、
  * Wi-Fi が切れたときに「繋がっているつもり」の状態が残らない。
@@ -175,6 +178,52 @@ object Smb {
                 "接続を拒否されました。ホストとポートを確認してください"
             else -> message.take(80).ifEmpty { error.javaClass.simpleName }
         }
+    }
+
+    /**
+     * 1 つのファイルを読む。**無ければ null**（失敗と区別する）。
+     *
+     * サイドカーは「まだ無い」が普通の状態なので、無いことを失敗として
+     * 扱うと、初回が毎回エラーになる。
+     */
+    suspend fun readIfExists(nas: Nas, password: String, path: String): SmbResult<ByteArray?> =
+        connect(nas, password) { share ->
+            if (!share.fileExists(path)) return@connect null
+            share.openFile(
+                path,
+                EnumSet.of(AccessMask.GENERIC_READ),
+                null,
+                SMB2ShareAccess.ALL,
+                SMB2CreateDisposition.FILE_OPEN,
+                null
+            ).use { file -> file.inputStream.use { it.readBytes() } }
+        }
+
+    /**
+     * 1 つのファイルを書く。**このアプリが NAS に書く唯一の経路。**
+     *
+     * 書いてよいのはサイドカー（.photo-curator の下）だけ。原本のある
+     * フォルダに増やすのは 1 ファイルだけと決めてある（設計 CON-3）。
+     * 親フォルダが無ければ作る。
+     */
+    suspend fun write(
+        nas: Nas,
+        password: String,
+        path: String,
+        bytes: ByteArray
+    ): SmbResult<Unit> = connect(nas, password) { share ->
+        val parent = path.substringBeforeLast('\\', "")
+        if (parent.isNotEmpty() && !share.folderExists(parent)) share.mkdir(parent)
+        share.openFile(
+            path,
+            EnumSet.of(AccessMask.GENERIC_WRITE),
+            null,
+            SMB2ShareAccess.ALL,
+            // 無ければ作る、あれば丸ごと置き換える。
+            SMB2CreateDisposition.FILE_OVERWRITE_IF,
+            null
+        ).use { file -> file.outputStream.use { it.write(bytes) } }
+        Unit
     }
 
     /** つながるかだけ試す。**設定画面の「接続を確認」。** */

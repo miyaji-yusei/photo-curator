@@ -74,6 +74,11 @@ fun ProjectScreen(
     var troubleDetail by remember { mutableStateOf(false) }
     // 大きく見ている並びと、その何枚目か。**ここは見るだけ**なので星は動かない。
     var zooming by remember { mutableStateOf<Pair<List<Photo>, Int>?>(null) }
+    // サイドカーとの食い違い。**選ぶまで選別を始めさせない。**
+    var clash by remember { mutableStateOf<Catalog?>(null) }
+    var mineSummary by remember { mutableStateOf("") }
+    // 同期の結果を 1 行で。**黙って書かない、黙って失敗しない。**
+    var syncNote by remember { mutableStateOf<String?>(null) }
 
     // **開いたら準備が動き出す。** カードに数が出ているのに何も進まないと、
     // 止まっているのか終わっているのか分からない。
@@ -111,6 +116,36 @@ fun ProjectScreen(
             }
             // 通ったら**前の転びは消す**。古い赤字を出し続けない。
             Trouble.clear(context, project.source.key)
+
+            // ---- サイドカー ----
+            // **開いたときに 1 回だけ見る。** 時刻の大小では決めない。
+            if (Sidecar.supports(project)) {
+                when (val sync = Sidecar.check(context, project)) {
+                    is Sync.Settled -> Unit
+                    is Sync.Push -> {
+                        // **書いたことは言う。** 黙って書くと、共有されたのか
+                        // されていないのかが分からない。
+                        val failed = Sidecar.push(context, project)
+                        syncNote = if (failed != null) "NAS に保存できませんでした: " + failed
+                        else "この端末の結果を NAS に保存しました"
+                    }
+                    is Sync.Pull -> {
+                        Sidecar.adopt(context, project, sync.catalog)
+                        session = Store.load(context, project.id)
+                        syncNote = "NAS の記録から続きを取り込みました"
+                    }
+                    is Sync.Clash -> {
+                        val local = Store.load(context, project.id)
+                        val kept = local?.ratings?.values?.count { it > 0 } ?: 0
+                        val round = local?.let {
+                            "ROUND " + it.round + (if (it.finished) "（完了）" else " の途中")
+                        } ?: "選別なし"
+                        mineSummary = "★1 以上 " + kept + " 枚 · " + round
+                        clash = sync.catalog
+                    }
+                    is Sync.Blocked -> syncNote = sync.reason
+                }
+            }
         } catch (error: Exception) {
             // **黙って落とさない。** 何が起きたかを 1 文にして、ホームにも残す。
             val said = Smb.describe(error)
@@ -195,6 +230,14 @@ fun ProjectScreen(
                         fontSize = 12.sp, color = Faint,
                         modifier = Modifier.padding(top = 6.dp)
                     )
+                    syncNote?.let { note ->
+                        Text(
+                            note,
+                            fontSize = 11.sp,
+                            color = if (note.contains("できません")) Warn else Sky,
+                            modifier = Modifier.padding(top = 6.dp)
+                        )
+                    }
                     HorizontalDivider(Modifier.padding(vertical = 10.dp), color = Color(0xFF24272D))
                     Row(verticalAlignment = Alignment.Top) {
                         Icon(Icons.Filled.Lock, null, Modifier.size(14.dp), tint = Faint)
@@ -471,6 +514,16 @@ fun ProjectScreen(
                         menu = false; choosingEdge = true
                     }
                 }
+                if (Sidecar.supports(project)) {
+                    DetailMenuRow("NAS に保存（この端末の結果を書く）") {
+                        menu = false
+                        syncNote = "NAS に保存しています…"
+                        scope.launch {
+                            val failed = Sidecar.push(context, project)
+                            syncNote = failed ?: "NAS に保存しました"
+                        }
+                    }
+                }
                 DetailMenuRow("名前を変更") { menu = false; renaming = true }
                 DetailMenuRow("技術情報") { menu = false; technical = true }
                 DetailMenuRow("選別を最初からやり直す", danger = true) {
@@ -507,6 +560,58 @@ fun ProjectScreen(
                 }
             }
         }
+    }
+
+    // ---- サイドカーの食い違い ----
+    // **プロジェクト単位で選ばせる。写真 1 枚ずつは選ばせない。**
+    // どちらを選んでも、選ばなかった方は catalog.<端末>.json に残る。
+    clash?.let { theirs ->
+        AlertDialog(
+            onDismissRequest = { },
+            title = { Text("別の端末の記録があります") },
+            text = {
+                Column {
+                    Text(
+                        "この端末と NAS の記録が、どちらも進んでいます。" +
+                            "どちらを残すか選んでください。",
+                        fontSize = 13.sp
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    Text("この端末（${Device.name()}）", fontSize = 12.sp, color = Lime)
+                    Text(mineSummary, fontSize = 13.sp)
+                    Spacer(Modifier.height(8.dp))
+                    Text("NAS の記録（${theirs.updatedByName}）", fontSize = 12.sp, color = Sky)
+                    Text(theirs.summary(), fontSize = 13.sp)
+                    Spacer(Modifier.height(12.dp))
+                    Text(
+                        "選ばなかった方は消しません。NAS の .photo-curator に " +
+                            "catalog.<端末>.json として残します。",
+                        fontSize = 11.sp, color = Faint
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    clash = null
+                    syncNote = "この端末の結果を NAS に書いています…"
+                    scope.launch {
+                        val failed = Sidecar.keepMine(context, project, theirs)
+                        syncNote = failed ?: "この端末の結果を NAS に反映しました"
+                    }
+                }) { Text("この端末の結果を使う") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    clash = null
+                    syncNote = "NAS の記録を取り込んでいます…"
+                    scope.launch {
+                        Sidecar.adopt(context, project, theirs)
+                        syncNote = "NAS の記録を取り込みました"
+                        reloads += 1
+                    }
+                }) { Text("NAS の記録を使う") }
+            }
+        )
     }
 
     if (renaming) {
@@ -557,9 +662,16 @@ fun ProjectScreen(
     }
 
     if (removing) {
-        // **消える容量を言う。** 「よろしいですか」では判断できない。
-        val bytes = remember(project.id) {
-            if (project.source.kind == "nas") {
+        // **絵は出所ごと。** 同じフォルダを使う別のプロジェクトが残っているなら
+        // 消してはいけないし、消すとも言ってはいけない（実際に消していないのに
+        // 「14MB 消します」と書いていた）。
+        var alone by remember(project.id) { mutableStateOf(false) }
+        var bytes by remember(project.id) { mutableStateOf(0L) }
+        LaunchedEffect(project.id, removing) {
+            val others = Projects.all(context)
+                .count { it.id != project.id && it.source.key == project.source.key }
+            alone = others == 0
+            bytes = if (alone && project.source.kind == "nas") {
                 Renders.bytes(context, project.source.key.substringBefore("|"))
             } else 0L
         }
@@ -567,6 +679,8 @@ fun ProjectScreen(
             title = "「${project.name}」を削除しますか",
             body = "このプロジェクトで付けた星・連写のまとめ方・どこまで見たかが消えます。" +
                 (if (bytes > 0) "端末に置いた表示用画像 ${bytes / 1024 / 1024}MB も消します。" else "") +
+                (if (!alone) "同じフォルダを使う別のプロジェクトがあるので、表示用画像は残します。" else "") +
+                (if (Sidecar.supports(project)) "NAS に置いた記録（catalog.json）は消しません。" else "") +
                 "写真そのものには手を触れません。",
             confirmLabel = "削除",
             onConfirm = {
@@ -574,6 +688,10 @@ fun ProjectScreen(
                 scope.launch {
                     Projects.remove(context, project.id)
                     Timing.clear(context, project.id)
+                    // **最後の 1 つだったときだけ絵を片付ける。**
+                    if (alone && project.source.kind == "nas") {
+                        Renders.clear(context, project.source.key.substringBefore("|"))
+                    }
                     onBack()
                 }
             },
@@ -600,6 +718,8 @@ fun ProjectScreen(
                     Learning.forget(context, project.id)
                     Overrides.clear(context, project.id)
                     Timing.clear(context, project.id)
+                    // **やり直したことも判断。** 次にサイドカーへ渡す。
+                    SyncState.touch(context, project.id)
                     reloads += 1
                 }
             },

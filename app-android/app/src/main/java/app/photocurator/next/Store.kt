@@ -31,6 +31,8 @@ object Store {
      */
     suspend fun save(context: Context, albumId: String, session: Session) =
         withContext(Dispatchers.IO) {
+            // **判断が変わった。** サイドカーへ渡すべきものが端末にできた印。
+            SyncState.touch(context, albumId)
             try {
                 // 途中で落ちても壊れた JSON を残さないよう、書いてから差し替える。
                 val target = file(context, albumId)
@@ -284,6 +286,8 @@ object Overrides {
 
     suspend fun save(context: Context, albumId: String, list: List<PairOverride>) =
         withContext(Dispatchers.IO) {
+            // 手直しも判断。**サイドカーへ渡すもの。**
+            SyncState.touch(context, albumId)
             try {
                 val array = org.json.JSONArray()
                 for (item in list) {
@@ -486,5 +490,79 @@ object Timing {
             seconds < 3600 -> "${seconds / 60} 分 ${seconds % 60} 秒"
             else -> "${seconds / 3600} 時間 ${(seconds % 3600) / 60} 分"
         }
+    }
+}
+
+/**
+ * この端末の名札。**サイドカーで「誰が書いたか」を言うために要る。**
+ *
+ * 端末ごとに 1 回だけ作る。人が見て分かる名前（機種名）と、機械が比べる id。
+ * id を機種名にしないのは、同じ機種が 2 台あると見分けが付かないため。
+ */
+object Device {
+    private const val FILE = "device"
+
+    fun id(context: Context): String {
+        val store = context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+        store.getString("id", null)?.let { return it }
+        val made = java.util.UUID.randomUUID().toString().take(12)
+        store.edit().putString("id", made).apply()
+        return made
+    }
+
+    /** 「SM-F971C」。人が見比べるときの手がかり。 */
+    fun name(): String = android.os.Build.MODEL ?: "この端末"
+}
+
+/**
+ * サイドカーと端末の食い違いを見分けるための控え。
+ *
+ * **時刻の大小で勝敗を決めない。** 端末ごとに時計はずれるので、
+ * 「新しい方を採る」は狂った端末が常に勝つ。見るのは
+ * 「**自分が最後に見た版と同じかどうか**」だけ。
+ *
+ * `changed` が動くのは**判断が変わったときだけ**（星・まとまりの手直し・
+ * 学習した基準・やり直し）。準備（指紋や表示用画像）では動かさない。
+ * 動かすと、見ただけで食い違い扱いになる。
+ */
+object SyncState {
+    private const val FILE = "sync"
+
+    private fun prefs(context: Context) =
+        context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+
+    fun seenAt(context: Context, projectId: String): Long =
+        prefs(context).getLong("$projectId-seenAt", -1L)
+
+    fun seenBy(context: Context, projectId: String): String =
+        prefs(context).getString("$projectId-seenBy", "") ?: ""
+
+    /** 端末側に、まだ共有していない判断があるか。 */
+    fun changed(context: Context, projectId: String): Boolean =
+        prefs(context).getBoolean("$projectId-dirty", false)
+
+    /** 判断が変わった。**ここでしか印を付けない。** */
+    fun touch(context: Context, projectId: String) {
+        prefs(context).edit().putBoolean("$projectId-dirty", true).apply()
+    }
+
+    /** 読んだ／書いた版を控える。**書けたときだけ呼ぶ。** */
+    fun saw(context: Context, projectId: String, updatedAt: Long, updatedBy: String) {
+        prefs(context).edit()
+            .putLong("$projectId-seenAt", updatedAt)
+            .putString("$projectId-seenBy", updatedBy)
+            .putBoolean("$projectId-dirty", false)
+            .apply()
+    }
+
+    fun clean(context: Context, projectId: String) {
+        prefs(context).edit().putBoolean("$projectId-dirty", false).apply()
+    }
+
+    fun forget(context: Context, projectId: String) {
+        val store = prefs(context)
+        val gone = store.all.keys.filter { it.startsWith("$projectId-") }
+        if (gone.isEmpty()) return
+        store.edit().apply { for (k in gone) remove(k) }.apply()
     }
 }

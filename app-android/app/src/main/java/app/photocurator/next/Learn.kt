@@ -83,6 +83,8 @@ object Learning {
 
     suspend fun save(context: Context, projectId: String, distance: Int) =
         withContext(Dispatchers.IO) {
+            // 人が答えて決めた基準も判断。**サイドカーへ渡すもの。**
+            SyncState.touch(context, projectId)
             try {
                 file(context, projectId)
                     .writeText(org.json.JSONObject().put("distance", distance).toString())

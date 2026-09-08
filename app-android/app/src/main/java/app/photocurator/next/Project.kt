@@ -131,5 +131,7 @@ object Projects {
         Store.clear(context, id)
         Overrides.clear(context, id)
         Learning.forget(context, id)
+        // **サイドカーは消さない。** 写真側の持ち物なので、端末の都合で消さない。
+        SyncState.forget(context, id)
     }
 }
