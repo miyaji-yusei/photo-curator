@@ -11,6 +11,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Lock
@@ -34,9 +35,13 @@ import kotlinx.coroutines.launch
  * 「いま何を見ているか」を常に 1 か所（出所タブ）で示す。
  * タブが下の一覧の出所と 1 対 1 になっていて、**切り替えたら必ず取り直す**。
  * これがずれると、別の場所のフォルダを選んだつもりで作ってしまう。
+ *
+ * **画面にする。シートにしない。** 下から出るシートだと、フォルダ一覧を
+ * 送ろうとした指がシートごと下へ動かして閉じてしまう。フォルダが多いほど
+ * 起きやすく、選び直しからやり直すことになる。
  */
 @Composable
-fun CreateSheet(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
+fun CreateScreen(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
@@ -98,20 +103,20 @@ fun CreateSheet(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
         }
     }
 
-    // **主ボタンを畳んだ高さの外に置かない。** 半開きだと「作成して準備を始める」
-    // が見えず、選んだのに次へ進めない画面になる。
-    val sheet = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    ModalBottomSheet(
-        onDismissRequest = onDismiss,
-        sheetState = sheet,
-        containerColor = Surface
+    Column(
+        Modifier
+            .fillMaxSize()
+            .windowInsetsPadding(WindowInsets.safeDrawing)
+            .padding(horizontal = 16.dp)
+            .padding(bottom = 16.dp)
     ) {
-        Column(Modifier.padding(horizontal = 16.dp).padding(bottom = 16.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("プロジェクトを作成", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.weight(1f))
-                IconButton(onClick = onDismiss) { Icon(Icons.Filled.Close, "閉じる") }
-            }
+        Row(Modifier.height(64.dp), verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onDismiss) { Icon(Icons.Filled.ArrowBack, "戻る") }
+            Spacer(Modifier.width(4.dp))
+            Text("プロジェクトを作成", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+        }
+        // 中身は残り全部を使う。**一覧が長いほど、送れる面積が要る。**
+        Column(Modifier.weight(1f)) {
 
             // ---- 出所タブ ----
             Row(
@@ -139,7 +144,7 @@ fun CreateSheet(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
                 }
             }
 
-            Row(Modifier.heightIn(max = 380.dp)) {
+            Row(Modifier.weight(1f)) {
                 // ---- 左: フォルダ一覧 ----
                 Column(Modifier.weight(1f)) {
                     Text(

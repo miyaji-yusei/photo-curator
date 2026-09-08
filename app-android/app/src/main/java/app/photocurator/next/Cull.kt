@@ -126,14 +126,29 @@ fun CullScreen(project: Project, onResults: () -> Unit, onBack: () -> Unit) {
 
         // **途中があれば続きから。** 無ければ新しく始める。
         val saved = Store.load(context, project.id)
-        session = saved ?: startRound(
-            refs,
-            groupSize = Prefs.groupSize(context).toUInt(),
-            targetStar = 0,
-            groupBursts = Prefs.groupBursts(context),
-            threshold = loadedThreshold,
-            overrides = loadedOverrides
-        )
+        val wantedSize = Prefs.groupSize(context)
+        val opened = when {
+            saved == null -> startRound(
+                refs,
+                groupSize = wantedSize.toUInt(),
+                targetStar = 0,
+                groupBursts = Prefs.groupBursts(context),
+                threshold = loadedThreshold,
+                overrides = loadedOverrides
+            )
+            // **続きから入るときも、開始前に選んだ枚数を効かせる。**
+            // 途中の session は前回の枚数を抱えているので、そのまま使うと
+            // 「4 枚に変えて開始したのに 2 枚で始まる」になる（実際に起きた）。
+            // 見終わった分は動かさない（core の resize）。
+            !saved.finished && saved.groupSize.toInt() != wantedSize ->
+                resize(saved, wantedSize.toUInt())
+            else -> saved
+        }
+        session = opened
+        // 組み直したなら**その場で控える**。ここで戻られても枚数が戻らないように。
+        if (saved != null && opened.groupSize != saved.groupSize) {
+            Store.save(context, project.id, opened)
+        }
         note = if (saved != null) "続きから" else ""
     }
 

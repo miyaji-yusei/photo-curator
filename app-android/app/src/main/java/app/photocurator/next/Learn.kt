@@ -65,6 +65,22 @@ object Learning {
             }
         }
 
+    /**
+     * 学習した基準を捨てる。**やり直しのときだけ。**
+     *
+     * ここを消さないと、一度答えた「同じ連写か」をもう二度と聞き直せない。
+     * まとめ方が気に入らなくてやり直したのに、同じ基準で同じまとめ方に
+     * なるので、やり直した意味が無くなる。
+     */
+    suspend fun forget(context: Context, projectId: String) = withContext(Dispatchers.IO) {
+        try {
+            file(context, projectId).delete()
+        } catch (error: Exception) {
+            Log.w(TAG, "基準を消せなかった: $projectId", error)
+        }
+        Unit
+    }
+
     suspend fun save(context: Context, projectId: String, distance: Int) =
         withContext(Dispatchers.IO) {
             try {

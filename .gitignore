@@ -28,9 +28,3 @@ src-tauri/gen/schemas/
 # UniFFI の生成物。バインディングはビルドで作るので追わない。
 core/bindings/
 core/target/
-
-# 端末に入れるために組んだ成果物。**リポジトリには置かない。**
-# 1 本 320MB あり、GitHub の 100MB 制限に引っかかって push できなくなる。
-# 実際に一度これで詰まり、履歴を積み直す羽目になった。
-build-out/
-*.apk

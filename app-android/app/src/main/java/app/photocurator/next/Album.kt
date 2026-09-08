@@ -505,12 +505,21 @@ fun ProjectScreen(
             title = "選別を最初からやり直しますか",
             // **何が消えるかを具体的に言う。**「よろしいですか」では判断できない。
             body = "これまでに付けた星と、どこまで見たかが消えます。" +
-                "連写の手直しは残ります。写真そのものには手を触れません。",
+                "連写のまとめ方（最初に答えた基準と、手で直した分）も消えるので、" +
+                "次に始めるときはもう一度「同じ連写ですか」から聞きます。" +
+                "写真そのものには手を触れません。",
             confirmLabel = "やり直す",
             // 原本には触らないので赤字は出さない。**赤を安売りしない。**
             onConfirm = {
                 confirmRestart = false
-                scope.launch { Store.clear(context, project.id); reloads += 1 }
+                scope.launch {
+                    Store.clear(context, project.id)
+                    // **基準と手直しも消す。** ここを残すと、やり直しても
+                    // 同じまとめ方になり、聞き直す道も無くなる。
+                    Learning.forget(context, project.id)
+                    Overrides.clear(context, project.id)
+                    reloads += 1
+                }
             },
             onDismiss = { confirmRestart = false }
         )
