@@ -132,6 +132,8 @@ fun LearnScreen(
     onDone: (List<Pair<Int, Boolean>>) -> Unit,
     onBack: () -> Unit
 ) {
+    val context = LocalContext.current
+    val displayEdge = remember(context) { Prefs.displayEdge(context) }
     var at by remember { mutableStateOf(0) }
     var answers by remember { mutableStateOf<List<Pair<Int, Boolean>>>(emptyList()) }
 
@@ -178,7 +180,7 @@ fun LearnScreen(
         Row(Modifier.weight(1f).padding(6.dp)) {
             for (ref in listOf(question.left, question.right)) {
                 Box(Modifier.weight(1f).fillMaxHeight().padding(3.dp)) {
-                    QuestionTile(byPath[ref.relativePath], ref.capturedAt)
+                    QuestionTile(byPath[ref.relativePath], ref.capturedAt, displayEdge)
                 }
             }
         }
@@ -213,7 +215,7 @@ fun LearnScreen(
 }
 
 @Composable
-private fun QuestionTile(photo: Photo?, capturedAt: Long?) {
+private fun QuestionTile(photo: Photo?, capturedAt: Long?, displayEdge: Int) {
     Box(
         Modifier.fillMaxSize().clip(RoundedCornerShape(8.dp)).background(Tile)
     ) {
@@ -224,7 +226,7 @@ private fun QuestionTile(photo: Photo?, capturedAt: Long?) {
         } else {
             AsyncImage(
                 model = ImageRequest.Builder(LocalContext.current)
-                    .data(photo.thumbModel).size(1280).build(),
+                    .data(photo.displayModel(displayEdge)).size(1280).build(),
                 contentDescription = photo.name,
                 imageLoader = Images.loader(LocalContext.current),
                 contentScale = ContentScale.Fit,

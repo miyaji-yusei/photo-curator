@@ -14,6 +14,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -46,6 +47,8 @@ fun BurstSheet(
     onSplit: () -> Unit,
     onDismiss: () -> Unit
 ) {
+    val context = LocalContext.current
+    val displayEdge = remember(context) { Prefs.displayEdge(context) }
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = Surface) {
         Column(Modifier.padding(horizontal = 16.dp).padding(bottom = 24.dp)) {
             Text(
@@ -92,7 +95,7 @@ fun BurstSheet(
                             } else {
                                 AsyncImage(
                                     model = ImageRequest.Builder(LocalContext.current)
-                                        .data(photo.fullModel).size(720).build(),
+                                        .data(photo.displayModel(displayEdge)).size(720).build(),
                                     contentDescription = photo.name,
                                     imageLoader = Images.loader(LocalContext.current),
                                     contentScale = ContentScale.Fit,

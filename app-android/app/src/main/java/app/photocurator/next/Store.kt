@@ -186,6 +186,20 @@ object Prefs {
             // どのチップも選ばれていない画面に落ちないよう、ここで丸める。
             .coerceIn(2, 4)
 
+    /**
+     * 表示用画像の長辺。**選別で見る絵の大きさ。**
+     * 標準 1024（2,000 枚で約 170MB）／大きく 1536（約 318MB）。
+     */
+    fun displayEdge(context: Context): Int =
+        context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+            .getInt("display_edge", 1024)
+            .coerceIn(768, 1920)
+
+    fun setDisplayEdge(context: Context, edge: Int) {
+        context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+            .edit().putInt("display_edge", edge.coerceIn(768, 1920)).apply()
+    }
+
     /** 連写を自動でまとめるか。既定 on。 */
     fun groupBursts(context: Context): Boolean =
         context.getSharedPreferences(FILE, Context.MODE_PRIVATE)

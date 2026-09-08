@@ -35,6 +35,7 @@ fun SettingsScreen(onBack: () -> Unit) {
     var groupSize by remember { mutableStateOf(Prefs.groupSize(context)) }
     var groupBursts by remember { mutableStateOf(Prefs.groupBursts(context)) }
     var askBeforeStart by remember { mutableStateOf(Prefs.askBeforeStart(context)) }
+    var displayEdge by remember { mutableStateOf(Prefs.displayEdge(context)) }
     val scope = rememberCoroutineScope()
     var nasList by remember { mutableStateOf<List<Nas>>(emptyList()) }
     // 編集中のつなぎ先。null で新規、Nas で既存。
@@ -110,6 +111,34 @@ fun SettingsScreen(onBack: () -> Unit) {
 
             Column(Modifier.weight(1f)) {
                 Panel {
+                    Text("表示用画像の既定", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                    Spacer(Modifier.height(4.dp))
+                    // **大きさと容量を並べて出す。** どちらか片方では選べない。
+                    Text(
+                        "選別で見る絵の大きさ。NAS の原本は 1 枚 6MB あるので、" +
+                            "準備のときに一度だけ読んで、この大きさで端末に残します。",
+                        fontSize = 11.sp, color = Faint
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        // 実測 1024px で 1 枚 約 80KB。2,000 枚で約 160MB。
+                        EdgeChip("標準 1024px", "2,000 枚で約 160MB", displayEdge == 1024) {
+                            displayEdge = 1024; Prefs.setDisplayEdge(context, 1024)
+                        }
+                        EdgeChip("大きく 1536px", "約 340MB", displayEdge == 1536) {
+                            displayEdge = 1536; Prefs.setDisplayEdge(context, 1536)
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "新しいプロジェクトに適用されます",
+                        fontSize = 11.sp, color = Faint
+                    )
+                }
+
+                Spacer(Modifier.height(16.dp))
+
+                Panel {
                     Text("選別の既定", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                     Spacer(Modifier.height(12.dp))
 
@@ -159,6 +188,27 @@ fun SettingsScreen(onBack: () -> Unit) {
             onDismiss = { adding = false; editing = null }
         )
     }
+}
+
+/** 大きさの選択。**容量を添える。** 数字だけでは選べない。 */
+@Composable
+private fun EdgeChip(label: String, note: String, selected: Boolean, onClick: () -> Unit) {
+    FilterChip(
+        selected = selected,
+        onClick = onClick,
+        label = {
+            Column {
+                Text(label, fontSize = 13.sp)
+                Text(
+                    note, fontSize = 10.sp,
+                    color = if (selected) Color.Black.copy(alpha = 0.7f) else Faint
+                )
+            }
+        },
+        colors = FilterChipDefaults.filterChipColors(
+            selectedContainerColor = Lime, selectedLabelColor = Color.Black
+        )
+    )
 }
 
 @Composable

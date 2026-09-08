@@ -45,15 +45,25 @@ data class Photo(
     val uri get() = ContentUris.withAppendedId(COLLECTION, id)
 
     /**
-     * 並べるときに Coil へ渡すもの。**NAS は EXIF の縮小画像を取りに行く。**
-     * 原本 6MB を網越しに引くと 2,000 枚で 12GB になる。
+     * 小さく並べるときの絵。**EXIF の縮小画像（160x120）。**
+     * 詳細の一覧と、まとまりの確認だけ。選別には使わない。
      */
     val thumbModel: Any
-        get() = smb?.let { SmbImage(it.nasId, it.path, full = false) } ?: uri
+        get() = smb?.let { SmbImage(it.nasId, it.path, SmbSize.Thumb) } ?: uri
 
-    /** 拡大して見るときに渡すもの。ここは原本を読む。 */
+    /**
+     * **選別と連写判定で見る絵。** 表示用画像（長辺 1024/1536）。
+     *
+     * 端末の写真は原本をそのまま渡す。手元のファイルなので、Coil が
+     * 要求した大きさでデコードすれば足りる。NAS は網越しなので、
+     * 準備のときに作って置いたものを使う。
+     */
+    fun displayModel(edge: Int): Any =
+        smb?.let { SmbImage(it.nasId, it.path, SmbSize.Display, edge) } ?: uri
+
+    /** 拡大して見るときの絵。原本。 */
     val fullModel: Any
-        get() = smb?.let { SmbImage(it.nasId, it.path, full = true) } ?: uri
+        get() = smb?.let { SmbImage(it.nasId, it.path, SmbSize.Full) } ?: uri
 }
 
 /** NAS の写真の指し先。**どの NAS の、どの道筋か。** */
