@@ -94,6 +94,16 @@ object Photos {
         found.values.sortedByDescending { it.count }
     }
 
+    /**
+     * 出所から写真を引く。**プロジェクトはここだけを通る。**
+     * 出所の種類が増えても、上の画面はこの 1 か所しか知らなくてよい。
+     */
+    suspend fun forSource(context: Context, source: Source): List<Photo> = when (source.kind) {
+        "album" -> photos(context, source.key)
+        // NAS はまだ繋げない。**空を返して黙るのではなく、呼ぶ側で理由を出す。**
+        else -> emptyList()
+    }
+
     /** あるアルバムの写真。**撮影時刻の昇順**で返す。 */
     suspend fun photos(context: Context, albumId: String): List<Photo> = withContext(Dispatchers.IO) {
         val (mimeWhere, mimeArgs) = mimeSelection()

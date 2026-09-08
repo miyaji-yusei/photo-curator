@@ -62,7 +62,7 @@ private fun gridFor(count: Int, landscape: Boolean): Pair<Int, Int> {
 }
 
 @Composable
-fun CullScreen(album: Album, onBack: () -> Unit) {
+fun CullScreen(project: Project, onBack: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
@@ -101,23 +101,23 @@ fun CullScreen(album: Album, onBack: () -> Unit) {
         BurstThreshold(windowMs = 4000, distance = 9u, dHashVersion = Analyse.VERSION)
     }
 
-    LaunchedEffect(album.id) {
+    LaunchedEffect(project.id) {
         note = "写真を読み込んでいます…"
-        photos = Photos.photos(context, album.id)
+        photos = Photos.forSource(context, project.source)
 
         // 指紋を作る。OS の縮小画像から作るので**原本を読まない**（1 枚 3.5ms）。
         // **前に作った分は作り直さない。** 開くたびに解析し直すと、
         // 何が起きているのか誰にも分からなくなる。
         note = "似た写真を調べています…"
-        val cached = Fingerprints.load(context, album.id)
+        val cached = Fingerprints.load(context, project.source.key)
         val prints = Analyse.fingerprints(
             context, photos, cached,
             onProgress = { done, total -> prepared = done to total },
             // 途中経過も書く。ここで戻られても作った分は残る。
-            onPartial = { Fingerprints.save(context, album.id, it) }
+            onPartial = { Fingerprints.save(context, project.source.key, it) }
         )
         // 変わっていなければ書かない。書く回数はそのまま壊れる機会になる。
-        if (prints != cached) Fingerprints.save(context, album.id, prints)
+        if (prints != cached) Fingerprints.save(context, project.source.key, prints)
 
         refs = photos.map {
             PhotoRef(
@@ -132,15 +132,15 @@ fun CullScreen(album: Album, onBack: () -> Unit) {
         photos.firstOrNull()?.let { Analyse.selfCheck(context, it) }
         Neighbours.log(refs, threshold)
 
-        overrides = Overrides.load(context, album.id)
+        overrides = Overrides.load(context, project.id)
 
         // **途中があれば続きから。** 無ければ新しく始める。
-        val saved = Store.load(context, album.id)
+        val saved = Store.load(context, project.id)
         session = saved ?: startRound(
             refs,
             groupSize = Prefs.groupSize(context).toUInt(),
             targetStar = 0,
-            groupBursts = true,
+            groupBursts = Prefs.groupBursts(context),
             threshold = threshold,
             overrides = overrides
         )
@@ -185,14 +185,14 @@ fun CullScreen(album: Album, onBack: () -> Unit) {
         selected = emptySet()
         // **複数モードは切らない。** 複数で選ぶ人はずっと複数で選ぶので、
         // 毎回押し直させるのは 1 グループにつき 1 タップ増えるのと同じ。
-        scope.launch { Store.save(context, album.id, next) }
+        scope.launch { Store.save(context, project.id, next) }
     }
 
     fun stepBack() {
         val next = undo(live)
         session = next
         selected = emptySet()
-        scope.launch { Store.save(context, album.id, next) }
+        scope.launch { Store.save(context, project.id, next) }
     }
 
     /**
@@ -209,8 +209,8 @@ fun CullScreen(album: Album, onBack: () -> Unit) {
         session = next
         selected = emptySet()
         scope.launch {
-            Overrides.save(context, album.id, merged)
-            Store.save(context, album.id, next)
+            Overrides.save(context, project.id, merged)
+            Store.save(context, project.id, next)
         }
     }
 
@@ -272,7 +272,7 @@ fun CullScreen(album: Album, onBack: () -> Unit) {
                         session = next
                         // 選ばれていた印は代表について回る。取り違えないよう外す。
                         selected = emptySet()
-                        scope.launch { Store.save(context, album.id, next) }
+                        scope.launch { Store.save(context, project.id, next) }
                     }
                     editingBurst = null
                 },
@@ -296,7 +296,7 @@ fun CullScreen(album: Album, onBack: () -> Unit) {
 
     Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
         CullBar(
-            album = album,
+            project = project,
             session = live,
             selectedCount = selected.size,
             multi = multi,
@@ -330,7 +330,7 @@ fun CullScreen(album: Album, onBack: () -> Unit) {
                 onNext = { next ->
                     session = next
                     selected = emptySet()
-                    scope.launch { Store.save(context, album.id, next) }
+                    scope.launch { Store.save(context, project.id, next) }
                 },
                 onBack = onBack
             )
@@ -382,7 +382,7 @@ fun CullScreen(album: Album, onBack: () -> Unit) {
 
 @Composable
 private fun CullBar(
-    album: Album,
+    project: Project,
     session: Session,
     selectedCount: Int,
     multi: Boolean,
@@ -425,7 +425,7 @@ private fun CullBar(
 
         Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
             if (session.finished) {
-                Text(album.name, fontSize = 13.sp)
+                Text(project.name, fontSize = 13.sp)
             } else {
                 Text(
                     "★${session.targetStar} を選別中 · ROUND ${session.round}",
