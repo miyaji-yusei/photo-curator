@@ -423,6 +423,92 @@ pub fn set_representative(session: Session, shown: String, wanted: String) -> Op
     Some(next)
 }
 
+/// まとめ方を変えて、いまのラウンドを組み直す。
+///
+/// **その場で組み直し、進んだ分は星として残す。** 手で直したのに次のラウンド
+/// まで何も変わらないのでは、「押したのに何も起きない」と同じことになる。
+///
+/// 組み直すのは**まだ判断していない写真だけ**。決めた写真は決めたまま置く。
+/// これで「どの写真も、決まっているか、これから出るか、どちらか一方」が保たれる。
+/// 全部を並べ直すと、決めた写真と未決の写真が同じまとまりに入ってしまい、
+/// 片方をもう一度見せるか、片方を黙って捨てるかしか選べなくなる。
+///
+/// 決めたまとまりの仲間は控えたまま残す。**戻すが効き続けるように。**
+/// 代表を手で選び直していたときは、顔ぶれが変わっていなければそのまま使う。
+pub fn regroup(
+    session: Session,
+    photos: Vec<PhotoRef>,
+    group_bursts_on: bool,
+    threshold: BurstThreshold,
+    overrides: Vec<PairOverride>,
+) -> Session {
+    let mut next = session;
+
+    // 決めた写真。history に出た代表の仲間まで含める。
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut kept_members: HashMap<String, Vec<String>> = HashMap::new();
+    for decision in &next.history {
+        for rep in &decision.group {
+            match next.members.get(rep) {
+                Some(mates) => {
+                    for mate in mates {
+                        seen.insert(mate.clone());
+                    }
+                    kept_members.insert(rep.clone(), mates.clone());
+                }
+                None => {
+                    seen.insert(rep.clone());
+                }
+            }
+        }
+    }
+
+    // 手で選んだ代表を覚えておく。顔ぶれが同じなら引き継ぐ。
+    let chosen_reps: HashMap<Vec<String>, String> = next
+        .members
+        .iter()
+        .map(|(rep, mates)| (mates.clone(), rep.clone()))
+        .collect();
+
+    let remaining: Vec<PhotoRef> = photos
+        .into_iter()
+        .filter(|photo| !seen.contains(&photo.relative_path))
+        .collect();
+
+    let (queue, mut members) = if group_bursts_on {
+        let groups = group_bursts(remaining, threshold, overrides);
+        let mut members = HashMap::new();
+        let mut queue = Vec::with_capacity(groups.len());
+        for group in groups {
+            // 顔ぶれが変わっていなければ、人が選んだ代表を尊重する。
+            let representative = chosen_reps
+                .get(&group.members)
+                .cloned()
+                .unwrap_or(group.representative);
+            queue.push(representative.clone());
+            if group.members.len() > 1 {
+                members.insert(representative, group.members);
+            }
+        }
+        (queue, members)
+    } else {
+        (
+            remaining
+                .iter()
+                .map(|photo| photo.relative_path.clone())
+                .collect(),
+            HashMap::new(),
+        )
+    };
+
+    members.extend(kept_members);
+    next.queue = queue;
+    next.members = members;
+    next.current = Vec::new();
+    fill(&mut next);
+    next
+}
+
 /// 次のラウンドへ。**前を通ったものだけが、星を持ったまま上がる。**
 ///
 /// 進めないときは None を返す。「まだ続けられます」と言っておいて
@@ -1104,5 +1190,116 @@ mod tests {
 
         let after = set_representative(session, "3.jpg".into(), "4.jpg".into()).unwrap();
         assert_eq!(after.queue, vec!["4.jpg"]);
+    }
+
+    // ---- まとめ直し ----
+
+    /// 1,2 が連写。3,4 は離れている。5,6 も連写。
+    fn regroup_photos() -> Vec<PhotoRef> {
+        vec![
+            photo("1.jpg", 0, "0000000000000000"),
+            photo("2.jpg", 1000, "0000000000000001"),
+            photo("3.jpg", 500_000, "ffffffffffffffff"),
+            photo("4.jpg", 900_000, "0f0f0f0f0f0f0f0f"),
+            photo("5.jpg", 1_400_000, "00ff00ff00ff00ff"),
+            photo("6.jpg", 1_401_000, "00ff00ff00ff00fe"),
+        ]
+    }
+
+    fn split(left: &str, right: &str) -> PairOverride {
+        PairOverride { left: left.into(), right: right.into(), decision: "split".into() }
+    }
+
+    fn join(left: &str, right: &str) -> PairOverride {
+        PairOverride { left: left.into(), right: right.into(), decision: "join".into() }
+    }
+
+    #[test]
+    fn まとまりを解くとその場で組が増える() {
+        let photos = regroup_photos();
+        let session = start_round(photos.clone(), 2, 0, true, threshold(), vec![]);
+        // 1+2 / 3 / 4 / 5+6 の 4 組
+        assert_eq!(session.queue.len() + session.current.len(), 4);
+
+        let after = regroup(session, photos, true, threshold(), vec![split("1.jpg", "2.jpg")]);
+        // 1 / 2 / 3 / 4 / 5+6 の 5 組
+        assert_eq!(after.queue.len() + after.current.len(), 5);
+        assert!(!after.members.contains_key("1.jpg"));
+    }
+
+    #[test]
+    fn 繋ぐとその場で組が減る() {
+        let photos = regroup_photos();
+        let session = start_round(photos.clone(), 2, 0, true, threshold(), vec![]);
+        let after = regroup(session, photos, true, threshold(), vec![join("3.jpg", "4.jpg")]);
+        assert_eq!(after.queue.len() + after.current.len(), 3);
+        assert_eq!(after.members["3.jpg"], vec!["3.jpg", "4.jpg"]);
+    }
+
+    #[test]
+    fn 組み直しても決めた写真は出てこない() {
+        let photos = regroup_photos();
+        let session = start_round(photos.clone(), 2, 0, true, threshold(), vec![]);
+        // 1+2 と 3 の組を確定して先へ進む。
+        assert_eq!(session.current, vec!["1.jpg", "3.jpg"]);
+        let session = advance(session, vec!["1.jpg".into()]);
+
+        let after = regroup(session, photos, true, threshold(), vec![join("5.jpg", "6.jpg")]);
+        let showing: Vec<String> = after.current.iter().chain(after.queue.iter()).cloned().collect();
+        // **決めた 1,2,3 はもう出ない。** 残りは 4 と 5+6。
+        assert!(!showing.contains(&"1.jpg".to_string()));
+        assert!(!showing.contains(&"2.jpg".to_string()));
+        assert!(!showing.contains(&"3.jpg".to_string()));
+        assert_eq!(showing, vec!["4.jpg", "5.jpg"]);
+    }
+
+    #[test]
+    fn 組み直しても星は残る() {
+        let photos = regroup_photos();
+        let session = start_round(photos.clone(), 2, 0, true, threshold(), vec![]);
+        let session = advance(session, vec!["1.jpg".into()]);
+        assert_eq!(session.ratings["1.jpg"], 1);
+        assert_eq!(session.ratings["2.jpg"], 1);
+
+        let after = regroup(session, photos, true, threshold(), vec![split("5.jpg", "6.jpg")]);
+        // **進んだ分は星として残る。** これが「その場で組み直す」の要点。
+        assert_eq!(after.ratings["1.jpg"], 1);
+        assert_eq!(after.ratings["2.jpg"], 1);
+        assert_eq!(after.survivors, vec!["1.jpg"]);
+    }
+
+    #[test]
+    fn 組み直しても決めた分は戻せる() {
+        let photos = regroup_photos();
+        let session = start_round(photos.clone(), 2, 0, true, threshold(), vec![]);
+        let session = advance(session, vec!["1.jpg".into()]);
+
+        let after = regroup(session, photos, true, threshold(), vec![split("5.jpg", "6.jpg")]);
+        // 決めたまとまりの仲間を控えているので、戻すと星も正しく戻る。
+        let undone = undo(after);
+        assert_eq!(undone.ratings["1.jpg"], 0);
+        assert_eq!(undone.ratings["2.jpg"], 0);
+        assert!(undone.survivors.is_empty());
+    }
+
+    #[test]
+    fn 手で選んだ代表は顔ぶれが同じなら残る() {
+        let photos = regroup_photos();
+        let session = start_round(photos.clone(), 2, 0, true, threshold(), vec![]);
+        let session = set_representative(session, "1.jpg".into(), "2.jpg".into()).unwrap();
+
+        // 別のところを切っても、1+2 の顔ぶれは変わらない。
+        let after = regroup(session, photos, true, threshold(), vec![split("5.jpg", "6.jpg")]);
+        assert!(after.members.contains_key("2.jpg"));
+        assert!(after.current.contains(&"2.jpg".to_string()));
+    }
+
+    #[test]
+    fn 組み直しはラウンドと星の段を動かさない() {
+        let photos = regroup_photos();
+        let session = start_round(photos.clone(), 2, 2, true, threshold(), vec![]);
+        let after = regroup(session, photos, true, threshold(), vec![split("1.jpg", "2.jpg")]);
+        assert_eq!(after.round, 1);
+        assert_eq!(after.target_star, 2);
     }
 }

@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import uniffi.photo_curator_core.PairOverride
 import uniffi.photo_curator_core.Session
 import uniffi.photo_curator_core.sessionFromJson
 import uniffi.photo_curator_core.sessionToJson
@@ -171,5 +172,73 @@ object Prefs {
             .edit()
             .putInt(GROUP_SIZE, size.coerceIn(2, 10))
             .apply()
+    }
+}
+
+/**
+ * 人が手で直したまとめ方。**基準より優先され、基準を変えても残る。**
+ *
+ * 持つのは「この 2 枚のあいだを繋ぐか切るか」だけ。まとまりそのものは
+ * そこから導く。まとまりを直接持つと、写真が増減したときに指し先を失う。
+ */
+object Overrides {
+    private const val TAG = "Overrides"
+
+    private fun file(context: Context, albumId: String) =
+        File(context.filesDir, "overrides-$albumId.json")
+
+    suspend fun load(context: Context, albumId: String): List<PairOverride> =
+        withContext(Dispatchers.IO) {
+            val target = file(context, albumId)
+            if (!target.exists()) return@withContext emptyList()
+            try {
+                val array = org.json.JSONArray(target.readText())
+                (0 until array.length()).map { at ->
+                    val entry = array.getJSONObject(at)
+                    PairOverride(
+                        left = entry.getString("l"),
+                        right = entry.getString("r"),
+                        decision = entry.getString("d")
+                    )
+                }
+            } catch (error: Exception) {
+                // 読めないものは無かったことにする。**中途半端に読まない。**
+                Log.w(TAG, "手直しを読めなかった: $albumId", error)
+                emptyList()
+            }
+        }
+
+    suspend fun save(context: Context, albumId: String, list: List<PairOverride>) =
+        withContext(Dispatchers.IO) {
+            try {
+                val array = org.json.JSONArray()
+                for (item in list) {
+                    array.put(
+                        org.json.JSONObject()
+                            .put("l", item.left)
+                            .put("r", item.right)
+                            .put("d", item.decision)
+                    )
+                }
+                val target = file(context, albumId)
+                val temporary = File(target.parentFile, "${target.name}.writing")
+                temporary.writeText(array.toString())
+                if (!temporary.renameTo(target)) {
+                    temporary.copyTo(target, overwrite = true)
+                    temporary.delete()
+                }
+                Unit
+            } catch (error: Exception) {
+                Log.w(TAG, "手直しを保存できなかった: $albumId", error)
+            }
+        }
+
+    /**
+     * 新しい指定を足す。**同じ境目には答えを 1 つしか持たない。**
+     * 2 つあると、どちらが効いているのか誰にも説明できなくなる。
+     */
+    fun merged(existing: List<PairOverride>, added: List<PairOverride>): List<PairOverride> {
+        val replaced = added.associateBy { it.left to it.right }
+        return existing.filterNot { (it.left to it.right) in replaced } + added
     }
 }
