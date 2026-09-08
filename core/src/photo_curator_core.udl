@@ -41,6 +41,10 @@ namespace photo_curator_core {
     // 直前の判断を取り消す。星も戻る。
     Session undo(Session session);
 
+    // 連写のまとまりで、画面に出す 1 枚を選び直す。星は動かさない。
+    // 選び直せないとき（まとまりでない・仲間でない・もう見終わった）は null。
+    Session? set_representative(Session session, string shown, string wanted);
+
     // 次のラウンドへ。**進めないときは null。** 通ったものが 2 枚未満か、
     // 星が上限に達しているとき。
     Session? next_round(
