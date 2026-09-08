@@ -120,6 +120,8 @@ private fun App() {
 
                 is Screen.Cull -> CullScreen(
                     project = here.project,
+                    // ラウンド完了から結果へ直行できるように。
+                    onResults = { screen = Screen.Results(here.project, -1) },
                     // **選別から戻る先はプロジェクト詳細。** 一覧まで飛ばすと、
                     // いま何枚残ったのかを確かめる前に見失う。
                     onBack = { screen = Screen.Detail(here.project) }
