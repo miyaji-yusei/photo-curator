@@ -45,6 +45,16 @@ namespace photo_curator_core {
     // 選び直せないとき（まとまりでない・仲間でない・もう見終わった）は null。
     Session? set_representative(Session session, string shown, string wanted);
 
+    // まとめ方を変えて、いまのラウンドを組み直す。**その場で反映する。**
+    // 組み直すのはまだ判断していない写真だけ。決めた分は星として残る。
+    Session regroup(
+        Session session,
+        sequence<PhotoRef> photos,
+        boolean group_bursts,
+        BurstThreshold threshold,
+        sequence<PairOverride> overrides
+    );
+
     // 次のラウンドへ。**進めないときは null。** 通ったものが 2 枚未満か、
     // 星が上限に達しているとき。
     Session? next_round(

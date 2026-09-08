@@ -43,6 +43,7 @@ fun BurstSheet(
     byPath: Map<String, Photo>,
     onPick: (String) -> Unit,
     onZoom: (Photo) -> Unit,
+    onSplit: () -> Unit,
     onDismiss: () -> Unit
 ) {
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = Surface) {
@@ -108,11 +109,17 @@ fun BurstSheet(
                 }
             }
 
-            Text(
-                "長押しで大きく見られます",
-                fontSize = 11.sp, color = Faint,
-                modifier = Modifier.padding(top = 12.dp)
-            )
+            Row(
+                Modifier.fillMaxWidth().padding(top = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("長押しで大きく見られます", fontSize = 11.sp, color = Faint)
+                Spacer(Modifier.weight(1f))
+                // まとめ方が違っていたとき用。**その場で組み直る。**
+                TextButton(onClick = onSplit) {
+                    Text("まとまりを解く", fontSize = 13.sp)
+                }
+            }
         }
     }
 }

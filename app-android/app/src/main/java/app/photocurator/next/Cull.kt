@@ -36,7 +36,9 @@ import uniffi.photo_curator_core.BurstThreshold
 import uniffi.photo_curator_core.PhotoRef
 import uniffi.photo_curator_core.Session
 import uniffi.photo_curator_core.advance
+import uniffi.photo_curator_core.PairOverride
 import uniffi.photo_curator_core.nextRound
+import uniffi.photo_curator_core.regroup
 import uniffi.photo_curator_core.setRepresentative
 import uniffi.photo_curator_core.startRound
 import uniffi.photo_curator_core.undo
@@ -78,6 +80,8 @@ fun CullScreen(album: Album, onBack: () -> Unit) {
     var zooming by remember { mutableStateOf<Photo?>(null) }
     // 開いている連写のまとまり（代表の相対パス）。
     var editingBurst by remember { mutableStateOf<String?>(null) }
+    // 人が手で直したまとめ方。**基準より優先される。**
+    var overrides by remember { mutableStateOf<List<PairOverride>>(emptyList()) }
 
     // 相対パスから写真を引く。core は相対パスしか知らない。
     val byPath = remember(photos) { photos.associateBy { it.relativePath } }
@@ -128,6 +132,8 @@ fun CullScreen(album: Album, onBack: () -> Unit) {
         photos.firstOrNull()?.let { Analyse.selfCheck(context, it) }
         Neighbours.log(refs, threshold)
 
+        overrides = Overrides.load(context, album.id)
+
         // **途中があれば続きから。** 無ければ新しく始める。
         val saved = Store.load(context, album.id)
         session = saved ?: startRound(
@@ -136,7 +142,7 @@ fun CullScreen(album: Album, onBack: () -> Unit) {
             targetStar = 0,
             groupBursts = true,
             threshold = threshold,
-            overrides = emptyList()
+            overrides = overrides
         )
         note = if (saved != null) "続きから" else ""
     }
@@ -189,6 +195,66 @@ fun CullScreen(album: Album, onBack: () -> Unit) {
         scope.launch { Store.save(context, album.id, next) }
     }
 
+    /**
+     * まとめ方を直して、**その場で組み直す。**
+     *
+     * 次のラウンドまで待たせると「押したのに何も起きない」と同じになる。
+     * 決めた写真はそのまま、進んだ分は星として残る（core の regroup）。
+     */
+    fun applyOverrides(added: List<PairOverride>) {
+        if (added.isEmpty()) return
+        val merged = Overrides.merged(overrides, added)
+        overrides = merged
+        val next = regroup(live, refs, true, threshold, merged)
+        session = next
+        selected = emptySet()
+        scope.launch {
+            Overrides.save(context, album.id, merged)
+            Store.save(context, album.id, next)
+        }
+    }
+
+    /** まとまりの中の隣どうしを全部切る。 */
+    fun splitBurst(rep: String) {
+        val mates = live.members[rep] ?: return
+        applyOverrides(
+            mates.zipWithNext().map { (left, right) ->
+                PairOverride(left = left, right = right, decision = "split")
+            }
+        )
+    }
+
+    /**
+     * いま選んでいる代表どうしを 1 つのまとまりにする。
+     *
+     * **繋げるのは画面で隣り合っているものだけ。** 代表は撮影順に並んでいるので、
+     * 隣り合う代表の境目は「前のまとまりの最後」と「次のまとまりの最初」になる。
+     * 飛び石で繋ぐと、あいだの写真がどちらに属するのか説明できなくなる。
+     */
+    fun joinSelected() {
+        val order = live.current.withIndex().filter { it.value in selected }.map { it.index }
+        if (order.size < 2) return
+        if (order.last() - order.first() != order.size - 1) return
+        val reps = order.map { live.current[it] }
+        applyOverrides(
+            reps.zipWithNext().map { (left, right) ->
+                PairOverride(
+                    // まとまりの端どうしを繋ぐ。代表は先頭とは限らないので、
+                    // 仲間の並び（撮影順）から取る。
+                    left = live.members[left]?.last() ?: left,
+                    right = live.members[right]?.first() ?: right,
+                    decision = "join"
+                )
+            }
+        )
+    }
+
+    /** 隣り合う 2 つ以上を選んでいるか。**繋げるときだけボタンを出す。** */
+    val canJoin = run {
+        val order = live.current.withIndex().filter { it.value in selected }.map { it.index }
+        order.size >= 2 && order.last() - order.first() == order.size - 1
+    }
+
     // 連写のまとまりを開いているとき。**選び直しても星は動かない**ので、
     // 保存はするが判断としては何も進めない。
     editingBurst?.let { rep ->
@@ -214,6 +280,10 @@ fun CullScreen(album: Album, onBack: () -> Unit) {
                     editingBurst = null
                     zooming = photo
                 },
+                onSplit = {
+                    editingBurst = null
+                    splitBurst(rep)
+                },
                 onDismiss = { editingBurst = null }
             )
         }
@@ -234,6 +304,8 @@ fun CullScreen(album: Album, onBack: () -> Unit) {
             onUndo = { stepBack() },
             onToggleMulti = { multi = !multi; selected = emptySet() },
             onClear = { selected = emptySet() },
+            canJoin = canJoin,
+            onJoin = { joinSelected() },
             onCommit = { commit(selected) }
         )
 
@@ -250,7 +322,7 @@ fun CullScreen(album: Album, onBack: () -> Unit) {
             // **進めるかどうかを、聞かれる前に確かめておく。**
             // 「次へ」を出しておいて何も起きない画面が、一番信用を失う。
             val upcoming = remember(live, refs) {
-                nextRound(live, refs, true, threshold, emptyList())
+                nextRound(live, refs, true, threshold, overrides)
             }
             RoundDone(
                 session = live,
@@ -318,6 +390,8 @@ private fun CullBar(
     onUndo: () -> Unit,
     onToggleMulti: () -> Unit,
     onClear: () -> Unit,
+    canJoin: Boolean,
+    onJoin: () -> Unit,
     onCommit: () -> Unit
 ) {
     Row(
@@ -340,6 +414,12 @@ private fun CullBar(
             )
             if (multi && selectedCount > 0) {
                 TextButton(onClick = onClear) { Text("解除", fontSize = 12.sp) }
+            }
+            // 隣り合う代表を選んでいるときだけ。**繋げないときは出さない。**
+            if (canJoin) {
+                TextButton(onClick = onJoin) {
+                    Text("ひとまとまりにする", fontSize = 12.sp, color = Lime)
+                }
             }
         }
 
