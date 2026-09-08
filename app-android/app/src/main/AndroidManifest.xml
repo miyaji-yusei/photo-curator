@@ -15,8 +15,9 @@
         android:maxSdkVersion="32" />
 
     <application
-        android:label="Photo Curator Next"
-        android:icon="@android:drawable/ic_menu_gallery"
+        android:label="Photo Curator"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.PhotoCurator">
         <activity

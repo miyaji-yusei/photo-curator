@@ -434,3 +434,57 @@ object Trouble {
         Unit
     }
 }
+
+/**
+ * ラウンドに掛かった時間を測る。**手が止まっていた時間は数えない。**
+ *
+ * 開始から完了までの時計をそのまま出すと、途中で寝て翌朝続けたときに
+ * 「所要 9 時間」になる。それは所要時間ではない。**確定と確定のあいだ**を
+ * 足し、間が開きすぎたところ（5 分以上）はそこで手が止まっていたとみなして
+ * 数えない。
+ */
+object Timing {
+    private const val TAG = "Timing"
+
+    /** これ以上空いたら「見ていなかった」とみなす。 */
+    private const val IDLE_MS = 5 * 60 * 1000L
+
+    private fun prefs(context: Context) =
+        context.getSharedPreferences("timing", Context.MODE_PRIVATE)
+
+    private fun key(projectId: String, round: UInt) = "$projectId-$round"
+
+    /** 1 回確定するたびに呼ぶ。前回からの間を足す。 */
+    fun tick(context: Context, projectId: String, round: UInt) {
+        val store = prefs(context)
+        val at = key(projectId, round)
+        val now = System.currentTimeMillis()
+        val last = store.getLong("$at-last", 0L)
+        val sum = store.getLong("$at-sum", 0L)
+        val gap = if (last > 0) now - last else 0L
+        val added = if (gap in 1..IDLE_MS) gap else 0L
+        store.edit().putLong("$at-last", now).putLong("$at-sum", sum + added).apply()
+    }
+
+    /** そのラウンドに掛かった時間（ミリ秒）。まだ何も測っていなければ 0。 */
+    fun spent(context: Context, projectId: String, round: UInt): Long =
+        prefs(context).getLong("${key(projectId, round)}-sum", 0L)
+
+    /** やり直したときは全部捨てる。 */
+    fun clear(context: Context, projectId: String) {
+        val store = prefs(context)
+        val gone = store.all.keys.filter { it.startsWith("$projectId-") }
+        if (gone.isEmpty()) return
+        store.edit().apply { for (k in gone) remove(k) }.apply()
+    }
+
+    /** 「9 分 40 秒」。**1 分未満は秒だけ、1 時間を超えたら時間と分。** */
+    fun describe(ms: Long): String {
+        val seconds = ms / 1000
+        return when {
+            seconds < 60 -> "$seconds 秒"
+            seconds < 3600 -> "${seconds / 60} 分 ${seconds % 60} 秒"
+            else -> "${seconds / 3600} 時間 ${(seconds % 3600) / 60} 分"
+        }
+    }
+}

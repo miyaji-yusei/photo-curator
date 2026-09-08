@@ -59,6 +59,8 @@ fun ResultsScreen(project: Project, star: Int, onBack: () -> Unit) {
     var members by remember { mutableStateOf<Map<String, List<String>>>(emptyMap()) }
     // 星チップの選択。-1 で来たら「すべて」から始める。
     var filter by remember { mutableStateOf(if (star >= 0) "star:$star" else "all") }
+    // 並べ替え。**既定は星が高い順**（結果を見に来る理由がそれ）。
+    var sort by remember { mutableStateOf("star") }
     var picked by remember { mutableStateOf<Set<String>>(emptySet()) }
     var selecting by remember { mutableStateOf(false) }
     var note by remember { mutableStateOf<String?>(null) }
@@ -119,13 +121,32 @@ fun ResultsScreen(project: Project, star: Int, onBack: () -> Unit) {
     for (photo in photos) counts[(ratings[photo.relativePath] ?: 0).coerceIn(0, 5)] += 1
     val atLeastOne = photos.count { (ratings[it.relativePath] ?: 0) > 0 }
 
-    val shown = when {
-        filter == "all" -> photos
-        filter == "atLeast1" -> photos.filter { (ratings[it.relativePath] ?: 0) > 0 }
+    // 連写の仲間は代表に畳む。**同じ組が 5 枚並ぶと、何を見ればいいのか分からない。**
+    // 中身は代表をタップして burst-review で見る。
+    val folded = remember(photos, members) {
+        val mates = members.entries
+            .filter { it.value.size > 1 }
+            .flatMap { entry -> entry.value.filter { it != entry.key } }
+            .toSet()
+        photos.filter { it.relativePath !in mates }
+    }
+
+    val picking = when {
+        filter == "all" -> folded
+        filter == "atLeast1" -> folded.filter { (ratings[it.relativePath] ?: 0) > 0 }
         else -> {
             val want = filter.removePrefix("star:").toIntOrNull() ?: 0
-            photos.filter { (ratings[it.relativePath] ?: 0) == want }
+            folded.filter { (ratings[it.relativePath] ?: 0) == want }
         }
+    }
+
+    // **並べ替えは見せ方だけ。** 星も順番もここでは動かさない。
+    val shown = remember(picking, sort, ratings) {
+        if (sort == "time") picking.sortedWith(compareBy({ it.takenAt }, { it.relativePath }))
+        else picking.sortedWith(
+            compareByDescending<Photo> { ratings[it.relativePath] ?: 0 }
+                .thenBy { it.takenAt }.thenBy { it.relativePath }
+        )
     }
     val targets = if (picked.isEmpty()) shown else shown.filter { it.relativePath in picked }
     val targetLabel = if (picked.isEmpty()) {
@@ -211,7 +232,11 @@ fun ResultsScreen(project: Project, star: Int, onBack: () -> Unit) {
 
         Column(Modifier.padding(horizontal = 16.dp)) {
             // ---- 星チップ ----
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 StarChip("すべて ${photos.size}", filter == "all") { filter = "all"; picked = emptySet() }
                 if (atLeastOne > 0) {
                     StarChip("★1 以上 $atLeastOne", filter == "atLeast1") {
@@ -224,6 +249,10 @@ fun ResultsScreen(project: Project, star: Int, onBack: () -> Unit) {
                         filter = "star:$value"; picked = emptySet()
                     }
                 }
+                Spacer(Modifier.weight(1f))
+                // **並べ替えは 2 つだけ。** 星で選んだのか、撮った順で見たいのか。
+                StarChip("星が高い順", sort == "star") { sort = "star" }
+                StarChip("撮影順", sort == "time") { sort = "time" }
             }
 
             // ---- 星の内訳バー ----

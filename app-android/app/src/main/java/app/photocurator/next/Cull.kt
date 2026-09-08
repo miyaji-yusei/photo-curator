@@ -185,6 +185,8 @@ fun CullScreen(project: Project, onResults: () -> Unit, onBack: () -> Unit) {
 
     /** 確定して次へ。**確定のたびに保存する。どこで止めても失わない。** */
     fun commit(picked: Set<String>) {
+        // 手を動かした分だけ時間を足す（間が開いた分は数えない）。
+        Timing.tick(context, project.id, live.round)
         val next = advance(live, picked.toList())
         session = next
         selected = emptySet()
@@ -198,6 +200,7 @@ fun CullScreen(project: Project, onResults: () -> Unit, onBack: () -> Unit) {
      * 以降のラウンドには出ない。1 つ戻すで元の星に返る（判断は core）。
      */
     fun keepTop(path: String) {
+        Timing.tick(context, project.id, live.round)
         val next = keepTop(live, path)
         session = next
         selected = emptySet()
@@ -469,6 +472,7 @@ fun CullScreen(project: Project, onResults: () -> Unit, onBack: () -> Unit) {
             RoundDone(
                 session = live,
                 upcoming = upcoming,
+                spentMs = Timing.spent(context, project.id, live.round),
                 onNext = { next ->
                     session = next
                     selected = emptySet()
@@ -763,6 +767,8 @@ private fun RoundButton(
 private fun RoundDone(
     session: Session,
     upcoming: Session?,
+    /** このラウンドに掛かった時間。0 なら出さない。 */
+    spentMs: Long,
     onNext: (Session) -> Unit,
     onResults: () -> Unit,
     onBack: () -> Unit
@@ -794,6 +800,14 @@ private fun RoundDone(
                 else "$seen 枚から $keptPhotos 枚に絞られました（$kept 組にまとめて選びました）。",
                 fontSize = 13.sp, color = Faint, modifier = Modifier.padding(top = 6.dp)
             )
+            // **掛かった時間を出す。** 次のラウンドをやるかどうかの判断材料。
+            // 手が止まっていた分は数えていない（Timing）。
+            if (spentMs > 0) {
+                Text(
+                    "所要 ${Timing.describe(spentMs)}",
+                    fontSize = 13.sp, color = Faint, modifier = Modifier.padding(top = 2.dp)
+                )
+            }
 
             // ---- 星の内訳。**どこに溜まったかを 1 本の帯で。** ----
             Spacer(Modifier.height(18.dp))

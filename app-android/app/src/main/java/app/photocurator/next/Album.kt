@@ -65,6 +65,10 @@ fun ProjectScreen(
     var rescan by remember { mutableStateOf(false) }
     // 開始前の確認を出しているか。**初回は必ず出す。**
     var starting by remember { mutableStateOf(false) }
+    // 「…」から開くもの。
+    var renaming by remember { mutableStateOf(false) }
+    var technical by remember { mutableStateOf(false) }
+    var removing by remember { mutableStateOf(false) }
     // 準備でつまずいたこと。（人の言葉, 技術文言）。**詳細は開いたときだけ出す。**
     var trouble by remember { mutableStateOf<Pair<String, String>?>(null) }
     var troubleDetail by remember { mutableStateOf(false) }
@@ -467,8 +471,13 @@ fun ProjectScreen(
                         menu = false; choosingEdge = true
                     }
                 }
+                DetailMenuRow("名前を変更") { menu = false; renaming = true }
+                DetailMenuRow("技術情報") { menu = false; technical = true }
                 DetailMenuRow("選別を最初からやり直す", danger = true) {
                     menu = false; confirmRestart = true
+                }
+                DetailMenuRow("このプロジェクトを削除", danger = true) {
+                    menu = false; removing = true
                 }
             }
         }
@@ -500,6 +509,78 @@ fun ProjectScreen(
         }
     }
 
+    if (renaming) {
+        var text by remember { mutableStateOf(project.name) }
+        AlertDialog(
+            onDismissRequest = { renaming = false },
+            title = { Text("名前を変更") },
+            text = {
+                OutlinedTextField(
+                    value = text, onValueChange = { text = it },
+                    singleLine = true, label = { Text("プロジェクト名") }
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val wanted = text.trim()
+                    renaming = false
+                    // **空にはしない。** 名前が無いカードは探せない。
+                    if (wanted.isNotEmpty()) scope.launch {
+                        Projects.rename(context, project.id, wanted)
+                        reloads += 1
+                    }
+                }) { Text("変える") }
+            },
+            dismissButton = { TextButton(onClick = { renaming = false }) { Text("やめる") } }
+        )
+    }
+
+    if (technical) {
+        AlertDialog(
+            onDismissRequest = { technical = false },
+            title = { Text("技術情報") },
+            // **生の指し先はここだけ。** 普段の画面は人の言葉で通す。
+            text = {
+                Text(
+                    """
+                        ID: ${project.id}
+                        出所: ${project.source.technical}
+                        写真: ${photos.size} 枚 / 指紋 ${prints.size} 枚
+                        表示用画像: ${rendering.first} / ${rendering.second}（${displayEdge}px）
+                    """.trimIndent(),
+                    fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                    fontSize = 12.sp
+                )
+            },
+            confirmButton = { TextButton(onClick = { technical = false }) { Text("閉じる") } }
+        )
+    }
+
+    if (removing) {
+        // **消える容量を言う。** 「よろしいですか」では判断できない。
+        val bytes = remember(project.id) {
+            if (project.source.kind == "nas") {
+                Renders.bytes(context, project.source.key.substringBefore("|"))
+            } else 0L
+        }
+        ConfirmDialog(
+            title = "「${project.name}」を削除しますか",
+            body = "このプロジェクトで付けた星・連写のまとめ方・どこまで見たかが消えます。" +
+                (if (bytes > 0) "端末に置いた表示用画像 ${bytes / 1024 / 1024}MB も消します。" else "") +
+                "写真そのものには手を触れません。",
+            confirmLabel = "削除",
+            onConfirm = {
+                removing = false
+                scope.launch {
+                    Projects.remove(context, project.id)
+                    Timing.clear(context, project.id)
+                    onBack()
+                }
+            },
+            onDismiss = { removing = false }
+        )
+    }
+
     if (confirmRestart) {
         ConfirmDialog(
             title = "選別を最初からやり直しますか",
@@ -518,6 +599,7 @@ fun ProjectScreen(
                     // 同じまとめ方になり、聞き直す道も無くなる。
                     Learning.forget(context, project.id)
                     Overrides.clear(context, project.id)
+                    Timing.clear(context, project.id)
                     reloads += 1
                 }
             },
