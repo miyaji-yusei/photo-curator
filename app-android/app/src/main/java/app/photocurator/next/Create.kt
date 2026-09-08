@@ -14,6 +14,8 @@ import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -45,12 +47,23 @@ fun CreateSheet(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
     var note by remember { mutableStateOf("読み込み中…") }
     var chosen by remember { mutableStateOf<Album?>(null) }
     var name by remember { mutableStateOf("") }
+    // 登録ずみの NAS。タブはここから作る。
+    var nasList by remember { mutableStateOf<List<Nas>>(emptyList()) }
+    var folders by remember { mutableStateOf<List<SmbFolder>>(emptyList()) }
+    var chosenFolder by remember { mutableStateOf<SmbFolder?>(null) }
+    // パスワードを聞く必要があるつなぎ先。**保存していない人のための道。**
+    var asking by remember { mutableStateOf<Nas?>(null) }
+
+    LaunchedEffect(Unit) { nasList = NasStore.all(context) }
 
     // **タブが変わったら必ず取り直す。** 前のタブの一覧が残っていると、
     // 見出しと中身が食い違う。
-    LaunchedEffect(tab) {
+    LaunchedEffect(tab, nasList) {
         albums = emptyList()
+        folders = emptyList()
         chosen = null
+        chosenFolder = null
+        name = ""
         note = "読み込み中…"
         if (tab == "album") {
             albums = Photos.albums(context)
@@ -59,8 +72,29 @@ fun CreateSheet(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
                 .map { it.source.key }
                 .toSet()
             note = if (albums.isEmpty()) "この端末に写真のフォルダがありません" else ""
-        } else {
-            note = "NAS はまだ繋げません"
+            return@LaunchedEffect
+        }
+
+        val nas = nasList.firstOrNull { it.id == tab } ?: return@LaunchedEffect
+        val password = Session.password(context, nas)
+        if (password == null) {
+            // **黙って空にしない。** 何が足りないのかを言って、入れる道を出す。
+            note = "パスワードが要ります"
+            asking = nas
+            return@LaunchedEffect
+        }
+        note = "${nas.label} に接続しています…"
+        when (val answer = Smb.folders(nas, password)) {
+            is SmbResult.Ok -> {
+                folders = answer.value
+                taken = Projects.all(context)
+                    .filter { it.source.kind == "nas" }
+                    .map { it.source.key }
+                    .toSet()
+                note = if (folders.isEmpty())
+                    "${nas.share} に写真のフォルダがありません" else ""
+            }
+            is SmbResult.Failed -> note = answer.reason
         }
     }
 
@@ -92,21 +126,25 @@ fun CreateSheet(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
                         selectedContainerColor = Lime, selectedLabelColor = Color.Black
                     )
                 )
-                FilterChip(
-                    selected = tab == "nas",
-                    onClick = { tab = "nas" },
-                    label = { Text("NAS を追加", fontSize = 13.sp) },
-                    colors = FilterChipDefaults.filterChipColors(
-                        selectedContainerColor = Lime, selectedLabelColor = Color.Black
+                for (nas in nasList) {
+                    FilterChip(
+                        selected = tab == nas.id,
+                        onClick = { tab = nas.id },
+                        // **人の言葉で。** 「home-nas · Share」
+                        label = { Text("${nas.label} · ${nas.share}", fontSize = 13.sp) },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = Lime, selectedLabelColor = Color.Black
+                        )
                     )
-                )
+                }
             }
 
             Row(Modifier.heightIn(max = 380.dp)) {
                 // ---- 左: フォルダ一覧 ----
                 Column(Modifier.weight(1f)) {
                     Text(
-                        if (tab == "album") "この端末のフォルダ · ${albums.size} 件" else "NAS",
+                        if (tab == "album") "この端末のフォルダ · ${albums.size} 件"
+                        else "${nasList.firstOrNull { it.id == tab }?.share ?: ""} のフォルダ · ${folders.size} 件",
                         fontSize = 12.sp, color = Faint,
                         modifier = Modifier.padding(bottom = 6.dp)
                     )
@@ -117,6 +155,40 @@ fun CreateSheet(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
                         )
                     }
                     LazyColumn {
+                        items(folders, key = { it.path }) { folder ->
+                            val here = chosenFolder?.path == folder.path
+                            val nasId = tab
+                            val already = "$nasId|${folder.path}" in taken
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .then(
+                                        if (here) Modifier
+                                            .background(Color(0x24D6FF73))
+                                            .border(1.dp, Lime, RoundedCornerShape(10.dp))
+                                        else Modifier
+                                    )
+                                    .clickable {
+                                        chosenFolder = folder
+                                        chosen = null
+                                        // 名前の既定はフォルダ名。**ID や道筋は入れない。**
+                                        name = folder.name
+                                    }
+                                    .padding(horizontal = 10.dp, vertical = 12.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(Icons.Filled.Folder, null, Modifier.size(18.dp), tint = Faint)
+                                Spacer(Modifier.width(10.dp))
+                                Text(folder.name, fontSize = 14.sp, modifier = Modifier.weight(1f))
+                                if (already) Text("作成済み", fontSize = 12.sp, color = Faint)
+                                else Text("${folder.count} 枚", fontSize = 12.sp, color = Faint)
+                                if (here) {
+                                    Spacer(Modifier.width(8.dp))
+                                    Icon(Icons.Filled.Check, null, Modifier.size(16.dp), tint = Lime)
+                                }
+                            }
+                        }
                         items(albums, key = { it.id }) { album ->
                             val here = chosen?.id == album.id
                             val already = album.id in taken
@@ -164,7 +236,7 @@ fun CreateSheet(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
                         onValueChange = { name = it },
                         singleLine = true,
                         label = { Text("プロジェクト名") },
-                        enabled = chosen != null,
+                        enabled = chosen != null || chosenFolder != null,
                         modifier = Modifier.fillMaxWidth()
                     )
                     Text(
@@ -172,6 +244,21 @@ fun CreateSheet(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
                         fontSize = 11.sp, color = Faint,
                         modifier = Modifier.padding(top = 4.dp, bottom = 14.dp)
                     )
+                    chosenFolder?.let { folder ->
+                        val nas = nasList.firstOrNull { it.id == tab }
+                        Confirm("出所", nas?.label ?: "NAS")
+                        Confirm("フォルダ", "${nas?.share}\${folder.path}")
+                        Confirm("写真", "${folder.count} 枚")
+                        Spacer(Modifier.height(12.dp))
+                        Row(verticalAlignment = Alignment.Top) {
+                            Icon(Icons.Filled.Lock, null, Modifier.size(14.dp), tint = Faint)
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                "原本は読むだけ。端末にコピーせず、必要な部分だけ読みます",
+                                fontSize = 11.sp, color = Faint
+                            )
+                        }
+                    }
                     chosen?.let { album ->
                         Confirm("出所", "この端末")
                         Confirm("フォルダ", album.relativeDir.ifBlank { album.name })
@@ -189,6 +276,19 @@ fun CreateSheet(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
                 }
             }
 
+            asking?.let { nas ->
+                AskPassword(
+                    nas = nas,
+                    onEntered = { entered ->
+                        Session.hold(nas.id, entered)
+                        asking = null
+                        // 同じタブをもう一度読み直させる。
+                        nasList = nasList.toList()
+                    },
+                    onDismiss = { asking = null; tab = "album" }
+                )
+            }
+
             Row(
                 Modifier.fillMaxWidth().padding(top = 16.dp),
                 horizontalArrangement = Arrangement.End,
@@ -198,22 +298,36 @@ fun CreateSheet(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
                 Spacer(Modifier.width(8.dp))
                 Button(
                     onClick = {
-                        val album = chosen ?: return@Button
-                        val wanted = name.trim().ifEmpty { album.name }
+                        val folder = chosenFolder
+                        val album = chosen
+                        val nas = nasList.firstOrNull { it.id == tab }
                         scope.launch {
-                            val project = Projects.add(
-                                context, wanted,
-                                Source(
-                                    kind = "album",
-                                    // **人の言葉。** 生の ID は技術情報だけに出す。
-                                    label = "この端末・アルバム「${album.name}」",
-                                    key = album.id
+                            val project = when {
+                                folder != null && nas != null -> Projects.add(
+                                    context, name.trim().ifEmpty { folder.name },
+                                    Source(
+                                        kind = "nas",
+                                        // **人の言葉。** 生の道筋は技術情報だけに出す。
+                                        label = "${nas.label} · ${nas.share} / ${folder.name}",
+                                        // 出所の鍵は「どの NAS の、どの道筋か」。
+                                        key = "${nas.id}|${folder.path}"
+                                    )
                                 )
-                            )
-                            onCreated(project)
+                                album != null -> Projects.add(
+                                    context, name.trim().ifEmpty { album.name },
+                                    Source(
+                                        kind = "album",
+                                        label = "この端末・アルバム「${album.name}」",
+                                        key = album.id
+                                    )
+                                )
+                                else -> null
+                            }
+                            project?.let(onCreated)
                         }
                     },
-                    enabled = chosen != null,
+
+                    enabled = chosen != null || chosenFolder != null,
                     shape = RoundedCornerShape(50)
                 ) {
                     Text("作成して準備を始める", fontWeight = FontWeight.Bold)
@@ -221,6 +335,52 @@ fun CreateSheet(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
             }
         }
     }
+}
+
+/**
+ * つなぐたびに聞く。**保存トグルが off の人のための道。**
+ * ここで入れた分は、このアプリを閉じるまでは覚えている。
+ */
+@Composable
+private fun AskPassword(nas: Nas, onEntered: (String) -> Unit, onDismiss: () -> Unit) {
+    var password by remember { mutableStateOf("") }
+    var shown by remember { mutableStateOf(false) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("${nas.label} のパスワード") },
+        text = {
+            Column {
+                Text(
+                    "この端末には保存していない設定です。閉じるまで覚えています。",
+                    fontSize = 12.sp, color = Faint
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it },
+                    singleLine = true,
+                    label = { Text("パスワード") },
+                    visualTransformation =
+                        if (shown) androidx.compose.ui.text.input.VisualTransformation.None
+                        else androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                    trailingIcon = {
+                        IconButton(onClick = { shown = !shown }) {
+                            Icon(
+                                if (shown) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                                if (shown) "隠す" else "表示する"
+                            )
+                        }
+                    }
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onEntered(password) }, enabled = password.isNotEmpty()) {
+                Text("つなぐ")
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("やめる") } }
+    )
 }
 
 @Composable
