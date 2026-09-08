@@ -61,6 +61,9 @@ dependencies {
     // 画面から消えたときの取り消しまで面倒を見る。
     implementation("io.coil-kt:coil-compose:2.7.0")
 
+    // EXIF を読む。**NAS では原本の先頭 64KB だけ**から撮影時刻と縮小画像を取る。
+    implementation("androidx.exifinterface:exifinterface:1.3.7")
+
     // **NAS（SMB）。** smbj は純 Java で、Android でもそのまま動く。
     // ログは SLF4J 越しに出るので、Android の Log に流す実装を入れる。
     implementation("com.hierynomus:smbj:0.13.0")

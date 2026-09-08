@@ -32,9 +32,11 @@ sealed interface SmbResult<out T> {
 /**
  * NAS（SMB）を読む。**読むだけ。** 書き込みの経路はここに置かない。
  *
- * 接続は毎回張って毎回閉じる。開きっぱなしにすると、Wi-Fi が切れたときに
- * 「繋がっているつもり」の状態が残り、次の操作が理由の分からない失敗になる。
- * 張り直しは速いので、**状態を持たない方が説明しやすい。**
+ * **接続は「ひと仕事」ごとに張って閉じる。** アプリが持ち歩かないので、
+ * Wi-Fi が切れたときに「繋がっているつもり」の状態が残らない。
+ *
+ * ただし 1 枚ごとに張り直すのは高い。187 枚の指紋づくりで実測 40 秒/50 枚
+ * だった。まとめて読むところは reading{} で 1 本にまとめる。
  */
 object Smb {
     private const val TAG = "Smb"
@@ -69,6 +71,65 @@ object Smb {
         } catch (error: Exception) {
             Log.w(TAG, "NAS につなげない: ${nas.host}/${nas.share}", error)
             SmbResult.Failed(describe(error))
+        }
+    }
+
+    /**
+     * 1 本の接続で、たくさん読む。**指紋づくりや一覧のように数が多いところ用。**
+     *
+     * 1 枚ごとに connect / authenticate / connectShare を繰り返すと、
+     * 網の往復がそのまま待ち時間になる。開けたままにするのはこの仕事の間だけ。
+     */
+    suspend fun <T> reading(
+        nas: Nas,
+        password: String,
+        work: suspend (Reader) -> T
+    ): SmbResult<T> = withContext(Dispatchers.IO) {
+        try {
+            SMBClient().use { client ->
+                client.connect(nas.host).use { connection ->
+                    val session = connection.authenticate(
+                        AuthenticationContext(nas.user, password.toCharArray(), null)
+                    )
+                    val share = session.connectShare(nas.share) as? DiskShare
+                        ?: return@withContext SmbResult.Failed(
+                            "「${nas.share}」は共有フォルダではありません"
+                        )
+                    share.use { SmbResult.Ok(work(Reader(it))) }
+                }
+            }
+        } catch (error: Exception) {
+            Log.w(TAG, "NAS の読み取りが途中で切れた: ${nas.host}", error)
+            SmbResult.Failed(describe(error))
+        }
+    }
+
+    /** 開いている接続で読む。**1 枚が読めなくても全体は止めない。** */
+    class Reader(private val share: DiskShare) {
+        fun head(path: String, bytes: Int): ByteArray? = try {
+            share.openFile(
+                path,
+                EnumSet.of(AccessMask.GENERIC_READ),
+                null,
+                SMB2ShareAccess.ALL,
+                SMB2CreateDisposition.FILE_OPEN,
+                null
+            ).use { file ->
+                file.inputStream.use { stream ->
+                    val buffer = ByteArray(bytes)
+                    var filled = 0
+                    while (filled < bytes) {
+                        val read = stream.read(buffer, filled, bytes - filled)
+                        if (read <= 0) break
+                        filled += read
+                    }
+                    buffer.copyOf(filled)
+                }
+            }
+        } catch (error: Exception) {
+            // **理由は必ず残す。** 1 枚で全体を止めない。
+            Log.w(TAG, "読めなかった: $path", error)
+            null
         }
     }
 

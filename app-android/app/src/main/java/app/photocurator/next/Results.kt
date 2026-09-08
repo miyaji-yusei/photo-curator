@@ -237,8 +237,9 @@ fun ResultsScreen(project: Project, star: Int, onBack: () -> Unit) {
                     ) {
                         AsyncImage(
                             model = ImageRequest.Builder(LocalContext.current)
-                                .data(photo.uri).size(320).build(),
+                                .data(photo.thumbModel).size(320).build(),
                             contentDescription = photo.name,
+                            imageLoader = Images.loader(LocalContext.current),
                             contentScale = ContentScale.Crop,
                             modifier = Modifier.fillMaxSize()
                         )

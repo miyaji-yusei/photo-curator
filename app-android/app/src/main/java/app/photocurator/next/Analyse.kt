@@ -6,6 +6,8 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import uniffi.photo_curator_core.dHashFromGray
 
@@ -37,6 +39,38 @@ object Analyse {
             null
         } finally {
             source.recycle()
+        }
+    }
+
+    /**
+     * NAS の 1 枚。**先頭 128KB だけ読んで、指紋と撮影時刻を同時に取る。**
+     *
+     * 原本 6MB を網越しに引くと 2,000 枚で 12GB になる。EXIF は先頭にあり、
+     * その中の縮小画像（160x120 程度）で指紋は十分に作れる。
+     */
+    fun hashOverNetwork(
+        reader: Smb.Reader,
+        photo: Photo,
+        fallbackAt: Long
+    ): Fingerprint? {
+        val path = photo.smb?.path ?: return null
+        val head = reader.head(path, SmbExifReader.HEAD_BYTES) ?: return null
+        val exif = SmbExifReader.parse(head, fallbackAt)
+        // 縮小画像が無い写真は指紋を作らない。**原本を引きに行かない。**
+        // 連写のまとめに入らないだけで、選別には出る。
+        val bytes = exif.thumbnail ?: return Fingerprint(VERSION, photo.size, "", exif.takenAt)
+        return try {
+            val decoded = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                ?: return Fingerprint(VERSION, photo.size, "", exif.takenAt)
+            // **向きを当ててから指紋を作る。** 回ったままだと、同じ連写でも
+            // 縦横が混ざって距離が開き、まとまらなくなる。
+            val bitmap = SmbExifReader.applyOrientation(decoded, exif.orientation)
+            val made = hashOf(bitmap)
+            bitmap.recycle()
+            Fingerprint(VERSION, photo.size, made ?: "", exif.takenAt)
+        } catch (error: Exception) {
+            Log.w(TAG, "NAS の指紋を作れなかった: ${photo.name}", error)
+            Fingerprint(VERSION, photo.size, "", exif.takenAt)
         }
     }
 
@@ -123,39 +157,68 @@ object Analyse {
         photos: List<Photo>,
         cached: Map<String, Fingerprint>,
         onProgress: (done: Int, total: Int) -> Unit,
-        onPartial: suspend (Map<String, Fingerprint>) -> Unit = {}
+        onPartial: suspend (Map<String, Fingerprint>) -> Unit = {},
+        // NAS のときだけ要る。**端末の写真には触らせない。**
+        nasAccess: Pair<Nas, String>? = null
     ): Map<String, Fingerprint> = withContext(Dispatchers.IO) {
         // **既に分かっている分から始める。** 途中で止まったときにここを空から
         // 始めていると、まだ見ていない写真の指紋まで消してしまう。
         val out = HashMap(cached)
-        var madeSinceSave = 0
-        photos.forEachIndexed { index, photo ->
+
+        fun needsWork(photo: Photo): Boolean {
             val known = cached[photo.relativePath]
-            val usable = known != null && known.version == VERSION && known.size == photo.size
-            if (!usable) {
-                val made = hash(context, photo)
-                if (made != null) {
-                    out[photo.relativePath] = Fingerprint(VERSION, photo.size, made)
-                } else {
-                    // 作れなかったものは控えない。**次に開いたときにもう一度試す。**
-                    // 古い（大きさの違う）値が残っていたら消す。合わない値は
-                    // 持っているより無い方がよい。
-                    out.remove(photo.relativePath)
-                }
-                madeSinceSave += 1
-            }
-            if (index % 10 == 9 || index == photos.lastIndex) {
-                onProgress(index + 1, photos.size)
-            }
+            return !(known != null && known.version == VERSION && known.size == photo.size)
+        }
+
+        var done = 0
+        suspend fun record(photo: Photo, made: Fingerprint?) {
+            if (made != null) out[photo.relativePath] = made
+            // 作れなかったものは控えない。**次に開いたときにもう一度試す。**
+            // 古い（大きさの違う）値が残っていたら消す。
+            else out.remove(photo.relativePath)
+            done += 1
+            if (done % 10 == 0 || done == photos.size) onProgress(done, photos.size)
             // **途中でやめても、作った分は残す。**
-            // 919 枚のアルバムを 800 枚まで数えて戻ったときに全部やり直しでは、
-            // 二度と最後までたどり着けない。
-            if (madeSinceSave >= 200) {
-                onPartial(HashMap(out))
-                madeSinceSave = 0
+            if (done % 50 == 0) onPartial(HashMap(out))
+        }
+
+        suspend fun sweepLocal() {
+            for (photo in photos) {
+                val made = if (needsWork(photo)) {
+                    hash(context, photo)?.let { Fingerprint(VERSION, photo.size, it) }
+                } else cached[photo.relativePath]
+                record(photo, made)
             }
         }
-        // 最後まで来たときだけ、アルバムに無くなったものを片付ける。
+
+        /**
+         * NAS はまとめて並べて読む。**待ち時間が支配的**なので、
+         * 何本か同時に投げるだけで大きく変わる。増やしすぎると NAS 側が
+         * 詰まるので、少なめに抑える。
+         */
+        suspend fun sweepNetwork(reader: Smb.Reader) = coroutineScope {
+            for (chunk in photos.chunked(8)) {
+                val results = chunk.map { photo ->
+                    async {
+                        photo to if (needsWork(photo)) {
+                            hashOverNetwork(reader, photo, photo.takenAt)
+                        } else cached[photo.relativePath]
+                    }
+                }.map { it.await() }
+                for ((photo, made) in results) record(photo, made)
+            }
+        }
+
+        if (nasAccess != null) {
+            // **1 本の接続で全部読む。** 1 枚ごとに張り直すと、網の往復が
+            // そのまま待ち時間になる（実測 50 枚で 40 秒）。
+            val (nas, password) = nasAccess
+            Smb.reading(nas, password) { reader -> sweepNetwork(reader) }
+        } else {
+            sweepLocal()
+        }
+
+        // 最後まで来たときだけ、無くなったものを片付ける。
         // 途中で刈ると、まだ見ていない写真を「消えた」と誤解する。
         val living = photos.mapTo(HashSet()) { it.relativePath }
         out.keys.retainAll(living)
@@ -163,12 +226,6 @@ object Analyse {
     }
 }
 
-/**
- * 選別・学習・確認のどれもが必要とする下ごしらえ。**1 か所にまとめる。**
- *
- * 写真を並べ、指紋を作り、core に渡す形にするところまで。
- * 3 つの画面が別々にこれを書くと、片方だけ直る不具合がまた出る。
- */
 object Prepare {
     suspend fun run(
         context: android.content.Context,
@@ -177,23 +234,45 @@ object Prepare {
     ): Pair<List<Photo>, List<uniffi.photo_curator_core.PhotoRef>> {
         val photos = Photos.forSource(context, project.source)
         val cached = Fingerprints.load(context, project.source.key)
+
+        // NAS のときだけ、つなぎ先とパスワードを渡す。
+        val nasAccess = if (project.source.kind == "nas") {
+            val nasId = project.source.key.substringBefore("|")
+            NasStore.all(context).firstOrNull { it.id == nasId }?.let { nas ->
+                Session.password(context, nas)?.let { nas to it }
+            }
+        } else null
+
         val prints = Analyse.fingerprints(
             context, photos, cached,
             onProgress = onProgress,
-            onPartial = { Fingerprints.save(context, project.source.key, it) }
+            onPartial = { Fingerprints.save(context, project.source.key, it) },
+            nasAccess = nasAccess
         )
         if (prints != cached) Fingerprints.save(context, project.source.key, prints)
-        val refs = photos.map {
+
+        // **撮影時刻は EXIF のものを使う。**
+        // NAS の更新時刻はコピーしたときに変わるので、撮影順にならない。
+        // 指紋と同じ読みで取れているので、ここで差し替えて並べ直す。
+        val dated = photos
+            .map { photo ->
+                val takenAt = prints[photo.relativePath]?.takenAt
+                if (takenAt != null && takenAt > 0) photo.copy(takenAt = takenAt) else photo
+            }
+            .sortedWith(compareBy({ it.takenAt }, { it.relativePath }))
+
+        val refs = dated.map {
             uniffi.photo_curator_core.PhotoRef(
                 relativePath = it.relativePath,
                 capturedAt = it.takenAt,
                 // **作れなかったものは null のまま。** 0 を入れると
                 // 読めない写真どうしが同一に見えて誤ってまとまる。
-                dHash = prints[it.relativePath]?.hash,
+                // 空文字も「作れなかった」の印として扱う。
+                dHash = prints[it.relativePath]?.hash?.takeIf { hash -> hash.isNotEmpty() },
                 dHashVersion = Analyse.VERSION
             )
         }
-        return photos to refs
+        return dated to refs
     }
 }
 

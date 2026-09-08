@@ -92,8 +92,9 @@ fun BurstSheet(
                             } else {
                                 AsyncImage(
                                     model = ImageRequest.Builder(LocalContext.current)
-                                        .data(photo.uri).size(720).build(),
+                                        .data(photo.thumbModel).size(720).build(),
                                     contentDescription = photo.name,
+                                    imageLoader = Images.loader(LocalContext.current),
                                     contentScale = ContentScale.Fit,
                                     modifier = Modifier.fillMaxSize()
                                 )

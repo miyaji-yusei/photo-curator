@@ -224,8 +224,9 @@ private fun QuestionTile(photo: Photo?, capturedAt: Long?) {
         } else {
             AsyncImage(
                 model = ImageRequest.Builder(LocalContext.current)
-                    .data(photo.uri).size(1280).build(),
+                    .data(photo.thumbModel).size(1280).build(),
                 contentDescription = photo.name,
+                imageLoader = Images.loader(LocalContext.current),
                 contentScale = ContentScale.Fit,
                 modifier = Modifier.fillMaxSize()
             )
