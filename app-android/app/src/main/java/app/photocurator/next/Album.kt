@@ -60,6 +60,8 @@ fun ProjectScreen(
     var menu by remember { mutableStateOf(false) }
     var confirmRestart by remember { mutableStateOf(false) }
     var reloads by remember { mutableStateOf(0) }
+    // 「写真を再読み込み」を押されたか。**押されたときだけ網へ行く。**
+    var rescan by remember { mutableStateOf(false) }
     // 開始前の確認を出しているか。**初回は必ず出す。**
     var starting by remember { mutableStateOf(false) }
 
@@ -71,10 +73,14 @@ fun ProjectScreen(
         scanned = false
         session = Store.load(context, project.id)
         prints = Fingerprints.load(context, project.source.key)
-        photos = Photos.forSource(context, project.source)
+        photos = Listing.load(context, project.source.key)
+            ?: Photos.forSource(context, project.source)
         scanned = true
         // 走査が終わってから指紋。**できた分から選別に出せる。**
-        val ready = Prepare.run(context, project) { done, total -> preparing = done to total }
+        val ready = Prepare.run(context, project, rescan) { done, total ->
+            preparing = done to total
+        }
+        rescan = false
         photos = ready.first
         prints = Fingerprints.load(context, project.source.key)
     }
@@ -308,7 +314,7 @@ fun ProjectScreen(
     if (menu) {
         ModalBottomSheet(onDismissRequest = { menu = false }, containerColor = Surface) {
             Column(Modifier.padding(horizontal = 8.dp).padding(bottom = 24.dp)) {
-                DetailMenuRow("写真を再読み込み") { menu = false; reloads += 1 }
+                DetailMenuRow("写真を再読み込み") { menu = false; rescan = true; reloads += 1 }
                 DetailMenuRow("選別を最初からやり直す", danger = true) {
                     menu = false; confirmRestart = true
                 }

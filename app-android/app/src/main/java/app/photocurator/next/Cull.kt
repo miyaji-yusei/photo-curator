@@ -466,8 +466,10 @@ private fun Tile(
         } else {
             AsyncImage(
                 model = ImageRequest.Builder(LocalContext.current)
-                    .data(photo.thumbModel)
-                    // **要求した大きさでデコードする。** 原本を丸ごと載せない。
+                    // **ここは大きく出すので原本を読む。**
+                    // EXIF の縮小画像は 160x120 しかなく、選別の判断には足りない。
+                    // 一度読めば端末に残るので、2 回目からは網に行かない。
+                    .data(photo.fullModel)
                     .size(1280)
                     .build(),
                 contentDescription = photo.name,

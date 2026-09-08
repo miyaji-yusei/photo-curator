@@ -49,6 +49,7 @@ object Analyse {
      * その中の縮小画像（160x120 程度）で指紋は十分に作れる。
      */
     fun hashOverNetwork(
+        context: Context,
         reader: Smb.Reader,
         photo: Photo,
         fallbackAt: Long
@@ -65,6 +66,8 @@ object Analyse {
             // **向きを当ててから指紋を作る。** 回ったままだと、同じ連写でも
             // 縦横が混ざって距離が開き、まとまらなくなる。
             val bitmap = SmbExifReader.applyOrientation(decoded, exif.orientation)
+            // **一度読んだ絵は捨てない。** 一覧を出すたびに網へ行かせない。
+            photo.smb?.let { ThumbCache.write(context, it.nasId, it.path, bitmap) }
             val made = hashOf(bitmap)
             bitmap.recycle()
             Fingerprint(VERSION, photo.size, made ?: "", exif.takenAt)
@@ -201,7 +204,7 @@ object Analyse {
                 val results = chunk.map { photo ->
                     async {
                         photo to if (needsWork(photo)) {
-                            hashOverNetwork(reader, photo, photo.takenAt)
+                            hashOverNetwork(context, reader, photo, photo.takenAt)
                         } else cached[photo.relativePath]
                     }
                 }.map { it.await() }
@@ -230,9 +233,16 @@ object Prepare {
     suspend fun run(
         context: android.content.Context,
         project: Project,
+        // **true のときだけ数え直す。** 押されたときだけ網へ行く。
+        rescan: Boolean = false,
         onProgress: (done: Int, total: Int) -> Unit
     ): Pair<List<Photo>, List<uniffi.photo_curator_core.PhotoRef>> {
-        val photos = Photos.forSource(context, project.source)
+        // 顔ぶれは控えたものを使う。開くたびに数え直すと、NAS では
+        // そのたびに網の往復が要る。
+        val known = if (rescan) null else Listing.load(context, project.source.key)
+        val photos = known ?: Photos.forSource(context, project.source).also {
+            Listing.save(context, project.source.key, it)
+        }
         val cached = Fingerprints.load(context, project.source.key)
 
         // NAS のときだけ、つなぎ先とパスワードを渡す。
@@ -260,6 +270,9 @@ object Prepare {
                 if (takenAt != null && takenAt > 0) photo.copy(takenAt = takenAt) else photo
             }
             .sortedWith(compareBy({ it.takenAt }, { it.relativePath }))
+
+        // 撮影時刻を当てたものを控え直す。**次に開いたときはここから始まる。**
+        if (dated != photos) Listing.save(context, project.source.key, dated)
 
         val refs = dated.map {
             uniffi.photo_curator_core.PhotoRef(
