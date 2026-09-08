@@ -76,127 +76,72 @@ val Lime = androidx.compose.ui.graphics.Color(0xFFD6FF73)
 val Faint = androidx.compose.ui.graphics.Color(0xFF9AA0AA)
 
 /**
- * いまどの画面か。**一覧 → アルバム → 選別 / 結果** の 1 本道。
+ * いまどの画面か。**ホーム → プロジェクト → 選別 / 結果** の 1 本道。
  *
- * アルバム画面を挟むのは、選別を終えた星の行き先を作るため。
- * 前は選別が終わっても戻る先が一覧しか無く、付けた星がどこへ行ったのか
- * 画面から確かめようが無かった。
+ * 単位はアルバムではなくプロジェクト。同じアルバムから 2 つ作れるし、
+ * 出所が端末でも NAS でも同じ道を通る。
  */
 private sealed interface Screen {
-    data object List : Screen
-    data class Detail(val album: Album) : Screen
-    data class Cull(val album: Album) : Screen
-    data class Results(val album: Album, val star: Int) : Screen
+    data object Home : Screen
+    data object Settings : Screen
+    data class Detail(val project: Project) : Screen
+    data class Cull(val project: Project) : Screen
+    data class Results(val project: Project, val star: Int) : Screen
 }
 
 @Composable
 private fun App() {
     MaterialTheme(colorScheme = darkColorScheme(primary = Lime, background = Ink, surface = Surface)) {
-        var screen by remember { mutableStateOf<Screen>(Screen.List) }
+        var screen by remember { mutableStateOf<Screen>(Screen.Home) }
+        var creating by remember { mutableStateOf(false) }
+        // ホームへ戻るたびに一覧を読み直すための鍵。
+        var homeKey by remember { mutableStateOf(0) }
+
         Surface(color = Ink, modifier = Modifier.fillMaxSize()) {
             when (val here = screen) {
-                is Screen.List -> AlbumList(onPick = { screen = Screen.Detail(it) })
+                is Screen.Home -> key(homeKey) {
+                    HomeScreen(
+                        onOpen = { screen = Screen.Detail(it) },
+                        onCreate = { creating = true },
+                        onSettings = { screen = Screen.Settings }
+                    )
+                }
 
-                is Screen.Detail -> AlbumScreen(
-                    album = here.album,
-                    onBack = { screen = Screen.List },
-                    onCull = { screen = Screen.Cull(here.album) },
-                    // やり直した直後は、その場に留まって新しい状態を見せる。
-                    onRestart = { screen = Screen.Detail(here.album) },
-                    onOpenStar = { screen = Screen.Results(here.album, it) }
+                is Screen.Settings -> SettingsScreen(
+                    onBack = { screen = Screen.Home; homeKey += 1 }
+                )
+
+                is Screen.Detail -> ProjectScreen(
+                    project = here.project,
+                    onBack = { screen = Screen.Home; homeKey += 1 },
+                    onCull = { screen = Screen.Cull(here.project) },
+                    onOpenStar = { screen = Screen.Results(here.project, it) }
                 )
 
                 is Screen.Cull -> CullScreen(
-                    album = here.album,
-                    // **選別から戻る先はアルバム画面。** 一覧まで飛ばすと、
+                    project = here.project,
+                    // **選別から戻る先はプロジェクト詳細。** 一覧まで飛ばすと、
                     // いま何枚残ったのかを確かめる前に見失う。
-                    onBack = { screen = Screen.Detail(here.album) }
+                    onBack = { screen = Screen.Detail(here.project) }
                 )
 
                 is Screen.Results -> ResultsScreen(
-                    album = here.album,
+                    project = here.project,
                     star = here.star,
-                    onBack = { screen = Screen.Detail(here.album) }
+                    onBack = { screen = Screen.Detail(here.project) }
                 )
             }
         }
-    }
-}
 
-@Composable
-private fun AlbumList(onPick: (Album) -> Unit) {
-    val context = LocalContext.current
-    var albums by remember { mutableStateOf<List<Album>>(emptyList()) }
-    // アルバムごとの一言。**どれに手を付けたかが一覧で分かるように。**
-    var marks by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
-    var note by remember { mutableStateOf("読み込み中…") }
-    // **前面に戻るたびに読み直す。**
-    // 権限のダイアログは別の Activity なので、許可した直後にここへ戻ってくる。
-    // 起動時に 1 回だけ問い合わせると、許可前の「0 件」がそのまま残る。
-    var reloads by remember { mutableStateOf(0) }
-    val owner = LocalLifecycleOwner.current
-    DisposableEffect(owner) {
-        val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) reloads += 1
-        }
-        owner.lifecycle.addObserver(observer)
-        onDispose { owner.lifecycle.removeObserver(observer) }
-    }
-
-    LaunchedEffect(reloads) {
-        note = "読み込み中…"
-        albums = Photos.albums(context)
-        note = if (albums.isEmpty()) "写真が見つかりません（権限を確認してください）"
-        else "アルバム ${albums.size} 件"
-        // 一覧を出してから足す。**印のために一覧を待たせない。**
-        marks = albums.mapNotNull { album ->
-            Store.summary(context, album.id)?.let { album.id to it }
-        }.toMap()
-    }
-
-    Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
-        Reading {
-            Row(
-                Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 16.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text("Photo Curator", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.weight(1f))
-                Text(note, fontSize = 12.sp, color = Faint)
-            }
-        }
-        LazyColumn(Modifier.fillMaxSize()) {
-            items(albums, key = { it.id }) { album ->
-                Reading {
-                Row(
-                    Modifier.fillMaxWidth().clickable { onPick(album) }.padding(16.dp, 10.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    AsyncImage(
-                        model = ImageRequest.Builder(LocalContext.current)
-                            .data(android.content.ContentUris.withAppendedId(
-                                android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                                album.coverId
-                            ))
-                            .size(160).build(),
-                        contentDescription = null,
-                        contentScale = ContentScale.Crop,
-                        modifier = Modifier.size(48.dp).clip(RoundedCornerShape(8.dp)).background(Tile)
-                    )
-                    Spacer(Modifier.width(14.dp))
-                    Column(Modifier.weight(1f)) {
-                        Text(album.name, fontSize = 15.sp)
-                        val mark = marks[album.id]
-                        Text(
-                            if (mark == null) "${album.count} 枚"
-                            else "${album.count} 枚 · $mark",
-                            fontSize = 12.sp,
-                            color = if (mark == null) Faint else Lime
-                        )
-                    }
-                }
-                }
-            }
+        if (creating) {
+            CreateSheet(
+                onCreated = { project ->
+                    creating = false
+                    // 作ったらそのまま詳細へ。準備の様子が見える。
+                    screen = Screen.Detail(project)
+                },
+                onDismiss = { creating = false }
+            )
         }
     }
 }

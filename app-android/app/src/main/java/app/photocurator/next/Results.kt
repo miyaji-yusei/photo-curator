@@ -37,7 +37,7 @@ import kotlinx.coroutines.launch
  * 実際の書き込みは Take が端末の同意を取ってから行う。
  */
 @Composable
-fun ResultsScreen(album: Album, star: Int, onBack: () -> Unit) {
+fun ResultsScreen(project: Project, star: Int, onBack: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
@@ -85,9 +85,9 @@ fun ResultsScreen(album: Album, star: Int, onBack: () -> Unit) {
         }
     }
 
-    LaunchedEffect(album.id, star, reloads) {
-        val all = Photos.photos(context, album.id)
-        val session = Store.load(context, album.id)
+    LaunchedEffect(project.id, star, reloads) {
+        val all = Photos.forSource(context, project.source)
+        val session = Store.load(context, project.id)
         val ratings = session?.ratings ?: emptyMap()
         // 星が付いていないものは 0 として扱う。**未知を「無い」にしない。**
         photos = all.filter { (ratings[it.relativePath] ?: 0) == star }
@@ -244,7 +244,7 @@ fun ResultsScreen(album: Album, star: Int, onBack: () -> Unit) {
     // 移し先を選ぶ。ここではまだ何も書かない。
     if (choosingDestination) {
         DestinationSheet(
-            from = album,
+            from = project,
             count = picked.size,
             onPick = { destination ->
                 choosingDestination = false

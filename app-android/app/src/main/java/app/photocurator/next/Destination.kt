@@ -32,7 +32,7 @@ import coil.request.ImageRequest
  */
 @Composable
 fun DestinationSheet(
-    from: Album,
+    from: Project,
     count: Int,
     onPick: (Album) -> Unit,
     onDismiss: () -> Unit
@@ -42,8 +42,9 @@ fun DestinationSheet(
     var note by remember { mutableStateOf("読み込み中…") }
 
     LaunchedEffect(from.id) {
-        // いま居るアルバムは出さない。**同じ所へ「移す」は何も起きない。**
-        albums = Photos.albums(context).filter { it.id != from.id && it.relativeDir.isNotBlank() }
+        // いま選別しているフォルダは出さない。**同じ所へ「移す」は何も起きない。**
+        albums = Photos.albums(context)
+            .filter { it.id != from.source.key && it.relativeDir.isNotBlank() }
         note = if (albums.isEmpty()) "ほかに移せるフォルダがありません" else ""
     }
 

@@ -167,6 +167,26 @@ object Prefs {
             .getInt(GROUP_SIZE, 4)
             .coerceIn(2, 10)
 
+    /** 連写を自動でまとめるか。既定 on。 */
+    fun groupBursts(context: Context): Boolean =
+        context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+            .getBoolean("group_bursts", true)
+
+    fun setGroupBursts(context: Context, on: Boolean) {
+        context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+            .edit().putBoolean("group_bursts", on).apply()
+    }
+
+    /** 開始前に毎回設定を確かめるか。**既定 off。** 選別中にも変えられるため。 */
+    fun askBeforeStart(context: Context): Boolean =
+        context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+            .getBoolean("ask_before_start", false)
+
+    fun setAskBeforeStart(context: Context, on: Boolean) {
+        context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+            .edit().putBoolean("ask_before_start", on).apply()
+    }
+
     fun setGroupSize(context: Context, size: Int) {
         context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
             .edit()
