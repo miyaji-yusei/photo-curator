@@ -131,6 +131,21 @@ object Smb {
             Log.w(TAG, "読めなかった: $path", error)
             null
         }
+
+        /** 原本を丸ごと。**表示用画像を作るときだけ。** */
+        fun whole(path: String): ByteArray? = try {
+            share.openFile(
+                path,
+                EnumSet.of(AccessMask.GENERIC_READ),
+                null,
+                SMB2ShareAccess.ALL,
+                SMB2CreateDisposition.FILE_OPEN,
+                null
+            ).use { file -> file.inputStream.use { it.readBytes() } }
+        } catch (error: Exception) {
+            Log.w(TAG, "原本を読めなかった: $path", error)
+            null
+        }
     }
 
     /** 例外を人の言葉にする。**次に何をすればいいかが分かる言い方で。** */

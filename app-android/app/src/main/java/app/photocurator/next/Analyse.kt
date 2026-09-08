@@ -287,6 +287,56 @@ object Prepare {
         }
         return dated to refs
     }
+
+    /**
+     * 表示用画像を作る。**準備の 3 段目。原本を読むのはここだけ。**
+     *
+     * 1 枚 6MB を網越しに読むので、ここがいちばん時間がかかる。だから
+     * **できた分から選別に出せる**ようにしてあり、途中で止めても残る。
+     * 端末のアルバムには作らない（手元のファイルは Coil が直接デコードする）。
+     *
+     * 戻り値は「作った枚数」。すでにあるものは数え直さない。
+     */
+    suspend fun renders(
+        context: android.content.Context,
+        project: Project,
+        photos: List<Photo>,
+        edge: Int,
+        onProgress: (done: Int, total: Int) -> Unit
+    ): Int = withContext(Dispatchers.IO) {
+        val nasId = project.source.key.substringBefore("|")
+        val nas = NasStore.all(context).firstOrNull { it.id == nasId }
+            ?: return@withContext 0
+        val password = Session.password(context, nas) ?: return@withContext 0
+
+        val missing = photos.filter { photo ->
+            photo.smb != null && !Renders.has(context, nasId, photo.smb.path, edge)
+        }
+        var done = photos.size - missing.size
+        onProgress(done, photos.size)
+        if (missing.isEmpty()) return@withContext 0
+
+        var made = 0
+        Smb.reading(nas, password) { reader ->
+            // **1 本の接続で通す。** 原本は大きいので、並べすぎると
+            // 端末のメモリと NAS の両方を圧迫する。少しずつ重ねる。
+            for (chunk in missing.chunked(3)) {
+                coroutineScope {
+                    chunk.map { photo ->
+                        async {
+                            val path = photo.smb?.path ?: return@async false
+                            val whole = reader.whole(path) ?: return@async false
+                            val orientation = SmbExifReader.parse(whole, 0L).orientation
+                            Renders.write(context, nasId, path, edge, whole, orientation)
+                        }
+                    }.map { it.await() }
+                }.forEach { if (it) made += 1 }
+                done += chunk.size
+                onProgress(done, photos.size)
+            }
+        }
+        made
+    }
 }
 
 /**

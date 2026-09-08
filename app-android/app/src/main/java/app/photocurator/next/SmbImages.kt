@@ -6,29 +6,41 @@ import androidx.exifinterface.media.ExifInterface
 import coil.ImageLoader
 import coil.decode.DataSource
 import coil.decode.ImageSource
+import coil.fetch.DrawableResult
 import coil.fetch.FetchResult
 import coil.fetch.Fetcher
-import coil.fetch.DrawableResult
 import coil.fetch.SourceResult
 import coil.request.Options
 import okio.Buffer
 import java.io.ByteArrayInputStream
 
 /**
- * NAS の写真 1 枚を指すもの。**Coil に渡す形。**
+ * どの大きさの絵が欲しいか。**役割を混ぜないために型で分ける。**
  *
- * `full` が false なら EXIF の縮小画像だけを取りに行く。並べるだけなら
- * それで足り、原本 6MB を網越しに引かずに済む。
+ * 前は boolean 1 つで「原本かどうか」しか言えず、選別画面が 160x120 の
+ * サムネイルを引き伸ばして出していた。3 つに分けて、取り違えを型で防ぐ。
  */
-data class SmbImage(val nasId: String, val path: String, val full: Boolean)
+enum class SmbSize {
+    /** EXIF の縮小画像（160x120）。小さく並べるところだけ。 */
+    Thumb,
 
-/** EXIF から取れたもの。**撮影時刻と縮小画像は同じ 1 回の読みで取れる。** */
-/**
- * EXIF から取れたもの。**向きも一緒に取る。**
- *
- * EXIF の縮小画像は「回す前」の絵で、向きは親ファイルの EXIF にしかない。
- * 縮小画像のバイト列だけを渡すと、縦の写真が横のまま並ぶ。
- */
+    /** 表示用画像（長辺 1024/1536）。**選別・連写判定はこれ。** */
+    Display,
+
+    /** 原本。拡大表示だけ。 */
+    Full
+}
+
+/** NAS の写真 1 枚を指すもの。**Coil に渡す形。** */
+data class SmbImage(
+    val nasId: String,
+    val path: String,
+    val size: SmbSize,
+    /** Display のときの長辺。鍵に含めるので、設定を変えれば別物になる。 */
+    val edge: Int = 1024
+)
+
+/** EXIF から取れたもの。**向きも一緒に取る。** */
 data class SmbExif(
     val takenAt: Long?,
     val thumbnail: ByteArray?,
@@ -65,7 +77,10 @@ object SmbExifReader {
     }
 
     /** EXIF の向きを絵に当てる。**回っていないものは触らない。** */
-    fun applyOrientation(bitmap: android.graphics.Bitmap, orientation: Int): android.graphics.Bitmap {
+    fun applyOrientation(
+        bitmap: android.graphics.Bitmap,
+        orientation: Int
+    ): android.graphics.Bitmap {
         val matrix = android.graphics.Matrix()
         when (orientation) {
             ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
@@ -91,59 +106,39 @@ object SmbExifReader {
 /**
  * Coil に NAS の写真を読ませる。
  *
- * **縮小は EXIF のものを使う。** 一覧に出すだけなら 160x120 で足りる。
- * 無いときだけ原本を読む。拡大表示（full）は最初から原本を読む。
+ * **置いてあるものから順に見る。** 網へ行くのは、どこにも無いときだけ。
  */
 class SmbFetcher(
     private val context: Context,
     private val image: SmbImage
 ) : Fetcher {
 
-    override suspend fun fetch(): FetchResult? {
-        val nas = NasStore.all(context).firstOrNull { it.id == image.nasId } ?: return null
-        val password = Session.password(context, nas) ?: return null
+    private fun bytesResult(bytes: ByteArray, source: DataSource) = SourceResult(
+        source = ImageSource(Buffer().apply { write(bytes) }, context),
+        mimeType = null,
+        dataSource = source
+    )
 
-        if (image.full) {
-            // 拡大は原本。JPEG の EXIF が付いたままなので、向きは Coil が当てる。
-            val bytes = (Smb.whole(nas, password, image.path) as? SmbResult.Ok)?.value
-                ?: return null
-            return SourceResult(
-                source = ImageSource(Buffer().apply { write(bytes) }, context),
-                mimeType = null,
-                dataSource = DataSource.NETWORK
-            )
+    override suspend fun fetch(): FetchResult? = when (image.size) {
+        SmbSize.Thumb -> thumb()
+        SmbSize.Display -> display()
+        SmbSize.Full -> full()
+    }
+
+    /** 一覧用。EXIF の縮小画像。 */
+    private suspend fun thumb(): FetchResult? {
+        ThumbCache.read(context, image.nasId, image.path)?.let {
+            return bytesResult(it, DataSource.DISK)
         }
-
-        // **置いてあれば網に行かない。** 準備のときに読んだものが残っている。
-        ThumbCache.read(context, image.nasId, image.path)?.let { cached ->
-            return SourceResult(
-                source = ImageSource(Buffer().apply { write(cached) }, context),
-                mimeType = null,
-                dataSource = DataSource.DISK
-            )
-        }
-
+        val nas = nas() ?: return null
+        val password = password(nas) ?: return null
         val head = (Smb.head(nas, password, image.path, SmbExifReader.HEAD_BYTES)
             as? SmbResult.Ok)?.value ?: return null
         val exif = SmbExifReader.parse(head, 0L)
-        val thumbnail = exif.thumbnail
-        if (thumbnail == null) {
-            // 縮小画像を持たない写真。**そのときだけ原本を読む。**
-            val bytes = (Smb.whole(nas, password, image.path) as? SmbResult.Ok)?.value
-                ?: return null
-            return SourceResult(
-                source = ImageSource(Buffer().apply { write(bytes) }, context),
-                mimeType = null,
-                dataSource = DataSource.NETWORK
-            )
-        }
-
-        // **向きを当ててから返す。** 縮小画像は回す前の絵で、向きは親の EXIF に
-        // しかない。バイト列のまま渡すと、縦の写真が横のまま並ぶ。
-        val bitmap = android.graphics.BitmapFactory
-            .decodeByteArray(thumbnail, 0, thumbnail.size) ?: return null
-        val turned = SmbExifReader.applyOrientation(bitmap, exif.orientation)
-        // 次からは網に行かなくて済むように置いておく。
+        val bytes = exif.thumbnail ?: return display()
+        val decoded = android.graphics.BitmapFactory
+            .decodeByteArray(bytes, 0, bytes.size) ?: return null
+        val turned = SmbExifReader.applyOrientation(decoded, exif.orientation)
         ThumbCache.write(context, image.nasId, image.path, turned)
         return DrawableResult(
             drawable = android.graphics.drawable.BitmapDrawable(context.resources, turned),
@@ -152,6 +147,54 @@ class SmbFetcher(
         )
     }
 
+    /**
+     * 選別用。**準備で作ってあるはずのもの。**
+     *
+     * まだ無ければその場で作る（原本を読む）。それも無理なら、
+     * せめてサムネイルを出す。**何も出さないよりは粗くても出す。**
+     */
+    private suspend fun display(): FetchResult? {
+        Renders.read(context, image.nasId, image.path, image.edge)?.let {
+            return bytesResult(it, DataSource.DISK)
+        }
+        val nas = nas()
+        val password = nas?.let { password(it) }
+        if (nas != null && password != null) {
+            val whole = (Smb.whole(nas, password, image.path) as? SmbResult.Ok)?.value
+            if (whole != null) {
+                val orientation = SmbExifReader.parse(whole, 0L).orientation
+                val made = Renders.write(
+                    context, image.nasId, image.path, image.edge, whole, orientation
+                )
+                if (made) {
+                    Renders.read(context, image.nasId, image.path, image.edge)?.let {
+                        return bytesResult(it, DataSource.NETWORK)
+                    }
+                }
+                return bytesResult(whole, DataSource.NETWORK)
+            }
+        }
+        // 網に行けない。**粗くても出す。** 選別は続けられる。
+        ThumbCache.read(context, image.nasId, image.path)?.let {
+            return bytesResult(it, DataSource.DISK)
+        }
+        return null
+    }
+
+    /** 拡大用。原本。**置かない。** 1 枚 6MB を溜めても使い道がない。 */
+    private suspend fun full(): FetchResult? {
+        val nas = nas() ?: return null
+        val password = password(nas) ?: return null
+        val whole = (Smb.whole(nas, password, image.path) as? SmbResult.Ok)?.value
+            ?: return display()
+        return bytesResult(whole, DataSource.NETWORK)
+    }
+
+    private suspend fun nas(): Nas? =
+        NasStore.all(context).firstOrNull { it.id == image.nasId }
+
+    private suspend fun password(nas: Nas): String? = Session.password(context, nas)
+
     class Factory(private val context: Context) : Fetcher.Factory<SmbImage> {
         override fun create(data: SmbImage, options: Options, imageLoader: ImageLoader) =
             SmbFetcher(context, data)
@@ -159,10 +202,18 @@ class SmbFetcher(
 }
 
 /**
- * このアプリの画像読み込み。**NAS の写真もここを通す。**
+ * 同じ写真を同じものだと分からせる。
  *
- * 端末の写真は Coil の既定でよいが、NAS は自前で取りに行く必要がある。
- * 1 か所にまとめておけば、どの画面も同じ道で読める。
+ * **大きさまで含めて鍵にする。** 含めないと、一覧用の 160x120 を
+ * 選別画面に出してしまう（実際それが起きた）。
+ */
+class SmbKeyer : coil.key.Keyer<SmbImage> {
+    override fun key(data: SmbImage, options: coil.request.Options): String =
+        "smb:${data.nasId}:${data.path}:${data.size}:${data.edge}"
+}
+
+/**
+ * このアプリの画像読み込み。**NAS の写真もここを通す。**
  */
 object Images {
     @Volatile
@@ -173,8 +224,7 @@ object Images {
             .components {
                 add(SmbFetcher.Factory(context.applicationContext))
                 // **鍵が無いと Coil は同じ写真だと分からない。**
-                // 分からなければ覚えられず、毎回網に行くことになる。
-                // 実際これが無いあいだ、一覧はスクロールのたびに読み直していた。
+                // 分からなければ覚えられず、毎回読み直すことになる。
                 add(SmbKeyer())
             }
             .memoryCache {
@@ -185,22 +235,11 @@ object Images {
             .diskCache {
                 coil.disk.DiskCache.Builder()
                     .directory(context.applicationContext.cacheDir.resolve("images"))
-                    .maxSizeBytes(512L * 1024 * 1024)
+                    .maxSizeBytes(256L * 1024 * 1024)
                     .build()
             }
             .respectCacheHeaders(false)
             .build()
             .also { loader = it }
     }
-}
-
-/**
- * 同じ写真を同じものだと分からせる。
- *
- * **大きさで別の鍵にする。** 一覧の縮小画像と拡大の原本は別物なので、
- * 同じ鍵にすると小さい絵を拡大表示に使ってしまう。
- */
-class SmbKeyer : coil.key.Keyer<SmbImage> {
-    override fun key(data: SmbImage, options: coil.request.Options): String =
-        "smb:${data.nasId}:${data.path}:${if (data.full) "full" else "thumb"}"
 }

@@ -88,6 +88,9 @@ fun CullScreen(project: Project, onResults: () -> Unit, onBack: () -> Unit) {
     // 相対パスから写真を引く。core は相対パスしか知らない。
     val byPath = remember(photos) { photos.associateBy { it.relativePath } }
 
+    // 選別で見る絵の大きさ。設定から。
+    val displayEdge = remember { Prefs.displayEdge(context) }
+
     val threshold = remember(learnedDistance) { thresholdFor(learnedDistance) }
 
     LaunchedEffect(project.id) {
@@ -333,6 +336,7 @@ fun CullScreen(project: Project, onResults: () -> Unit, onBack: () -> Unit) {
                                     picked = path in selected,
                                     // この 1 枚が何枚ぶんの代表か。
                                     stands = live.members[path]?.size ?: 1,
+                                    displayEdge = displayEdge,
                                     onHold = { zooming = byPath[path] },
                                     onOpenBurst = { editingBurst = path },
                                     onTap = {
@@ -441,6 +445,7 @@ private fun Tile(
     photo: Photo?,
     picked: Boolean,
     stands: Int,
+    displayEdge: Int,
     onTap: () -> Unit,
     onHold: () -> Unit,
     onOpenBurst: () -> Unit
@@ -469,10 +474,13 @@ private fun Tile(
                     // **ここは大きく出すので原本を読む。**
                     // EXIF の縮小画像は 160x120 しかなく、選別の判断には足りない。
                     // 一度読めば端末に残るので、2 回目からは網に行かない。
-                    .data(photo.fullModel)
+                    .data(photo.displayModel(displayEdge))
                     .size(1280)
                     .build(),
                 contentDescription = photo.name,
+                // **このアプリの読み込み器を通す。** 既定の Coil は NAS の
+                // 写真の読み方を知らないので、渡し忘れると何も出ない。
+                imageLoader = Images.loader(LocalContext.current),
                 // 切らずに全部見せる。縦横比が合わなくても黒帯にしない。
                 contentScale = ContentScale.Fit,
                 modifier = Modifier.fillMaxSize()

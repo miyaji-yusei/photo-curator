@@ -68,6 +68,9 @@ fun ProjectScreen(
     // **開いたら準備が動き出す。** カードに数が出ているのに何も進まないと、
     // 止まっているのか終わっているのか分からない。
     var preparing by remember { mutableStateOf(0 to 0) }
+    // 表示用画像の進み。**NAS のときだけ動く。**
+    var rendering by remember { mutableStateOf(0 to 0) }
+    val displayEdge = remember { Prefs.displayEdge(context) }
 
     LaunchedEffect(project.id, reloads) {
         scanned = false
@@ -83,6 +86,13 @@ fun ProjectScreen(
         rescan = false
         photos = ready.first
         prints = Fingerprints.load(context, project.source.key)
+
+        // 3 段目。**原本を読むのはここだけ。** できた分から選別に出せる。
+        if (project.source.kind == "nas") {
+            Prepare.renders(context, project, ready.first, displayEdge) { done, total ->
+                rendering = done to total
+            }
+        }
     }
 
     val live = session
@@ -162,23 +172,37 @@ fun ProjectScreen(
                         Text("準備", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
                         Spacer(Modifier.weight(1f))
                         Text(
-                            if (scanned && prints.size >= photos.size) "完了" else "進行中",
+                            if (scanned && prints.size >= photos.size &&
+                                (project.source.kind != "nas" ||
+                                    (rendering.second > 0 && rendering.first >= rendering.second))
+                            ) "完了" else "進行中",
                             fontSize = 12.sp, color = Lime
                         )
                     }
                     Spacer(Modifier.height(10.dp))
                     PrepRow("写真の走査", if (scanned) photos.size else 0, photos.size, scanned)
-                    PrepRow("撮影時刻・サムネイル", if (scanned) photos.size else 0, photos.size, scanned)
                     // Tauri 版の「表示用画像」に当たる段。ネイティブでは OS の縮小画像を
                     // そのまま使うので、実際に作るのは連写のまとめに使う指紋だけ。
+                    // 指紋は撮影時刻と同じ 1 回の読みで取れるので、同じ行に畳む。
                     PrepRow(
-                        "連写の指紋",
+                        "撮影時刻・サムネイル",
                         maxOf(prints.size, preparing.first),
                         photos.size,
                         prints.size >= photos.size && photos.isNotEmpty()
                     )
+                    // **NAS のときだけ。** 端末の写真は手元でデコードすれば足りる。
+                    if (project.source.kind == "nas") {
+                        PrepRow(
+                            "表示用画像（${displayEdge}px）",
+                            rendering.first,
+                            photos.size,
+                            rendering.second > 0 && rendering.first >= rendering.second
+                        )
+                    }
                     Text(
-                        "できた写真から選別に出ます",
+                        if (project.source.kind == "nas")
+                            "できた写真から選別に出ます。NAS から読むので Wi-Fi 推奨"
+                        else "できた写真から選別に出ます",
                         fontSize = 11.sp, color = Faint,
                         modifier = Modifier.padding(top = 8.dp)
                     )
