@@ -281,6 +281,17 @@ const MAX_STAR: i32 = 5;
 pub struct Decision {
     pub group: Vec<String>,
     pub chosen: Vec<String>,
+    /// ★5 で確定したなら、その 1 枚と**その前の星**。
+    /// 戻すときは上げ下げではなく元の星に返す必要がある。
+    #[serde(default)]
+    pub topped: Option<Topped>,
+}
+
+/// ★5 で確定した 1 枚の控え。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Topped {
+    pub path: String,
+    pub previous: i32,
 }
 
 /// 選別の途中。**丸ごと保存して、丸ごと読み戻す。**
@@ -397,7 +408,7 @@ pub fn advance(session: Session, selected: Vec<String>) -> Session {
         shift_star(&mut next, id, 1);
     }
 
-    next.history.push(Decision { group, chosen });
+    next.history.push(Decision { group, chosen, topped: None });
     fill(&mut next);
     next
 }
@@ -425,7 +436,49 @@ pub fn undo(session: Session) -> Session {
         shift_star(&mut next, id, -1);
     }
 
+    // ★5 で確定した分は 1 つ下げるのではなく、**押す前の星に返す**。
+    // 5 から 1 つ下げると 4 が残り、押していないはずの星が残る。
+    if let Some(top) = &last.topped {
+        for id in family(&next, &top.path) {
+            next.ratings.insert(id, top.previous);
+        }
+    }
+
     fill(&mut next);
+    next
+}
+
+/// その 1 枚と、まとまりの仲間。**星は代表と仲間で必ず揃える。**
+fn family(session: &Session, path: &str) -> Vec<String> {
+    let mut all = session.members.get(path).cloned().unwrap_or_default();
+    if !all.iter().any(|id| id == path) {
+        all.push(path.to_string());
+    }
+    all
+}
+
+/// ★5 を付けてそのグループを確定する。**以降のラウンドには出さない。**
+///
+/// 「これは決まり」と分かっている 1 枚を、ラウンドを重ねて 5 回選ばせるのは
+/// ただの作業になる。星を最高にして survivors から外すので、次のラウンドの
+/// 顔ぶれには出てこない。**戻せる**（1 つ戻すで元の星に返る）。
+///
+/// 画面に出ていない写真を指されたら何もしない。呼び出し側を信用しない。
+pub fn keep_top(session: Session, path: String) -> Session {
+    if !session.current.iter().any(|id| id == &path) {
+        return session;
+    }
+    let previous = session.ratings.get(&path).copied().unwrap_or(0);
+    let mut next = advance(session, vec![path.clone()]);
+    for id in family(&next, &path) {
+        next.ratings.insert(id, MAX_STAR);
+    }
+    if let Some(position) = next.survivors.iter().rposition(|s| s == &path) {
+        next.survivors.remove(position);
+    }
+    if let Some(last) = next.history.last_mut() {
+        last.topped = Some(Topped { path, previous });
+    }
     next
 }
 
@@ -677,6 +730,35 @@ mod tests {
 
     fn round(names: &[&str], size: u32) -> Session {
         start_round(plain(names), size, 0, false, threshold(), vec![])
+    }
+
+    #[test]
+    fn 星5で確定すると次のラウンドに出ない() {
+        let session = round(&["1", "2", "3", "4"], 2);
+        let after = keep_top(session, "1".into());
+        assert_eq!(after.ratings.get("1"), Some(&5));
+        // **survivors に残らない。** 残ると次のラウンドで見比べる相手にされる。
+        assert!(!after.survivors.contains(&"1".to_string()));
+        // グループは進んでいる。
+        assert_eq!(after.current, vec!["3", "4"]);
+    }
+
+    #[test]
+    fn 星5を戻すと元の星に返る() {
+        let session = round(&["1", "2", "3", "4"], 2);
+        let topped = keep_top(session, "1".into());
+        let back = undo(topped);
+        // 5 から 1 つ下げた 4 ではなく、押す前の 0 に返る。
+        assert_eq!(back.ratings.get("1").copied().unwrap_or(0), 0);
+        assert_eq!(back.current, vec!["1", "2"]);
+    }
+
+    #[test]
+    fn 画面に出ていない写真は星5にできない() {
+        let session = round(&["1", "2", "3", "4"], 2);
+        let after = keep_top(session.clone(), "4".into());
+        assert_eq!(after.current, session.current);
+        assert!(after.history.is_empty());
     }
 
     #[test]

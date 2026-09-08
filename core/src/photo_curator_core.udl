@@ -42,8 +42,12 @@ namespace photo_curator_core {
     // いまのグループを確定して次へ。**選ばれたものは星が 1 つ上がる。**
     Session advance(Session session, sequence<string> selected);
 
-    // 直前の判断を取り消す。星も戻る。
+    // 直前の判断を取り消す。星も戻る。★5 で確定した分は元の星に返る。
     Session undo(Session session);
+
+    // ★5 を付けてそのグループを確定する。**以降のラウンドには出さない。**
+    // 画面に出ていない写真を指されたら何もしない。
+    Session keep_top(Session session, string path);
 
     // 連写のまとまりで、画面に出す 1 枚を選び直す。星は動かさない。
     // 選び直せないとき（まとまりでない・仲間でない・もう見終わった）は null。
@@ -154,4 +158,11 @@ dictionary Session {
 dictionary Decision {
     sequence<string> group;
     sequence<string> chosen;
+    // ★5 で確定したなら、その 1 枚と押す前の星。戻すときに使う。
+    Topped? topped;
+};
+
+dictionary Topped {
+    string path;
+    i32 previous;
 };

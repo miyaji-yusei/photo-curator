@@ -193,10 +193,15 @@ fun BurstEditSheet(
 
             Spacer(Modifier.height(12.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
-                for ((index, start) in starts.withIndex()) {
+                // **単独の写真は名前を消費しない。** A・B・C と続けて出す。
+                // 添字をそのまま使うと「B・C・E」のように飛んで、
+                // どこかに D があるのに見えていないように読める。
+                var letter = 0
+                for (start in starts) {
                     val size = sizeOf(start)
                     if (size <= 1) continue
-                    Legend(colorOf[start] ?: Lime, "まとまり ${('A' + index)} · $size 枚")
+                    Legend(colorOf[start] ?: Lime, "まとまり ${'A' + letter} · $size 枚")
+                    letter += 1
                 }
                 Legend(Color(0xFF5F6572), "灰色の線 ＝ まとまりの外側")
             }

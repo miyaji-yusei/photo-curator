@@ -33,7 +33,9 @@ data class Standing(
     val detail: String,
     val progress: Float?,
     val tint: Color,
-    val action: String
+    val action: String,
+    /** 完了カードだけ。★0..★5 の枚数。**棒 1 本で結果の形を見せる。** */
+    val stars: List<Int>? = null
 )
 
 /**
@@ -256,17 +258,35 @@ private fun ProjectCard(
             color = standing?.tint ?: Faint
         )
         Spacer(Modifier.height(6.dp))
-        Box(
-            Modifier.fillMaxWidth().height(3.dp).clip(RoundedCornerShape(2.dp))
-                .background(Color(0xFF24272D))
-        ) {
-            val progress = standing?.progress
-            if (progress != null && standing != null) {
-                Box(
-                    Modifier.fillMaxWidth(progress.coerceIn(0f, 1f)).fillMaxHeight()
-                        .clip(RoundedCornerShape(2.dp))
-                        .background(standing.tint)
-                )
+        val stars = standing?.stars
+        if (stars != null && stars.sum() > 0) {
+            // **完了したカードは星の内訳。** 進み具合はもう関係ない。
+            Row(Modifier.fillMaxWidth().height(3.dp).clip(RoundedCornerShape(2.dp))) {
+                val order = listOf(5, 4, 3, 2, 1, 0)
+                for (star in order) {
+                    val count = stars.getOrElse(star) { 0 }
+                    if (count == 0) continue
+                    Box(
+                        Modifier
+                            .weight(count.toFloat())
+                            .fillMaxHeight()
+                            .background(starTint(star))
+                    )
+                }
+            }
+        } else {
+            Box(
+                Modifier.fillMaxWidth().height(3.dp).clip(RoundedCornerShape(2.dp))
+                    .background(Color(0xFF24272D))
+            ) {
+                val progress = standing?.progress
+                if (progress != null && standing != null) {
+                    Box(
+                        Modifier.fillMaxWidth(progress.coerceIn(0f, 1f)).fillMaxHeight()
+                            .clip(RoundedCornerShape(2.dp))
+                            .background(standing.tint)
+                    )
+                }
             }
         }
         Row(
@@ -288,15 +308,61 @@ private fun ProjectCard(
     }
 }
 
-/** カードに出す状態を組み立てる。**保存されているものだけから決める。** */
+/**
+ * カードに出す状態を組み立てる。**保存されているものだけから決める。**
+ *
+ * ここで網へ行かない。ホームは一覧が出るまでの時間がすべてなので、
+ * 「開いたら NAS を待つ」は作らない。準備の進みは端末に置いたもの
+ * （顔ぶれ・指紋・表示用画像）を数えれば分かる。
+ */
 private suspend fun standingOf(context: Context, project: Project): Standing {
     val session = Store.load(context, project.id)
-        ?: return Standing("まだ選別していません", "", null, Faint, "開始")
+
+    // ---- つまずき ----
+    // 準備で転んだ側が書き残したもの。**次に通れば消える。**
+    val trouble = Trouble.load(context, project.source.key)
+    if (trouble != null && session?.finished != true) {
+        return Standing(trouble, "", null, Warn, "再試行")
+    }
+
+    // ---- 準備中 ----
+    val known = Listing.load(context, project.source.key)
+    if (session == null) {
+        if (known == null) {
+            // 一度も数えていない。**開けば走査が始まる。**
+            return Standing("準備中 · 写真の走査", "", null, Sky, "開く")
+        }
+        val prints = Fingerprints.load(context, project.source.key).size
+        if (prints < known.size) {
+            return Standing(
+                "準備中 · 撮影時刻・サムネイル",
+                "$prints / ${known.size} 枚", ratio(prints, known.size), Sky, "開始"
+            )
+        }
+        if (project.source.kind == "nas") {
+            val nasId = project.source.key.substringBefore("|")
+            val edge = Prefs.projectEdge(context, project.id)
+            val made = Renders.count(context, nasId, edge)
+            if (made < known.size) {
+                return Standing(
+                    "準備中 · 表示用画像を作成",
+                    "$made / ${known.size} 枚", ratio(made, known.size), Sky, "開始"
+                )
+            }
+        }
+        // ---- 未開始 ----
+        return Standing("準備完了", "${known.size} 枚", null, Faint, "開始")
+    }
 
     val total = session.ratings.size
     if (session.finished) {
         val kept = session.ratings.values.count { it > 0 }
-        return Standing("選別完了 · ★1 以上が $kept 枚", "$total 枚", 1f, Lime, "結果を見る")
+        val stars = (0..5).map { star -> session.ratings.values.count { it == star } }
+        // **完了は白。** 選別中（primary）と一目で分ける。
+        return Standing(
+            "選別完了 · ★1 以上が $kept 枚", "$total 枚", null, Color.White, "結果を見る",
+            stars = stars
+        )
     }
     val remainingPhotos = (session.queue + session.current)
         .sumOf { session.members[it]?.size ?: 1 }
@@ -310,4 +376,17 @@ private suspend fun standingOf(context: Context, project: Project): Standing {
         tint = Lime,
         action = "続ける"
     )
+}
+
+/** 進み具合。**総数が 0 のときは棒を出さない**（0/0 は 100% ではない）。 */
+private fun ratio(done: Int, total: Int): Float? =
+    if (total > 0) (done.toFloat() / total).coerceIn(0f, 1f) else null
+
+/** 星の色。**結果・ラウンド完了・ホームで同じ**にしておく。 */
+internal fun starTint(star: Int): Color = when (star) {
+    5 -> Lime
+    4 -> Color(0xFFB7D95F)
+    3 -> Color(0xFF8FA84F)
+    2, 1 -> Color(0xFF5F6A3A)
+    else -> Color(0xFF2A2D34)
 }

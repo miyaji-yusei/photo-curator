@@ -75,6 +75,12 @@ val Tile = androidx.compose.ui.graphics.Color(0xFF16181D)
 val Lime = androidx.compose.ui.graphics.Color(0xFFD6FF73)
 val Faint = androidx.compose.ui.graphics.Color(0xFF9AA0AA)
 
+/** 準備中（secondary）。**まだ動いている**ことを緑と分けて言うための色。 */
+val Sky = androidx.compose.ui.graphics.Color(0xFFA7C8FF)
+
+/** つまずき（error）。原本を変える操作の警告にも使う。 */
+val Warn = androidx.compose.ui.graphics.Color(0xFFFFB4AB)
+
 /**
  * いまどの画面か。**ホーム → プロジェクト → 選別 / 結果** の 1 本道。
  *

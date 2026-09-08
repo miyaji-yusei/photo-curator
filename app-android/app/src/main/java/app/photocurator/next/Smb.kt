@@ -149,7 +149,7 @@ object Smb {
     }
 
     /** 例外を人の言葉にする。**次に何をすればいいかが分かる言い方で。** */
-    private fun describe(error: Exception): String {
+    internal fun describe(error: Exception): String {
         val message = error.message.orEmpty()
         return when {
             message.contains("STATUS_LOGON_FAILURE", true) ->
