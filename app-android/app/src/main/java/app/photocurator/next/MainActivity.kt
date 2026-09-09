@@ -99,6 +99,20 @@ private sealed interface Screen {
 
 @Composable
 private fun App() {
+    // **背面へ回るときに書く。** Android は畳んだ・他のアプリへ移った時点で
+    // 止められるので、その前に渡しておく（設計 03「中断されたときは必ず書く」）。
+    val context = LocalContext.current
+    val owner = LocalLifecycleOwner.current
+    DisposableEffect(owner) {
+        val watch = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) {
+                for (project in Projects.cached()) Sidecar.pushIfChanged(context, project)
+            }
+        }
+        owner.lifecycle.addObserver(watch)
+        onDispose { owner.lifecycle.removeObserver(watch) }
+    }
+
     MaterialTheme(colorScheme = darkColorScheme(primary = Lime, background = Ink, surface = Surface)) {
         var screen by remember { mutableStateOf<Screen>(Screen.Home) }
         // ホームへ戻るたびに一覧を読み直すための鍵。

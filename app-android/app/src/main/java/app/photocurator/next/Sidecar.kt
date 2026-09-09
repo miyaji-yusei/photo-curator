@@ -3,6 +3,7 @@ package app.photocurator.next
 import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -67,6 +68,32 @@ object Sidecar {
     private const val TAG = "Sidecar"
     private const val VERSION = 1
 
+    /**
+     * 画面が消えても書けるように、アプリの寿命で動く。
+     *
+     * **書く契機は 4 つ**（設計 03）: ラウンドが終わったとき／背面へ回るとき／
+     * プロジェクトを閉じるとき／明示の保存。どれも「端末側に変更があるとき
+     * だけ」。無いのに書くと updatedAt が動き、次に開いたとき自分の書き込みを
+     * 他人の変更と誤認する。
+     */
+    private val scope = kotlinx.coroutines.CoroutineScope(
+        kotlinx.coroutines.SupervisorJob() + Dispatchers.IO
+    )
+
+    /**
+     * 変更があれば書く。**無ければ何もしない。**
+     * 画面が消えたあとでも走るので、戻るボタンや背面への移動から呼べる。
+     */
+    fun pushIfChanged(context: Context, project: Project) {
+        if (!supports(project)) return
+        if (!SyncState.changed(context, project.id)) return
+        val app = context.applicationContext
+        scope.launch {
+            val failed = push(app, project)
+            if (failed != null) Log.w(TAG, "サイドカーを書けなかった: " + failed)
+        }
+    }
+
     /** 写真のフォルダの直下。**増やすのはこの 1 ファイルだけ。** */
     private fun path(folder: String) = "$folder\\.photo-curator\\catalog.json"
 
@@ -77,7 +104,7 @@ object Sidecar {
     fun supports(project: Project): Boolean = project.source.kind == "nas"
 
     private fun nasId(project: Project) = project.source.key.substringBefore("|")
-    private fun folder(project: Project) = project.source.key.substringAfter("|")
+    private fun folder(project: Project) = project.source.folder
 
     // ---- 形 ----
 

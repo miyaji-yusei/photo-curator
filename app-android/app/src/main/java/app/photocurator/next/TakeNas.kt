@@ -126,7 +126,7 @@ object TakeNas {
     ): Done = withContext(Dispatchers.IO) {
         val (nas, password) = credentials(context, project)
             ?: return@withContext Done(0, photos.size, "NAS のパスワードが要ります")
-        val root = project.source.key.substringAfter("|")
+        val root = project.source.folder
         var done = 0
         var failed = 0
         var reason: String? = null

@@ -139,10 +139,13 @@ object Photos {
      */
     private suspend fun fromNas(context: Context, key: String): List<Photo> {
         val nasId = key.substringBefore("|")
-        val folder = key.substringAfter("|")
+        val deep = key.endsWith("|**")
+        val folder = key.removeSuffix("|**").substringAfter("|")
         val nas = NasStore.all(context).firstOrNull { it.id == nasId } ?: return emptyList()
         val password = Session.password(context, nas) ?: return emptyList()
-        val listed = Smb.photos(nas, password, folder)
+        // **「以下ぜんぶ」なら入れ子もたどる。** 印は鍵の末尾に付いている。
+        val listed = if (deep) Smb.photosDeep(nas, password, folder)
+        else Smb.photos(nas, password, folder)
         if (listed !is SmbResult.Ok) return emptyList()
         return listed.value.map { entry ->
             Photo(

@@ -26,6 +26,17 @@ data class Source(
     /** kind ごとの指し先。album なら bucket id。 */
     val key: String
 ) {
+    /**
+     * 「このフォルダ以下ぜんぶ」か。
+     *
+     * 鍵の末尾に印を足すだけにしてある。出所の形（kind）を増やすと、
+     * 保存してあるプロジェクトの読み方まで変わるので、そこは触らない。
+     */
+    val deep: Boolean get() = key.endsWith("|**")
+
+    /** 印を外した、実際のフォルダの道筋。 */
+    val folder: String get() = key.removeSuffix("|**").substringAfter("|")
+
     /** 技術情報に出す生の値。**普段は見せない。** */
     val technical: String get() = "$kind:$key"
 }
@@ -49,7 +60,7 @@ object Projects {
         if (!target.exists()) return@withContext emptyList()
         try {
             val array = org.json.JSONArray(target.readText())
-            (0 until array.length()).map { at ->
+            val read = (0 until array.length()).map { at ->
                 val entry = array.getJSONObject(at)
                 val source = entry.getJSONObject("source")
                 Project(
@@ -65,6 +76,8 @@ object Projects {
                 )
             // **更新順。** 2 回目以降は続きから始めることの方が多い。
             }.sortedByDescending { it.updatedAt }
+            lastSeen = read
+            read
         } catch (error: Exception) {
             Log.w(TAG, "プロジェクトを読めなかった", error)
             emptyList()
@@ -102,6 +115,15 @@ object Projects {
             Log.w(TAG, "プロジェクトを保存できなかった", error)
         }
     }
+
+    /**
+     * 最後に読んだ一覧。**背面へ回るときに、どれを書けばよいかを知るため。**
+     * そのときにファイルを読みに行くと、止められる前に間に合わないことがある。
+     */
+    @Volatile
+    private var lastSeen: List<Project> = emptyList()
+
+    fun cached(): List<Project> = lastSeen
 
     suspend fun add(context: Context, name: String, source: Source): Project {
         val now = System.currentTimeMillis()

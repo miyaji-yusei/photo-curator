@@ -304,6 +304,53 @@ object Smb {
         }
 
     /**
+     * フォルダの下を**全部**たどって写真を集める。
+     *
+     * 「この日の撮影」が raw と jpg のサブフォルダに分かれている置き方は
+     * よくある。1 階層目だけだと、そういう置き方を 1 つのプロジェクトに
+     * できない。
+     *
+     * **深さは 4 階層まで。** それ以上は事故（共有の根を選んでしまった等）の
+     * 方が疑わしいので、そこで止める。
+     */
+    suspend fun photosDeep(
+        nas: Nas,
+        password: String,
+        folder: String,
+        limit: Int = 20000
+    ): SmbResult<List<SmbPhoto>> = connect(nas, password) { share ->
+        val found = ArrayList<SmbPhoto>()
+        fun walk(path: String, depth: Int) {
+            if (depth > 4 || found.size >= limit) return
+            val entries = try {
+                share.list(path)
+            } catch (error: Exception) {
+                Log.w(TAG, "たどれなかった: " + path, error)
+                return
+            }
+            for (entry in entries) {
+                val name = entry.fileName
+                if (name == "." || name == ".." || name.startsWith(".")) continue
+                val child = if (path.isEmpty()) name else path + "\\" + name
+                if (isPhoto(name)) {
+                    found += SmbPhoto(
+                        name = name,
+                        path = child,
+                        size = entry.endOfFile,
+                        modifiedAt = entry.lastWriteTime.toEpochMillis()
+                    )
+                    if (found.size >= limit) return
+                } else if (try { share.folderExists(child) } catch (e: Exception) { false }) {
+                    walk(child, depth + 1)
+                }
+            }
+        }
+        walk(folder, 0)
+        // **使う値そのもので並べる。** 同時刻は道筋で決める（毎回同じ順）。
+        found.sortedWith(compareBy({ it.modifiedAt }, { it.path }))
+    }
+
+    /**
      * ファイルの先頭を読む。**全部は読まない。**
      *
      * 指紋と一覧のサムネイルには EXIF の縮小画像で足りる。原本 1 枚 6MB を

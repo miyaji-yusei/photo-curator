@@ -180,6 +180,12 @@ fun CullScreen(
         note = if (saved != null) "続きから" else ""
     }
 
+    // **この画面を離れるときに書く。** 選別のあいだは端末に貯め、
+    // 区切りで NAS へ渡す（1 組ごとに網へ行くと遅くて高い）。
+    DisposableEffect(project.id) {
+        onDispose { Sidecar.pushIfChanged(context, project) }
+    }
+
     val live = session
     if (live == null) {
         Box(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
@@ -471,6 +477,10 @@ fun CullScreen(
         )
 
         if (live.finished) {
+            // ラウンドの終わりは**区切り**。ここで NAS へ渡す。
+            LaunchedEffect(live.round, live.finished) {
+                Sidecar.pushIfChanged(context, project)
+            }
             // **進めるかどうかを、聞かれる前に確かめておく。**
             // 「次へ」を出しておいて何も起きない画面が、一番信用を失う。
             val upcoming = remember(live, refs) {

@@ -67,6 +67,8 @@ fun CreateScreen(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
     // いま開いている NAS のフォルダ（"" は共有の直下）。**潜れるようにする。**
     // 直下に写真が無くても、中のフォルダに写真があることは普通にある。
     var here by remember { mutableStateOf("") }
+    // 「このフォルダ以下ぜんぶ」で作るか。**中にフォルダがあるときだけ選べる。**
+    var deep by remember { mutableStateOf(false) }
     var strip by remember { mutableStateOf<List<Any>>(emptyList()) }
     // 取れた見本。**行の再構成はこれで起こす。**
     // SmbFolder は取得の前後で同じ値なので、一覧を作り直しても行は更新されない
@@ -261,6 +263,7 @@ fun CreateScreen(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
                                         }
                                         chosenFolder = folder
                                         chosen = null
+                                        deep = false
                                         // 名前の既定はフォルダ名。**ID や道筋は入れない。**
                                         name = folder.name
                                     }
@@ -350,10 +353,37 @@ fun CreateScreen(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
                     )
                     chosenFolder?.let { folder ->
                         val nas = nasList.firstOrNull { it.id == tab }
+                        // **入れ子があるときだけ聞く。** 無いフォルダで聞いても
+                        // 選びようがない。
+                        if (folder.folders > 0) {
+                            Row(
+                                Modifier.fillMaxWidth().padding(bottom = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(Modifier.weight(1f)) {
+                                    Text("中のフォルダもまとめて 1 つに", fontSize = 13.sp)
+                                    Text(
+                                        "${folder.folders} 個のフォルダの写真も一緒に選別します",
+                                        fontSize = 11.sp, color = Faint
+                                    )
+                                }
+                                Switch(
+                                    checked = deep,
+                                    onCheckedChange = { deep = it },
+                                    colors = SwitchDefaults.colors(
+                                        checkedThumbColor = Color.Black, checkedTrackColor = Lime
+                                    )
+                                )
+                            }
+                        }
                         Confirm("出所", nas?.label ?: "NAS")
                         // **どこにあるフォルダなのかを実際の道筋で見せる。**
                         Confirm("フォルダ", (nas?.share ?: "") + " / " + folder.path)
-                        Confirm("写真", "${folder.count} 枚")
+                        Confirm(
+                            "写真",
+                            if (deep) "${folder.count} 枚 ＋ 中のフォルダの分"
+                            else "${folder.count} 枚"
+                        )
                         Spacer(Modifier.height(12.dp))
                         Row(verticalAlignment = Alignment.Top) {
                             Icon(Icons.Filled.Lock, null, Modifier.size(14.dp), tint = Faint)
@@ -450,9 +480,11 @@ fun CreateScreen(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
                                     Source(
                                         kind = "nas",
                                         // **人の言葉。** 生の道筋は技術情報だけに出す。
-                                        label = "${nas.label} · ${nas.share} / ${folder.name}",
+                                        label = "${nas.label} · ${nas.share} / ${folder.name}" +
+                                            (if (deep) "（以下ぜんぶ）" else ""),
                                         // 出所の鍵は「どの NAS の、どの道筋か」。
-                                        key = "${nas.id}|${folder.path}"
+                                        // 以下ぜんぶなら末尾に印を足す（形は変えない）。
+                                        key = "${nas.id}|${folder.path}" + (if (deep) "|**" else "")
                                     )
                                 )
                                 album != null -> Projects.add(

@@ -168,6 +168,12 @@ fun ProjectScreen(
         }
     }
 
+    // **閉じるときにも書く。** 開いたときだけだと、詳細で星を直して
+    // そのまま閉じた分が渡らない。
+    DisposableEffect(project.id) {
+        onDispose { Sidecar.pushIfChanged(context, project) }
+    }
+
     val live = session
     val ratings = live?.ratings ?: emptyMap()
     val starred = photos.count { (ratings[it.relativePath] ?: 0) > 0 }
