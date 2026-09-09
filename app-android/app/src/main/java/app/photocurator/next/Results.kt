@@ -441,9 +441,10 @@ fun ResultsScreen(
             )
         }
 
-        // 将来の同期状態の席。**いまは端末だけだと言い切る。**
+        // どこに残るのかを 1 行で。**書ける相手かどうかで言い分ける。**
         Text(
-            "この端末だけの結果（NAS との同期は今後）",
+            if (Sidecar.supports(project)) "星は写真のフォルダにも記録します（.photo-curator）"
+            else "この端末だけの結果",
             fontSize = 11.sp, color = Faint,
             modifier = Modifier.padding(16.dp)
         )
