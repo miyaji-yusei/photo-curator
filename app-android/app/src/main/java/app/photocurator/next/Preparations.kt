@@ -84,6 +84,9 @@ object Preparations {
                         Prepare.renders(app, project, ready.first, displayEdge) { done, total ->
                             put(project.id) { it.copy(display = done to total) }
                         }
+                        // EXIF に縮小画像が無かった写真を、落とした表示用画像から
+                        // 埋める。**網へは行かない。**
+                        Prepare.fillFromRenders(app, project, ready.first, displayEdge)
                     }
                     Trouble.clear(app, project.source.key)
                 }

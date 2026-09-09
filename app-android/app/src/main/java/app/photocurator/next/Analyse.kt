@@ -337,6 +337,56 @@ object Prepare {
         }
         made
     }
+
+    /**
+     * EXIF に縮小画像が無かった写真を、**表示用画像から**埋める。
+     *
+     * 書き出し方によっては EXIF に縮小画像が入らない（実機の NAS にあった
+     * 「倉坂くるる」の 17 枚がそうで、指紋が全部空だった）。すると
+     *
+     *   * 連写がまとまらない（指紋が無いので比べようがない）
+     *   * カバーが出ない（端末に小さい絵が 1 枚も無い）
+     *
+     * の 2 つが、何も言わずに起きる。表示用画像は準備で**もう落としてある**
+     * ので、そこから作れば網へは行かない。
+     *
+     * 指紋の元が EXIF の縮小画像か表示用画像かで、同じ写真でも値は少しずれる。
+     * まとまりの判定は距離で見ているので、そこは吸収できる範囲に収まる。
+     */
+    suspend fun fillFromRenders(
+        context: android.content.Context,
+        project: Project,
+        photos: List<Photo>,
+        edge: Int
+    ): Int = withContext(Dispatchers.IO) {
+        val key = project.source.key
+        val nasId = key.substringBefore("|")
+        val prints = Fingerprints.load(context, key)
+        val filled = HashMap<String, Fingerprint>(prints)
+        var made = 0
+        for (photo in photos) {
+            val path = photo.smb?.path ?: continue
+            val print = prints[photo.relativePath] ?: continue
+            if (print.hash.isNotEmpty()) continue
+            val file = Renders.file(context, nasId, path, edge)
+            if (!file.exists() || file.length() == 0L) continue
+            try {
+                // **指紋に要るのは形だけ。** 大きいまま読むと 17 枚でも重い。
+                val options = android.graphics.BitmapFactory.Options().apply { inSampleSize = 4 }
+                val bitmap = android.graphics.BitmapFactory.decodeFile(file.path, options)
+                    ?: continue
+                filled[photo.relativePath] = print.copy(hash = Analyse.hashOf(bitmap) ?: "")
+                // カバーにも使う。**表示用画像を毎回開かせない。**
+                ThumbCache.write(context, nasId, path, bitmap)
+                bitmap.recycle()
+                made += 1
+            } catch (error: Exception) {
+                Log.w("Prepare", "表示用画像から作れなかった: ${photo.name}", error)
+            }
+        }
+        if (made > 0) Fingerprints.save(context, key, filled)
+        made
+    }
 }
 
 /**

@@ -152,8 +152,11 @@ fun CreateScreen(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
                     .filter { it.source.kind == "nas" }
                     .map { it.source.key }
                     .toSet()
+                // 潜っているときは**いま居る場所の名前**で言う。
+                // 共有の名前で言うと、どこの話か分からなくなる。
+                val place = if (here.isEmpty()) nas.share else here.substringAfterLast("\\")
                 note = if (folders.isEmpty())
-                    "${nas.share} に写真のフォルダがありません" else ""
+                    "$place に写真のフォルダがありません" else ""
                 // 見本を**1 本の接続でまとめて**取る。1 枚ずつ繋ぎ直すと
                 // 1 枚 800ms かかる（実測）。取れた分は端末に残るので次は速い。
                 Covers.warm(context, nas, password, answer.value.mapNotNull { it.cover })
@@ -256,14 +259,11 @@ fun CreateScreen(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
                                         else Modifier
                                     )
                                     .clickable {
-                                        // 写真が無いフォルダは選べない（中へ入る）。
-                                        if (folder.count == 0 && folder.folders > 0) {
-                                            here = folder.path
-                                            return@clickable
-                                        }
                                         chosenFolder = folder
                                         chosen = null
-                                        deep = false
+                                        // 写真が直下に無いなら、**まとめる前提**で選ぶ。
+                                        // そうしないと 0 枚のプロジェクトができる。
+                                        deep = folder.count == 0 && folder.folders > 0
                                         // 名前の既定はフォルダ名。**ID や道筋は入れない。**
                                         name = folder.name
                                     }
@@ -369,6 +369,9 @@ fun CreateScreen(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
                                 }
                                 Switch(
                                     checked = deep,
+                                    // 直下に写真が無い親は、まとめないと 0 枚になる。
+                                    // **選べない選択肢は出さない。**
+                                    enabled = folder.count > 0,
                                     onCheckedChange = { deep = it },
                                     colors = SwitchDefaults.colors(
                                         checkedThumbColor = Color.Black, checkedTrackColor = Lime
@@ -381,8 +384,13 @@ fun CreateScreen(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
                         Confirm("フォルダ", (nas?.share ?: "") + " / " + folder.path)
                         Confirm(
                             "写真",
-                            if (deep) "${folder.count} 枚 ＋ 中のフォルダの分"
-                            else "${folder.count} 枚"
+                            when {
+                                // 直下に無いときに「0 枚 ＋ …」と出ると、
+                                // 何も入っていないように読める。
+                                deep && folder.count == 0 -> "中のフォルダの分"
+                                deep -> "${folder.count} 枚 ＋ 中のフォルダの分"
+                                else -> "${folder.count} 枚"
+                            }
                         )
                         Spacer(Modifier.height(12.dp))
                         Row(verticalAlignment = Alignment.Top) {

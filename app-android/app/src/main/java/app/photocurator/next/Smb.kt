@@ -76,6 +76,26 @@ object Smb {
         (entry.fileAttributes and DIRECTORY) != 0L
 
     /**
+     * 「中へ（n）」の n を数えるとき、中を見に行く上限。
+     * ここを超える枝分かれは**数えるだけ**にする（1 往復ずつ増えるため）。
+     */
+    private const val INSIDE_LIMIT = 24
+
+    /** 一覧に出す価値があるか。**写真か、さらに下のフォルダがあるか。** */
+    private fun worthShowing(share: com.hierynomus.smbj.share.DiskShare, path: String): Boolean =
+        try {
+            share.list(path).any { child ->
+                val name = child.fileName
+                if (name == "." || name == ".." || name.startsWith(".")) false
+                else isPhoto(name) || isFolder(child)
+            }
+        } catch (error: Exception) {
+            Log.w(TAG, "中を見られなかった: " + path, error)
+            // 見られないものは**出す側に倒す**。入り口が消えるより気づける。
+            true
+        }
+
+    /**
      * 1 回だけつないで、中で仕事をして、必ず閉じる。
      *
      * 失敗は**理由を文にして返す**。「接続できません」だけでは、
@@ -275,12 +295,18 @@ object Smb {
                     count = photos.size
                     // 区切りは SMB の "\"。**path と同じ組み立て方**にする。
                     cover = photos.firstOrNull()?.let { path + "\\" + it.fileName }
-                    // 中のフォルダも数える。**属性で見るので往復は増えない。**
-                    inside = entries.count { child ->
+                    // 中のフォルダを数える。**中に入ったとき出るものだけ数える。**
+                    // 素通しで数えると「中へ（1）」を押した先が 0 件になる
+                    // （写真も下位フォルダも無いフォルダが 1 つあった）。
+                    // ここは 1 フォルダにつき 1 往復だが、写真の数には比例しない。
+                    val children = entries.filter { child ->
                         val childName = child.fileName
                         childName != "." && childName != ".." && !childName.startsWith(".") &&
                             isFolder(child)
                     }
+                    inside = children.take(INSIDE_LIMIT).count { child ->
+                        worthShowing(share, path + "\\" + child.fileName)
+                    } + maxOf(children.size - INSIDE_LIMIT, 0)
                 } catch (error: Exception) {
                     // 数えられないフォルダは 0 にせず落とす。**嘘の数を出さない。**
                     Log.w(TAG, "数えられなかった: $path", error)
