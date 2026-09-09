@@ -134,53 +134,71 @@ fun ResultsScreen(
     for (photo in photos) counts[(ratings[photo.relativePath] ?: 0).coerceIn(0, 5)] += 1
     val atLeastOne = photos.count { (ratings[it.relativePath] ?: 0) > 0 }
 
-    // 連写の仲間は 1 枚に畳む。**同じ組が 5 枚並ぶと、何を見ればいいのか分からない。**
+    // ---- 絞ってから畳む ----
     //
-    // ただし出すのは代表ではなく、**その組で星が一番高い 1 枚**。連写の中身を
-    // 選別して上げた写真が代表でないと、一覧から消えてしまう（★2 が 1 枚ある
-    // のに「この星の写真はありません」と出た）。
-    val folded = remember(photos, members, ratings) {
-        val byPath = photos.associateBy { it.relativePath }
-        val groups = members.filterValues { it.size > 1 }
-        val hidden = HashSet<String>()
-        val shownFor = HashMap<String, String>()
-        for ((head, mates) in groups) {
-            val all = (mates + head).distinct()
-            val best = all
-                .mapNotNull { byPath[it] }
-                .maxByOrNull { ratings[it.relativePath] ?: 0 }
-                ?: continue
-            for (path in all) if (path != best.relativePath) hidden += path
-            shownFor[best.relativePath] = head
-        }
-        photos.filter { it.relativePath !in hidden }
-    }
-
+    // **順番が逆だと写真が消える。** 先に畳むと、★5 を含む組の ★3 の仲間が
+    // 隠れてしまい、「★3 · 3」と出ているのに一覧が空になる（実機で発生）。
+    // 絞ってから畳めば、その星を持つ 1 枚が組ごとに残る。
     val picking = when {
-        filter == "all" -> folded
-        filter == "atLeast1" -> folded.filter { (ratings[it.relativePath] ?: 0) > 0 }
+        filter == "all" -> photos
+        filter == "atLeast1" -> photos.filter { (ratings[it.relativePath] ?: 0) > 0 }
         else -> {
             val want = filter.removePrefix("star:").toIntOrNull() ?: 0
-            folded.filter { (ratings[it.relativePath] ?: 0) == want }
+            photos.filter { (ratings[it.relativePath] ?: 0) == want }
         }
+    }
+
+    // 同じ組から出すのは 1 枚だけ。**出すのは星が一番高い 1 枚。**
+    val folded = remember(picking, members, ratings) {
+        val groupOf = HashMap<String, String>()
+        for ((head, mates) in members) {
+            if (mates.size <= 1) continue
+            for (path in (mates + head).distinct()) groupOf[path] = head
+        }
+        val best = HashMap<String, Photo>()
+        val singles = ArrayList<Photo>()
+        for (photo in picking) {
+            val head = groupOf[photo.relativePath]
+            if (head == null) { singles += photo; continue }
+            val now = best[head]
+            if (now == null ||
+                (ratings[photo.relativePath] ?: 0) > (ratings[now.relativePath] ?: 0)
+            ) best[head] = photo
+        }
+        val kept = (singles + best.values).toSet()
+        picking.filter { it in kept }
     }
 
     // **並べ替えは見せ方だけ。** 星も順番もここでは動かさない。
-    val shown = remember(picking, sort, ratings) {
-        if (sort == "time") picking.sortedWith(compareBy({ it.takenAt }, { it.relativePath }))
-        else picking.sortedWith(
+    val shown = remember(folded, sort, ratings) {
+        if (sort == "time") folded.sortedWith(compareBy({ it.takenAt }, { it.relativePath }))
+        else folded.sortedWith(
             compareByDescending<Photo> { ratings[it.relativePath] ?: 0 }
                 .thenBy { it.takenAt }.thenBy { it.relativePath }
         )
     }
-    val targets = if (picked.isEmpty()) shown else shown.filter { it.relativePath in picked }
+
+    // **取り出す相手は「畳む前」。** 畳んだのは見せ方の都合で、
+    // 連写の仲間を置いていく理由にはならない（★3 が 3 枚なら 3 枚とも取り出す）。
+    val targets = if (picked.isEmpty()) picking
+    else {
+        val groupOf = HashMap<String, String>()
+        for ((head, mates) in members) {
+            if (mates.size <= 1) continue
+            for (path in (mates + head).distinct()) groupOf[path] = head
+        }
+        val heads = picked.mapNotNull { groupOf[it] }.toSet()
+        picking.filter { it.relativePath in picked || groupOf[it.relativePath] in heads }
+    }
+    // **数えるのは取り出す相手（畳む前）。** 一覧は連写を 1 枚に畳んで
+    // 見せているが、取り出すのは仲間も含めた実際の枚数。
     val targetLabel = if (picked.isEmpty()) {
         when {
-            filter == "all" -> "すべて ${shown.size} 枚"
-            filter == "atLeast1" -> "★1 以上 ${shown.size} 枚"
-            else -> "${filter.removePrefix("star:").let { "★$it" }} ${shown.size} 枚"
+            filter == "all" -> "すべて ${targets.size} 枚"
+            filter == "atLeast1" -> "★1 以上 ${targets.size} 枚"
+            else -> "${filter.removePrefix("star:").let { "★$it" }} ${targets.size} 枚"
         }
-    } else "選んだ ${picked.size} 枚"
+    } else "選んだ ${targets.size} 枚"
 
     // 連写の中身を選別。**選別画面と同じ部品**を使う別画面。
     reviewing?.let { head ->
