@@ -565,8 +565,9 @@ fun ResultsScreen(
     sortingOnNas?.let { list ->
         ConfirmDialog(
             title = "${list.size} 枚を NAS で星ごとに分けます",
-            body = "同じフォルダの中に star-5 / star-4 … を作って、そこへコピーします。" +
-                "**原本は元の場所に残ります**（移動ではありません）。" +
+            // Compose は Markdown を描かない。**強調は書き方と順番で出す。**
+            body = "コピーです。原本は元の場所にそのまま残ります。\n" +
+                "同じフォルダの中に star-5 / star-4 … を作って、そこへ複製します。\n" +
                 "1 枚 6MB ほどあるので、${list.size} 枚で数分かかることがあります。",
             confirmLabel = "分ける",
             onConfirm = {

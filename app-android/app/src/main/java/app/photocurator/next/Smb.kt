@@ -62,6 +62,19 @@ object Smb {
     /** このアプリが扱う形式。MediaStore 側と揃える。 */
     private val EXTENSIONS = setOf("jpg", "jpeg", "png", "webp")
 
+    /** ディレクトリの印（SMB のファイル属性）。 */
+    private const val DIRECTORY = 0x10L
+
+    /**
+     * 一覧に入っている属性でフォルダかを見る。**1 件ずつ聞きに行かない。**
+     *
+     * folderExists() は 1 件につき 1 往復かかる。写真 4,692 枚のフォルダで
+     * 全件に聞いたら一覧が 35 秒かかった（実測）。属性は一覧と一緒に
+     * 返ってきているので、それを読めば往復はゼロ。
+     */
+    private fun isFolder(entry: com.hierynomus.msfscc.fileinformation.FileIdBothDirectoryInformation) =
+        (entry.fileAttributes and DIRECTORY) != 0L
+
     /**
      * 1 回だけつないで、中で仕事をして、必ず閉じる。
      *
@@ -251,12 +264,7 @@ object Smb {
                 val name = entry.fileName
                 if (name == "." || name == ".." || name.startsWith(".")) continue
                 val path = if (parent.isEmpty()) name else "$parent\\$name"
-                val isDirectory = try {
-                    share.folderExists(path)
-                } catch (error: Exception) {
-                    false
-                }
-                if (!isDirectory) continue
+                if (!isFolder(entry)) continue
                 // 数えるのと見本を拾うのは**同じ一覧**で済ませる。
                 var count = -1
                 var cover: String? = null
@@ -267,11 +275,11 @@ object Smb {
                     count = photos.size
                     // 区切りは SMB の "\"。**path と同じ組み立て方**にする。
                     cover = photos.firstOrNull()?.let { path + "\\" + it.fileName }
-                    // 中のフォルダも数える。**写真が無くても入り口を出す。**
+                    // 中のフォルダも数える。**属性で見るので往復は増えない。**
                     inside = entries.count { child ->
                         val childName = child.fileName
                         childName != "." && childName != ".." && !childName.startsWith(".") &&
-                            try { share.folderExists(path + "\\" + childName) } catch (e: Exception) { false }
+                            isFolder(child)
                     }
                 } catch (error: Exception) {
                     // 数えられないフォルダは 0 にせず落とす。**嘘の数を出さない。**
@@ -340,7 +348,7 @@ object Smb {
                         modifiedAt = entry.lastWriteTime.toEpochMillis()
                     )
                     if (found.size >= limit) return
-                } else if (try { share.folderExists(child) } catch (e: Exception) { false }) {
+                } else if (isFolder(entry)) {
                     walk(child, depth + 1)
                 }
             }

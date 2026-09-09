@@ -25,9 +25,16 @@ object TakeNas {
 
     /** 何枚できて、何枚だめだったか。**「失敗」と「やめた」を混ぜない。** */
     data class Done(val done: Int, val failed: Int, val reason: String?) {
+        /**
+         * 「1 枚をNAS で分けました」と詰まって読めないので、
+         * **英数字で始まる言い方の前には空きを入れる。**
+         */
+        private fun joined(what: String) =
+            if ((what.firstOrNull()?.code ?: 0) in 33..127) " " + what else what
+
         fun describe(what: String): String = when {
-            done > 0 && failed == 0 -> "$done 枚を$what"
-            done > 0 -> "$done 枚を$what。$failed 枚はできませんでした（${reason ?: "理由不明"}）"
+            done > 0 && failed == 0 -> "$done 枚を${joined(what)}"
+            done > 0 -> "$done 枚を${joined(what)}。$failed 枚はできませんでした（${reason ?: "理由不明"}）"
             else -> "できませんでした（${reason ?: "理由不明"}）"
         }
     }
