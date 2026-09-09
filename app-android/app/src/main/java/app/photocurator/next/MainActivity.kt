@@ -47,6 +47,8 @@ class MainActivity : ComponentActivity() {
             navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
         )
         super.onCreate(savedInstanceState)
+        // 網の状態を言い分けるために預ける。**ここでしか渡さない。**
+        Smb.remember(this)
         requestPhotoPermissions()
         setContent { App() }
     }

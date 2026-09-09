@@ -6,6 +6,8 @@
         外へ出るためではなく、同じ家の中の NAS を読むために要る。
     -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- つながっていないのか、NAS が居ないのかを言い分けるためだけに見る。 -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <!-- 写真は読むだけ。書き込みの権限は要求しない。 -->
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />

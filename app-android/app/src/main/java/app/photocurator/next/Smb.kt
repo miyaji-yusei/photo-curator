@@ -200,8 +200,45 @@ object Smb {
     }
 
     /** 例外を人の言葉にする。**次に何をすればいいかが分かる言い方で。** */
+    /**
+     * どの網にもつながっていないか。**言い方を変えるためだけに見る。**
+     *
+     * つながっていないのに「ホストとポートを確認してください」と出ると、
+     * 設定を疑わせてしまう（実機で Wi-Fi を切って確認した）。
+     */
+    /**
+     * 網の状態を見るためだけに預かる。**アプリの寿命の分だけ持つ。**
+     * 画面から呼ばれるとは限らない（準備は背面でも動く）ので、
+     * 引数で回さずここに置く。
+     */
+    @Volatile
+    private var appContext: android.content.Context? = null
+
+    fun remember(context: android.content.Context) {
+        appContext = context.applicationContext
+    }
+
+    private fun offline(context: android.content.Context?): Boolean = try {
+        val manager = context?.getSystemService(android.content.Context.CONNECTIVITY_SERVICE)
+            as? android.net.ConnectivityManager
+        val network = manager?.activeNetwork
+        val able = network?.let { manager.getNetworkCapabilities(it) }
+        when {
+            manager == null -> false
+            network == null || able == null -> true
+            else -> !able.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                !able.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)
+        }
+    } catch (error: Exception) {
+        // **言い方を選ぶためだけの確認で落とさない。**
+        // 権限が無い端末でも、元の言い方に戻るだけで済ませる。
+        Log.w(TAG, "網の状態を見られなかった", error)
+        false
+    }
+
     internal fun describe(error: Exception): String {
         val message = error.message.orEmpty()
+        if (offline(appContext)) return "ネットワークにつながっていません"
         return when {
             message.contains("STATUS_LOGON_FAILURE", true) ->
                 "ユーザー名かパスワードが違います"
