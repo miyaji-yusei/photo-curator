@@ -310,7 +310,9 @@ object Prepare {
         // 指紋と同じ読みで取れているので、ここで差し替えて並べ直す。
         val dated = photos
             .map { photo ->
-                val takenAt = prints[photo.relativePath]?.takenAt
+                // Amazon は一覧の時刻が正（EXIF を読んでいない）。指紋に控えた古い値で
+                // 上書きすると、読み方を直しても直らない。
+                val takenAt = if (photo.amazon != null) null else prints[photo.relativePath]?.takenAt
                 if (takenAt != null && takenAt > 0) photo.copy(takenAt = takenAt) else photo
             }
             .sortedWith(compareBy({ it.takenAt }, { it.relativePath }))

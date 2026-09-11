@@ -185,8 +185,17 @@ object Amazon {
         }
     }
 
+    /**
+     * 撮影時刻。**末尾の Z を信じない。**
+     *
+     * Amazon は EXIF の撮影時刻（時差を持たない、その土地の時計）にそのまま Z を
+     * 付けて返す。名前が 13-13-29 の写真が 13:13:29Z で来た（実測）。UTC として
+     * 読むと日本では 9 時間ずれるので、**その土地の時計として読む**
+     * （NAS で EXIF を読むときと同じ扱い）。
+     */
     private fun dateOf(text: String): Long = try {
-        java.time.Instant.parse(text).toEpochMilli()
+        java.time.LocalDateTime.parse(text.removeSuffix("Z"))
+            .atZone(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
     } catch (error: Exception) {
         0L
     }
