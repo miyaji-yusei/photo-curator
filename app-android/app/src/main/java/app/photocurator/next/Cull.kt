@@ -349,7 +349,8 @@ fun CullScreen(
             groupSize = live.groupSize.toInt(),
             groupBursts = groupBursts,
             displayEdge = edge,
-            showDisplayEdge = project.source.kind == "nas",
+            showDisplayEdge = project.source.remote,
+            maxEdge = Prefs.maxEdgeFor(context, project.source),
             onGroupSize = { size ->
                 Prefs.setGroupSize(context, size)
                 val next = resize(live, size.toUInt())

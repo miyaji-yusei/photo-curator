@@ -31,8 +31,10 @@ fun OptionsSheet(
     groupSize: Int,
     groupBursts: Boolean,
     displayEdge: Int,
-    /** NAS のときだけ表示用画像の大きさを出す。端末は作らないので意味がない。 */
+    /** 網越しのときだけ表示用画像の大きさを出す。端末は作らないので意味がない。 */
     showDisplayEdge: Boolean,
+    /** 出せる長辺の上限。**0 は上限なし。** これを超える大きさは非活性（設計 08 章 8.5）。 */
+    maxEdge: Int = 0,
     onGroupSize: (Int) -> Unit,
     onGroupBursts: (Boolean) -> Unit,
     onDisplayEdge: (Int) -> Unit,
@@ -107,10 +109,11 @@ fun OptionsSheet(
                     modifier = Modifier.padding(top = 2.dp, bottom = 8.dp)
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    for (edge in listOf(768, 1024, 1280, 1536, 1920)) {
+                    for (edge in Prefs.EDGES) {
                         FilterChip(
                             selected = edge == displayEdge,
                             onClick = { onDisplayEdge(edge) },
+                            enabled = Prefs.edgeAllowed(edge, maxEdge),
                             label = { Text("$edge", fontSize = 13.sp) },
                             colors = FilterChipDefaults.filterChipColors(
                                 selectedContainerColor = Lime, selectedLabelColor = Color.Black

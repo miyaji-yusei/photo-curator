@@ -12,6 +12,7 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Dns
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Smartphone
@@ -279,8 +280,7 @@ private fun ProjectCard(
                 } else {
                     // 見本が無いときは出所を薄く。**空白のまま置かない。**
                     Icon(
-                        if (project.source.kind == "nas") Icons.Filled.Dns
-                        else Icons.Filled.Smartphone,
+                        sourceIcon(project.source.kind),
                         null, Modifier.size(18.dp), tint = Color(0xFF3A3E47)
                     )
                 }
@@ -357,6 +357,13 @@ private fun ProjectCard(
     }
 }
 
+/** 出所の印。**端末・NAS・Amazon を一目で分ける。** 詳細画面でも使う。 */
+fun sourceIcon(kind: String): androidx.compose.ui.graphics.vector.ImageVector = when (kind) {
+    "nas" -> Icons.Filled.Dns
+    "amazon" -> Icons.Filled.Cloud
+    else -> Icons.Filled.Smartphone
+}
+
 /**
  * カードに出す状態を組み立てる。**保存されているものだけから決める。**
  *
@@ -388,10 +395,10 @@ private suspend fun standingOf(context: Context, project: Project): Standing {
                 "$prints / ${known.size} 枚", ratio(prints, known.size), Sky, "開始"
             )
         }
-        if (project.source.kind == "nas") {
-            val nasId = project.source.key.substringBefore("|")
+        val cacheId = project.source.cacheId
+        if (project.source.remote && cacheId != null) {
             val edge = Prefs.projectEdge(context, project.id)
-            val made = Renders.count(context, nasId, edge)
+            val made = Renders.count(context, cacheId, edge)
             if (made < known.size) {
                 return Standing(
                     "準備中 · 表示用画像を作成",

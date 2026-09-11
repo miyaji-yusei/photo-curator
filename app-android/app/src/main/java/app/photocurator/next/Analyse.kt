@@ -77,6 +77,32 @@ object Analyse {
         }
     }
 
+    /**
+     * Amazon の写真の指紋。**縮小して返してもらったサムネイルから作る。**
+     * 撮影時刻は一覧に入っていたものをそのまま控える（EXIF を読まない）。
+     *
+     * リンクが消えていたら**準備ごと止める**（つまずきとして出すため）。
+     * それ以外で取れなければ null（次に開いたときにもう一度試す）。
+     */
+    suspend fun hashOverAmazon(context: Context, photo: Photo): Fingerprint? {
+        val ref = photo.amazon ?: return null
+        val cacheId = Amazon.linkOf(ref.shareKey).cacheId
+        val bytes = ThumbCache.read(context, cacheId, ref.nodeId) ?: run {
+            when (val got = Amazon.image(ref, Amazon.THUMB)) {
+                is SmbResult.Failed -> {
+                    if (got.reason == Amazon.GONE) throw IllegalStateException(Amazon.GONE)
+                    return null
+                }
+                is SmbResult.Ok -> got.value.also { ThumbCache.put(context, cacheId, ref.nodeId, it) }
+            }
+        }
+        val bitmap = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            ?: return Fingerprint(VERSION, photo.size, "", photo.takenAt)
+        val made = hashOf(bitmap)
+        bitmap.recycle()
+        return Fingerprint(VERSION, photo.size, made ?: "", photo.takenAt)
+    }
+
     /** 絵から指紋を作る。**元の Bitmap は片付けない**（呼んだ側の持ち物）。 */
     fun hashOf(source: Bitmap): String? {
         // **縮小は core に任せる。** ここで createScaledBitmap を使うと、
@@ -212,11 +238,29 @@ object Analyse {
             }
         }
 
+        /**
+         * Amazon は縮小を向こうに頼む。**サムネを取って、そのまま指紋にする。**
+         * 取ったサムネは一覧でも使うので置いておく（二度取らない）。
+         */
+        suspend fun sweepAmazon() = coroutineScope {
+            for (chunk in photos.chunked(Amazon.PARALLEL)) {
+                val results = chunk.map { photo ->
+                    async {
+                        photo to if (needsWork(photo)) hashOverAmazon(context, photo)
+                        else cached[photo.relativePath]
+                    }
+                }.map { it.await() }
+                for ((photo, made) in results) record(photo, made)
+            }
+        }
+
         if (nasAccess != null) {
             // **1 本の接続で全部読む。** 1 枚ごとに張り直すと、網の往復が
             // そのまま待ち時間になる（実測 50 枚で 40 秒）。
             val (nas, password) = nasAccess
             Smb.reading(nas, password) { reader -> sweepNetwork(reader) }
+        } else if (photos.any { it.amazon != null }) {
+            sweepAmazon()
         } else {
             sweepLocal()
         }
@@ -240,7 +284,7 @@ object Prepare {
         // 顔ぶれは控えたものを使う。開くたびに数え直すと、NAS では
         // そのたびに網の往復が要る。
         val known = if (rescan) null else Listing.load(context, project.source.key)
-        val photos = known ?: Photos.forSource(context, project.source).also {
+        val photos = known ?: Photos.list(context, project.source).also {
             Listing.save(context, project.source.key, it)
         }
         val cached = Fingerprints.load(context, project.source.key)
@@ -304,6 +348,9 @@ object Prepare {
         edge: Int,
         onProgress: (done: Int, total: Int) -> Unit
     ): Int = withContext(Dispatchers.IO) {
+        if (project.source.kind == "amazon") {
+            return@withContext rendersAmazon(context, project, photos, edge, onProgress)
+        }
         val nasId = project.source.key.substringBefore("|")
         val nas = NasStore.all(context).firstOrNull { it.id == nasId }
             ?: return@withContext 0
@@ -336,6 +383,52 @@ object Prepare {
             }
         }
         made
+    }
+
+    /**
+     * Amazon の表示用画像。**縮小は向こうに頼む。原本は読まない。**
+     *
+     * 最初に 1 枚だけ上限を測り（設計 08 章 8.5）、選んでいた大きさが出せなければ
+     * 出せる中で一番大きいものに直す。リンクが消えていたら準備ごと止める。
+     */
+    private suspend fun rendersAmazon(
+        context: android.content.Context,
+        project: Project,
+        photos: List<Photo>,
+        edge: Int,
+        onProgress: (done: Int, total: Int) -> Unit
+    ): Int {
+        val link = Amazon.linkOf(project.source.key)
+        val refs = photos.mapNotNull { it.amazon }
+        if (refs.isEmpty()) return 0
+        if (Prefs.amazonMaxEdge(context, link.shareId) == 0) {
+            Amazon.measureMaxEdge(refs.first())?.let { Prefs.setAmazonMaxEdge(context, link.shareId, it) }
+        }
+        val usable = Prefs.usableEdge(edge, Prefs.amazonMaxEdge(context, link.shareId))
+        if (usable != edge) Prefs.setProjectEdge(context, project.id, usable)
+
+        val missing = refs.filter { !Renders.has(context, link.cacheId, it.nodeId, usable) }
+        var done = refs.size - missing.size
+        onProgress(done, refs.size)
+        var made = 0
+        for (chunk in missing.chunked(Amazon.PARALLEL)) {
+            coroutineScope {
+                chunk.map { ref ->
+                    async {
+                        when (val got = Amazon.image(ref, usable)) {
+                            is SmbResult.Ok -> Renders.put(context, link.cacheId, ref.nodeId, usable, got.value)
+                            is SmbResult.Failed -> {
+                                if (got.reason == Amazon.GONE) throw IllegalStateException(Amazon.GONE)
+                                false
+                            }
+                        }
+                    }
+                }.map { it.await() }
+            }.forEach { if (it) made += 1 }
+            done += chunk.size
+            onProgress(done, refs.size)
+        }
+        return made
     }
 
     /**

@@ -39,7 +39,9 @@ data class Photo(
     val size: Long,
     val takenAt: Long,
     /** NAS の写真ならその指し先。端末の写真なら null。 */
-    val smb: SmbRef? = null
+    val smb: SmbRef? = null,
+    /** Amazon の共有リンクの写真ならその指し先（設計 08 章）。 */
+    val amazon: AmazonRef? = null
 ) {
     /** この端末での指し先。共有しない。 */
     val uri get() = ContentUris.withAppendedId(COLLECTION, id)
@@ -49,7 +51,8 @@ data class Photo(
      * 詳細の一覧と、まとまりの確認だけ。選別には使わない。
      */
     val thumbModel: Any
-        get() = smb?.let { SmbImage(it.nasId, it.path, SmbSize.Thumb) } ?: uri
+        get() = smb?.let { SmbImage(it.nasId, it.path, SmbSize.Thumb) }
+            ?: amazon?.let { AmazonImage(it, SmbSize.Thumb) } ?: uri
 
     /**
      * **選別と連写判定で見る絵。** 表示用画像（長辺 1024/1536）。
@@ -59,15 +62,23 @@ data class Photo(
      * 準備のときに作って置いたものを使う。
      */
     fun displayModel(edge: Int): Any =
-        smb?.let { SmbImage(it.nasId, it.path, SmbSize.Display, edge) } ?: uri
+        smb?.let { SmbImage(it.nasId, it.path, SmbSize.Display, edge) }
+            ?: amazon?.let { AmazonImage(it, SmbSize.Display, edge) } ?: uri
 
     /** 拡大して見るときの絵。原本。 */
     val fullModel: Any
-        get() = smb?.let { SmbImage(it.nasId, it.path, SmbSize.Full) } ?: uri
+        get() = smb?.let { SmbImage(it.nasId, it.path, SmbSize.Full) }
+            ?: amazon?.let { AmazonImage(it, SmbSize.Full) } ?: uri
 }
 
 /** NAS の写真の指し先。**どの NAS の、どの道筋か。** */
 data class SmbRef(val nasId: String, val path: String)
+
+/**
+ * Amazon の写真の指し先。**鍵は node id。** tempLink は控えとして持つだけで、
+ * 使えなければ取り直す（設計 08 章 5.2）。
+ */
+data class AmazonRef(val shareKey: String, val nodeId: String, val tempLink: String)
 
 private val COLLECTION = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
     MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
@@ -124,10 +135,44 @@ object Photos {
      * 出所から写真を引く。**プロジェクトはここだけを通る。**
      * 出所の種類が増えても、上の画面はこの 1 か所しか知らなくてよい。
      */
-    suspend fun forSource(context: Context, source: Source): List<Photo> = when (source.kind) {
+    suspend fun forSource(context: Context, source: Source): List<Photo> = try {
+        list(context, source)
+    } catch (error: Exception) {
+        // 画面から呼ばれる。**ここで落とさない。** 理由は準備の側（list）で残す。
+        Log.w("Photos", "写真を読めなかった: ${source.kind}", error)
+        emptyList()
+    }
+
+    /**
+     * 読めなかったら**理由を投げる**。準備はこちらを使う（つまずきとして残すため）。
+     * Amazon の「リンクが消えた」をここで拾えないと、空のプロジェクトに見える。
+     */
+    suspend fun list(context: Context, source: Source): List<Photo> = when (source.kind) {
         "album" -> photos(context, source.key)
         "nas" -> fromNas(context, source.key)
+        "amazon" -> fromAmazon(source.key)
         else -> emptyList()
+    }
+
+    /** Amazon の共有リンクの写真。**撮影時刻の昇順で来る。** */
+    private suspend fun fromAmazon(key: String): List<Photo> =
+        when (val got = Amazon.photos(Amazon.linkOf(key))) {
+            is SmbResult.Failed -> throw IllegalStateException(got.reason)
+            is SmbResult.Ok -> fromItems(key, got.value)
+        }
+
+    /** Amazon の一覧を写真に。**作成画面で読んだものをそのまま控えるのにも使う。** */
+    fun fromItems(key: String, items: List<Amazon.Item>): List<Photo> = items.map { item ->
+        Photo(
+            // MediaStore の id は無いので node id から作る。**同じ写真なら同じ値。**
+            id = item.nodeId.hashCode().toLong() and 0xffffffffL,
+            name = item.name,
+            // 星と連写の鍵。**名前は重なりうるので node id にする。**
+            relativePath = item.nodeId,
+            size = item.size,
+            takenAt = item.takenAt,
+            amazon = AmazonRef(key, item.nodeId, item.tempLink)
+        )
     }
 
     /**

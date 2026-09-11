@@ -32,6 +32,9 @@ object Preparations {
     /** 網へ行く仕事は 1 本ずつ。**端末の写真は関係ないので待たせない。** */
     private val network = Mutex()
 
+    /** Amazon の仕事も 1 本に並べる。**NAS とは別の列**（相手が違うので待たせない）。 */
+    private val amazonLine = Mutex()
+
     private val jobs = HashMap<String, Job>()
 
     /** プロジェクトごとの進み。（撮影時刻・サムネイル, 表示用画像）。 */
@@ -75,23 +78,28 @@ object Preparations {
         jobs[project.id] = scope.launch {
             put(project.id) { it.copy(running = true, trouble = null) }
             try {
-                val overNetwork = project.source.kind == "nas"
+                val kind = project.source.kind
                 val work: suspend () -> Unit = {
                     val ready = Prepare.run(app, project, rescan) { done, total ->
                         put(project.id) { it.copy(meta = done to total) }
                     }
-                    if (overNetwork) {
+                    if (project.source.remote) {
                         Prepare.renders(app, project, ready.first, displayEdge) { done, total ->
                             put(project.id) { it.copy(display = done to total) }
                         }
                         // EXIF に縮小画像が無かった写真を、落とした表示用画像から
                         // 埋める。**網へは行かない。**
-                        Prepare.fillFromRenders(app, project, ready.first, displayEdge)
+                        // Amazon は縮小画像から指紋を作るので要らない。
+                        if (kind == "nas") Prepare.fillFromRenders(app, project, ready.first, displayEdge)
                     }
                     Trouble.clear(app, project.source.key)
                 }
-                // **網へ行く仕事だけ 1 本に並べる。**
-                if (overNetwork) network.withLock { work() } else work()
+                // **網へ行く仕事だけ 1 本に並べる。** 相手ごとに別の列。
+                when (kind) {
+                    "nas" -> network.withLock { work() }
+                    "amazon" -> amazonLine.withLock { work() }
+                    else -> work()
+                }
                 put(project.id) { it.copy(running = false) }
                 onFinished()
             } catch (error: kotlinx.coroutines.CancellationException) {

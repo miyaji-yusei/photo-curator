@@ -60,6 +60,24 @@ object ThumbCache {
         }
     }
 
+    /**
+     * 受け取った JPEG をそのまま置く。**Amazon は縮小して向きも直して返す**ので、
+     * こちらでデコードし直さない（設計 08 章 6）。
+     */
+    fun put(context: Context, nasId: String, path: String, bytes: ByteArray) {
+        try {
+            val target = File(dir(context), name(nasId, path))
+            val temporary = File(target.parentFile, "${target.name}.writing")
+            temporary.writeBytes(bytes)
+            if (!temporary.renameTo(target)) {
+                temporary.copyTo(target, overwrite = true)
+                temporary.delete()
+            }
+        } catch (error: Exception) {
+            Log.w(TAG, "縮小画像を置けなかった: $path", error)
+        }
+    }
+
     /** プロジェクトを消したときに片付ける。 */
     suspend fun clear(context: Context, nasId: String) = withContext(Dispatchers.IO) {
         try {

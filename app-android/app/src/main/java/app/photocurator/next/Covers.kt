@@ -73,6 +73,11 @@ object Covers {
         withContext(Dispatchers.IO) {
             val known = Listing.load(context, project.source.key) ?: return@withContext null
             val first = known.firstOrNull() ?: return@withContext null
+            // Amazon も端末に残っているサムネイルだけ。**取りに行かない。**
+            first.amazon?.let { ref ->
+                val file = ThumbCache.file(context, Amazon.linkOf(ref.shareKey).cacheId, ref.nodeId)
+                return@withContext if (file.exists() && file.length() > 0) file else null
+            }
             val smb = first.smb
             if (smb == null) return@withContext first.uri
             // NAS は端末に残っているときだけ。**取りに行かない。**

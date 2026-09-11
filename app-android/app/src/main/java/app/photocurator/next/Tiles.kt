@@ -38,6 +38,16 @@ fun unsupportedFormat(name: String): String? {
 }
 
 /**
+ * 写真で見る版。**Amazon の写真は名前で決めない。**
+ *
+ * 名前が `.cr2` でも中身は JPEG のことがある（実測で 454 枚すべて）。
+ * 一覧を作るときに中身の種類（image/ で始まるもの）で選んであり、絵は Amazon が
+ * JPEG に縮小して返すので、拡張子で「非対応」と言ってはいけない。
+ */
+fun unsupportedFormat(photo: Photo): String? =
+    if (photo.amazon != null) null else unsupportedFormat(photo.name)
+
+/**
  * 絵がまだ無いタイルの中身。
  *
  * `Ready` では何も描かない。読み込みが終われば写真がこの上に載る。

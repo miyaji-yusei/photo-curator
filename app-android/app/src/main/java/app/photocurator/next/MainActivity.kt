@@ -1,6 +1,7 @@
 package app.photocurator.next
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -50,7 +51,20 @@ class MainActivity : ComponentActivity() {
         // 網の状態を言い分けるために預ける。**ここでしか渡さない。**
         Smb.remember(this)
         requestPhotoPermissions()
+        take(intent)
         setContent { App() }
+    }
+
+    /** もう開いているときに共有されたら、ここに来る（singleTask）。 */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        take(intent)
+    }
+
+    /** 共有で受け取った文を預ける。**受け取るのは文だけ**（設計 08 章 8.2）。 */
+    private fun take(intent: Intent?) {
+        if (intent?.action != Intent.ACTION_SEND) return
+        Incoming.text.value = intent.getStringExtra(Intent.EXTRA_TEXT) ?: return
     }
 
     private fun requestPhotoPermissions() {
@@ -68,6 +82,11 @@ class MainActivity : ComponentActivity() {
         }
         if (missing.isNotEmpty()) requestPhotos.launch(missing.toTypedArray())
     }
+}
+
+/** 共有で受け取った文。**受け口は MainActivity だけ**で、画面はこれを見て動く。 */
+object Incoming {
+    val text = kotlinx.coroutines.flow.MutableStateFlow<String?>(null)
 }
 
 /** 配色は Tauri 版と揃える。同じアプリだと分かること。 */
@@ -92,7 +111,8 @@ val Warn = androidx.compose.ui.graphics.Color(0xFFFFB4AB)
 private sealed interface Screen {
     data object Home : Screen
     data object Settings : Screen
-    data object Create : Screen
+    /** [link] は共有で受け取った Amazon の共有リンク。**あれば Amazon のタブで開く。** */
+    data class Create(val link: String? = null) : Screen
     data class Detail(val project: Project) : Screen
     data class Learn(val project: Project) : Screen
     data class Cull(val project: Project, val againFromStar: Int? = null) : Screen
@@ -120,12 +140,29 @@ private fun App() {
         // ホームへ戻るたびに一覧を読み直すための鍵。
         var homeKey by remember { mutableStateOf(0) }
 
+        // **共有で Amazon のリンクが届いたら、作成画面の Amazon タブへ。**
+        // リンクが無い文なら、何も変えずにそう言う（設計 08 章 8.2）。
+        val incoming by Incoming.text.collectAsState()
+        LaunchedEffect(incoming) {
+            val text = incoming ?: return@LaunchedEffect
+            Incoming.text.value = null
+            val link = Amazon.parse(text)
+            if (link == null) {
+                android.widget.Toast.makeText(
+                    context, "Amazon Photos の共有リンクが見つかりませんでした",
+                    android.widget.Toast.LENGTH_LONG
+                ).show()
+            } else {
+                screen = Screen.Create(link.url)
+            }
+        }
+
         Surface(color = Ink, modifier = Modifier.fillMaxSize()) {
             when (val here = screen) {
                 is Screen.Home -> key(homeKey) {
                     HomeScreen(
                         onOpen = { screen = Screen.Detail(it) },
-                        onCreate = { screen = Screen.Create },
+                        onCreate = { screen = Screen.Create() },
                         onSettings = { screen = Screen.Settings }
                     )
                 }
@@ -136,13 +173,16 @@ private fun App() {
 
                 // **作成は画面。** 下から出るシートだと、フォルダ一覧を送る指で
                 // 閉じてしまう（実際に何度も起きた）。
-                is Screen.Create -> CreateScreen(
+                is Screen.Create -> key(here.link) {
+                  CreateScreen(
+                    initialLink = here.link,
                     onCreated = { project ->
                         // 作ったらそのまま詳細へ。準備の様子が見える。
                         screen = Screen.Detail(project)
                     },
                     onDismiss = { screen = Screen.Home; homeKey += 1 }
-                )
+                  )
+                }
 
                 is Screen.Detail -> ProjectScreen(
                     project = here.project,

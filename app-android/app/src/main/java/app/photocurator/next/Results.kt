@@ -375,7 +375,7 @@ fun ResultsScreen(
                                 }
                             )
                     ) {
-                        val format = remember(photo.id) { unsupportedFormat(photo.name) }
+                        val format = remember(photo.id) { unsupportedFormat(photo) }
                         var state by remember(photo.id) {
                             mutableStateOf(
                                 if (format != null) Preview.Unsupported else Preview.Generating
@@ -475,6 +475,11 @@ fun ResultsScreen(
                     OutputRow("NAS で星ごとに分ける", "NAS の中にコピーします。原本は残ります") {
                         outputMenu = false; sortingOnNas = targets
                     }
+                } else if (project.source.kind == "amazon") {
+                    // **並びは設計 08 章 8.3 のとおり。** 保存 → もう一度 → 星 → お気に入り。
+                    OutputRow("ギャラリーに保存", "Amazon から原本をコピーします。Amazon の写真は動きません") {
+                        outputMenu = false; savingToGallery = targets
+                    }
                 } else {
                     OutputRow("アルバムに移動", "原本を動かします") {
                         outputMenu = false; choosingDestination = true
@@ -517,9 +522,16 @@ fun ResultsScreen(
                     }
                 }
 
-                // NAS の写真は端末に無いので、共有に渡す URI が無い。
+                // **Amazon のお気に入りは、いまは付けられない。** 付ける口はログインが要る。
+                // 将来はファイル名を含む JSON を書き出し、Chrome 拡張や Silo のスクリプトで
+                // 付ける（設計 08 章 8.3）。消さずに薄く置いて、いずれできると分かるように。
+                if (project.source.kind == "amazon") {
+                    OutputRow("Amazon Photos のお気に入りに追加", "今後対応します", enabled = false) {}
+                }
+
+                // NAS・Amazon の写真は端末に無いので、共有に渡す URI が無い。
                 // **できないものは出さない**（保存してから共有してもらう）。
-                if (project.source.kind != "nas") OutputRow("共有", "端末の共有メニューへ") {
+                if (project.source.kind == "album") OutputRow("共有", "端末の共有メニューへ") {
                     outputMenu = false
                     val send = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
                         type = "image/*"
@@ -541,7 +553,11 @@ fun ResultsScreen(
     savingToGallery?.let { list ->
         ConfirmDialog(
             title = "${list.size} 枚を端末のギャラリーに保存します",
-            body = "NAS からコピーして、端末の「Pictures / ${project.name}」に入れます。" +
+            body = if (project.source.kind == "amazon")
+                "Amazon Photos から原本をコピーして、端末の「Pictures / ${project.name}」に入れます。" +
+                    "Amazon の写真は動かしませんし、消えません。" +
+                    "1 枚 3〜8MB ほどあるので、${list.size} 枚で数分かかることがあります。"
+            else "NAS からコピーして、端末の「Pictures / ${project.name}」に入れます。" +
                 "NAS の写真は動かしませんし、消えません。" +
                 "1 枚 6MB ほどあるので、${list.size} 枚で数分かかることがあります。",
             confirmLabel = "保存する",
@@ -550,9 +566,10 @@ fun ResultsScreen(
                 busy = true
                 taking = 0 to list.size
                 scope.launch {
-                    val done = TakeNas.saveToGallery(context, project, list, project.name) { at, total ->
-                        taking = at to total
-                    }
+                    val progress: (Int, Int) -> Unit = { at, total -> taking = at to total }
+                    val done = if (project.source.kind == "amazon")
+                        TakeAmazon.saveToGallery(context, list, project.name, progress)
+                    else TakeNas.saveToGallery(context, project, list, project.name, progress)
                     note = done.describe("端末に保存しました")
                     taking = null
                     busy = false
@@ -664,15 +681,19 @@ private fun StarChip(label: String, selected: Boolean, onClick: () -> Unit) {
 }
 
 @Composable
-private fun OutputRow(label: String, note: String, onClick: () -> Unit) {
+private fun OutputRow(label: String, note: String, enabled: Boolean = true, onClick: () -> Unit) {
     Column(
         Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(10.dp))
-            .clickable(onClick = onClick)
+            .clickable(enabled = enabled, onClick = onClick)
             .padding(horizontal = 12.dp, vertical = 12.dp)
     ) {
-        Text(label, fontSize = 15.sp)
+        // **押せないものは薄く。** 消さずに置くのは「いずれできる」と分かるように。
+        Text(
+            label, fontSize = 15.sp,
+            color = if (enabled) androidx.compose.ui.graphics.Color.White else Faint
+        )
         // **原本に触るものは、押す前にそう書く。**
         Text(note, fontSize = 11.sp, color = Faint)
     }

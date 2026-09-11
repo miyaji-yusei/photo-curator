@@ -126,6 +126,8 @@ fun ProjectScreen(
                 scope.launch {
                     photos = Listing.load(context, project.source.key) ?: photos
                     prints = Fingerprints.load(context, project.source.key)
+                    // 出せない大きさだったら準備の側で直している（設計 08 章 8.5）。
+                    displayEdge = Prefs.projectEdge(context, project.id)
                 }
             }
             rescan = false
@@ -157,6 +159,19 @@ fun ProjectScreen(
                         clash = sync.catalog
                     }
                     is Sync.Blocked -> syncNote = sync.reason
+                }
+            }
+
+            // ---- Amazon のリンク ----
+            // **開いたときに 1 回だけ確かめる。** 消えていても、準備済みの絵で選別は
+            // 続けられる。できなくなることだけを言う（設計 08 章 8.4）。
+            if (project.source.kind == "amazon") {
+                val alive = Amazon.share(Amazon.linkOf(project.source.key))
+                if (alive is SmbResult.Failed) {
+                    syncNote = if (alive.reason == Amazon.GONE)
+                        "Amazon のリンクが削除されています。準備済みの画像で選別は続けられますが、" +
+                            "拡大とギャラリーへの保存はできません"
+                    else alive.reason
                 }
             }
         } catch (error: Exception) {
@@ -235,8 +250,7 @@ fun ProjectScreen(
                 Card {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(
-                            if (project.source.kind == "nas") Icons.Filled.Dns
-                            else Icons.Filled.Smartphone,
+                            sourceIcon(project.source.kind),
                             null, Modifier.size(16.dp), tint = Faint
                         )
                         Spacer(Modifier.width(8.dp))
@@ -279,7 +293,7 @@ fun ProjectScreen(
                             when {
                                 trouble != null -> "止まっています"
                                 scanned && prints.size >= photos.size &&
-                                    (project.source.kind != "nas" ||
+                                    (!project.source.remote ||
                                         (rendering.second > 0 && rendering.first >= rendering.second))
                                 -> "完了"
                                 else -> "進行中"
@@ -293,9 +307,11 @@ fun ProjectScreen(
                         Spacer(Modifier.height(10.dp))
                         Text(said, fontSize = 13.sp, color = Warn)
                         Text(
-                            if (project.source.kind == "nas")
-                                "同じ Wi-Fi につながっているか、NAS の電源を確かめてください"
-                            else "写真へのアクセスが許可されているか確かめてください",
+                            when (project.source.kind) {
+                                "nas" -> "同じ Wi-Fi につながっているか、NAS の電源を確かめてください"
+                                "amazon" -> "ネットワークと、Amazon Photos のリンクが残っているかを確かめてください"
+                                else -> "写真へのアクセスが許可されているか確かめてください"
+                            },
                             fontSize = 12.sp, color = Faint,
                             modifier = Modifier.padding(top = 2.dp)
                         )
@@ -337,8 +353,8 @@ fun ProjectScreen(
                         photos.size,
                         prints.size >= photos.size && photos.isNotEmpty()
                     )
-                    // **NAS のときだけ。** 端末の写真は手元でデコードすれば足りる。
-                    if (project.source.kind == "nas") {
+                    // **網越しのときだけ。** 端末の写真は手元でデコードすれば足りる。
+                    if (project.source.remote) {
                         PrepRow(
                             "表示用画像（${displayEdge}px）",
                             rendering.first,
@@ -347,9 +363,11 @@ fun ProjectScreen(
                         )
                     }
                     Text(
-                        if (project.source.kind == "nas")
-                            "できた写真から選別に出ます。NAS から読むので Wi-Fi 推奨"
-                        else "できた写真から選別に出ます",
+                        when (project.source.kind) {
+                            "nas" -> "できた写真から選別に出ます。NAS から読むので Wi-Fi 推奨"
+                            "amazon" -> "できた写真から選別に出ます。Amazon から縮小した絵を受け取るので Wi-Fi 推奨"
+                            else -> "できた写真から選別に出ます"
+                        },
                         fontSize = 11.sp, color = Faint,
                         modifier = Modifier.padding(top = 8.dp)
                     )
@@ -453,7 +471,7 @@ fun ProjectScreen(
                     items(shown, key = { it.id }) { photo ->
                         // **なぜ絵が無いのかを、タイルの中で言う。**
                         // 読めない形式・まだ作っていない・作れなかった、を分ける。
-                        val format = remember(photo.id) { unsupportedFormat(photo.name) }
+                        val format = remember(photo.id) { unsupportedFormat(photo) }
                         var state by remember(photo.id) {
                             mutableStateOf(
                                 when {
@@ -536,7 +554,7 @@ fun ProjectScreen(
         StartSheet(
             project = project,
             photoCount = photos.size,
-            readyCount = if (project.source.kind == "nas") rendering.first else photos.size,
+            readyCount = if (project.source.remote) rendering.first else photos.size,
             onStart = {
                 starting = false
                 // 連写をまとめる設定で、まだ基準を決めていなければ学習へ。
@@ -561,7 +579,7 @@ fun ProjectScreen(
     ) {
             Column(Modifier.padding(horizontal = 8.dp).padding(bottom = 24.dp)) {
                 DetailMenuRow("写真を再読み込み") { menu = false; rescan = true; reloads += 1 }
-                if (project.source.kind == "nas") {
+                if (project.source.remote) {
                     DetailMenuRow("表示用画像の大きさ（${displayEdge}px）") {
                         menu = false; choosingEdge = true
                     }
@@ -605,9 +623,18 @@ fun ProjectScreen(
                     fontSize = 12.sp, color = Faint,
                     modifier = Modifier.padding(top = 4.dp, bottom = 12.dp)
                 )
+                // **出せない大きさは選べない**（Amazon が小さくしか返さない等。設計 08 章 8.5）。
+                val maxEdge = Prefs.maxEdgeFor(context, project.source)
+                if (Prefs.EDGES.any { !Prefs.edgeAllowed(it, maxEdge) }) {
+                    Text(
+                        "Amazon が出せるのは長辺 ${maxEdge}px までです",
+                        fontSize = 12.sp, color = Faint,
+                        modifier = Modifier.padding(bottom = 8.dp)
+                    )
+                }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    for (edge in listOf(768, 1024, 1280, 1536, 1920)) {
-                        Chip("${edge}px", edge == displayEdge) {
+                    for (edge in Prefs.EDGES) {
+                        Chip("${edge}px", edge == displayEdge, enabled = Prefs.edgeAllowed(edge, maxEdge)) {
                             displayEdge = edge
                             Prefs.setProjectEdge(context, project.id, edge)
                             choosingEdge = false
@@ -729,9 +756,8 @@ fun ProjectScreen(
             val others = Projects.all(context)
                 .count { it.id != project.id && it.source.key == project.source.key }
             alone = others == 0
-            bytes = if (alone && project.source.kind == "nas") {
-                Renders.bytes(context, project.source.key.substringBefore("|"))
-            } else 0L
+            val cache = project.source.cacheId
+            bytes = if (alone && cache != null) Renders.bytes(context, cache) else 0L
         }
         ConfirmDialog(
             title = "「${project.name}」を削除しますか",
@@ -747,8 +773,11 @@ fun ProjectScreen(
                     Projects.remove(context, project.id)
                     Timing.clear(context, project.id)
                     // **最後の 1 つだったときだけ絵を片付ける。**
-                    if (alone && project.source.kind == "nas") {
-                        Renders.clear(context, project.source.key.substringBefore("|"))
+                    val cache = project.source.cacheId
+                    if (alone && cache != null) {
+                        Renders.clear(context, cache)
+                        // Amazon のサムネイルもこのアプリが取ってきたもの。**一緒に片付ける。**
+                        if (project.source.kind == "amazon") ThumbCache.clear(context, cache)
                     }
                     onBack()
                 }
@@ -829,10 +858,11 @@ private fun PrepRow(label: String, done: Int, total: Int, complete: Boolean) {
 }
 
 @Composable
-private fun Chip(label: String, selected: Boolean, onClick: () -> Unit) {
+private fun Chip(label: String, selected: Boolean, enabled: Boolean = true, onClick: () -> Unit) {
     FilterChip(
         selected = selected,
         onClick = onClick,
+        enabled = enabled,
         label = { Text(label, fontSize = 12.sp) },
         colors = FilterChipDefaults.filterChipColors(
             selectedContainerColor = Lime, selectedLabelColor = Color.Black

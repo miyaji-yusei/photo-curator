@@ -61,6 +61,10 @@ dependencies {
     // 画面から消えたときの取り消しまで面倒を見る。
     implementation("io.coil-kt:coil-compose:2.7.0")
 
+    // **Amazon Photos の共有リンクを読む**（設計 08 章）。Coil が既に連れてきている
+    // 版を明示して、勝手に上がらないようにする。
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
     // EXIF を読む。**NAS では原本の先頭 64KB だけ**から撮影時刻と縮小画像を取る。
     implementation("androidx.exifinterface:exifinterface:1.3.7")
 

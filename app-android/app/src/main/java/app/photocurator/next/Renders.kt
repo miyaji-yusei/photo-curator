@@ -113,6 +113,25 @@ object Renders {
         false
     }
 
+    /**
+     * 受け取った表示用画像をそのまま置く。**原本から作らない**（Amazon が
+     * 縮小して返す。設計 08 章 6）。書き終えてから置き換える。
+     */
+    fun put(context: Context, nasId: String, path: String, edge: Int, bytes: ByteArray): Boolean =
+        try {
+            val target = File(dir(context), name(nasId, path, edge))
+            val temporary = File(target.parentFile, "${target.name}.writing")
+            temporary.writeBytes(bytes)
+            if (!temporary.renameTo(target)) {
+                temporary.copyTo(target, overwrite = true)
+                temporary.delete()
+            }
+            true
+        } catch (error: Exception) {
+            Log.w(TAG, "表示用画像を置けなかった: $path", error)
+            false
+        }
+
     private fun scaleToEdge(bitmap: Bitmap, edge: Int): Bitmap {
         val longest = maxOf(bitmap.width, bitmap.height)
         if (longest <= edge) return bitmap

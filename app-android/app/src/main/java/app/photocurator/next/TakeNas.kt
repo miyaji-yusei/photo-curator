@@ -178,6 +178,45 @@ object TakeNas {
         Done(done, failed, reason)
     }
 
+    /** ギャラリーのフォルダ名。**MediaStore は使えない字で黙って失敗する**ので落とす。 */
+    internal fun galleryFolder(album: String): String =
+        album.filter { it.isLetterOrDigit() || it == '_' || it == '-' || it == ' ' }
+            .trim().ifBlank { "PhotoCurator" }
+
+    /**
+     * 1 枚をギャラリーに入れる。**書き終えてから見せる**（途中のファイルを出さない）。
+     * 同じ名前があっても上書きしない（MediaStore が名前を変える）。
+     */
+    internal fun insertIntoGallery(
+        context: Context,
+        folder: String,
+        name: String,
+        mime: String,
+        bytes: ByteArray
+    ): Boolean = try {
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+            put(MediaStore.MediaColumns.MIME_TYPE, mime)
+            put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/$folder/")
+            put(MediaStore.MediaColumns.IS_PENDING, 1)
+        }
+        val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+        if (uri == null) {
+            false
+        } else {
+            context.contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+            context.contentResolver.update(
+                uri,
+                ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) },
+                null, null
+            )
+            true
+        }
+    } catch (error: Exception) {
+        Log.w(TAG, "ギャラリーに入れられなかった: $name", error)
+        false
+    }
+
     private fun mimeOf(name: String): String =
         when (name.substringAfterLast('.', "").lowercase()) {
             "png" -> "image/png"

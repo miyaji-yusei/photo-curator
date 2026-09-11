@@ -39,6 +39,23 @@ data class Source(
 
     /** 技術情報に出す生の値。**普段は見せない。** */
     val technical: String get() = "$kind:$key"
+
+    /**
+     * 網越しか。**NAS も Amazon も「表示用画像を作って置く」側。**
+     * 「NAS か端末か」の 2 択で書かれていた分岐のうち、この意味のものはこれを見る。
+     */
+    val remote: Boolean get() = kind != "album"
+
+    /**
+     * 端末に置いた絵（サムネイル・表示用画像）の名前の頭。
+     * 端末のアルバムは絵を置かないので null。
+     */
+    val cacheId: String?
+        get() = when (kind) {
+            "nas" -> key.substringBefore("|")
+            "amazon" -> Amazon.linkOf(key).cacheId
+            else -> null
+        }
 }
 
 data class Project(

@@ -223,9 +223,11 @@ object Images {
         loader ?: ImageLoader.Builder(context.applicationContext)
             .components {
                 add(SmbFetcher.Factory(context.applicationContext))
+                add(AmazonFetcher.Factory(context.applicationContext))
                 // **鍵が無いと Coil は同じ写真だと分からない。**
                 // 分からなければ覚えられず、毎回読み直すことになる。
                 add(SmbKeyer())
+                add(AmazonKeyer())
             }
             .memoryCache {
                 coil.memory.MemoryCache.Builder(context.applicationContext)

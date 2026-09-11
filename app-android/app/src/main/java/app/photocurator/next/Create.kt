@@ -46,12 +46,17 @@ import kotlinx.coroutines.launch
  * 起きやすく、選び直しからやり直すことになる。
  */
 @Composable
-fun CreateScreen(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
+fun CreateScreen(
+    onCreated: (Project) -> Unit,
+    onDismiss: () -> Unit,
+    /** 共有で受け取った Amazon のリンク。**あれば Amazon のタブで開いて読み込む。** */
+    initialLink: String? = null
+) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
     // いまは「この端末」だけ。NAS のタブは繋げられるようになってから足す。
-    var tab by remember { mutableStateOf("album") }
+    var tab by remember { mutableStateOf(if (initialLink != null) "amazon" else "album") }
     var albums by remember { mutableStateOf<List<Album>>(emptyList()) }
     var taken by remember { mutableStateOf<Set<String>>(emptySet()) }
     var note by remember { mutableStateOf("読み込み中…") }
@@ -75,6 +80,51 @@ fun CreateScreen(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
     // （Compose は入力が等しければ省く）。取れたことを別の状態で伝える。
     var covers by remember { mutableStateOf<Map<String, java.io.File>>(emptyMap()) }
     var stripNote by remember { mutableStateOf("") }
+
+    // ---- Amazon Photos（共有リンク。設計 08 章）----
+    var linkText by remember { mutableStateOf(initialLink ?: "") }
+    var amazon by remember { mutableStateOf<AmazonPick?>(null) }
+    var amazonNote by remember { mutableStateOf("") }
+    var amazonLoading by remember { mutableStateOf(false) }
+
+    // リンクを読む。**本人が押したときだけ**（規約の約束。設計 08 章 13）。
+    fun readLink() {
+        val link = Amazon.parse(linkText.trim())
+        amazon = null
+        strip = emptyList()
+        stripNote = ""
+        if (link == null) {
+            amazonNote = "Amazon Photos の共有リンクではありません"
+            return
+        }
+        amazonLoading = true
+        amazonNote = "読み込んでいます…"
+        scope.launch {
+            val share = Amazon.share(link)
+            if (share is SmbResult.Failed) {
+                amazonNote = share.reason
+                amazonLoading = false
+                return@launch
+            }
+            val shareName = (share as SmbResult.Ok).value.name.ifBlank { "Amazon Photos" }
+            when (val got = Amazon.photos(link)) {
+                is SmbResult.Failed -> amazonNote = got.reason
+                is SmbResult.Ok -> {
+                    val photos = Photos.fromItems(link.key, got.value)
+                    amazon = AmazonPick(link, shareName, photos)
+                    name = shareName
+                    amazonNote = if (photos.isEmpty()) "このリンクに写真がありません" else ""
+                    // **中身を少しだけ。** 取ったサムネは端末に残るので、準備で二度取らない。
+                    strip = photos.take(Covers.STRIP).map { it.thumbModel }
+                    stripNote = if (photos.size > Covers.STRIP) "先頭の ${Covers.STRIP} 枚" else ""
+                }
+            }
+            amazonLoading = false
+        }
+    }
+
+    // 共有で受け取ったときは、**開いた時点で読み込む**（押す手間を省く）。
+    LaunchedEffect(Unit) { if (initialLink != null) readLink() }
 
     LaunchedEffect(Unit) { nasList = NasStore.all(context) }
 
@@ -126,6 +176,15 @@ fun CreateScreen(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
         chosenFolder = null
         name = ""
         note = "読み込み中…"
+        if (tab == "amazon") {
+            // 一覧は無い。**リンクを貼ってもらう**（左の欄）。
+            note = ""
+            taken = Projects.all(context)
+                .filter { it.source.kind == "amazon" }
+                .map { it.source.key }
+                .toSet()
+            return@LaunchedEffect
+        }
         if (tab == "album") {
             albums = Photos.albums(context)
             taken = Projects.all(context)
@@ -210,11 +269,28 @@ fun CreateScreen(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
                         )
                     )
                 }
+                FilterChip(
+                    selected = tab == "amazon",
+                    onClick = { tab = "amazon" },
+                    label = { Text("Amazon Photos", fontSize = 13.sp) },
+                    colors = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = Lime, selectedLabelColor = Color.Black
+                    )
+                )
             }
 
             Row(Modifier.weight(1f)) {
-                // ---- 左: フォルダ一覧 ----
+                // ---- 左: フォルダ一覧（Amazon はリンクの欄）----
                 Column(Modifier.weight(1f)) {
+                  if (tab == "amazon") {
+                    AmazonLinkPane(
+                        text = linkText,
+                        onText = { linkText = it },
+                        note = amazonNote,
+                        loading = amazonLoading,
+                        onRead = { readLink() }
+                    )
+                  } else {
                     Row(
                         Modifier.fillMaxWidth().padding(bottom = 6.dp),
                         verticalAlignment = Alignment.CenterVertically
@@ -332,6 +408,7 @@ fun CreateScreen(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
                             }
                         }
                     }
+                  }
                 }
 
                 Spacer(Modifier.width(16.dp))
@@ -343,11 +420,12 @@ fun CreateScreen(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
                         onValueChange = { name = it },
                         singleLine = true,
                         label = { Text("プロジェクト名") },
-                        enabled = chosen != null || chosenFolder != null,
+                        enabled = chosen != null || chosenFolder != null || (tab == "amazon" && amazon != null),
                         modifier = Modifier.fillMaxWidth()
                     )
                     Text(
-                        "フォルダ名を使います。あとで変えられます",
+                        if (tab == "amazon") "共有の名前を使います。あとで変えられます"
+                        else "フォルダ名を使います。あとで変えられます",
                         fontSize = 11.sp, color = Faint,
                         modifier = Modifier.padding(top = 4.dp, bottom = 14.dp)
                     )
@@ -401,6 +479,36 @@ fun CreateScreen(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
                                 fontSize = 11.sp, color = Faint
                             )
                         }
+                    }
+                    if (tab == "amazon") {
+                        amazon?.let { pick ->
+                            Confirm("出所", "Amazon Photos")
+                            Confirm("共有", pick.name)
+                            Confirm("写真", "${pick.photos.size} 枚")
+                            if (pick.link.key in taken) {
+                                Text(
+                                    "このリンクのプロジェクトは作成済みです（もう 1 つ作れます）",
+                                    fontSize = 11.sp, color = Faint,
+                                    modifier = Modifier.padding(top = 4.dp)
+                                )
+                            }
+                            Spacer(Modifier.height(12.dp))
+                            Row(verticalAlignment = Alignment.Top) {
+                                Icon(Icons.Filled.Lock, null, Modifier.size(14.dp), tint = Faint)
+                                Spacer(Modifier.width(6.dp))
+                                Text(
+                                    "原本は読むだけ。縮小した絵を Amazon から受け取ります。ログインはしません",
+                                    fontSize = 11.sp, color = Faint
+                                )
+                            }
+                        }
+                        // **公開リンクであることは常に言う**（設計 08 章 8.1）。
+                        Spacer(Modifier.height(12.dp))
+                        Text(
+                            "リンクを知っている人は誰でも見られます。選別が終わったら、" +
+                                "Amazon Photos でリンクを削除してください",
+                            fontSize = 12.sp, color = Warn
+                        )
                     }
                     // **中身を少しだけ見せる。** 名前と枚数だけでは決められない。
                     if (strip.isNotEmpty() || stripNote.isNotEmpty()) {
@@ -481,8 +589,22 @@ fun CreateScreen(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
                         val folder = chosenFolder
                         val album = chosen
                         val nas = nasList.firstOrNull { it.id == tab }
+                        val pick = amazon.takeIf { tab == "amazon" }
                         scope.launch {
                             val project = when {
+                                pick != null -> {
+                                    // **読んだ一覧をそのまま控える。** 開いてすぐもう一度読まない。
+                                    Listing.save(context, pick.link.key, pick.photos)
+                                    Projects.add(
+                                        context, name.trim().ifEmpty { pick.name },
+                                        Source(
+                                            kind = "amazon",
+                                            // **人の言葉。** 生のリンクは技術情報だけに出す。
+                                            label = "Amazon Photos · ${pick.name}",
+                                            key = pick.link.key
+                                        )
+                                    )
+                                }
                                 folder != null && nas != null -> Projects.add(
                                     context, name.trim().ifEmpty { folder.name },
                                     Source(
@@ -509,7 +631,7 @@ fun CreateScreen(onCreated: (Project) -> Unit, onDismiss: () -> Unit) {
                         }
                     },
 
-                    enabled = chosen != null || chosenFolder != null,
+                    enabled = chosen != null || chosenFolder != null || (tab == "amazon" && amazon != null),
                     shape = RoundedCornerShape(50)
                 ) {
                     Text("作成して準備を始める", fontWeight = FontWeight.Bold)
@@ -577,6 +699,60 @@ private fun Confirm(label: String, value: String) {
  * フォルダ行の見本。**無ければフォルダのアイコンに戻す。**
  * 選ぶ前の画面なので、読めなかったことを言葉で並べない。
  */
+/** 作成画面で読んだ Amazon の共有。**読めたものだけ**ここに入る。 */
+private data class AmazonPick(val link: Amazon.Link, val name: String, val photos: List<Photo>)
+
+/**
+ * Amazon の共有リンクを貼る欄。**フォルダ一覧の代わりに左に置く。**
+ * ログインはしない。貼って「読み込む」を押したときだけ Amazon へ行く。
+ */
+@Composable
+private fun AmazonLinkPane(
+    text: String,
+    onText: (String) -> Unit,
+    note: String,
+    loading: Boolean,
+    onRead: () -> Unit
+) {
+    Column {
+        Text(
+            "Amazon Photos の共有リンク", fontSize = 12.sp, color = Faint,
+            modifier = Modifier.padding(bottom = 6.dp)
+        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value = text,
+                onValueChange = onText,
+                singleLine = true,
+                placeholder = { Text("https://www.amazon.co.jp/photos/share/…", fontSize = 12.sp) },
+                keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                    imeAction = androidx.compose.ui.text.input.ImeAction.Go
+                ),
+                keyboardActions = androidx.compose.foundation.text.KeyboardActions(onGo = { onRead() }),
+                modifier = Modifier.weight(1f)
+            )
+            Spacer(Modifier.width(8.dp))
+            Button(
+                onClick = onRead,
+                enabled = text.isNotBlank() && !loading,
+                shape = RoundedCornerShape(50)
+            ) { Text(if (loading) "読み込み中…" else "読み込む") }
+        }
+        if (note.isNotEmpty()) {
+            Text(
+                note, fontSize = 13.sp, color = if (loading) Faint else Warn,
+                modifier = Modifier.padding(top = 12.dp)
+            )
+        }
+        Spacer(Modifier.height(20.dp))
+        Text(
+            "Amazon Photos アプリで写真やアルバムを選んで「共有」→「リンクをコピー」して貼るか、" +
+                "「共有」→「Photo Curator」で直接渡せます。ログインは要りません。",
+            fontSize = 12.sp, color = Faint
+        )
+    }
+}
+
 @Composable
 private fun FolderCover(model: Any?) {
     Box(

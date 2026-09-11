@@ -217,6 +217,33 @@ object Prefs {
             .edit().putInt("display_edge_" + projectId, edge.coerceIn(768, 1920)).apply()
     }
 
+    /** 表示用画像の大きさの選択肢。**画面ごとに書き直さない。** */
+    val EDGES = listOf(768, 1024, 1280, 1536, 1920)
+
+    /**
+     * Amazon が出せる長辺の上限（設計 08 章 8.5）。**0 はまだ測っていない。**
+     * 共有リンクごとに 1 回だけ測る。
+     */
+    fun amazonMaxEdge(context: Context, shareId: String): Int =
+        context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+            .getInt("amazon_max_edge_" + shareId, 0)
+
+    fun setAmazonMaxEdge(context: Context, shareId: String, edge: Int) {
+        context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+            .edit().putInt("amazon_max_edge_" + shareId, edge).apply()
+    }
+
+    /** その出所で出せる上限。**上限の無い出所は 0。** */
+    fun maxEdgeFor(context: Context, source: Source): Int =
+        if (source.kind == "amazon") amazonMaxEdge(context, Amazon.linkOf(source.key).shareId) else 0
+
+    /** その大きさを選べるか。上限が分からなければ選べる。 */
+    fun edgeAllowed(edge: Int, max: Int): Boolean = max <= 0 || edge <= max
+
+    /** 上限を超えない一番大きい選択肢。**超えていなければそのまま。** */
+    fun usableEdge(edge: Int, max: Int): Int =
+        if (edgeAllowed(edge, max)) edge else EDGES.filter { it <= max }.maxOrNull() ?: EDGES.first()
+
     /**
      * プロジェクト詳細の一覧の列数。**0 は「おまかせ」**（幅から決める）。
      * 覚えておくのは、開くたびに選び直したくないため。
@@ -365,6 +392,9 @@ object Listing {
                     takenAt = entry.getLong("at"),
                     smb = if (entry.has("nas")) {
                         SmbRef(entry.getString("nas"), entry.getString("path"))
+                    } else null,
+                    amazon = if (entry.has("amz")) {
+                        AmazonRef(entry.getString("amz"), entry.getString("node"), entry.optString("tl"))
                     } else null
                 )
             }
@@ -388,6 +418,9 @@ object Listing {
                             .put("at", photo.takenAt)
                             .apply {
                                 photo.smb?.let { put("nas", it.nasId); put("path", it.path) }
+                                photo.amazon?.let {
+                                    put("amz", it.shareKey); put("node", it.nodeId); put("tl", it.tempLink)
+                                }
                             }
                     )
                 }
