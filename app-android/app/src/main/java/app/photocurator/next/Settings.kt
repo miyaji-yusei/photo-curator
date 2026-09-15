@@ -36,6 +36,7 @@ fun SettingsScreen(onBack: () -> Unit) {
     var groupSize by remember { mutableStateOf(Prefs.groupSize(context)) }
     var groupBursts by remember { mutableStateOf(Prefs.groupBursts(context)) }
     var askBeforeStart by remember { mutableStateOf(Prefs.askBeforeStart(context)) }
+    var holdZooms by remember { mutableStateOf(Prefs.holdZooms(context)) }
     var displayEdge by remember { mutableStateOf(Prefs.displayEdge(context)) }
     var detailing by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
@@ -214,6 +215,11 @@ fun SettingsScreen(onBack: () -> Unit) {
                     }
                     Toggle("開始前に毎回この設定を確認する", askBeforeStart) {
                         askBeforeStart = it; Prefs.setAskBeforeStart(context, it)
+                    }
+                    // **既定は「選ぶ」。** 複数選びは長押しでしか始められないが、
+                    // 拡大はタイルの虫眼鏡にもある。好みで戻せるようにする。
+                    Toggle("選別中の長押しで拡大する（既定は選ぶ）", holdZooms) {
+                        holdZooms = it; Prefs.setHoldZooms(context, it)
                     }
 
                     Spacer(Modifier.height(16.dp))

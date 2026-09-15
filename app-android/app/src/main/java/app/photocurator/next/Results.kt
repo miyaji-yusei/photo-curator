@@ -169,9 +169,12 @@ fun ResultsScreen(
         picking.filter { it in kept }
     }
 
+    // **星を 1 つに絞っているときは、いつも撮影順。**
+    // その中は全部同じ星なので、星で並べ替えても並びは変わらない。
+    val singleStar = filter.startsWith("star:")
     // **並べ替えは見せ方だけ。** 星も順番もここでは動かさない。
-    val shown = remember(folded, sort, ratings) {
-        if (sort == "time") folded.sortedWith(compareBy({ it.takenAt }, { it.relativePath }))
+    val shown = remember(folded, sort, ratings, singleStar) {
+        if (sort == "time" || singleStar) folded.sortedWith(compareBy({ it.takenAt }, { it.relativePath }))
         else folded.sortedWith(
             compareByDescending<Photo> { ratings[it.relativePath] ?: 0 }
                 .thenBy { it.takenAt }.thenBy { it.relativePath }
@@ -298,10 +301,18 @@ fun ResultsScreen(
                         filter = "star:$value"; picked = emptySet()
                     }
                 }
-                Spacer(Modifier.width(8.dp))
-                // **並べ替えは 2 つだけ。** 星で選んだのか、撮った順で見たいのか。
-                StarChip("星が高い順", sort == "star") { sort = "star" }
-                StarChip("撮影順", sort == "time") { sort = "time" }
+                // **絞り込みと並べ替えを見た目で分ける。** 同じ形のチップが
+                // 間隔だけで分かれていると、どちらを押しているのか分からない。
+                if (!singleStar) {
+                    Spacer(Modifier.width(6.dp))
+                    Box(Modifier.width(1.dp).height(22.dp).background(Color(0xFF3A3E47)))
+                    Spacer(Modifier.width(6.dp))
+                    Text("並べ替え", fontSize = 11.sp, color = Faint)
+                    Spacer(Modifier.width(2.dp))
+                    // **並べ替えは 2 つだけ。** 星で選んだのか、撮った順で見たいのか。
+                    SortChip("星が高い順", sort == "star") { sort = "star" }
+                    SortChip("撮影順", sort == "time") { sort = "time" }
+                }
             }
 
             // ---- 星の内訳バー ----
@@ -321,6 +332,14 @@ fun ResultsScreen(
 
             note?.let {
                 Text(it, fontSize = 12.sp, color = Faint, modifier = Modifier.padding(top = 8.dp))
+            }
+            // **入口があることを言う。** 押せると分かって初めて機能になる。
+            if (members.values.any { it.size > 1 }) {
+                Text(
+                    "⧉ が付いた組は、押すと中身を選別できます",
+                    fontSize = 11.sp, color = Faint,
+                    modifier = Modifier.padding(top = 6.dp)
+                )
             }
         }
 
@@ -666,6 +685,19 @@ fun ResultsScreen(
             onDismiss = { confirmingMove = null }
         )
     }
+}
+
+@Composable
+private fun SortChip(label: String, selected: Boolean, onClick: () -> Unit) {
+    FilterChip(
+        selected = selected,
+        onClick = onClick,
+        label = { Text(label, fontSize = 12.sp) },
+        // **絞り込み（Lime）とは別の色。** 役割が違うものを同じ色で並べない。
+        colors = FilterChipDefaults.filterChipColors(
+            selectedContainerColor = Sky, selectedLabelColor = Color.Black
+        )
+    )
 }
 
 @Composable

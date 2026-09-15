@@ -465,11 +465,27 @@ fn family(session: &Session, path: &str) -> Vec<String> {
 ///
 /// 画面に出ていない写真を指されたら何もしない。呼び出し側を信用しない。
 pub fn keep_top(session: Session, path: String) -> Session {
+    keep_and_top(session, Vec::new(), path)
+}
+
+/// 選んだ分は残しつつ、**1 枚だけ ★5 で確定する。**
+///
+/// 「1・2 枚目は残す、3 枚目は ★5、4 枚目は落とす」を 1 組の中でやるための道。
+/// ★5 でその組が決まるのは今までどおり。違うのは、**そのとき選んでいた分が
+/// ちゃんと残る**こと（前は押した 1 枚だけが残り、選んでいた分は黙って落ちた）。
+pub fn keep_and_top(session: Session, selected: Vec<String>, path: String) -> Session {
     if !session.current.iter().any(|id| id == &path) {
         return session;
     }
     let previous = session.ratings.get(&path).copied().unwrap_or(0);
-    let mut next = advance(session, vec![path.clone()]);
+    // 押した 1 枚は必ず含める。**同じものは 2 回入れない。**
+    let mut chosen: Vec<String> = Vec::new();
+    for id in selected.into_iter().chain(std::iter::once(path.clone())) {
+        if !chosen.contains(&id) {
+            chosen.push(id);
+        }
+    }
+    let mut next = advance(session, chosen);
     for id in family(&next, &path) {
         next.ratings.insert(id, MAX_STAR);
     }
@@ -559,6 +575,8 @@ pub fn regroup(
     overrides: Vec<PairOverride>,
 ) -> Session {
     let mut next = session;
+    // 前のラウンドまでのまとまり。**作り直すのはこのラウンドの分だけ。**
+    let carried: HashMap<String, Vec<String>> = next.members.clone();
 
     // 決めた写真。history に出た代表の仲間まで含める。
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -586,9 +604,31 @@ pub fn regroup(
         .map(|(rep, mates)| (mates.clone(), rep.clone()))
         .collect();
 
+    // **このラウンドに属する写真だけを組み直す。**
+    //
+    // 呼ぶ側はプロジェクトの写真を全部渡してくる（どれが今のラウンドに残って
+    // いるかは core しか知らない）。history は**ラウンドごとに空になる**ので、
+    // seen だけで弾くと、**前のラウンドで落とした写真が queue に戻る**。
+    // 実際そうなっていた（2026-09-15。まとめ方を直した直後に戻ってきた）。
+    let mut in_round: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for id in next.queue.iter().chain(next.current.iter()) {
+        for member in family(&next, id) {
+            in_round.insert(member);
+        }
+    }
+    for decision in &next.history {
+        for rep in &decision.group {
+            for member in family(&next, rep) {
+                in_round.insert(member);
+            }
+        }
+    }
+
     let remaining: Vec<PhotoRef> = photos
         .into_iter()
-        .filter(|photo| !seen.contains(&photo.relative_path))
+        .filter(|photo| {
+            in_round.contains(&photo.relative_path) && !seen.contains(&photo.relative_path)
+        })
         .collect();
 
     let (queue, mut members) = if group_bursts_on {
@@ -618,8 +658,12 @@ pub fn regroup(
     };
 
     members.extend(kept_members);
+    // 前のラウンドで決めた組は残す。**このラウンドの分だけ入れ替える。**
+    let mut all = carried;
+    all.retain(|rep, _| !in_round.contains(rep));
+    all.extend(members);
     next.queue = queue;
-    next.members = members;
+    next.members = all;
     next.current = Vec::new();
     fill(&mut next);
     next
@@ -678,6 +722,11 @@ pub fn round_for(
     session.round = previous.round + 1;
     // **星は全部引き継ぐ。** ここで選び直さない写真の星が消えてはいけない。
     session.ratings = previous.ratings;
+    // **まとまりも引き継ぐ。** 作り直すだけだと、前のラウンドで決めた組が
+    // 結果画面から消える（連写の中身を選別する入口も一緒に消える）。
+    let mut members = previous.members;
+    members.extend(session.members);
+    session.members = members;
     Some(session)
 }
 
@@ -718,6 +767,11 @@ pub fn next_round(
     // 星は引き継ぐ。start_round は target_star で埋め直すが、それでは
     // **畳まれて画面に出なかった仲間の星**と、落ちたものの星が消える。
     session.ratings = previous.ratings;
+    // **まとまりも引き継ぐ。** 作り直すだけだと、前のラウンドで決めた組が
+    // 結果画面から消える（連写の中身を選別する入口も一緒に消える）。
+    let mut members = previous.members;
+    members.extend(session.members);
+    session.members = members;
     // history は引き継がない。**戻すはラウンドをまたがない。**
     // またぐと、戻した先の round と target_star が合わなくなる。
     Some(session)
@@ -1417,6 +1471,83 @@ mod tests {
     // ---- まとめ直し ----
 
     /// 1,2 が連写。3,4 は離れている。5,6 も連写。
+    #[test]
+    fn 組み直しても前のラウンドで落とした写真は戻らない() {
+        let photos = plain(&["1", "2", "3", "4"]);
+        // 1 組 2 枚。1 と 3 を残し、2 と 4 を落とす。
+        let first = round(&["1", "2", "3", "4"], 2);
+        let first = advance(first, vec!["1".into()]);
+        let first = advance(first, vec!["3".into()]);
+        let second = next_round(first, photos.clone(), false, threshold(), vec![]).unwrap();
+
+        // 呼ぶ側はプロジェクトの写真を**全部**渡す。
+        let after = regroup(second, photos, false, threshold(), vec![]);
+
+        let mut shown: Vec<String> = after.current.clone();
+        shown.extend(after.queue.clone());
+        shown.sort();
+        assert_eq!(shown, vec!["1".to_string(), "3".to_string()]);
+    }
+
+    #[test]
+    fn 組み直してもこのラウンドで決めた分は戻らない() {
+        let photos = plain(&["1", "2", "3", "4"]);
+        let session = round(&["1", "2", "3", "4"], 2);
+        // 1 を残して 2 を落とす。この 2 枚は決めた分。
+        let session = advance(session, vec!["1".into()]);
+
+        let after = regroup(session, photos, false, threshold(), vec![]);
+
+        let mut shown: Vec<String> = after.current.clone();
+        shown.extend(after.queue.clone());
+        shown.sort();
+        assert_eq!(shown, vec!["3".to_string(), "4".to_string()]);
+    }
+
+    #[test]
+    fn 選んだ分を残したまま一枚だけ確定できる() {
+        let session = round(&["1", "2", "3", "4"], 4);
+        // 1・2 を選んだ状態で 3 を ★5。4 は落とす。
+        let after = keep_and_top(session, vec!["1".into(), "2".into()], "3".into());
+        assert_eq!(after.ratings.get("1"), Some(&1));
+        assert_eq!(after.ratings.get("2"), Some(&1));
+        assert_eq!(after.ratings.get("3"), Some(&MAX_STAR));
+        assert_eq!(after.ratings.get("4"), Some(&0));
+        // ★5 は次のラウンドに出さない。選んだ 2 枚は出す。
+        assert_eq!(after.survivors, vec!["1".to_string(), "2".to_string()]);
+    }
+
+    #[test]
+    fn 選んだ分ごと一枚確定を戻せる() {
+        let after = keep_and_top(round(&["1", "2", "3", "4"], 4), vec!["1".into()], "3".into());
+        let back = undo(after);
+        assert_eq!(back.ratings.get("1"), Some(&0));
+        assert_eq!(back.ratings.get("3"), Some(&0));
+        assert!(back.survivors.is_empty());
+        assert_eq!(back.current.len(), 4);
+    }
+
+    #[test]
+    fn 次のラウンドでも前のまとまりを覚えている() {
+        // 1 と 2 が連写。3 と 4 は単独。
+        let photos = vec![
+            photo("1", 0, "0000000000000000"),
+            photo("2", 500, "0000000000000000"),
+            photo("3", 100_000, "ffffffffffffffff"),
+            photo("4", 200_000, "0f0f0f0f0f0f0f0f"),
+        ];
+        let session = start_round(photos.clone(), 2, 0, true, threshold(), vec![]);
+        assert!(session.members.contains_key("1"));
+
+        // 連写の組は落とし、3 と 4 を残す。
+        let session = advance(session, vec!["3".into()]);
+        let session = advance(session, vec!["4".into()]);
+        let next = next_round(session, photos, true, threshold(), vec![]).unwrap();
+
+        // **まとまりの記録は残る。** 結果画面で中身を選別できるように。
+        assert!(next.members.contains_key("1"));
+    }
+
     fn regroup_photos() -> Vec<PhotoRef> {
         vec![
             photo("1.jpg", 0, "0000000000000000"),

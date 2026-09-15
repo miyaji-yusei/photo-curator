@@ -38,6 +38,7 @@ import uniffi.photo_curator_core.BurstThreshold
 import uniffi.photo_curator_core.PhotoRef
 import uniffi.photo_curator_core.Session
 import uniffi.photo_curator_core.advance
+import uniffi.photo_curator_core.keepAndTop
 import uniffi.photo_curator_core.keepTop
 import uniffi.photo_curator_core.PairOverride
 import uniffi.photo_curator_core.nextRound
@@ -86,6 +87,8 @@ fun CullScreen(
     var session by remember { mutableStateOf<Session?>(null) }
     var selected by remember { mutableStateOf<Set<String>>(emptySet()) }
     var multi by remember { mutableStateOf(false) }
+    // 長押しの動き。**既定は「選ぶ」**（設定で拡大に戻せる）。
+    var holdZooms by remember { mutableStateOf(false) }
     var note by remember { mutableStateOf("読み込み中…") }
     var stageSize by remember { mutableStateOf(0 to 0) }
     // 連写のまとめに使う指紋。**出来た分だけで始められる。**
@@ -129,6 +132,7 @@ fun CullScreen(
         learnedDistance = distance
         overrides = loadedOverrides
         groupBursts = Prefs.groupBursts(context)
+        holdZooms = Prefs.holdZooms(context)
         // **大きさはプロジェクトごと。** 設定の値はその既定。
         edge = Prefs.projectEdge(context, project.id)
         Neighbours.log(refs, loadedThreshold)
@@ -235,7 +239,9 @@ fun CullScreen(
      */
     fun keepTop(path: String) {
         Timing.tick(context, project.id, live.round)
-        val next = keepTop(live, path)
+        // **選んでいた分は残す。** 「1・2 は残す、3 は ★5、4 は落とす」を
+        // 1 組の中でやれるように（前は押した 1 枚だけが残っていた）。
+        val next = keepAndTop(live, selected.toList(), path)
         session = next
         selected = emptySet()
         scope.launch { Store.save(context, project.id, next) }
@@ -530,13 +536,22 @@ fun CullScreen(
                                         val idx = line.indexOfFirst { it.relativePath == path }
                                         if (idx >= 0) zooming = line to idx
                                     },
-                                    // **長押しも拡大。** 拡大・★5・まとまりは
-                                    // タイルのボタンにあるので、献立は作らない。
+                                    // **長押しは選ぶ。** 複数選びはここでしか
+                                    // 始められない。拡大はタイルの虫眼鏡にある
+                                    // （設定で長押しを拡大に戻せる）。
                                     onHold = {
-                                        val line = live.current.mapNotNull { byPath[it] }
-                                        val idx = line.indexOfFirst { it.relativePath == path }
-                                        if (idx >= 0) zooming = line to idx
+                                        if (holdZooms) {
+                                            val line = live.current.mapNotNull { byPath[it] }
+                                            val idx = line.indexOfFirst { it.relativePath == path }
+                                            if (idx >= 0) zooming = line to idx
+                                        } else {
+                                            multi = true
+                                            selected = selected + path
+                                        }
                                     },
+                                    // 長押しが選ぶに変わったら、**細いタイルでも
+                                    // 虫眼鏡を出す**（拡大の入口が無くなるため）。
+                                    alwaysZoom = !holdZooms,
                                     onOpenBurst = { editingBurst = path },
                                     onTop = { keepTop(path) },
                                     onTap = {
@@ -664,8 +679,10 @@ internal fun Tile(
     onTap: () -> Unit,
     /** 右上のボタン。**待たずに大きく見る。** */
     onZoom: () -> Unit,
-    /** 長押し。細いタイルではボタンを出さないので、**ここが唯一の入口**。 */
+    /** 長押し。**既定は「選ぶ」**（設定で拡大に戻せる）。 */
     onHold: () -> Unit,
+    /** 細いタイルでも拡大のボタンを出すか。長押しが拡大でないときは出す。 */
+    alwaysZoom: Boolean = false,
     onOpenBurst: () -> Unit,
     /** ★5 で確定する。連写の中身選別のように**使えない場所では null**。 */
     onTop: (() -> Unit)? = null
@@ -750,7 +767,7 @@ internal fun Tile(
         // ---- 右上: 拡大 と ★5。**押したらすぐ効く。** ----
         // 長押しでも同じことができるが、長押しは 300ms 待つ。何百回も
         // 触る画面なので、待たずに押せる場所を置く。
-        if (wide && photo != null) {
+        if ((wide || alwaysZoom) && photo != null) {
             Column(
                 Modifier.align(Alignment.TopEnd).padding(6.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp)

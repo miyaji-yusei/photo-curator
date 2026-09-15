@@ -267,6 +267,21 @@ object Prefs {
             .edit().putBoolean("group_bursts", on).apply()
     }
 
+    /**
+     * 選別中に写真を長押ししたときの動き。**既定は「選ぶ」**（off）。
+     *
+     * 拡大はタイルの虫眼鏡にもあるが、複数選びは長押しでしか始められない。
+     * 拡大の方が好きな人のために、設定で戻せるようにしてある。
+     */
+    fun holdZooms(context: Context): Boolean =
+        context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+            .getBoolean("hold_zooms", false)
+
+    fun setHoldZooms(context: Context, on: Boolean) {
+        context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+            .edit().putBoolean("hold_zooms", on).apply()
+    }
+
     /** 開始前に毎回設定を確かめるか。**既定 off。** 選別中にも変えられるため。 */
     fun askBeforeStart(context: Context): Boolean =
         context.getSharedPreferences(FILE, Context.MODE_PRIVATE)

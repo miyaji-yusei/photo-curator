@@ -49,6 +49,8 @@ namespace photo_curator_core {
     // 画面に出ていない写真を指されたら何もしない。
     Session keep_top(Session session, string path);
 
+    Session keep_and_top(Session session, sequence<string> selected, string path);
+
     // 連写のまとまりで、画面に出す 1 枚を選び直す。星は動かさない。
     // 選び直せないとき（まとまりでない・仲間でない・もう見終わった）は null。
     Session? set_representative(Session session, string shown, string wanted);

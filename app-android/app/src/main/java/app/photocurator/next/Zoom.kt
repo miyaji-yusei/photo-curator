@@ -155,6 +155,19 @@ fun ZoomView(
             )
         }
 
+        // ---- 中央: まだ来ていないことを出す ----
+        // **ぼやけているのが「ピンボケ」なのか「まだ来ていない」のか**、
+        // 絵だけでは区別できない（実機で分からなかった）。回っていれば待てる。
+        if (!ready && !broken) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                androidx.compose.material3.CircularProgressIndicator(
+                    color = Lime,
+                    strokeWidth = 3.dp,
+                    modifier = Modifier.size(44.dp)
+                )
+            }
+        }
+
         // ---- 上端: 閉じる・名前・いま何枚目か ----
         // **写真の上に文字を直接置かない。** 白い写真だと白文字が消える。
         // 実機で「原本を読み込み中…」がまったく読めなかった。
