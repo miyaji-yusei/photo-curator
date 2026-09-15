@@ -267,4 +267,9 @@ private fun BoxScope.Arrow(
 
 /** 「6.7MB」。**原本の重さは、待たされる理由そのもの**なので数字で出す。 */
 private fun megabytes(bytes: Long): String =
-    if (bytes <= 0) "サイズ不明" else "%.1fMB".format(bytes / 1024.0 / 1024.0)
+    when {
+        bytes <= 0 -> "サイズ不明"
+        // **0.0MB と出さない。** 1MB 未満は KB で言う（Amazon の写真は数百 KB のこともある）。
+        bytes < 1024L * 1024 -> "%dKB".format(bytes / 1024)
+        else -> "%.1fMB".format(bytes / 1024.0 / 1024.0)
+    }

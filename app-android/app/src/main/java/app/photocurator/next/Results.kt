@@ -301,15 +301,19 @@ fun ResultsScreen(
                         filter = "star:$value"; picked = emptySet()
                     }
                 }
-                // **絞り込みと並べ替えを見た目で分ける。** 同じ形のチップが
-                // 間隔だけで分かれていると、どちらを押しているのか分からない。
-                if (!singleStar) {
-                    Spacer(Modifier.width(6.dp))
-                    Box(Modifier.width(1.dp).height(22.dp).background(Color(0xFF3A3E47)))
-                    Spacer(Modifier.width(6.dp))
+            }
+
+            // ---- 並べ替え ----
+            // **絞り込みと同じ行に置かない。** 同じ形のチップが並ぶと、どちらを
+            // 押しているのか分からないし、狭い画面では右端に隠れて見つからない。
+            // **並べ替えは 2 つだけ。** 星で選んだのか、撮った順で見たいのか。
+            if (!singleStar) {
+                Row(
+                    Modifier.fillMaxWidth().padding(top = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
                     Text("並べ替え", fontSize = 11.sp, color = Faint)
-                    Spacer(Modifier.width(2.dp))
-                    // **並べ替えは 2 つだけ。** 星で選んだのか、撮った順で見たいのか。
                     SortChip("星が高い順", sort == "star") { sort = "star" }
                     SortChip("撮影順", sort == "time") { sort = "time" }
                 }
