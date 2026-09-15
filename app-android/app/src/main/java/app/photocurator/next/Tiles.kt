@@ -9,9 +9,11 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.BrokenImage
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -19,6 +21,20 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+
+/**
+ * 入力欄の右端の×。**中身があるときだけ出す**（設計 02「入力欄の決まり」）。
+ *
+ * 既定の名前が入っている欄ほど、消して打ち直す手間が要る（Amazon の共有名は
+ * 日時のことがある）。パスワードの欄は例外で、右端は「見る／隠す」。
+ */
+@Composable
+fun ClearIcon(value: String, onClear: () -> Unit) {
+    if (value.isEmpty()) return
+    IconButton(onClick = onClear) {
+        Icon(Icons.Filled.Close, "消す", Modifier.size(18.dp), tint = Faint)
+    }
+}
 
 /**
  * 絵が出ていないタイルの理由。**空白のまま置かない。**

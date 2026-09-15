@@ -627,7 +627,7 @@ fun ProjectScreen(
                 val maxEdge = Prefs.maxEdgeFor(context, project.source)
                 if (Prefs.EDGES.any { !Prefs.edgeAllowed(it, maxEdge) }) {
                     Text(
-                        "Amazon が出せるのは長辺 ${maxEdge}px までです",
+                        "この共有の写真は長辺 ${maxEdge}px までです",
                         fontSize = 12.sp, color = Faint,
                         modifier = Modifier.padding(bottom = 8.dp)
                     )
@@ -707,7 +707,9 @@ fun ProjectScreen(
             text = {
                 OutlinedTextField(
                     value = text, onValueChange = { text = it },
-                    singleLine = true, label = { Text("プロジェクト名") }
+                    singleLine = true, label = { Text("プロジェクト名") },
+                    // **全部消して打ち直せるように**（設計 02「入力欄の決まり」）。
+                    trailingIcon = { ClearIcon(text) { text = "" } }
                 )
             },
             confirmButton = {

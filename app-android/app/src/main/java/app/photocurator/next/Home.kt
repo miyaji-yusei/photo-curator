@@ -175,7 +175,9 @@ fun HomeScreen(
             text = {
                 OutlinedTextField(
                     value = text, onValueChange = { text = it },
-                    singleLine = true, label = { Text("プロジェクト名") }
+                    singleLine = true, label = { Text("プロジェクト名") },
+                    // **全部消して打ち直せるように**（設計 02「入力欄の決まり」）。
+                    trailingIcon = { ClearIcon(text) { text = "" } }
                 )
             },
             confirmButton = {

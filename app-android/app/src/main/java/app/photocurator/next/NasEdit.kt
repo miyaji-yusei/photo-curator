@@ -203,6 +203,8 @@ private fun Field(
         singleLine = true,
         label = { Text(label) },
         placeholder = if (hint.isEmpty()) null else ({ Text(hint, color = Faint) }),
+        // **中身があるときだけ×**（設計 02「入力欄の決まり」）。
+        trailingIcon = { ClearIcon(value) { onChange("") } },
         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
     )
 }

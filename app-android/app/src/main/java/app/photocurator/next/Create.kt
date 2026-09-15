@@ -100,17 +100,18 @@ fun CreateScreen(
         amazonLoading = true
         amazonNote = "読み込んでいます…"
         scope.launch {
-            val share = Amazon.share(link)
-            if (share is SmbResult.Failed) {
-                amazonNote = share.reason
-                amazonLoading = false
-                return@launch
-            }
-            val shareName = (share as SmbResult.Ok).value.name.ifBlank { "Amazon Photos" }
-            when (val got = Amazon.photos(link)) {
+            when (val got = Amazon.contents(link)) {
                 is SmbResult.Failed -> amazonNote = got.reason
                 is SmbResult.Ok -> {
-                    val photos = Photos.fromItems(link.key, got.value)
+                    // **名前はアルバム名を優先**（設計 08 章 8.1）。写真を選んで作った
+                    // 共有には、Amazon が日時の名前を付ける。
+                    val shareName = got.value.name.ifBlank { "Amazon Photos" }
+                    val photos = Photos.fromItems(link.key, got.value.items)
+                    // 出せる大きさの上限は**一覧に入っている大きさから**分かる
+                    // （設計 08 章 8.5）。準備を待たずに選択肢を絞れる。
+                    Amazon.maxEdgeOf(got.value.items).takeIf { it > 0 }?.let {
+                        Prefs.setAmazonMaxEdge(context, link.shareId, it)
+                    }
                     amazon = AmazonPick(link, shareName, photos)
                     name = shareName
                     amazonNote = if (photos.isEmpty()) "このリンクに写真がありません" else ""
@@ -421,6 +422,8 @@ fun CreateScreen(
                         singleLine = true,
                         label = { Text("プロジェクト名") },
                         enabled = chosen != null || chosenFolder != null || (tab == "amazon" && amazon != null),
+                        // 既定の名前が入っているので、**消して打ち直せるように**（設計 02）。
+                        trailingIcon = { ClearIcon(name) { name = "" } },
                         modifier = Modifier.fillMaxWidth()
                     )
                     Text(
@@ -725,6 +728,7 @@ private fun AmazonLinkPane(
                 onValueChange = onText,
                 singleLine = true,
                 placeholder = { Text("https://www.amazon.co.jp/photos/share/…", fontSize = 12.sp) },
+                trailingIcon = { ClearIcon(text) { onText("") } },
                 keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
                     imeAction = androidx.compose.ui.text.input.ImeAction.Go
                 ),

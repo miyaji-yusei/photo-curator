@@ -66,8 +66,18 @@ object Amazon {
         val name: String,
         val takenAt: Long,
         val size: Long,
-        val tempLink: String
+        val tempLink: String,
+        /** 原本の長辺。**出せる大きさの上限を知るために持つ**（設計 08 章 8.5）。 */
+        val longest: Int = 0
     )
+
+    /**
+     * 共有の中身。**名前は「人が見て分かる方」を選ぶ**（設計 08 章 8.1）。
+     *
+     * アルバムを共有すると共有の名前＝アルバム名だが、写真を選んで共有すると
+     * 日時になる。直下がアルバム 1 つだけなら、そのアルバムの名前を使う。
+     */
+    data class Contents(val name: String, val items: List<Item>)
 
     private val client: OkHttpClient by lazy {
         OkHttpClient.Builder()
@@ -128,12 +138,21 @@ object Amazon {
      * 共有の直下はアルバムとは限らない（今回は 共有 → アルバム → 写真）。
      * FILE 以外は 2 階層まで潜る。
      */
-    suspend fun photos(link: Link): SmbResult<List<Item>> = withContext(Dispatchers.IO) {
+    /** 写真だけ要るとき（準備・取り直し）。 */
+    suspend fun photos(link: Link): SmbResult<List<Item>> = when (val got = contents(link)) {
+        is SmbResult.Failed -> got
+        is SmbResult.Ok -> SmbResult.Ok(got.value.items)
+    }
+
+    suspend fun contents(link: Link): SmbResult<Contents> = withContext(Dispatchers.IO) {
         val share = when (val got = share(link)) {
             is SmbResult.Failed -> return@withContext got
             is SmbResult.Ok -> got.value
         }
         val found = ArrayList<Item>()
+        // 直下にあったアルバムの名前と、その数。**1 つだけならそれを名前にする。**
+        var insideName: String? = null
+        var insideCount = 0
 
         suspend fun walk(nodeId: String, depth: Int) {
             var offset = 0
@@ -153,6 +172,10 @@ object Amazon {
                 for (at in 0 until data.length()) {
                     val node = data.getJSONObject(at)
                     if (node.optString("kind") != "FILE") {
+                        if (depth == 0) {
+                            insideCount += 1
+                            insideName = node.optString("name").takeIf { it.isNotBlank() }
+                        }
                         if (depth < DEPTH) walk(node.getString("id"), depth + 1)
                         continue
                     }
@@ -162,12 +185,14 @@ object Amazon {
                     if (!content.optString("contentType").startsWith("image/")) continue
                     val temp = node.optString("tempLink")
                     if (temp.isEmpty()) continue
+                    val image = content.optJSONObject("image")
                     found += Item(
                         nodeId = node.getString("id"),
                         name = node.optString("name"),
                         takenAt = dateOf(content.optString("contentDate")),
                         size = content.optLong("size"),
-                        tempLink = temp
+                        tempLink = temp,
+                        longest = maxOf(image?.optInt("width") ?: 0, image?.optInt("height") ?: 0)
                     )
                 }
                 offset += data.length()
@@ -177,8 +202,15 @@ object Amazon {
 
         try {
             walk(share.rootId, 0)
-            // **使う値そのもので並べる。** 同時刻は node id で決める（毎回同じ順）。
-            SmbResult.Ok(found.sortedWith(compareBy({ it.takenAt }, { it.nodeId })))
+            // アルバム 1 つだけの共有なら、その名前。**日時の名前より探しやすい。**
+            val name = if (insideCount == 1) insideName ?: share.name else share.name
+            SmbResult.Ok(
+                Contents(
+                    name = name,
+                    // **使う値そのもので並べる。** 同時刻は node id で決める（毎回同じ順）。
+                    items = found.sortedWith(compareBy({ it.takenAt }, { it.nodeId }))
+                )
+            )
         } catch (error: Exception) {
             Log.w(TAG, "一覧を読めなかった", error)
             SmbResult.Failed(describe(error))
@@ -244,8 +276,21 @@ object Amazon {
     private fun sized(url: String, box: Int?) = if (box == null) url else "$url?viewBox=$box,$box"
 
     /**
-     * Amazon が出せる長辺の上限を測る。**1 枚だけ、選択肢の最大を頼んで、
-     * 返ってきた長辺を見る**（設計 08 章 8.5）。測れなければ null。
+     * 出せる長辺の上限（設計 08 章 8.5）。**一覧に入っている大きさから決める。**
+     *
+     * `viewBox` は原本より大きくはしないので、原本の長辺が上限になる。一覧に
+     * 幅と高さが入っているので、**網へ行かずに分かる**。
+     *
+     * 1 枚で決めると、たまたま小さい 1 枚に引きずられる。**真ん中の値**にすれば、
+     * 半分以上の写真がその大きさで出せる。分からなければ 0（上限なし扱い）。
+     */
+    fun maxEdgeOf(items: List<Item>): Int {
+        val sizes = items.mapNotNull { it.longest.takeIf { long -> long > 0 } }.sorted()
+        return if (sizes.isEmpty()) 0 else sizes[sizes.size / 2]
+    }
+
+    /**
+     * 一覧に大きさが入っていなかったときの備え。**1 枚だけ頼んで測る。**
      */
     suspend fun measureMaxEdge(ref: AmazonRef): Int? {
         val bytes = (image(ref, Prefs.EDGES.max()) as? SmbResult.Ok)?.value ?: return null

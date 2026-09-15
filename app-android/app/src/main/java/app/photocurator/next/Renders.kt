@@ -132,6 +132,37 @@ object Renders {
             false
         }
 
+    /**
+     * すでにある**大きい絵から作り直す。網へ行かない。**
+     *
+     * 1024px で作ったあとに 768px へ落とすようなとき、もう一度取り直すのは
+     * 無駄（Amazon なら通信、NAS なら原本 6MB の読み直し）。小さくするだけなら
+     * 手元の絵で足りる。**大きくするときは作れない**ので false を返す。
+     */
+    fun deriveFromLarger(context: Context, nasId: String, path: String, edge: Int): Boolean {
+        // 近い方から探す。**必要以上に大きい絵をデコードしない。**
+        val larger = Prefs.EDGES.filter { it > edge }.sorted()
+            .firstOrNull { has(context, nasId, path, it) } ?: return false
+        return try {
+            val source = file(context, nasId, path, larger)
+            val decoded = BitmapFactory.decodeFile(source.path) ?: return false
+            val scaled = scaleToEdge(decoded, edge)
+            if (scaled !== decoded) decoded.recycle()
+            val target = File(dir(context), name(nasId, path, edge))
+            val temporary = File(target.parentFile, "${target.name}.writing")
+            temporary.outputStream().use { scaled.compress(Bitmap.CompressFormat.JPEG, 80, it) }
+            scaled.recycle()
+            if (!temporary.renameTo(target)) {
+                temporary.copyTo(target, overwrite = true)
+                temporary.delete()
+            }
+            true
+        } catch (error: Exception) {
+            Log.w(TAG, "大きい絵から作れなかった: $path", error)
+            false
+        }
+    }
+
     private fun scaleToEdge(bitmap: Bitmap, edge: Int): Bitmap {
         val longest = maxOf(bitmap.width, bitmap.height)
         if (longest <= edge) return bitmap

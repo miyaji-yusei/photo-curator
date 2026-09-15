@@ -359,7 +359,13 @@ object Prepare {
         val password = Session.password(context, nas) ?: return@withContext 0
 
         val missing = photos.filter { photo ->
-            photo.smb != null && !Renders.has(context, nasId, photo.smb.path, edge)
+            val path = photo.smb?.path ?: return@filter false
+            when {
+                Renders.has(context, nasId, path, edge) -> false
+                // **大きい絵から縮めて作れるなら、原本を読み直さない。**
+                Renders.deriveFromLarger(context, nasId, path, edge) -> false
+                else -> true
+            }
         }
         var done = photos.size - missing.size
         onProgress(done, photos.size)
@@ -409,7 +415,15 @@ object Prepare {
         val usable = Prefs.usableEdge(edge, Prefs.amazonMaxEdge(context, link.shareId))
         if (usable != edge) Prefs.setProjectEdge(context, project.id, usable)
 
-        val missing = refs.filter { !Renders.has(context, link.cacheId, it.nodeId, usable) }
+        val missing = refs.filter { ref ->
+            when {
+                Renders.has(context, link.cacheId, ref.nodeId, usable) -> false
+                // **大きい絵がもうあるなら、それを縮めるだけ。** 1024 で作ったあとに
+                // 768 へ落とすとき、Amazon から取り直さない。
+                Renders.deriveFromLarger(context, link.cacheId, ref.nodeId, usable) -> false
+                else -> true
+            }
+        }
         var done = refs.size - missing.size
         onProgress(done, refs.size)
         var made = 0
