@@ -290,7 +290,7 @@ object Prepare {
         val cached = Fingerprints.load(context, project.source.key)
 
         // NAS のときだけ、つなぎ先とパスワードを渡す。
-        val nasAccess = if (project.source.kind == "nas") {
+        val nasAccess = if (project.source.kind == SourceKind.Nas) {
             val nasId = project.source.key.substringBefore("|")
             NasStore.all(context).firstOrNull { it.id == nasId }?.let { nas ->
                 NasPasswords.password(context, nas)?.let { nas to it }
@@ -350,7 +350,7 @@ object Prepare {
         edge: Int,
         onProgress: (done: Int, total: Int) -> Unit
     ): Int = withContext(Dispatchers.IO) {
-        if (project.source.kind == "amazon") {
+        if (project.source.kind == SourceKind.Amazon) {
             return@withContext rendersAmazon(context, project, photos, edge, onProgress)
         }
         val nasId = project.source.key.substringBefore("|")

@@ -360,10 +360,10 @@ private fun ProjectCard(
 }
 
 /** 出所の印。**端末・NAS・Amazon を一目で分ける。** 詳細画面でも使う。 */
-fun sourceIcon(kind: String): androidx.compose.ui.graphics.vector.ImageVector = when (kind) {
-    "nas" -> Icons.Filled.Dns
-    "amazon" -> Icons.Filled.Cloud
-    else -> Icons.Filled.Smartphone
+fun sourceIcon(kind: SourceKind): androidx.compose.ui.graphics.vector.ImageVector = when (kind) {
+    SourceKind.Nas -> Icons.Filled.Dns
+    SourceKind.Amazon -> Icons.Filled.Cloud
+    SourceKind.Album -> Icons.Filled.Smartphone
 }
 
 /**

@@ -138,7 +138,7 @@ fun CreateScreen(
         when {
             album != null -> {
                 // 端末は手元なので、そのまま並べてよい。
-                val inside = Photos.forSource(context, Source("album", album.name, album.id))
+                val inside = Photos.forSource(context, Source(SourceKind.Album, album.name, album.id))
                 strip = inside.take(Covers.STRIP).map { it.thumbModel }
                 stripNote = if (inside.size > Covers.STRIP)
                     "先頭の ${Covers.STRIP} 枚" else ""
@@ -181,7 +181,7 @@ fun CreateScreen(
             // 一覧は無い。**リンクを貼ってもらう**（左の欄）。
             note = ""
             taken = Projects.all(context)
-                .filter { it.source.kind == "amazon" }
+                .filter { it.source.kind == SourceKind.Amazon }
                 .map { it.source.key }
                 .toSet()
             return@LaunchedEffect
@@ -189,7 +189,7 @@ fun CreateScreen(
         if (tab == "album") {
             albums = Photos.albums(context)
             taken = Projects.all(context)
-                .filter { it.source.kind == "album" }
+                .filter { it.source.kind == SourceKind.Album }
                 .map { it.source.key }
                 .toSet()
             note = if (albums.isEmpty()) "この端末に写真のフォルダがありません" else ""
@@ -209,7 +209,7 @@ fun CreateScreen(
             is SmbResult.Ok -> {
                 folders = answer.value
                 taken = Projects.all(context)
-                    .filter { it.source.kind == "nas" }
+                    .filter { it.source.kind == SourceKind.Nas }
                     .map { it.source.key }
                     .toSet()
                 // 潜っているときは**いま居る場所の名前**で言う。
@@ -601,7 +601,7 @@ fun CreateScreen(
                                     Projects.add(
                                         context, name.trim().ifEmpty { pick.name },
                                         Source(
-                                            kind = "amazon",
+                                            kind = SourceKind.Amazon,
                                             // **人の言葉。** 生のリンクは技術情報だけに出す。
                                             label = "Amazon Photos · ${pick.name}",
                                             key = pick.link.key
@@ -611,7 +611,7 @@ fun CreateScreen(
                                 folder != null && nas != null -> Projects.add(
                                     context, name.trim().ifEmpty { folder.name },
                                     Source(
-                                        kind = "nas",
+                                        kind = SourceKind.Nas,
                                         // **人の言葉。** 生の道筋は技術情報だけに出す。
                                         label = "${nas.label} · ${nas.share} / ${folder.name}" +
                                             (if (deep) "（以下ぜんぶ）" else ""),
@@ -623,7 +623,7 @@ fun CreateScreen(
                                 album != null -> Projects.add(
                                     context, name.trim().ifEmpty { album.name },
                                     Source(
-                                        kind = "album",
+                                        kind = SourceKind.Album,
                                         label = "この端末・アルバム「${album.name}」",
                                         key = album.id
                                     )

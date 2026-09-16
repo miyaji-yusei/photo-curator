@@ -221,7 +221,7 @@ object Prefs {
 
     /** その出所で出せる上限。**上限の無い出所は 0。** */
     fun maxEdgeFor(context: Context, source: Source): Int =
-        if (source.kind == "amazon") amazonMaxEdge(context, Amazon.linkOf(source.key).shareId) else 0
+        if (source.kind == SourceKind.Amazon) amazonMaxEdge(context, Amazon.linkOf(source.key).shareId) else 0
 
     /** その大きさを選べるか。上限が分からなければ選べる。 */
     fun edgeAllowed(edge: Int, max: Int): Boolean = max <= 0 || edge <= max
@@ -390,12 +390,11 @@ object Listing {
                     relativePath = entry.getString("rel"),
                     size = entry.getLong("size"),
                     takenAt = entry.getLong("at"),
-                    smb = if (entry.has("nas")) {
-                        SmbRef(entry.getString("nas"), entry.getString("path"))
-                    } else null,
-                    amazon = if (entry.has("amz")) {
-                        AmazonRef(entry.getString("amz"), entry.getString("node"), entry.optString("tl"))
-                    } else null
+                    remote = when {
+                        entry.has("nas") -> SmbRef(entry.getString("nas"), entry.getString("path"))
+                        entry.has("amz") -> AmazonRef(entry.getString("amz"), entry.getString("node"), entry.optString("tl"))
+                        else -> null
+                    }
                 )
             }
         } catch (error: Exception) {

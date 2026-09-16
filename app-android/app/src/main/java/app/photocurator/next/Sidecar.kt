@@ -101,7 +101,7 @@ object Sidecar {
     private fun asidePath(folder: String, device: String) =
         "$folder\\.photo-curator\\catalog.$device.json"
 
-    fun supports(project: Project): Boolean = project.source.kind == "nas"
+    fun supports(project: Project): Boolean = project.source.kind == SourceKind.Nas
 
     private fun nasId(project: Project) = project.source.key.substringBefore("|")
     private fun folder(project: Project) = project.source.folder

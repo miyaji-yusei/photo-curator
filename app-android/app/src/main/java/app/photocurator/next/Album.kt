@@ -165,7 +165,7 @@ fun ProjectScreen(
             // ---- Amazon のリンク ----
             // **開いたときに 1 回だけ確かめる。** 消えていても、準備済みの絵で選別は
             // 続けられる。できなくなることだけを言う（設計 08 章 8.4）。
-            if (project.source.kind == "amazon") {
+            if (project.source.kind == SourceKind.Amazon) {
                 val alive = Amazon.share(Amazon.linkOf(project.source.key))
                 if (alive is SmbResult.Failed) {
                     syncNote = if (alive.reason == Amazon.GONE)
@@ -308,9 +308,9 @@ fun ProjectScreen(
                         Text(said, fontSize = 13.sp, color = Warn)
                         Text(
                             when (project.source.kind) {
-                                "nas" -> "同じ Wi-Fi につながっているか、NAS の電源を確かめてください"
-                                "amazon" -> "ネットワークと、Amazon Photos のリンクが残っているかを確かめてください"
-                                else -> "写真へのアクセスが許可されているか確かめてください"
+                                SourceKind.Nas -> "同じ Wi-Fi につながっているか、NAS の電源を確かめてください"
+                                SourceKind.Amazon -> "ネットワークと、Amazon Photos のリンクが残っているかを確かめてください"
+                                SourceKind.Album -> "写真へのアクセスが許可されているか確かめてください"
                             },
                             fontSize = 12.sp, color = Faint,
                             modifier = Modifier.padding(top = 2.dp)
@@ -364,9 +364,9 @@ fun ProjectScreen(
                     }
                     Text(
                         when (project.source.kind) {
-                            "nas" -> "できた写真から選別に出ます。NAS から読むので Wi-Fi 推奨"
-                            "amazon" -> "できた写真から選別に出ます。Amazon から縮小した絵を受け取るので Wi-Fi 推奨"
-                            else -> "できた写真から選別に出ます"
+                            SourceKind.Nas -> "できた写真から選別に出ます。NAS から読むので Wi-Fi 推奨"
+                            SourceKind.Amazon -> "できた写真から選別に出ます。Amazon から縮小した絵を受け取るので Wi-Fi 推奨"
+                            SourceKind.Album -> "できた写真から選別に出ます"
                         },
                         fontSize = 11.sp, color = Faint,
                         modifier = Modifier.padding(top = 8.dp)

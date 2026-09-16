@@ -90,15 +90,15 @@ object Preparations {
                         // EXIF に縮小画像が無かった写真を、落とした表示用画像から
                         // 埋める。**網へは行かない。**
                         // Amazon は縮小画像から指紋を作るので要らない。
-                        if (kind == "nas") Prepare.fillFromRenders(app, project, ready.first, displayEdge)
+                        if (kind == SourceKind.Nas) Prepare.fillFromRenders(app, project, ready.first, displayEdge)
                     }
                     Trouble.clear(app, project.source.key)
                 }
                 // **網へ行く仕事だけ 1 本に並べる。** 相手ごとに別の列。
                 when (kind) {
-                    "nas" -> network.withLock { work() }
-                    "amazon" -> amazonLine.withLock { work() }
-                    else -> work()
+                    SourceKind.Nas -> network.withLock { work() }
+                    SourceKind.Amazon -> amazonLine.withLock { work() }
+                    SourceKind.Album -> work()
                 }
                 put(project.id) { it.copy(running = false) }
                 onFinished()

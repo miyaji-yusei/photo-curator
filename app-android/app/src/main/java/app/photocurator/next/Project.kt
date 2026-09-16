@@ -15,12 +15,26 @@ import java.io.File
  */
 
 /**
+ * 出所の種類。**文字列ではなく型で持つ**（設計 09 章 §5 #2）。
+ * 種類を足したときに `when` の漏れをコンパイルで検出できるようにする。
+ * 保存する JSON には [id] をそのまま書く。**過去に書いた値は変えない。**
+ */
+enum class SourceKind(val id: String) {
+    Album("album"),
+    Nas("nas"),
+    Amazon("amazon");
+
+    companion object {
+        fun fromId(id: String): SourceKind = entries.first { it.id == id }
+    }
+}
+
+/**
  * 出所。**人の言葉（label）と、機械の指し先を分けて持つ。**
  * 生のパスや ID は「技術情報」にだけ出す。
  */
 data class Source(
-    /** "album"（この端末）／"nas"（SMB）。 */
-    val kind: String,
+    val kind: SourceKind,
     /** 人に見せる言い方。「この端末・アルバム「Camera」」など。 */
     val label: String,
     /** kind ごとの指し先。album なら bucket id。 */
@@ -38,13 +52,13 @@ data class Source(
     val folder: String get() = key.removeSuffix("|**").substringAfter("|")
 
     /** 技術情報に出す生の値。**普段は見せない。** */
-    val technical: String get() = "$kind:$key"
+    val technical: String get() = "${kind.id}:$key"
 
     /**
      * 網越しか。**NAS も Amazon も「表示用画像を作って置く」側。**
      * 「NAS か端末か」の 2 択で書かれていた分岐のうち、この意味のものはこれを見る。
      */
-    val remote: Boolean get() = kind != "album"
+    val remote: Boolean get() = kind != SourceKind.Album
 
     /**
      * 端末に置いた絵（サムネイル・表示用画像）の名前の頭。
@@ -52,9 +66,9 @@ data class Source(
      */
     val cacheId: String?
         get() = when (kind) {
-            "nas" -> key.substringBefore("|")
-            "amazon" -> Amazon.linkOf(key).cacheId
-            else -> null
+            SourceKind.Nas -> key.substringBefore("|")
+            SourceKind.Amazon -> Amazon.linkOf(key).cacheId
+            SourceKind.Album -> null
         }
 }
 
@@ -84,7 +98,7 @@ object Projects {
                     id = entry.getString("id"),
                     name = entry.getString("name"),
                     source = Source(
-                        kind = source.getString("kind"),
+                        kind = SourceKind.fromId(source.getString("kind")),
                         label = source.getString("label"),
                         key = source.getString("key")
                     ),
@@ -114,7 +128,7 @@ object Projects {
                         .put(
                             "source",
                             org.json.JSONObject()
-                                .put("kind", project.source.kind)
+                                .put("kind", project.source.kind.id)
                                 .put("label", project.source.label)
                                 .put("key", project.source.key)
                         )

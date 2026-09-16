@@ -31,7 +31,7 @@ object ProjectData {
         if (cache != null && othersUsing(context, project) == 0) {
             Renders.clear(context, cache)
             // Amazon のサムネイルもこのアプリが取ってきたもの。**一緒に片付ける。**
-            if (project.source.kind == "amazon") ThumbCache.clear(context, cache)
+            if (project.source.kind == SourceKind.Amazon) ThumbCache.clear(context, cache)
         }
     }
 

@@ -48,6 +48,22 @@ enum class ImageSize {
     Full
 }
 
+/**
+ * 網越しの写真の指し先。**NAS か Amazon か、どちらか一方だけ**（設計 09 章 §5 #3）。
+ * 前は `Photo` が `smb`・`amazon` を別々の null 可フィールドで持ち、
+ * 「両方入っている」という起きてはいけない形を型が許していた。
+ */
+sealed interface RemoteRef
+
+/** NAS の写真の指し先。**どの NAS の、どの道筋か。** */
+data class SmbRef(val nasId: String, val path: String) : RemoteRef
+
+/**
+ * Amazon の写真の指し先。**鍵は node id。** tempLink は控えとして持つだけで、
+ * 使えなければ取り直す（設計 08 章 5.2）。
+ */
+data class AmazonRef(val shareKey: String, val nodeId: String, val tempLink: String) : RemoteRef
+
 data class Photo(
     val id: Long,
     val name: String,
@@ -55,10 +71,8 @@ data class Photo(
     val relativePath: String,
     val size: Long,
     val takenAt: Long,
-    /** NAS の写真ならその指し先。端末の写真なら null。 */
-    val smb: SmbRef? = null,
-    /** Amazon の共有リンクの写真ならその指し先（設計 08 章）。 */
-    val amazon: AmazonRef? = null
+    /** 網越しの写真ならその指し先。端末の写真なら null。 */
+    val remote: RemoteRef? = null
 ) {
     /** この端末での指し先。共有しない。 */
     val uri get() = ContentUris.withAppendedId(COLLECTION, id)
@@ -68,8 +82,11 @@ data class Photo(
      * 詳細の一覧と、まとまりの確認だけ。選別には使わない。
      */
     val thumbModel: Any
-        get() = smb?.let { SmbImage(it.nasId, it.path, ImageSize.Thumb) }
-            ?: amazon?.let { AmazonImage(it, ImageSize.Thumb) } ?: uri
+        get() = when (val r = remote) {
+            is SmbRef -> SmbImage(r.nasId, r.path, ImageSize.Thumb)
+            is AmazonRef -> AmazonImage(r, ImageSize.Thumb)
+            null -> uri
+        }
 
     /**
      * **選別と連写判定で見る絵。** 表示用画像（長辺 1024/1536）。
@@ -78,24 +95,26 @@ data class Photo(
      * 要求した大きさでデコードすれば足りる。NAS は網越しなので、
      * 準備のときに作って置いたものを使う。
      */
-    fun displayModel(edge: Int): Any =
-        smb?.let { SmbImage(it.nasId, it.path, ImageSize.Display, edge) }
-            ?: amazon?.let { AmazonImage(it, ImageSize.Display, edge) } ?: uri
+    fun displayModel(edge: Int): Any = when (val r = remote) {
+        is SmbRef -> SmbImage(r.nasId, r.path, ImageSize.Display, edge)
+        is AmazonRef -> AmazonImage(r, ImageSize.Display, edge)
+        null -> uri
+    }
 
     /** 拡大して見るときの絵。原本。 */
     val fullModel: Any
-        get() = smb?.let { SmbImage(it.nasId, it.path, ImageSize.Full) }
-            ?: amazon?.let { AmazonImage(it, ImageSize.Full) } ?: uri
+        get() = when (val r = remote) {
+            is SmbRef -> SmbImage(r.nasId, r.path, ImageSize.Full)
+            is AmazonRef -> AmazonImage(r, ImageSize.Full)
+            null -> uri
+        }
 }
 
-/** NAS の写真の指し先。**どの NAS の、どの道筋か。** */
-data class SmbRef(val nasId: String, val path: String)
+/** `photo.smb?.path` のような書き方を残すための計算プロパティ。**保持はしない。** */
+val Photo.smb: SmbRef? get() = remote as? SmbRef
 
-/**
- * Amazon の写真の指し先。**鍵は node id。** tempLink は控えとして持つだけで、
- * 使えなければ取り直す（設計 08 章 5.2）。
- */
-data class AmazonRef(val shareKey: String, val nodeId: String, val tempLink: String)
+/** `photo.amazon` のような書き方を残すための計算プロパティ。**保持はしない。** */
+val Photo.amazon: AmazonRef? get() = remote as? AmazonRef
 
 private val COLLECTION = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
     MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
@@ -165,10 +184,9 @@ object Photos {
      * Amazon の「リンクが消えた」をここで拾えないと、空のプロジェクトに見える。
      */
     suspend fun list(context: Context, source: Source): List<Photo> = when (source.kind) {
-        "album" -> photos(context, source.key)
-        "nas" -> fromNas(context, source.key)
-        "amazon" -> fromAmazon(source.key)
-        else -> emptyList()
+        SourceKind.Album -> photos(context, source.key)
+        SourceKind.Nas -> fromNas(context, source.key)
+        SourceKind.Amazon -> fromAmazon(source.key)
     }
 
     /** Amazon の共有リンクの写真。**撮影時刻の昇順で来る。** */
@@ -188,7 +206,7 @@ object Photos {
             relativePath = item.nodeId,
             size = item.size,
             takenAt = item.takenAt,
-            amazon = AmazonRef(key, item.nodeId, item.tempLink)
+            remote = AmazonRef(key, item.nodeId, item.tempLink)
         )
     }
 
@@ -218,7 +236,7 @@ object Photos {
                 relativePath = entry.path.replace("\\", "/"),
                 size = entry.size,
                 takenAt = entry.modifiedAt,
-                smb = SmbRef(nasId, entry.path)
+                remote = SmbRef(nasId, entry.path)
             )
         }
     }

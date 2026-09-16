@@ -491,14 +491,14 @@ fun ResultsScreen(
                 // **出所でできることが違う。** できないものを並べても押せないので、
                 // NAS のときは端末の写真にしかない操作（お気に入り・アルバムへ移動）を
                 // 出さない。代わりに NAS でできることを出す。
-                if (project.source.kind == "nas") {
+                if (project.source.kind == SourceKind.Nas) {
                     OutputRow("ギャラリーに保存", "NAS からコピーします。原本は動きません") {
                         outputMenu = false; savingToGallery = targets
                     }
                     OutputRow("NAS で星ごとに分ける", "NAS の中にコピーします。原本は残ります") {
                         outputMenu = false; sortingOnNas = targets
                     }
-                } else if (project.source.kind == "amazon") {
+                } else if (project.source.kind == SourceKind.Amazon) {
                     // **並びは設計 08 章 8.3 のとおり。** 保存 → もう一度 → 星 → お気に入り。
                     OutputRow("ギャラリーに保存", "Amazon から原本をコピーします。Amazon の写真は動きません") {
                         outputMenu = false; savingToGallery = targets
@@ -548,13 +548,13 @@ fun ResultsScreen(
                 // **Amazon のお気に入りは、いまは付けられない。** 付ける口はログインが要る。
                 // 将来はファイル名を含む JSON を書き出し、Chrome 拡張や Silo のスクリプトで
                 // 付ける（設計 08 章 8.3）。消さずに薄く置いて、いずれできると分かるように。
-                if (project.source.kind == "amazon") {
+                if (project.source.kind == SourceKind.Amazon) {
                     OutputRow("Amazon Photos のお気に入りに追加", "今後対応します", enabled = false) {}
                 }
 
                 // NAS・Amazon の写真は端末に無いので、共有に渡す URI が無い。
                 // **できないものは出さない**（保存してから共有してもらう）。
-                if (project.source.kind == "album") OutputRow("共有", "端末の共有メニューへ") {
+                if (project.source.kind == SourceKind.Album) OutputRow("共有", "端末の共有メニューへ") {
                     outputMenu = false
                     val send = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
                         type = "image/*"
@@ -576,7 +576,7 @@ fun ResultsScreen(
     savingToGallery?.let { list ->
         ConfirmDialog(
             title = "${list.size} 枚を端末のギャラリーに保存します",
-            body = if (project.source.kind == "amazon")
+            body = if (project.source.kind == SourceKind.Amazon)
                 "Amazon Photos から原本をコピーして、端末の「Pictures / ${project.name}」に入れます。" +
                     "Amazon の写真は動かしませんし、消えません。" +
                     "1 枚 3〜8MB ほどあるので、${list.size} 枚で数分かかることがあります。"
@@ -590,7 +590,7 @@ fun ResultsScreen(
                 taking = 0 to list.size
                 scope.launch {
                     val progress: (Int, Int) -> Unit = { at, total -> taking = at to total }
-                    val done = if (project.source.kind == "amazon")
+                    val done = if (project.source.kind == SourceKind.Amazon)
                         TakeAmazon.saveToGallery(context, list, project.name, progress)
                     else TakeNas.saveToGallery(context, project, list, project.name, progress)
                     note = done.describe("端末に保存しました")
