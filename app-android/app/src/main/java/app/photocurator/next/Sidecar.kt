@@ -115,8 +115,9 @@ object Sidecar {
         }
         val overrides = JSONArray()
         for (one in catalog.overrides) {
+            // **キー名は core の PairOverride と揃える**（設計 09 章 §5 #9）。
             overrides.put(
-                JSONObject().put("l", one.left).put("r", one.right).put("d", one.decision)
+                JSONObject().put("left", one.left).put("right", one.right).put("decision", one.decision)
             )
         }
         val sessions = JSONObject()
@@ -144,9 +145,13 @@ object Sidecar {
         val array = root.optJSONArray("burstOverrides") ?: JSONArray()
         for (at in 0 until array.length()) {
             val one = array.getJSONObject(at)
-            overrides += PairOverride(
-                one.getString("l"), one.getString("r"), one.getString("d")
-            )
+            // **"l"/"r"/"d" は 2026-09-16 までの短い形。** 古い catalog.json が
+            // NAS に残っているので、読むときだけ両方に対応する。
+            overrides += if (one.has("left")) {
+                PairOverride(one.getString("left"), one.getString("right"), one.getString("decision"))
+            } else {
+                PairOverride(one.getString("l"), one.getString("r"), one.getString("d"))
+            }
         }
         val session = root.optJSONObject("sessions")?.optJSONObject("tournament")
             ?.let { sessionFromJson(it.toString()) }
