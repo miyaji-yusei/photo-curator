@@ -35,18 +35,18 @@ object Renders {
      * 名前に**大きさを含める。** 設定を変えたときに、古い小さい絵を
      * そのまま出してしまわないため。
      */
-    private fun name(nasId: String, path: String, edge: Int): String =
-        "${nasId}_${path.hashCode().toUInt().toString(16)}_$edge.jpg"
+    private fun name(cacheId: String, path: String, edge: Int): String =
+        "${cacheId}_${path.hashCode().toUInt().toString(16)}_$edge.jpg"
 
-    fun file(context: Context, nasId: String, path: String, edge: Int) =
-        File(dir(context), name(nasId, path, edge))
+    fun file(context: Context, cacheId: String, path: String, edge: Int) =
+        File(dir(context), name(cacheId, path, edge))
 
-    fun has(context: Context, nasId: String, path: String, edge: Int): Boolean =
-        file(context, nasId, path, edge).let { it.exists() && it.length() > 0 }
+    fun has(context: Context, cacheId: String, path: String, edge: Int): Boolean =
+        file(context, cacheId, path, edge).let { it.exists() && it.length() > 0 }
 
-    suspend fun read(context: Context, nasId: String, path: String, edge: Int): ByteArray? =
+    suspend fun read(context: Context, cacheId: String, path: String, edge: Int): ByteArray? =
         withContext(Dispatchers.IO) {
-            val target = file(context, nasId, path, edge)
+            val target = file(context, cacheId, path, edge)
             if (!target.exists() || target.length() == 0L) return@withContext null
             try {
                 target.readBytes()
@@ -64,7 +64,7 @@ object Renders {
      */
     fun write(
         context: Context,
-        nasId: String,
+        cacheId: String,
         path: String,
         edge: Int,
         original: ByteArray,
@@ -93,17 +93,11 @@ object Renders {
                 val turned = SmbExifReader.applyOrientation(scaled, orientation)
                 if (turned !== scaled) scaled.recycle()
 
-                val target = File(dir(context), name(nasId, path, edge))
-                val temporary = File(target.parentFile, "${target.name}.writing")
-                temporary.outputStream().use {
-                    turned.compress(Bitmap.CompressFormat.JPEG, 80, it)
+                // **書き終えてから置き換える。** 途中で止まっても壊れた絵を残さない。
+                File(dir(context), name(cacheId, path, edge)).writeAtomically {
+                    it.outputStream().use { out -> turned.compress(Bitmap.CompressFormat.JPEG, 80, out) }
                 }
                 turned.recycle()
-                // **書き終えてから置き換える。** 途中で止まっても壊れた絵を残さない。
-                if (!temporary.renameTo(target)) {
-                    temporary.copyTo(target, overwrite = true)
-                    temporary.delete()
-                }
                 true
             }
         }
@@ -117,15 +111,9 @@ object Renders {
      * 受け取った表示用画像をそのまま置く。**原本から作らない**（Amazon が
      * 縮小して返す。設計 08 章 6）。書き終えてから置き換える。
      */
-    fun put(context: Context, nasId: String, path: String, edge: Int, bytes: ByteArray): Boolean =
+    fun put(context: Context, cacheId: String, path: String, edge: Int, bytes: ByteArray): Boolean =
         try {
-            val target = File(dir(context), name(nasId, path, edge))
-            val temporary = File(target.parentFile, "${target.name}.writing")
-            temporary.writeBytes(bytes)
-            if (!temporary.renameTo(target)) {
-                temporary.copyTo(target, overwrite = true)
-                temporary.delete()
-            }
+            File(dir(context), name(cacheId, path, edge)).writeAtomically { it.writeBytes(bytes) }
             true
         } catch (error: Exception) {
             Log.w(TAG, "表示用画像を置けなかった: $path", error)
@@ -139,23 +127,19 @@ object Renders {
      * 無駄（Amazon なら通信、NAS なら原本 6MB の読み直し）。小さくするだけなら
      * 手元の絵で足りる。**大きくするときは作れない**ので false を返す。
      */
-    fun deriveFromLarger(context: Context, nasId: String, path: String, edge: Int): Boolean {
+    fun deriveFromLarger(context: Context, cacheId: String, path: String, edge: Int): Boolean {
         // 近い方から探す。**必要以上に大きい絵をデコードしない。**
         val larger = Prefs.EDGES.filter { it > edge }.sorted()
-            .firstOrNull { has(context, nasId, path, it) } ?: return false
+            .firstOrNull { has(context, cacheId, path, it) } ?: return false
         return try {
-            val source = file(context, nasId, path, larger)
+            val source = file(context, cacheId, path, larger)
             val decoded = BitmapFactory.decodeFile(source.path) ?: return false
             val scaled = scaleToEdge(decoded, edge)
             if (scaled !== decoded) decoded.recycle()
-            val target = File(dir(context), name(nasId, path, edge))
-            val temporary = File(target.parentFile, "${target.name}.writing")
-            temporary.outputStream().use { scaled.compress(Bitmap.CompressFormat.JPEG, 80, it) }
-            scaled.recycle()
-            if (!temporary.renameTo(target)) {
-                temporary.copyTo(target, overwrite = true)
-                temporary.delete()
+            File(dir(context), name(cacheId, path, edge)).writeAtomically {
+                it.outputStream().use { out -> scaled.compress(Bitmap.CompressFormat.JPEG, 80, out) }
             }
+            scaled.recycle()
             true
         } catch (error: Exception) {
             Log.w(TAG, "大きい絵から作れなかった: $path", error)
@@ -176,19 +160,19 @@ object Renders {
     }
 
     /** いま置いてある枚数。準備の進み具合に使う。 */
-    fun count(context: Context, nasId: String, edge: Int): Int =
+    fun count(context: Context, cacheId: String, edge: Int): Int =
         dir(context).listFiles { file ->
-            file.name.startsWith("${nasId}_") && file.name.endsWith("_$edge.jpg")
+            file.name.startsWith("${cacheId}_") && file.name.endsWith("_$edge.jpg")
         }?.size ?: 0
 
     /** 置いてある量。**消すときに何 MB 消えるかを言うため。** */
-    fun bytes(context: Context, nasId: String): Long =
-        dir(context).listFiles { file -> file.name.startsWith("${nasId}_") }
+    fun bytes(context: Context, cacheId: String): Long =
+        dir(context).listFiles { file -> file.name.startsWith("${cacheId}_") }
             ?.sumOf { it.length() } ?: 0L
 
-    suspend fun clear(context: Context, nasId: String) = withContext(Dispatchers.IO) {
+    suspend fun clear(context: Context, cacheId: String) = withContext(Dispatchers.IO) {
         try {
-            dir(context).listFiles { file -> file.name.startsWith("${nasId}_") }
+            dir(context).listFiles { file -> file.name.startsWith("${cacheId}_") }
                 ?.forEach { it.delete() }
             Unit
         } catch (error: Exception) {

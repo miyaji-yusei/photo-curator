@@ -293,7 +293,7 @@ object Prepare {
         val nasAccess = if (project.source.kind == "nas") {
             val nasId = project.source.key.substringBefore("|")
             NasStore.all(context).firstOrNull { it.id == nasId }?.let { nas ->
-                Session.password(context, nas)?.let { nas to it }
+                NasPasswords.password(context, nas)?.let { nas to it }
             }
         } else null
 
@@ -356,7 +356,7 @@ object Prepare {
         val nasId = project.source.key.substringBefore("|")
         val nas = NasStore.all(context).firstOrNull { it.id == nasId }
             ?: return@withContext 0
-        val password = Session.password(context, nas) ?: return@withContext 0
+        val password = NasPasswords.password(context, nas) ?: return@withContext 0
 
         val missing = photos.filter { photo ->
             val path = photo.smb?.path ?: return@filter false

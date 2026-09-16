@@ -22,42 +22,35 @@ import java.io.File
 object Store {
     private const val TAG = "Store"
 
-    private fun file(context: Context, albumId: String) =
-        File(context.filesDir, "session-$albumId.json")
+    private fun file(context: Context, projectId: String) =
+        File(context.filesDir, "session-$projectId.json")
 
     /**
      * 保存する。**確定のたびに呼ばれる想定なので、失敗しても選別は止めない。**
      * 書けなかったことは記録する（黙って落とさない）。
      */
-    suspend fun save(context: Context, albumId: String, session: Session) =
+    suspend fun save(context: Context, projectId: String, session: Session) =
         withContext(Dispatchers.IO) {
             // **判断が変わった。** サイドカーへ渡すべきものが端末にできた印。
-            SyncState.touch(context, albumId)
+            SyncState.touch(context, projectId)
             try {
                 // 途中で落ちても壊れた JSON を残さないよう、書いてから差し替える。
-                val target = file(context, albumId)
-                val temporary = File(target.parentFile, "${target.name}.writing")
-                temporary.writeText(sessionToJson(session))
                 // rename が使えない環境ではコピーで置き換える。
-                if (!temporary.renameTo(target)) {
-                    temporary.copyTo(target, overwrite = true)
-                    temporary.delete()
-                }
-                Unit
+                file(context, projectId).writeAtomically { it.writeText(sessionToJson(session)) }
             } catch (error: Exception) {
-                Log.w(TAG, "選別の途中を保存できなかった: $albumId", error)
+                Log.w(TAG, "選別の途中を保存できなかった: $projectId", error)
             }
         }
 
     /** 読み戻す。**形が合わなければ null。** 最初からやり直してもらう。 */
-    suspend fun load(context: Context, albumId: String): Session? =
+    suspend fun load(context: Context, projectId: String): Session? =
         withContext(Dispatchers.IO) {
-            val target = file(context, albumId)
+            val target = file(context, projectId)
             if (!target.exists()) return@withContext null
             try {
                 sessionFromJson(target.readText())
             } catch (error: Exception) {
-                Log.w(TAG, "選別の途中を読めなかった: $albumId", error)
+                Log.w(TAG, "選別の途中を読めなかった: $projectId", error)
                 null
             }
         }
@@ -66,8 +59,8 @@ object Store {
      * 一覧に出すための、ごく短い言い方。**中身は読まずに済ませたい**ので、
      * ここだけは丸ごと読んで畳む。アルバムの数だけ小さな JSON を読む。
      */
-    suspend fun summary(context: Context, albumId: String): String? {
-        val session = load(context, albumId) ?: return null
+    suspend fun summary(context: Context, projectId: String): String? {
+        val session = load(context, projectId) ?: return null
         val stars = session.ratings.values.count { it > 0 }
         return when {
             !session.finished ->
@@ -77,8 +70,8 @@ object Store {
         }
     }
 
-    suspend fun clear(context: Context, albumId: String) = withContext(Dispatchers.IO) {
-        file(context, albumId).delete()
+    suspend fun clear(context: Context, projectId: String) = withContext(Dispatchers.IO) {
+        file(context, projectId).delete()
         Unit
     }
 }
@@ -115,12 +108,12 @@ object Fingerprints {
      * NAS の鍵は "nasId|フォルダ道筋" の形で、区切り記号がそのまま入ると
      * **扱いにくい名前のファイル**ができる。英数字以外は _ に潰す。
      */
-    private fun file(context: Context, key: String) =
-        File(context.filesDir, "fingerprints-${key.replace(Regex("[^A-Za-z0-9_-]"), "_")}.json")
+    private fun file(context: Context, sourceKey: String) =
+        File(context.filesDir, "fingerprints-${sourceKey.replace(Regex("[^A-Za-z0-9_-]"), "_")}.json")
 
-    suspend fun load(context: Context, albumId: String): Map<String, Fingerprint> =
+    suspend fun load(context: Context, sourceKey: String): Map<String, Fingerprint> =
         withContext(Dispatchers.IO) {
-            val target = file(context, albumId)
+            val target = file(context, sourceKey)
             if (!target.exists()) return@withContext emptyMap()
             try {
                 val root = org.json.JSONObject(target.readText())
@@ -137,12 +130,12 @@ object Fingerprints {
                 out
             } catch (error: Exception) {
                 // 読めないものは無かったことにして作り直す。**部分的に読まない。**
-                Log.w(TAG, "指紋を読めなかった: $albumId", error)
+                Log.w(TAG, "指紋を読めなかった: $sourceKey", error)
                 emptyMap()
             }
         }
 
-    suspend fun save(context: Context, albumId: String, prints: Map<String, Fingerprint>) =
+    suspend fun save(context: Context, sourceKey: String, prints: Map<String, Fingerprint>) =
         withContext(Dispatchers.IO) {
             try {
                 val root = org.json.JSONObject()
@@ -156,16 +149,9 @@ object Fingerprints {
                             .apply { print.takenAt?.let { put("t", it) } }
                     )
                 }
-                val target = file(context, albumId)
-                val temporary = File(target.parentFile, "${target.name}.writing")
-                temporary.writeText(root.toString())
-                if (!temporary.renameTo(target)) {
-                    temporary.copyTo(target, overwrite = true)
-                    temporary.delete()
-                }
-                Unit
+                file(context, sourceKey).writeAtomically { it.writeText(root.toString()) }
             } catch (error: Exception) {
-                Log.w(TAG, "指紋を保存できなかった: $albumId", error)
+                Log.w(TAG, "指紋を保存できなかった: $sourceKey", error)
             }
         }
 }
@@ -298,6 +284,12 @@ object Prefs {
             .putInt(GROUP_SIZE, size.coerceIn(2, 10))
             .apply()
     }
+
+    /** プロジェクトを消すときに、そのプロジェクトだけの設定を片付ける。 */
+    fun forgetProject(context: Context, projectId: String) {
+        context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+            .edit().remove("display_edge_" + projectId).apply()
+    }
 }
 
 /**
@@ -309,12 +301,12 @@ object Prefs {
 object Overrides {
     private const val TAG = "Overrides"
 
-    private fun file(context: Context, albumId: String) =
-        File(context.filesDir, "overrides-$albumId.json")
+    private fun file(context: Context, projectId: String) =
+        File(context.filesDir, "overrides-$projectId.json")
 
-    suspend fun load(context: Context, albumId: String): List<PairOverride> =
+    suspend fun load(context: Context, projectId: String): List<PairOverride> =
         withContext(Dispatchers.IO) {
-            val target = file(context, albumId)
+            val target = file(context, projectId)
             if (!target.exists()) return@withContext emptyList()
             try {
                 val array = org.json.JSONArray(target.readText())
@@ -328,21 +320,21 @@ object Overrides {
                 }
             } catch (error: Exception) {
                 // 読めないものは無かったことにする。**中途半端に読まない。**
-                Log.w(TAG, "手直しを読めなかった: $albumId", error)
+                Log.w(TAG, "手直しを読めなかった: $projectId", error)
                 emptyList()
             }
         }
 
     /** 手直しを全部消す。**やり直しのときだけ。** */
-    suspend fun clear(context: Context, albumId: String) = withContext(Dispatchers.IO) {
-        file(context, albumId).delete()
+    suspend fun clear(context: Context, projectId: String) = withContext(Dispatchers.IO) {
+        file(context, projectId).delete()
         Unit
     }
 
-    suspend fun save(context: Context, albumId: String, list: List<PairOverride>) =
+    suspend fun save(context: Context, projectId: String, list: List<PairOverride>) =
         withContext(Dispatchers.IO) {
             // 手直しも判断。**サイドカーへ渡すもの。**
-            SyncState.touch(context, albumId)
+            SyncState.touch(context, projectId)
             try {
                 val array = org.json.JSONArray()
                 for (item in list) {
@@ -353,16 +345,9 @@ object Overrides {
                             .put("d", item.decision)
                     )
                 }
-                val target = file(context, albumId)
-                val temporary = File(target.parentFile, "${target.name}.writing")
-                temporary.writeText(array.toString())
-                if (!temporary.renameTo(target)) {
-                    temporary.copyTo(target, overwrite = true)
-                    temporary.delete()
-                }
-                Unit
+                file(context, projectId).writeAtomically { it.writeText(array.toString()) }
             } catch (error: Exception) {
-                Log.w(TAG, "手直しを保存できなかった: $albumId", error)
+                Log.w(TAG, "手直しを保存できなかった: $projectId", error)
             }
         }
 
@@ -389,11 +374,11 @@ object Overrides {
 object Listing {
     private const val TAG = "Listing"
 
-    private fun file(context: Context, key: String) =
-        File(context.filesDir, "listing-${key.replace(Regex("[^A-Za-z0-9_-]"), "_")}.json")
+    private fun file(context: Context, sourceKey: String) =
+        File(context.filesDir, "listing-${sourceKey.replace(Regex("[^A-Za-z0-9_-]"), "_")}.json")
 
-    suspend fun load(context: Context, key: String): List<Photo>? = withContext(Dispatchers.IO) {
-        val target = file(context, key)
+    suspend fun load(context: Context, sourceKey: String): List<Photo>? = withContext(Dispatchers.IO) {
+        val target = file(context, sourceKey)
         if (!target.exists()) return@withContext null
         try {
             val array = org.json.JSONArray(target.readText())
@@ -414,12 +399,12 @@ object Listing {
                 )
             }
         } catch (error: Exception) {
-            Log.w(TAG, "顔ぶれを読めなかった: $key", error)
+            Log.w(TAG, "顔ぶれを読めなかった: $sourceKey", error)
             null
         }
     }
 
-    suspend fun save(context: Context, key: String, photos: List<Photo>) =
+    suspend fun save(context: Context, sourceKey: String, photos: List<Photo>) =
         withContext(Dispatchers.IO) {
             try {
                 val array = org.json.JSONArray()
@@ -439,21 +424,14 @@ object Listing {
                             }
                     )
                 }
-                val target = file(context, key)
-                val temporary = File(target.parentFile, "${target.name}.writing")
-                temporary.writeText(array.toString())
-                if (!temporary.renameTo(target)) {
-                    temporary.copyTo(target, overwrite = true)
-                    temporary.delete()
-                }
-                Unit
+                file(context, sourceKey).writeAtomically { it.writeText(array.toString()) }
             } catch (error: Exception) {
-                Log.w(TAG, "顔ぶれを保存できなかった: $key", error)
+                Log.w(TAG, "顔ぶれを保存できなかった: $sourceKey", error)
             }
         }
 
-    suspend fun clear(context: Context, key: String) = withContext(Dispatchers.IO) {
-        file(context, key).delete()
+    suspend fun clear(context: Context, sourceKey: String) = withContext(Dispatchers.IO) {
+        file(context, sourceKey).delete()
         Unit
     }
 }
@@ -468,20 +446,20 @@ object Listing {
 object Trouble {
     private const val TAG = "Trouble"
 
-    private fun file(context: Context, key: String) =
-        File(context.filesDir, "trouble-${key.replace(Regex("[^A-Za-z0-9_-]"), "_")}.txt")
+    private fun file(context: Context, sourceKey: String) =
+        File(context.filesDir, "trouble-${sourceKey.replace(Regex("[^A-Za-z0-9_-]"), "_")}.txt")
 
-    suspend fun note(context: Context, key: String, message: String) =
+    suspend fun note(context: Context, sourceKey: String, message: String) =
         withContext(Dispatchers.IO) {
             try {
-                file(context, key).writeText(message)
+                file(context, sourceKey).writeText(message)
             } catch (error: Exception) {
-                Log.w(TAG, "困りごとを書けなかった: $key", error)
+                Log.w(TAG, "困りごとを書けなかった: $sourceKey", error)
             }
         }
 
-    suspend fun load(context: Context, key: String): String? = withContext(Dispatchers.IO) {
-        val target = file(context, key)
+    suspend fun load(context: Context, sourceKey: String): String? = withContext(Dispatchers.IO) {
+        val target = file(context, sourceKey)
         if (!target.exists()) return@withContext null
         try {
             target.readText().takeIf { it.isNotBlank() }
@@ -490,11 +468,11 @@ object Trouble {
         }
     }
 
-    suspend fun clear(context: Context, key: String) = withContext(Dispatchers.IO) {
+    suspend fun clear(context: Context, sourceKey: String) = withContext(Dispatchers.IO) {
         try {
-            file(context, key).delete()
+            file(context, sourceKey).delete()
         } catch (error: Exception) {
-            Log.w(TAG, "困りごとを消せなかった: $key", error)
+            Log.w(TAG, "困りごとを消せなかった: $sourceKey", error)
         }
         Unit
     }

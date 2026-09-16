@@ -120,14 +120,7 @@ object Projects {
                         )
                 )
             }
-            val target = file(context)
-            val temporary = File(target.parentFile, "${target.name}.writing")
-            temporary.writeText(array.toString())
-            if (!temporary.renameTo(target)) {
-                temporary.copyTo(target, overwrite = true)
-                temporary.delete()
-            }
-            Unit
+            file(context).writeAtomically { it.writeText(array.toString()) }
         } catch (error: Exception) {
             Log.w(TAG, "プロジェクトを保存できなかった", error)
         }
@@ -160,17 +153,10 @@ object Projects {
     }
 
     /**
-     * 消す。**選別の結果も一緒に消える。写真そのものには触らない。**
-     * 指紋は写真についての事実なので残す（別のプロジェクトでも使える）。
+     * 一覧から外す。**プロジェクトごとの持ち物の片付けは [ProjectData.remove] が行う。**
+     * ここを直接呼ぶのは [ProjectData.remove] からだけにする（09 章 §5 #1）。
      */
     suspend fun remove(context: Context, id: String) {
         save(context, all(context).filterNot { it.id == id })
-        // **プロジェクトごとのものは全部消す。** 星・手直し・学習した基準。
-        // 消し忘れると使われないファイルが端末に残り続ける（実際に残っていた）。
-        Store.clear(context, id)
-        Overrides.clear(context, id)
-        Learning.forget(context, id)
-        // **サイドカーは消さない。** 写真側の持ち物なので、端末の都合で消さない。
-        SyncState.forget(context, id)
     }
 }

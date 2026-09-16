@@ -16,7 +16,7 @@ import okio.Buffer
  * サムネイルと表示用画像は Amazon に縮小させて端末に置く。拡大は原本を
  * そのたびに取り、**端末には置かない**（設計 08 章 6）。
  */
-data class AmazonImage(val ref: AmazonRef, val size: SmbSize, val edge: Int = 0)
+data class AmazonImage(val ref: AmazonRef, val size: ImageSize, val edge: Int = 0)
 
 class AmazonFetcher(
     private val context: Context,
@@ -33,9 +33,9 @@ class AmazonFetcher(
     )
 
     override suspend fun fetch(): FetchResult? = when (image.size) {
-        SmbSize.Thumb -> thumb()
-        SmbSize.Display -> display()
-        SmbSize.Full -> full()
+        ImageSize.Thumb -> thumb()
+        ImageSize.Display -> display()
+        ImageSize.Full -> full()
     }
 
     /** 一覧用。**一度取ったら二度と取りに行かない。** */

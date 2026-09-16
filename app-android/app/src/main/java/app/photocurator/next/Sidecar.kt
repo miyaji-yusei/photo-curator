@@ -169,7 +169,7 @@ object Sidecar {
 
     private suspend fun credentials(context: Context, project: Project): Pair<Nas, String>? {
         val nas = NasStore.all(context).firstOrNull { it.id == nasId(project) } ?: return null
-        val password = Session.password(context, nas) ?: return null
+        val password = NasPasswords.password(context, nas) ?: return null
         return nas to password
     }
 

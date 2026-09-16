@@ -14,28 +14,11 @@ import coil.request.Options
 import okio.Buffer
 import java.io.ByteArrayInputStream
 
-/**
- * どの大きさの絵が欲しいか。**役割を混ぜないために型で分ける。**
- *
- * 前は boolean 1 つで「原本かどうか」しか言えず、選別画面が 160x120 の
- * サムネイルを引き伸ばして出していた。3 つに分けて、取り違えを型で防ぐ。
- */
-enum class SmbSize {
-    /** EXIF の縮小画像（160x120）。小さく並べるところだけ。 */
-    Thumb,
-
-    /** 表示用画像（長辺 1024/1536）。**選別・連写判定はこれ。** */
-    Display,
-
-    /** 原本。拡大表示だけ。 */
-    Full
-}
-
 /** NAS の写真 1 枚を指すもの。**Coil に渡す形。** */
 data class SmbImage(
     val nasId: String,
     val path: String,
-    val size: SmbSize,
+    val size: ImageSize,
     /** Display のときの長辺。鍵に含めるので、設定を変えれば別物になる。 */
     val edge: Int = 1024
 )
@@ -120,9 +103,9 @@ class SmbFetcher(
     )
 
     override suspend fun fetch(): FetchResult? = when (image.size) {
-        SmbSize.Thumb -> thumb()
-        SmbSize.Display -> display()
-        SmbSize.Full -> full()
+        ImageSize.Thumb -> thumb()
+        ImageSize.Display -> display()
+        ImageSize.Full -> full()
     }
 
     /** 一覧用。EXIF の縮小画像。 */
@@ -193,7 +176,7 @@ class SmbFetcher(
     private suspend fun nas(): Nas? =
         NasStore.all(context).firstOrNull { it.id == image.nasId }
 
-    private suspend fun password(nas: Nas): String? = Session.password(context, nas)
+    private suspend fun password(nas: Nas): String? = NasPasswords.password(context, nas)
 
     class Factory(private val context: Context) : Fetcher.Factory<SmbImage> {
         override fun create(data: SmbImage, options: Options, imageLoader: ImageLoader) =

@@ -755,9 +755,7 @@ fun ProjectScreen(
         var alone by remember(project.id) { mutableStateOf(false) }
         var bytes by remember(project.id) { mutableStateOf(0L) }
         LaunchedEffect(project.id, removing) {
-            val others = Projects.all(context)
-                .count { it.id != project.id && it.source.key == project.source.key }
-            alone = others == 0
+            alone = ProjectData.othersUsing(context, project) == 0
             val cache = project.source.cacheId
             bytes = if (alone && cache != null) Renders.bytes(context, cache) else 0L
         }
@@ -772,15 +770,7 @@ fun ProjectScreen(
             onConfirm = {
                 removing = false
                 scope.launch {
-                    Projects.remove(context, project.id)
-                    Timing.clear(context, project.id)
-                    // **最後の 1 つだったときだけ絵を片付ける。**
-                    val cache = project.source.cacheId
-                    if (alone && cache != null) {
-                        Renders.clear(context, cache)
-                        // Amazon のサムネイルもこのアプリが取ってきたもの。**一緒に片付ける。**
-                        if (project.source.kind == "amazon") ThumbCache.clear(context, cache)
-                    }
+                    ProjectData.remove(context, project)
                     onBack()
                 }
             },
@@ -801,14 +791,7 @@ fun ProjectScreen(
             onConfirm = {
                 confirmRestart = false
                 scope.launch {
-                    Store.clear(context, project.id)
-                    // **基準と手直しも消す。** ここを残すと、やり直しても
-                    // 同じまとめ方になり、聞き直す道も無くなる。
-                    Learning.forget(context, project.id)
-                    Overrides.clear(context, project.id)
-                    Timing.clear(context, project.id)
-                    // **やり直したことも判断。** 次にサイドカーへ渡す。
-                    SyncState.touch(context, project.id)
+                    ProjectData.restart(context, project.id)
                     reloads += 1
                 }
             },

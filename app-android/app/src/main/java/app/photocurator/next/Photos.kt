@@ -31,6 +31,23 @@ data class Album(
     val relativeDir: String
 )
 
+/**
+ * どの大きさの絵が欲しいか。**役割を混ぜないために型で分ける。**
+ *
+ * 前は boolean 1 つで「原本かどうか」しか言えず、選別画面が 160x120 の
+ * サムネイルを引き伸ばして出していた。3 つに分けて、取り違えを型で防ぐ。
+ */
+enum class ImageSize {
+    /** EXIF の縮小画像（160x120）。小さく並べるところだけ。 */
+    Thumb,
+
+    /** 表示用画像（長辺 1024/1536）。**選別・連写判定はこれ。** */
+    Display,
+
+    /** 原本。拡大表示だけ。 */
+    Full
+}
+
 data class Photo(
     val id: Long,
     val name: String,
@@ -51,8 +68,8 @@ data class Photo(
      * 詳細の一覧と、まとまりの確認だけ。選別には使わない。
      */
     val thumbModel: Any
-        get() = smb?.let { SmbImage(it.nasId, it.path, SmbSize.Thumb) }
-            ?: amazon?.let { AmazonImage(it, SmbSize.Thumb) } ?: uri
+        get() = smb?.let { SmbImage(it.nasId, it.path, ImageSize.Thumb) }
+            ?: amazon?.let { AmazonImage(it, ImageSize.Thumb) } ?: uri
 
     /**
      * **選別と連写判定で見る絵。** 表示用画像（長辺 1024/1536）。
@@ -62,13 +79,13 @@ data class Photo(
      * 準備のときに作って置いたものを使う。
      */
     fun displayModel(edge: Int): Any =
-        smb?.let { SmbImage(it.nasId, it.path, SmbSize.Display, edge) }
-            ?: amazon?.let { AmazonImage(it, SmbSize.Display, edge) } ?: uri
+        smb?.let { SmbImage(it.nasId, it.path, ImageSize.Display, edge) }
+            ?: amazon?.let { AmazonImage(it, ImageSize.Display, edge) } ?: uri
 
     /** 拡大して見るときの絵。原本。 */
     val fullModel: Any
-        get() = smb?.let { SmbImage(it.nasId, it.path, SmbSize.Full) }
-            ?: amazon?.let { AmazonImage(it, SmbSize.Full) } ?: uri
+        get() = smb?.let { SmbImage(it.nasId, it.path, ImageSize.Full) }
+            ?: amazon?.let { AmazonImage(it, ImageSize.Full) } ?: uri
 }
 
 /** NAS の写真の指し先。**どの NAS の、どの道筋か。** */
@@ -187,7 +204,7 @@ object Photos {
         val deep = key.endsWith("|**")
         val folder = key.removeSuffix("|**").substringAfter("|")
         val nas = NasStore.all(context).firstOrNull { it.id == nasId } ?: return emptyList()
-        val password = Session.password(context, nas) ?: return emptyList()
+        val password = NasPasswords.password(context, nas) ?: return emptyList()
         // **「以下ぜんぶ」なら入れ子もたどる。** 印は鍵の末尾に付いている。
         val listed = if (deep) Smb.photosDeep(nas, password, folder)
         else Smb.photos(nas, password, folder)

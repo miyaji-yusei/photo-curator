@@ -178,7 +178,7 @@ fun NasEditSheet(
                             // 「off にしたのに残っている」が一番まずい。
                             if (nas.remember) NasStore.rememberPassword(context, nas.id, password)
                             else NasStore.forgetPassword(context, nas.id)
-                            Session.hold(nas.id, password)
+                            NasPasswords.hold(nas.id, password)
                             onSaved(nas)
                         }
                     },
@@ -215,7 +215,7 @@ private fun Field(
  * **保存トグルが off の人のための場所。** 一度入れれば、
  * アプリを閉じるまでは繰り返し聞かれない。閉じれば消える。
  */
-object Session {
+object NasPasswords {
     private val held = HashMap<String, String>()
 
     fun hold(id: String, password: String) {

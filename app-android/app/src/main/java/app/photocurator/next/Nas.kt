@@ -78,14 +78,7 @@ object NasStore {
                         .put("remember", nas.remember)
                 )
             }
-            val target = file(context)
-            val temporary = File(target.parentFile, "${target.name}.writing")
-            temporary.writeText(array.toString())
-            if (!temporary.renameTo(target)) {
-                temporary.copyTo(target, overwrite = true)
-                temporary.delete()
-            }
-            Unit
+            file(context).writeAtomically { it.writeText(array.toString()) }
         } catch (error: Exception) {
             Log.w(TAG, "NAS の設定を保存できなかった", error)
         }

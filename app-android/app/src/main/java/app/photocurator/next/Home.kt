@@ -218,7 +218,7 @@ fun HomeScreen(
             confirmButton = {
                 TextButton(onClick = {
                     removing = null
-                    scope.launch { Projects.remove(context, project.id); reloads += 1 }
+                    scope.launch { ProjectData.remove(context, project); reloads += 1 }
                 }) { Text("削除") }
             },
             dismissButton = { TextButton(onClick = { removing = null }) { Text("やめる") } }

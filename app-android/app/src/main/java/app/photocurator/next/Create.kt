@@ -145,7 +145,7 @@ fun CreateScreen(
             }
             folder != null -> {
                 val nas = nasList.firstOrNull { it.id == tab } ?: return@LaunchedEffect
-                val password = Session.password(context, nas) ?: return@LaunchedEffect
+                val password = NasPasswords.password(context, nas) ?: return@LaunchedEffect
                 stripNote = "中身を読み込んでいます…"
                 val inside = (Smb.photos(nas, password, folder.path) as? SmbResult.Ok)?.value
                 if (inside == null) {
@@ -197,7 +197,7 @@ fun CreateScreen(
         }
 
         val nas = nasList.firstOrNull { it.id == tab } ?: return@LaunchedEffect
-        val password = Session.password(context, nas)
+        val password = NasPasswords.password(context, nas)
         if (password == null) {
             // **黙って空にしない。** 何が足りないのかを言って、入れる道を出す。
             note = "パスワードが要ります"
@@ -571,7 +571,7 @@ fun CreateScreen(
                 AskPassword(
                     nas = nas,
                     onEntered = { entered ->
-                        Session.hold(nas.id, entered)
+                        NasPasswords.hold(nas.id, entered)
                         asking = null
                         // 同じタブをもう一度読み直させる。
                         nasList = nasList.toList()

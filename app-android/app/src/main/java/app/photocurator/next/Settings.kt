@@ -136,7 +136,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                                             // **保存していないパスワードは訊かない。**
                                             // 入っていないなら「届かない」ではなく、
                                             // 何も言わずに編集シートで入れてもらう。
-                                            val secret = Session.password(context, nas)
+                                            val secret = NasPasswords.password(context, nas)
                                             val ok = secret != null &&
                                                 Smb.check(nas, secret) is SmbResult.Ok
                                             health = health + (nas.id to ok)
