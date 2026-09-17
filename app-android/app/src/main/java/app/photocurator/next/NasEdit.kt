@@ -123,8 +123,8 @@ fun NasEditSheet(
                         )
                     }
                     Text(
-                        if (remember_) "端末の鍵で暗号化して保存します"
-                        else "off のあいだは、このアプリを閉じると忘れます",
+                        if (remember_) "保存されます（暗号化）"
+                        else "アプリを閉じると忘れます",
                         fontSize = 11.sp, color = Faint
                     )
                 }

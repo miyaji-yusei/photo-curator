@@ -62,7 +62,7 @@ fun LearnFlow(project: Project, onStart: () -> Unit, onBack: () -> Unit) {
                         modifier = Modifier.padding(top = 8.dp)
                     )
                     Text(
-                        "ここで戻っても、調べた分はとってあります",
+                        "進んだ分は保存されます",
                         color = Faint, fontSize = 11.sp,
                         modifier = Modifier.padding(top = 6.dp)
                     )

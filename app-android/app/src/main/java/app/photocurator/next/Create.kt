@@ -478,7 +478,7 @@ fun CreateScreen(
                             Icon(Icons.Filled.Lock, null, Modifier.size(14.dp), tint = Faint)
                             Spacer(Modifier.width(6.dp))
                             Text(
-                                "原本は読むだけ。端末にコピーせず、必要な部分だけ読みます",
+                                "端末にはコピーしません",
                                 fontSize = 11.sp, color = Faint
                             )
                         }
@@ -500,7 +500,7 @@ fun CreateScreen(
                                 Icon(Icons.Filled.Lock, null, Modifier.size(14.dp), tint = Faint)
                                 Spacer(Modifier.width(6.dp))
                                 Text(
-                                    "原本は読むだけ。縮小した絵を Amazon から受け取ります。ログインはしません",
+                                    "ログインは不要です",
                                     fontSize = 11.sp, color = Faint
                                 )
                             }
@@ -508,8 +508,7 @@ fun CreateScreen(
                         // **公開リンクであることは常に言う**（設計 08 章 8.1）。
                         Spacer(Modifier.height(12.dp))
                         Text(
-                            "リンクを知っている人は誰でも見られます。選別が終わったら、" +
-                                "Amazon Photos でリンクを削除してください",
+                            "リンクを知る人は誰でも閲覧できます。選別後は Amazon Photos でリンクを削除してください",
                             fontSize = 12.sp, color = Warn
                         )
                     }
@@ -559,7 +558,7 @@ fun CreateScreen(
                             Icon(Icons.Filled.Lock, null, Modifier.size(14.dp), tint = Faint)
                             Spacer(Modifier.width(6.dp))
                             Text(
-                                "原本は読むだけ。星やまとめ方はこのアプリの中に保存します",
+                                "星やまとめ方はこのアプリ内に保存します",
                                 fontSize = 11.sp, color = Faint
                             )
                         }

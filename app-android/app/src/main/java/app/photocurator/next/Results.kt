@@ -607,9 +607,9 @@ fun ResultsScreen(
         ConfirmDialog(
             title = "${list.size} 枚を NAS で星ごとに分けます",
             // Compose は Markdown を描かない。**強調は書き方と順番で出す。**
-            body = "コピーです。原本は元の場所にそのまま残ります。\n" +
-                "同じフォルダの中に star-5 / star-4 … を作って、そこへ複製します。\n" +
-                "1 枚 6MB ほどあるので、${list.size} 枚で数分かかることがあります。",
+            body = "コピーです。原本はそのまま残ります。\n" +
+                "同じフォルダ内に star-5 / star-4 … を作って複製します" +
+                "（1 枚 6MB のため ${list.size} 枚で数分かかります）。",
             confirmLabel = "分ける",
             onConfirm = {
                 sortingOnNas = null
@@ -669,9 +669,8 @@ fun ResultsScreen(
     confirmingMove?.let { destination ->
         ConfirmDialog(
             title = "${targets.size} 枚を「${destination.name}」へ移します",
-            body = "端末の中の置き場所が ${destination.relativeDir} に変わります。" +
-                "写真は消えませんが、元のアルバムからは無くなります。" +
-                "この操作にアプリ側の取り消しはありません。",
+            body = "「${destination.relativeDir}」に移動します（元のアルバムからは無くなります）。" +
+                "この操作は取り消せません。",
             confirmLabel = "移す",
             touchesOriginals = true,
             onConfirm = {

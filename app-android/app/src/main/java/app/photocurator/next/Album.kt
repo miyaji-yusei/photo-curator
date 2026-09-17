@@ -271,15 +271,6 @@ fun ProjectScreen(
                             modifier = Modifier.padding(top = 6.dp)
                         )
                     }
-                    HorizontalDivider(Modifier.padding(vertical = 10.dp), color = Color(0xFF24272D))
-                    Row(verticalAlignment = Alignment.Top) {
-                        Icon(Icons.Filled.Lock, null, Modifier.size(14.dp), tint = Faint)
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            "原本は読むだけ。移動・削除・書き換えはしません",
-                            fontSize = 11.sp, color = Faint
-                        )
-                    }
                 }
 
                 Spacer(Modifier.height(12.dp))
@@ -761,11 +752,10 @@ fun ProjectScreen(
         }
         ConfirmDialog(
             title = "「${project.name}」を削除しますか",
-            body = "このプロジェクトで付けた星・連写のまとめ方・どこまで見たかが消えます。" +
-                (if (bytes > 0) "端末に置いた表示用画像 ${bytes / 1024 / 1024}MB も消します。" else "") +
-                (if (!alone) "同じフォルダを使う別のプロジェクトがあるので、表示用画像は残します。" else "") +
-                (if (Sidecar.supports(project)) "NAS に置いた記録（catalog.json）は消しません。" else "") +
-                "写真そのものには手を触れません。",
+            body = "星・連写のまとめ方・進捗が消えます。写真そのものは変更しません。" +
+                (if (bytes > 0) "\n端末の表示用画像 ${bytes / 1024 / 1024}MB も消します。" else "") +
+                (if (!alone) "\n同じフォルダの別プロジェクトがあるため表示用画像は残します。" else "") +
+                (if (Sidecar.supports(project)) "\nNAS の記録（catalog.json）は消しません。" else ""),
             confirmLabel = "削除",
             onConfirm = {
                 removing = false
@@ -782,10 +772,8 @@ fun ProjectScreen(
         ConfirmDialog(
             title = "選別を最初からやり直しますか",
             // **何が消えるかを具体的に言う。**「よろしいですか」では判断できない。
-            body = "これまでに付けた星と、どこまで見たかが消えます。" +
-                "連写のまとめ方（最初に答えた基準と、手で直した分）も消えるので、" +
-                "次に始めるときはもう一度「同じ連写ですか」から聞きます。" +
-                "写真そのものには手を触れません。",
+            body = "星と進捗が消えます。連写のまとめ方もリセットされ、次回また質問します。" +
+                "写真そのものは変更しません。",
             confirmLabel = "やり直す",
             // 原本には触らないので赤字は出さない。**赤を安売りしない。**
             onConfirm = {

@@ -123,8 +123,8 @@ fun BurstReviewScreen(
         }
 
         Text(
-            "選んだ写真だけ ★${(baseStar + 1).coerceAtMost(5)} に上がります。" +
-                "選ばなければ ★$baseStar のまま。一度に見比べる枚数より多い分は下へ送って見られます",
+            "選んだ写真だけ ★${(baseStar + 1).coerceAtMost(5)} に上がります（選ばなければ ★$baseStar のまま）。" +
+                "多い分は下にスクロールして見られます",
             fontSize = 11.sp, color = Faint,
             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)
         )

@@ -80,8 +80,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                     Spacer(Modifier.height(8.dp))
                     if (nasList.isEmpty()) {
                         Text(
-                            "まだ登録がありません。「追加」から、ホスト名・共有名・" +
-                                "ユーザー名を入れてください。",
+                            "まだ登録がありません。「追加」から NAS をつないでください。",
                             fontSize = 12.sp, color = Faint
                         )
                     }
@@ -163,8 +162,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                     Spacer(Modifier.height(4.dp))
                     // **大きさと容量を並べて出す。** どちらか片方では選べない。
                     Text(
-                        "選別で見る絵の大きさ。NAS の原本は 1 枚 6MB あるので、" +
-                            "準備のときに一度だけ読んで、この大きさで端末に残します。",
+                        "選別で見る絵の大きさです。大きいほど鮮明ですが端末の保存容量を使います。",
                         fontSize = 11.sp, color = Faint
                     )
                     Spacer(Modifier.height(8.dp))

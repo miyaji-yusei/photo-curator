@@ -104,11 +104,6 @@ fun HomeScreen(
                 fontSize = 12.sp, color = Faint
             )
             Spacer(Modifier.weight(1f))
-            // 約束文。**毎回同じ場所に置く。**
-            Text(
-                "写真の原本は読むだけで、移動・削除・書き換えはしません",
-                fontSize = 12.sp, color = Faint
-            )
         }
 
         if (!loaded) {
@@ -122,7 +117,7 @@ fun HomeScreen(
             ) {
                 Text("まだプロジェクトがありません", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
                 Text(
-                    "写真のフォルダを選ぶと、原本には触らずに選別を始められます",
+                    "写真のフォルダを選ぶと選別を始められます",
                     fontSize = 13.sp, color = Faint, modifier = Modifier.padding(top = 6.dp)
                 )
             }

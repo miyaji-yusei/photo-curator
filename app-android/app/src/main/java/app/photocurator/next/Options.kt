@@ -86,10 +86,6 @@ fun OptionsSheet(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text("似た連写をまとめて 1 枚として見る", fontSize = 13.sp)
-                    Text(
-                        "切り替えると、まだ見ていない写真だけ組み直します",
-                        fontSize = 11.sp, color = Faint
-                    )
                 }
                 Switch(
                     checked = groupBursts,

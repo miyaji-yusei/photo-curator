@@ -113,7 +113,7 @@ fun BurstEditSheet(
                 Text("連写のまとまりを編集", fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.weight(1f))
                 Text(
-                    "線を動かして分ける／つなげる · 写真をタップで代表 · 横にスクロール",
+                    "線をドラッグして分ける／つなげる",
                     fontSize = 11.sp, color = Faint
                 )
             }

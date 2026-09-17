@@ -211,7 +211,7 @@ fun CullScreen(
                         modifier = Modifier.padding(top = 8.dp)
                     )
                     Text(
-                        "ここで戻っても、調べた分はとってあります",
+                        "進んだ分は保存されます",
                         color = Faint, fontSize = 11.sp,
                         modifier = Modifier.padding(top = 6.dp)
                     )
@@ -887,8 +887,7 @@ private fun RoundDone(
                     maxOf(1, upcoming.groupSize.toInt())
                 Text(
                     "次は ★${session.targetStar + 1} の $keptPhotos 枚を " +
-                        "${upcoming.groupSize} 枚ずつ見比べます（約 $turns 回）。" +
-                        "ここで終えても、結果はいつでも開けます。",
+                        "${upcoming.groupSize} 枚ずつ見比べます（約 $turns 回）。",
                     fontSize = 13.sp, color = Faint
                 )
                 Spacer(Modifier.height(16.dp))
