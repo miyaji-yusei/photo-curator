@@ -14,8 +14,21 @@ edition = "2021"
 name = "photo_curator_core"
 crate-type = ["cdylib", "lib"]
 
+# uniffi-bindgen（Kotlin バインディング生成）は uniffi があるときだけ組む。
+# `--no-default-features` のときはこの bin を丸ごと外す。
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["uniffi"]
+
+[features]
+# 既定は今までどおり uniffi あり（Android 向けの .so をそのまま作れる）。
+# `--no-default-features` で uniffi 無しでも組める（PC・Web が wasm から呼ぶとき用）。
+default = ["uniffi"]
+uniffi = ["dep:uniffi"]
+
 [dependencies]
-uniffi = { version = "0.28", features = ["cli"] }
+uniffi = { version = "0.28", features = ["cli"], optional = true }
 # 保存の形は core が持つ。**各環境が独自に組み立てない。**
 # サイドカー（NAS で共有する catalog.json）もこの形をそのまま使う。
 serde = { version = "1", features = ["derive"] }

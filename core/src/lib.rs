@@ -6,9 +6,10 @@
 //! いまは連写のまとめ方が Rust（PC）と TypeScript（Web）に二重実装されていて、
 //! 片方だけ直る不具合が実際に起きた。作り直しでここを 1 つに畳む。
 
+#[cfg(feature = "uniffi")]
 uniffi::include_scaffolding!("photo_curator_core");
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PhotoRef {
     pub relative_path: String,
     pub captured_at: Option<i64>,
@@ -16,27 +17,27 @@ pub struct PhotoRef {
     pub d_hash_version: i32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BurstPair {
     pub left: PhotoRef,
     pub right: PhotoRef,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BurstThreshold {
     pub window_ms: i64,
     pub distance: u32,
     pub d_hash_version: i32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PairOverride {
     pub left: String,
     pub right: String,
     pub decision: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BurstGroup {
     pub members: Vec<String>,
     pub representative: String,
@@ -222,7 +223,7 @@ pub fn d_hash_from_gray(gray: Vec<u8>, width: u32, height: u32) -> Option<String
 }
 
 /// 学習の 1 問への答え。**距離と、人の判断だけ。**
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BurstAnswer {
     pub distance: u32,
     pub same: bool,
