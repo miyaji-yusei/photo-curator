@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // 選別結果（設計 02 章）。星チップで絞る／並べ替え。格子（<1100は4列/≥1100は6列）。
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, toRaw } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useBackend } from '~/composables/useBackend'
 import { useCapabilities } from '~/composables/useCapabilities'
@@ -136,9 +136,17 @@ async function loadReviewUrls(paths: string[]) {
   for (const [p, url] of entries) if (url) thumbUrls.value[p] = url
 }
 // 決めるまでデータは変えない。選んだ写真だけ ratings を更新（連写の仲間は道連れにしない）。
+//
+// **必ず toRaw(session.value) から組み立てる。** session は ref なので、代入した
+// オブジェクトは Vue が中身まで reactive（Proxy）にする。session.value を直接
+// スプレッドすると members・ratings 等の中身が Proxy のまま新しいオブジェクトに
+// 乗り移り、webFolder 版（IndexedDB の structured clone）で
+// 「DataCloneError: could not be cloned」となって保存に失敗する
+// （tauri 版は JSON 経由の invoke なので気づかれなかった）。
 async function applyReview(changes: Record<string, number>) {
   if (!session.value) return
-  const next: Session = { ...session.value, ratings: { ...session.value.ratings, ...changes } }
+  const raw = toRaw(session.value)
+  const next: Session = { ...raw, ratings: { ...raw.ratings, ...changes } }
   session.value = next
   await backend.saveSession(projectId.value, next)
   reviewTarget.value = null
@@ -146,7 +154,8 @@ async function applyReview(changes: Record<string, number>) {
 
 async function bumpRating(path: string | null, delta: number) {
   if (!path || !session.value) return
-  const next: Session = { ...session.value, ratings: { ...session.value.ratings } }
+  const raw = toRaw(session.value)
+  const next: Session = { ...raw, ratings: { ...raw.ratings } }
   const current = next.ratings[path] ?? 0
   next.ratings[path] = Math.max(0, Math.min(5, current + delta))
   session.value = next
