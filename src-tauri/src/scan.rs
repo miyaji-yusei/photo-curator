@@ -166,7 +166,10 @@ pub fn list_entries(root: &str, sub_path: &str) -> Result<Vec<crate::model::Fold
                     if !child.file_name().to_string_lossy().starts_with('.') {
                         has_children = true;
                     }
-                } else if !has_photos && is_image_file(&child_path) {
+                } else if !has_photos
+                    && !child.file_name().to_string_lossy().starts_with('.')
+                    && is_image_file(&child_path)
+                {
                     has_photos = true;
                 }
                 if has_photos && has_children {
@@ -233,14 +236,19 @@ fn file_mtime_ms(metadata: &fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-/// 直下だけでなく、下位のフォルダも常にたどる（`.photo-curator` は除く）。
+/// 直下だけでなく、下位のフォルダも常にたどる。**ドット始まりのフォルダは種類を問わず
+/// 全部除外する**（`.photo-curator` だけを名指しで除いていたため、NAS の WebAccess
+/// 機能が自動で作る `.webaxs\thumbnail`（縮小画像キャッシュ）を原本と一緒に数えて
+/// しまい、「画質違いの同じ構図の写真が大量に出る」不具合になっていた。
+/// `L:\名古屋ひとり旅` で実測: 235枚のうち150枚が `.webaxs\thumbnail` のキャッシュ、
+/// 実写真は約85枚）。
 /// Web（フォルダ）版の `prepare` と同じ挙動（作成時の「まとめて」判断はここでは見ない）。
 fn walk_all_files(root: &Path) -> Vec<RawEntry> {
     let mut out = Vec::new();
     for entry in WalkDir::new(root)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|e| e.file_name().to_str().map(|n| n != ".photo-curator").unwrap_or(true))
+        .filter_entry(|e| e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.'))
         .flatten()
     {
         if !entry.file_type().is_file() {

@@ -329,10 +329,10 @@ export class WebFolderBackend implements Backend {
     const raw = await io.list(subPath)
     const entries: FolderEntry[] = []
     for (const item of raw) {
-      if (item.isDirectory) {
+      if (item.isDirectory && !item.name.startsWith('.')) {
         const children = await io.list(joinPath(subPath, item.name)).catch(() => [])
-        const hasPhotos = children.some(c => !c.isDirectory && !isVideoName(c.name))
-        const hasChildren = children.some(c => c.isDirectory)
+        const hasPhotos = children.some(c => !c.isDirectory && !c.name.startsWith('.') && !isVideoName(c.name))
+        const hasChildren = children.some(c => c.isDirectory && !c.name.startsWith('.'))
         if (!hasPhotos && !hasChildren) continue // 空フォルダは出さない
         entries.push({ name: item.name, key: joinPath(subPath, item.name), hasPhotos, hasChildren, sample: null })
       }
@@ -355,6 +355,7 @@ export class WebFolderBackend implements Backend {
       if (depth > 6) return
       const entries = await io.list(path)
       for (const entry of entries) {
+        if (entry.name.startsWith('.')) continue // ドット始まりは種類を問わず除外（scan.rs と揃える）
         if (entry.isDirectory) await walk(joinPath(path, entry.name), depth + 1)
         else if (!isVideoName(entry.name)) found.push({ subPath: path, entry })
       }
@@ -382,13 +383,16 @@ export class WebFolderBackend implements Backend {
     const io = await this.ioFor(project)
     await core.init()
 
-    // scan: 再帰的に写真を集める。
+    // scan: 再帰的に写真を集める。**ドット始まりのフォルダ・ファイルは種類を問わず除外**
+    // （NAS の WebAccess 機能が自動で作る `.webaxs\thumbnail` のような縮小画像キャッシュを
+    // 原本と一緒に数えてしまう不具合の元。scan.rs の walk_all_files と揃える）。
     const found: { subPath: string; entry: RawEntry }[] = []
     const walk = async (subPath: string, depth: number) => {
       if (depth > 6) return
       const entries = await io.list(subPath)
       for (const entry of entries) {
         if (signal.aborted) return
+        if (entry.name.startsWith('.')) continue
         if (entry.isDirectory) {
           await walk(joinPath(subPath, entry.name), depth + 1)
         } else if (!isVideoName(entry.name)) {
