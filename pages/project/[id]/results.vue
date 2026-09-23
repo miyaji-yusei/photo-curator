@@ -27,7 +27,10 @@ const session = ref<Session | null>(null)
 const thumbUrls = ref<Record<string, string>>({})
 const photoByPath = computed(() => Object.fromEntries(photos.value.map(p => [p.relativePath, p])))
 
-const filterStar = ref<number | null>(null)
+// プロジェクト詳細の「星の行」から来たときは、その星で絞った状態で開く
+// （02章「プロジェクト詳細」の遷移表「星の行 → results（その星で絞る）」）。
+const initialStar = Number(route.query.star)
+const filterStar = ref<number | null>(Number.isFinite(initialStar) && initialStar >= 0 && initialStar <= 5 ? initialStar : null)
 const sort = ref<PhotoSort>('rating')
 const selected = ref<Set<string>>(new Set())
 const multiMode = ref(false)

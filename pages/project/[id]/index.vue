@@ -33,16 +33,53 @@ const techOpen = ref(false)
 const restartOpen = ref(false)
 let abortController: AbortController | null = null
 
+// フィルタチップ「すべて／★1以上／連写n組」（02章「プロジェクト詳細」の一覧）。
+// 連写は代表1枚に畳んで数える（結果画面と同じ考え方）。
+const filterMode = ref<'all' | 'atLeast1' | 'burst'>('all')
+interface PhotoRow { relativePath: string; rating: number; burstSize: number }
+const photoRows = computed<PhotoRow[]>(() => {
+  const live = session.value
+  if (!live) return photos.value.map(p => ({ relativePath: p.relativePath, rating: 0, burstSize: 1 }))
+  const seen = new Set<string>()
+  const out: PhotoRow[] = []
+  for (const photo of photos.value) {
+    if (seen.has(photo.relativePath)) continue
+    const mates = live.members[photo.relativePath]
+    if (mates) {
+      for (const m of mates) seen.add(m)
+      out.push({ relativePath: photo.relativePath, rating: live.ratings[photo.relativePath] ?? 0, burstSize: mates.length })
+    } else {
+      seen.add(photo.relativePath)
+      out.push({ relativePath: photo.relativePath, rating: live.ratings[photo.relativePath] ?? 0, burstSize: 1 })
+    }
+  }
+  return out
+})
+const burstGroupCount = computed(() => photoRows.value.filter(r => r.burstSize > 1).length)
+const filteredRows = computed(() => {
+  if (filterMode.value === 'atLeast1') return photoRows.value.filter(r => r.rating > 0)
+  if (filterMode.value === 'burst') return photoRows.value.filter(r => r.burstSize > 1)
+  return photoRows.value
+})
+// 星の行 → results（その星で絞る。02章「プロジェクト詳細」の遷移表）。
+const starRows = computed(() => {
+  const live = session.value
+  if (!live) return []
+  const counts = [0, 0, 0, 0, 0, 0]
+  for (const row of photoRows.value) counts[Math.min(5, Math.max(0, row.rating))] += 1
+  return [5, 4, 3, 2, 1].map(star => ({ star, count: counts[star] ?? 0 })).filter(r => r.count > 0)
+})
+
 async function load() {
   await app.load()
   project.value = await backend.getProject(projectId.value)
   if (!project.value) return
   photos.value = await backend.listPhotos(projectId.value)
   session.value = await backend.loadSession(projectId.value)
-  // 画面に出す分だけ URL を取る（先頭 96 枚。格子は簡易実装）。
-  const shown = photos.value.slice(0, 96)
+  // 画面に出す分だけ URL を取る（先頭 96 枚。格子は簡易実装。フィルタで畳んだ後の並びに合わせる）。
+  const shown = filteredRows.value.slice(0, 96)
   const entries = await Promise.all(
-    shown.map(async p => [p.relativePath, await backend.thumbnailUrl(projectId.value, p.relativePath)] as const)
+    shown.map(async r => [r.relativePath, await backend.thumbnailUrl(projectId.value, r.relativePath)] as const)
   )
   thumbUrls.value = Object.fromEntries(entries.filter(([, url]) => url) as [string, string][])
 }
@@ -128,6 +165,17 @@ function fmtBytes(bytes: number): string {
 }
 
 watch(projectId, load)
+
+// フィルタを切り替えたとき、まだ URL を取っていない分だけ追加で取る（サムネイルは出所ごとに軽い）。
+watch(filterMode, async () => {
+  const shown = filteredRows.value.slice(0, 96)
+  const missing = shown.filter(r => !thumbUrls.value[r.relativePath])
+  if (missing.length === 0) return
+  const entries = await Promise.all(
+    missing.map(async r => [r.relativePath, await backend.thumbnailUrl(projectId.value, r.relativePath)] as const)
+  )
+  for (const [path, url] of entries) if (url) thumbUrls.value[path] = url
+})
 </script>
 
 <template>
@@ -201,6 +249,18 @@ watch(projectId, load)
           <v-card-item :title="`★${session.target_star} を選別中 · ROUND ${session.round}`">
             <template #subtitle>残り {{ session.queue.length + session.current.length }} 枚</template>
           </v-card-item>
+          <v-card-text v-if="starRows.length" class="pt-0">
+            <div
+              v-for="row in starRows"
+              :key="row.star"
+              class="d-flex justify-space-between text-body-2 py-1"
+              style="cursor: pointer"
+              @click="router.push(`/project/${projectId}/results?star=${row.star}`)"
+            >
+              <span>★{{ row.star }}</span>
+              <span class="text-medium-emphasis">{{ row.count }} 枚</span>
+            </div>
+          </v-card-text>
         </v-card>
       </div>
 
@@ -226,22 +286,46 @@ watch(projectId, load)
           />
         </div>
 
+        <!-- フィルタチップ「すべて／★1以上／連写n組」（02章「プロジェクト詳細」の一覧）。 -->
+        <div v-if="session" class="d-flex flex-wrap align-center mb-2" style="gap: 6px">
+          <v-chip :color="filterMode === 'all' ? 'primary' : undefined" size="small" @click="filterMode = 'all'">
+            すべて
+          </v-chip>
+          <v-chip :color="filterMode === 'atLeast1' ? 'primary' : undefined" size="small" @click="filterMode = 'atLeast1'">
+            ★1 以上
+          </v-chip>
+          <v-chip
+            v-if="burstGroupCount > 0"
+            :color="filterMode === 'burst' ? 'primary' : undefined"
+            size="small"
+            @click="filterMode = 'burst'"
+          >
+            連写 {{ burstGroupCount }} 組
+          </v-chip>
+        </div>
+
         <div class="d-flex flex-wrap" style="gap: 4px">
           <div
-            v-for="photo in photos.slice(0, 96)"
-            :key="photo.relativePath"
-            style="width: 96px; height: 96px; background: #16181d; overflow: hidden; border-radius: 4px"
+            v-for="row in filteredRows.slice(0, 96)"
+            :key="row.relativePath"
+            style="position: relative; width: 96px; height: 96px; background: #16181d; overflow: hidden; border-radius: 4px"
           >
             <img
-              v-if="thumbUrls[photo.relativePath]"
-              :src="thumbUrls[photo.relativePath]"
-              :alt="photo.relativePath"
+              v-if="thumbUrls[row.relativePath]"
+              :src="thumbUrls[row.relativePath]"
+              :alt="row.relativePath"
               style="width: 100%; height: 100%; object-fit: cover"
             >
+            <span v-if="row.burstSize > 1" class="text-caption" style="position: absolute; left: 2px; top: 2px; background: rgba(0,0,0,.6); padding: 0 4px">
+              ⧉{{ row.burstSize }}
+            </span>
           </div>
         </div>
-        <p v-if="photos.length > 96" class="text-caption text-medium-emphasis mt-2">
-          ほか {{ photos.length - 96 }} 枚
+        <p v-if="filteredRows.length > 96" class="text-caption text-medium-emphasis mt-2">
+          ほか {{ filteredRows.length - 96 }} 枚
+        </p>
+        <p v-if="filteredRows.length === 0 && photos.length > 0" class="text-medium-emphasis pa-4 text-center">
+          この絞り込みに合う写真はありません
         </p>
         <p v-if="photos.length === 0 && !needsPrepare" class="text-medium-emphasis pa-4 text-center">
           写真がありません
