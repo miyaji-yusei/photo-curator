@@ -1,10 +1,11 @@
 <script setup lang="ts">
 // 選別結果（設計 02 章）。星チップで絞る／並べ替え。格子（<1100は4列/≥1100は6列）。
-import { computed, onMounted, ref, toRaw } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, toRaw } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useBackend } from '~/composables/useBackend'
 import { useCapabilities } from '~/composables/useCapabilities'
 import { useLayout } from '~/composables/useLayout'
+import { registerAutoPush } from '~/composables/useSidecarSync'
 import type { Project, ProjectPhoto } from '~/types/project'
 import type { Session } from '~/lib/core'
 import { comparePhotos, filterPhotos, summarizeRatings } from '~/utils/photoQuery'
@@ -92,6 +93,11 @@ async function load() {
   thumbUrls.value = Object.fromEntries(entries.filter(([, u]) => u) as [string, string][])
 }
 onMounted(load)
+
+// 書き時「画面を離れる・背面へ回る・窓を閉じる」（設計02章）。結果画面での★上げ下げ・
+// 連写中身選別・やり直しも、ここを離れるときに書く。
+const stopAutoPush = registerAutoPush(() => project.value)
+onBeforeUnmount(() => stopAutoPush())
 
 function tapTile(row: Row) {
   if (multiMode.value) {

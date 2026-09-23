@@ -11,6 +11,7 @@ import type { PhotoRef, Session, BurstAnswer, BurstThreshold, PairOverride } fro
 import type { ProjectPhoto, Project } from '~/types/project'
 import { buildBurstQuestions } from '~/utils/burstQuestions'
 import { groupSizeLimits, clampGroupSize } from '~/utils/groupSize'
+import { registerAutoPush } from '~/composables/useSidecarSync'
 import BurstEditSheet from '~/components/BurstEditSheet.vue'
 import ZoomView from '~/components/ZoomView.vue'
 
@@ -247,7 +248,11 @@ async function persist(next: Session) {
   session.value = next
   await backend.saveSession(projectId.value, next)
   await loadDisplayUrls(next.current)
-  if (next.finished) phase.value = 'roundComplete'
+  if (next.finished) {
+    phase.value = 'roundComplete'
+    // 書き時「ラウンド完了」（設計02章）。最後のラウンドだけでなく、毎ラウンド書く。
+    if (project.value) await backend.pushSidecarIfChanged(project.value)
+  }
 }
 
 async function tapTile(path: string) {
@@ -333,6 +338,11 @@ function onKeydown(event: KeyboardEvent) {
   }
 }
 onMounted(() => window.addEventListener('keydown', onKeydown))
+onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
+
+// 書き時「画面を離れる・背面へ回る・窓を閉じる」（設計02章）。ラウンド完了は persist() で個別に書く。
+const stopAutoPush = registerAutoPush(() => project.value)
+onBeforeUnmount(() => stopAutoPush())
 </script>
 
 <template>

@@ -5,9 +5,11 @@ import { useRoute, useRouter } from 'vue-router'
 import { useBackend } from '~/composables/useBackend'
 import { useLayout } from '~/composables/useLayout'
 import { useAppStore } from '~/stores/app'
+import { useSidecarSync } from '~/composables/useSidecarSync'
 import type { Project, ProjectPhoto, PrepareProgress } from '~/types/project'
 import type { Session } from '~/lib/core'
 import { projectStatus } from '~/utils/projectStatus'
+import SidecarConflictDialog from '~/components/SidecarConflictDialog.vue'
 
 definePageMeta({ layout: 'default' })
 
@@ -32,6 +34,15 @@ const deleteBytes = ref(0)
 const techOpen = ref(false)
 const restartOpen = ref(false)
 let abortController: AbortController | null = null
+
+// サイドカーの4通り（設計02章）。開いたときに確かめ、食い違いなら2択を出す。
+const { clash, checkOnOpen, keepMine, keepTheirs } = useSidecarSync()
+async function resolveClash(which: 'mine' | 'theirs') {
+  if (!project.value) return
+  if (which === 'mine') await keepMine(project.value)
+  else await keepTheirs(project.value)
+  await load()
+}
 
 // フィルタチップ「すべて／★1以上／連写n組」（02章「プロジェクト詳細」の一覧）。
 // 連写は代表1枚に畳んで数える（結果画面と同じ考え方）。
@@ -74,6 +85,8 @@ async function load() {
   await app.load()
   project.value = await backend.getProject(projectId.value)
   if (!project.value) return
+  // 開いたときに4通りを確かめる。Push・Pull は自動で片付き、Clash だけ2択を出す。
+  await checkOnOpen(project.value)
   photos.value = await backend.listPhotos(projectId.value)
   session.value = await backend.loadSession(projectId.value)
   // 画面に出す分だけ URL を取る（先頭 96 枚。格子は簡易実装。フィルタで畳んだ後の並びに合わせる）。
@@ -385,6 +398,13 @@ watch(filterMode, async () => {
         </v-card-actions>
       </v-card>
     </v-dialog>
+
+    <SidecarConflictDialog
+      v-if="clash"
+      :theirs="clash"
+      @keep-mine="resolveClash('mine')"
+      @keep-theirs="resolveClash('theirs')"
+    />
   </div>
   <div v-else class="text-center pa-8">
     <v-progress-circular indeterminate color="primary" />
