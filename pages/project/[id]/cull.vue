@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // 選別（本体）＋開始シート／基準学習／まとまり確認／ラウンド完了（設計 02 章）。
 // **帯は上の1本だけ。アプリバーは出さない**（layouts/focus.vue）。
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useBackend } from '~/composables/useBackend'
 import { useCapabilities } from '~/composables/useCapabilities'
@@ -12,6 +12,7 @@ import type { ProjectPhoto, Project } from '~/types/project'
 import { buildBurstQuestions } from '~/utils/burstQuestions'
 import { groupSizeLimits, clampGroupSize } from '~/utils/groupSize'
 import BurstEditSheet from '~/components/BurstEditSheet.vue'
+import ZoomView from '~/components/ZoomView.vue'
 
 definePageMeta({ layout: 'focus' })
 
@@ -27,6 +28,8 @@ const photos = ref<ProjectPhoto[]>([])
 const photoRefs = ref<PhotoRef[]>([])
 const overrides = ref<PairOverride[]>([])
 const burstDistance = ref<number | null>(null)
+// パス→写真。拡大の「n MB」表示に使う（設計 02 章 zoom シート）。
+const photoByPath = computed(() => Object.fromEntries(photos.value.map(p => [p.relativePath, p])))
 
 type Phase = 'loading' | 'start' | 'learn' | 'preview' | 'tournament' | 'roundComplete'
 const phase = ref<Phase>('loading')
@@ -51,6 +54,56 @@ const previewGroups = ref<core.BurstGroup[]>([])
 const selected = ref<Set<string>>(new Set())
 const multiMode = ref(false)
 const roundStartedAt = ref(0)
+
+// 枠の行×列（02章「選別」の表。GRID = {2:[1,2],3:[1,3],4:[2,2],...}）。
+// landscape/portrait で行列を入れ替える（app-android の Cull.kt gridFor と同じ）。
+const GRID: Record<number, [number, number]> = {
+  1: [1, 1], 2: [1, 2], 3: [1, 3], 4: [2, 2], 5: [2, 3],
+  6: [2, 3], 7: [2, 4], 8: [2, 4], 9: [3, 3], 10: [2, 5]
+}
+function gridFor(count: number, landscape: boolean): [number, number] {
+  const found = GRID[count]
+  const [rows, cols] = found ?? [Math.ceil(count / 5), Math.min(5, Math.max(1, count))]
+  return landscape ? [rows, cols] : [cols, rows]
+}
+
+// 枠の実寸から landscape/portrait を測る。**画面の残り全部を使う**ため、
+// vw/vh の固定サイズではなく実測したコンテナの縦横比で行×列を決める。
+const stageEl = ref<HTMLElement | null>(null)
+const stageSize = ref({ width: 0, height: 0 })
+let stageObserver: ResizeObserver | null = null
+watch(stageEl, (el) => {
+  stageObserver?.disconnect()
+  stageObserver = null
+  if (el) {
+    stageObserver = new ResizeObserver((entries) => {
+      const rect = entries[0]?.contentRect
+      if (rect) stageSize.value = { width: rect.width, height: rect.height }
+    })
+    stageObserver.observe(el)
+  }
+})
+onBeforeUnmount(() => stageObserver?.disconnect())
+
+const gridDims = computed<[number, number]>(() => {
+  const count = session.value?.current.length ?? 0
+  const landscape = stageSize.value.width >= stageSize.value.height
+  return gridFor(count, landscape)
+})
+
+// 拡大（zoom）。いまの組の中を左右で見比べられる（02章 zoom シート）。
+const zoomIndex = ref<number | null>(null)
+function openZoom(path: string) {
+  if (!session.value) return
+  const at = session.value.current.indexOf(path)
+  if (at >= 0) zoomIndex.value = at
+}
+async function zoomKeep(path: string) {
+  zoomIndex.value = null
+  if (!session.value) return
+  await persist(core.advance(session.value, [path]))
+  selected.value = new Set()
+}
 
 function threshold(): BurstThreshold {
   return { window_ms: 4000, distance: burstDistance.value ?? previewDistance.value ?? 9, d_hash_version: 2 }
@@ -236,7 +289,7 @@ async function finishToResults() {
 }
 
 function onKeydown(event: KeyboardEvent) {
-  if (!capabilities.keyboard || phase.value !== 'tournament' || !session.value) return
+  if (!capabilities.keyboard || phase.value !== 'tournament' || !session.value || zoomIndex.value !== null) return
   if (event.key === 'Enter') { confirmGroup(); return }
   if (event.key === 'Backspace') { undo(); return }
   if (event.key.toLowerCase() === 'm') { multiMode.value = !multiMode.value; return }
@@ -276,21 +329,27 @@ onMounted(() => window.addEventListener('keydown', onKeydown))
     </div>
 
     <!-- 基準学習 -->
-    <div v-else-if="phase === 'learn'" class="pa-6 flex-grow-1 d-flex flex-column" style="max-width: 640px; margin: 0 auto">
-      <p class="text-h6 mb-4">この2枚は同じ連写ですか？（{{ questionIndex + 1 }} / {{ questions.length }}）</p>
-      <div v-if="questions[questionIndex]" class="d-flex flex-grow-1 ga-4 justify-center align-center">
-        <img
+    <div v-else-if="phase === 'learn'" class="pa-4 d-flex flex-column flex-grow-1" style="min-height: 0">
+      <p class="text-h6 mb-2">この2枚は同じ連写ですか？（{{ questionIndex + 1 }} / {{ questions.length }}）</p>
+      <div v-if="questions[questionIndex]" class="d-flex flex-grow-1 ga-2" style="min-height: 0">
+        <div
           v-for="side in [questions[questionIndex]!.left, questions[questionIndex]!.right]"
           :key="side.relative_path"
-          :src="displayUrls[side.relative_path]"
-          style="max-width: 45%; max-height: 60vh; object-fit: contain"
+          class="flex-grow-1"
+          style="min-width: 0; position: relative; background: #16181d; border-radius: 6px; overflow: hidden"
         >
+          <img
+            v-if="displayUrls[side.relative_path]"
+            :src="displayUrls[side.relative_path]"
+            style="width: 100%; height: 100%; object-fit: contain"
+          >
+        </div>
       </div>
-      <div class="d-flex ga-2 justify-center mt-4">
+      <div class="d-flex ga-2 justify-center mt-4" style="flex-shrink: 0">
         <v-btn color="primary" @click="answerQuestion(true)">同じ</v-btn>
         <v-btn variant="tonal" @click="answerQuestion(false)">別</v-btn>
       </div>
-      <v-btn variant="text" class="mt-4" @click="skipLearning">残りをスキップ</v-btn>
+      <v-btn variant="text" class="mt-2" style="flex-shrink: 0" @click="skipLearning">残りをスキップ</v-btn>
     </div>
 
     <!-- まとまり確認 -->
@@ -325,7 +384,7 @@ onMounted(() => window.addEventListener('keydown', onKeydown))
     </div>
 
     <!-- 選別本体 -->
-    <div v-else-if="phase === 'tournament' && session" class="d-flex flex-column flex-grow-1">
+    <div v-else-if="phase === 'tournament' && session" class="d-flex flex-column flex-grow-1" style="min-height: 0">
       <div class="d-flex align-center px-3" style="height: 56px; flex-shrink: 0">
         <v-btn icon="mdi-arrow-left" variant="text" :to="`/project/${projectId}`" />
         <v-btn icon="mdi-undo" variant="text" :disabled="session.history.length === 0" @click="undo" />
@@ -340,14 +399,19 @@ onMounted(() => window.addEventListener('keydown', onKeydown))
         </v-btn>
       </div>
       <v-progress-linear :model-value="((photos.length - session.queue.length - session.current.length) / Math.max(1, photos.length)) * 100" height="2" color="primary" />
-      <p class="text-center text-caption text-medium-emphasis my-1">
+      <p class="text-center text-caption text-medium-emphasis my-1" style="flex-shrink: 0">
         残り {{ session.queue.length + session.current.length }} 枚
       </p>
-      <div class="flex-grow-1 d-flex flex-wrap align-center justify-center ga-2 pa-2" style="overflow: auto">
+      <div
+        ref="stageEl"
+        class="flex-grow-1 pa-2"
+        style="min-height: 0; overflow: hidden; display: grid; gap: 6px"
+        :style="{ gridTemplateColumns: `repeat(${gridDims[1]}, 1fr)`, gridTemplateRows: `repeat(${gridDims[0]}, 1fr)` }"
+      >
         <div
           v-for="path in session.current"
           :key="path"
-          style="position: relative; width: min(45vw, 45vh); height: min(45vw, 45vh); background: #16181d; border-radius: 6px; overflow: hidden; cursor: pointer"
+          style="position: relative; min-width: 0; min-height: 0; background: #16181d; border-radius: 6px; overflow: hidden; cursor: pointer"
           :style="selected.has(path) ? 'outline: 3px solid #d6ff73' : ''"
           @click="tapTile(path)"
           @contextmenu.prevent="longPress(path)"
@@ -356,7 +420,10 @@ onMounted(() => window.addEventListener('keydown', onKeydown))
           <span v-if="session.members[path]" class="text-caption" style="position: absolute; left: 4px; top: 4px; background: rgba(0,0,0,.6); padding: 0 4px; cursor: pointer" @click.stop="burstEditTarget = path">
             ⧉{{ session.members[path]!.length }}
           </span>
-          <v-btn icon="mdi-star" size="x-small" variant="text" style="position: absolute; right: 4px; top: 4px" @click.stop="keepTop5(path)" />
+          <div style="position: absolute; right: 4px; top: 4px; display: flex; flex-direction: column; gap: 4px">
+            <v-btn icon="mdi-magnify" size="x-small" variant="text" style="background: rgba(0,0,0,.4)" @click.stop="openZoom(path)" />
+            <v-btn icon="mdi-star" size="x-small" variant="text" style="background: rgba(0,0,0,.4)" @click.stop="keepTop5(path)" />
+          </div>
         </div>
       </div>
     </div>
@@ -378,6 +445,19 @@ onMounted(() => window.addEventListener('keydown', onKeydown))
       :photos="photoRefs"
       @close="burstEditTarget = null"
       @apply="afterBurstEdit"
+    />
+
+    <ZoomView
+      v-if="zoomIndex !== null && session"
+      :paths="session.current"
+      :index="zoomIndex"
+      :display-urls="displayUrls"
+      :resolve-original="(p) => backend.originalUrl(projectId, p)"
+      :file-size="(p) => photoByPath[p]?.size ?? null"
+      :show-keep="true"
+      @close="zoomIndex = null"
+      @move="(i) => (zoomIndex = i)"
+      @keep="zoomKeep"
     />
   </div>
 </template>
