@@ -66,11 +66,16 @@ export interface AppSettings {
   groupBursts: boolean
   /** 開始前に毎回 startSheet を出すか。 */
   confirmBeforeStart: boolean
+  /** 選別中の長押しで拡大するか（既定は false＝長押しは複数選び）。
+   *  Android の Settings.kt の holdZooms に相当。マウスは押し続け、タッチは
+   *  長押しで同じ扱いにする（cull.vue の pointerdown/up）。 */
+  holdZooms: boolean
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
   displayEdge: 1024,
   groupSize: 4,
   groupBursts: true,
-  confirmBeforeStart: true
+  confirmBeforeStart: true,
+  holdZooms: false
 }

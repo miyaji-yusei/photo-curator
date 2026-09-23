@@ -80,6 +80,11 @@ pub struct AppSettings {
     pub group_size: u32,
     pub group_bursts: bool,
     pub confirm_before_start: bool,
+    /// 選別中の長押しで拡大するか（既定は選ぶ＝false）。Android の `Settings.kt` の
+    /// `holdZooms` に相当（07章・段8以降の突き合わせで追加）。既存の settings.json に
+    /// 無くても壊れないよう `#[serde(default)]`。
+    #[serde(default)]
+    pub hold_zooms: bool,
 }
 
 impl Default for AppSettings {
@@ -89,6 +94,7 @@ impl Default for AppSettings {
             group_size: 4,
             group_bursts: true,
             confirm_before_start: true,
+            hold_zooms: false,
         }
     }
 }

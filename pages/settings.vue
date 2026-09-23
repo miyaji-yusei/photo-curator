@@ -84,6 +84,12 @@ async function persist() {
             color="primary"
             @update:model-value="persist"
           />
+          <v-switch
+            v-model="app.settings.holdZooms"
+            label="選別中の長押しで拡大する（既定は選ぶ）"
+            color="primary"
+            @update:model-value="persist"
+          />
         </v-card-text>
       </v-card-item>
     </v-card>

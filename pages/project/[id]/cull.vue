@@ -55,6 +55,14 @@ const previewGroups = ref<core.BurstGroup[]>([])
 const selected = ref<Set<string>>(new Set())
 const multiMode = ref(false)
 const roundStartedAt = ref(0)
+// 選別中の長押し。既定は「選ぶ」（複数選びを始める）。設定で「拡大」に変えられる
+// （app-android の Settings.kt / Cull.kt の holdZooms と同じ。07章 段8以降の突き合わせ）。
+// マウスは押し続け、タッチは長押しで同じに扱う（pointerdown からの経過時間で判定。
+// contextmenu＝右クリックだけだと iPad 相当の Web（ピッカー）で入口が無くなるため）。
+const holdZooms = ref(false)
+const LONG_PRESS_MS = 450
+let pressTimer: ReturnType<typeof setTimeout> | null = null
+let longPressFired = false
 
 // 枠の行×列（02章「選別」の表。GRID = {2:[1,2],3:[1,3],4:[2,2],...}）。
 // landscape/portrait で行列を入れ替える（app-android の Cull.kt gridFor と同じ）。
@@ -169,6 +177,7 @@ onMounted(async () => {
   burstDistance.value = await backend.loadBurstDistance(projectId.value)
   groupSize.value = clampGroupSize(app.settings.groupSize, groupSizeLimits(capabilities.largeGroups))
   groupBursts.value = app.settings.groupBursts
+  holdZooms.value = app.settings.holdZooms
 
   const existing = await backend.loadSession(projectId.value)
   if (existing && !existing.finished) {
@@ -256,6 +265,9 @@ async function persist(next: Session) {
 }
 
 async function tapTile(path: string) {
+  // 長押しが成立した直後の click（タッチはタップ終わりに click も飛ぶ）は無視する。
+  // **1 回の長押しが「選ぶ／確定」の両方に化けないため。**
+  if (longPressFired) { longPressFired = false; return }
   if (!session.value) return
   if (multiMode.value) {
     const set = new Set(selected.value)
@@ -275,10 +287,28 @@ async function confirmGroup() {
 }
 
 function longPress(path: string) {
+  // **設定で長押しを拡大に変えられる**（既定は選ぶ＝複数選びを始める。Cull.kt の
+  // holdZooms と同じ分岐）。
+  if (holdZooms.value) {
+    openZoom(path)
+    return
+  }
   multiMode.value = true
   const set = new Set(selected.value)
   set.add(path)
   selected.value = set
+}
+
+function onTilePointerDown(path: string) {
+  longPressFired = false
+  if (pressTimer) clearTimeout(pressTimer)
+  pressTimer = setTimeout(() => {
+    longPressFired = true
+    longPress(path)
+  }, LONG_PRESS_MS)
+}
+function cancelPress() {
+  if (pressTimer) { clearTimeout(pressTimer); pressTimer = null }
 }
 
 async function undo() {
@@ -459,6 +489,10 @@ onBeforeUnmount(() => stopAutoPush())
           :style="selected.has(path) ? 'outline: 3px solid #d6ff73' : ''"
           @click="tapTile(path)"
           @contextmenu.prevent="longPress(path)"
+          @pointerdown="onTilePointerDown(path)"
+          @pointerup="cancelPress"
+          @pointerleave="cancelPress"
+          @pointercancel="cancelPress"
         >
           <img v-if="displayUrls[path]" :src="displayUrls[path]" style="width: 100%; height: 100%; object-fit: contain">
           <span v-if="session.members[path]" class="text-caption" style="position: absolute; left: 4px; top: 4px; background: rgba(0,0,0,.6); padding: 0 4px; cursor: pointer" @click.stop="burstEditTarget = path">
