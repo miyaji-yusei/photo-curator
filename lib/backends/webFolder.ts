@@ -425,6 +425,9 @@ export class WebFolderBackend implements Backend {
       sinceSave += 1
       if (sinceSave >= 50) {
         await idbSet(`photos:${projectId}`, photos)
+        project.metaHashedCount = metaDone
+        project.displayedCount = displayDone
+        await idbSet(`project:${projectId}`, project)
         sinceSave = 0
       }
       onProgress({ task: 'display', done: index + 1, total: photos.length, warning: failed > 0 ? `${failed} 枚を読めませんでした` : null })
