@@ -4,25 +4,10 @@ version = "0.1.0"
 description = "A human-centered desktop workflow for curating large photo collections"
 authors = []
 edition = "2021"
-# 計測ハーネス bench.rs を追加したことで bin ターゲットが2つになり、
-# `cargo run`（tauri dev が内部で呼ぶ）がどちらを起動するか決められなくなる。
-# required-features を付けていても曖昧さは解消しないため、既定を明示する。
-default-run = "photo-curator"
 
 [lib]
 name = "photo_curator_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
-
-# 計測ハーネス。既定ビルドには入らない。
-# `cargo run --features bench --bin bench -- <subcommand>`
-[[bin]]
-name = "bench"
-path = "src/bin/bench.rs"
-required-features = ["bench"]
-
-[features]
-# 計測ハーネスの bin ターゲットを有効にするだけ。既定ビルドには入らない。
-bench = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -32,7 +17,6 @@ tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rusqlite = { version = "0.32", features = ["bundled"] }
 walkdir = "2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 kamadak-exif = "0.6"
@@ -41,12 +25,6 @@ uuid = { version = "1", features = ["v4"] }
 # scaled decode を提供しないため、EXIF サムネイルが無い JPEG の
 # フォールバック経路としてこちらを併用する。
 jpeg-decoder = "0.3"
-
-# Android だけ。端末の写真（MediaStore）へは Kotlin 経由でしか届かないので、
-# JNI で PhotoAccess.kt の静的メソッドを呼ぶ。**Tauri のプラグイン機構は使わない**：
-# 必要なのが「一覧を返す」「バイト列を返す」の 2 つだけで、Activity の
-# やりとりが要らないため。
-[target.'cfg(target_os = "android")'.dependencies]
-# JavaVM は JNI_OnLoad で受け取る（android_photos.rs）。
-# ndk-context は NativeActivity 系でしか埋まらないので使わない。
-jni = "0.21"
+# 判断（星の付き方・連写のまとめ方・指紋）は core に任せる（設計 05 章
+# 2026-09-23: PC も core を直接呼ぶ）。uniffi は要らないので切る。
+photo-curator-core = { path = "../core", default-features = false }
