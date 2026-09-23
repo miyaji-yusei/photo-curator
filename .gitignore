@@ -34,3 +34,8 @@ core/target/
 # 実際に一度これで詰まり、履歴を積み直す羽目になった。
 build-out/
 *.apk
+
+# core-wasm の出力（wasm-pack build）。pkg/ 自体に .gitignore（*）があるが、
+# core/ と揃えて明示しておく。
+core-wasm/target/
+core-wasm/pkg/
