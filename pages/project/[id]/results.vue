@@ -9,6 +9,7 @@ import type { Project, ProjectPhoto } from '~/types/project'
 import type { Session } from '~/lib/core'
 import { comparePhotos, filterPhotos, summarizeRatings } from '~/utils/photoQuery'
 import type { PhotoSort } from '~/types/photo'
+import ZoomView from '~/components/ZoomView.vue'
 
 definePageMeta({ layout: 'default' })
 
@@ -23,16 +24,20 @@ const project = ref<Project | null>(null)
 const photos = ref<ProjectPhoto[]>([])
 const session = ref<Session | null>(null)
 const thumbUrls = ref<Record<string, string>>({})
+const photoByPath = computed(() => Object.fromEntries(photos.value.map(p => [p.relativePath, p])))
 
 const filterStar = ref<number | null>(null)
 const sort = ref<PhotoSort>('rating')
 const selected = ref<Set<string>>(new Set())
 const multiMode = ref(false)
-const zoomPath = ref<string | null>(null)
-const zoomUrl = ref<string | null>(null)
+const zoomIndex = ref<number | null>(null)
 const menu = ref(false)
 const exportBusy = ref(false)
 const exportMessage = ref('')
+// 「最初からやり直す」（02章「results」の「…」）。押した場所で即やり直せるように
+// ここで確認ダイアログを挟んで実行する（プロジェクト詳細への遷移だけでは終わらない）。
+const restartOpen = ref(false)
+const restarting = ref(false)
 
 interface Row { relativePath: string; rating: number; capturedAt: number | null; burstSize: number }
 
@@ -67,6 +72,7 @@ const filteredSorted = computed(() => {
   const filtered = filterPhotos(rows.value.map(r => ({ ...r, isMissing: false })), filterStar.value)
   return filtered.sort(comparePhotos<Row>(filterStar.value === null ? sort.value : 'name'))
 })
+const zoomPaths = computed(() => filteredSorted.value.map(r => r.relativePath))
 
 async function load() {
   project.value = await backend.getProject(projectId.value)
@@ -95,13 +101,13 @@ function longPress(row: Row) {
   selected.value = set
 }
 
-async function openZoom(path: string) {
-  zoomPath.value = path
-  zoomUrl.value = thumbUrls.value[path] ?? await backend.displayUrl(projectId.value, path)
+function openZoom(path: string) {
+  const at = zoomPaths.value.indexOf(path)
+  if (at >= 0) zoomIndex.value = at
 }
 
-async function bumpRating(path: string, delta: number) {
-  if (!session.value) return
+async function bumpRating(path: string | null, delta: number) {
+  if (!path || !session.value) return
   const next: Session = { ...session.value, ratings: { ...session.value.ratings } }
   const current = next.ratings[path] ?? 0
   next.ratings[path] = Math.max(0, Math.min(5, current + delta))
@@ -156,6 +162,23 @@ async function doExport(kind: 'folders' | 'xmp' | 'csv') {
   }
 }
 
+// 「最初からやり直す」。app-android の Album.kt の確認文と同じ考え方
+// （何が消えるかを具体的に言う）。実行後は詳細画面へ（選別はまだ開始していない状態）。
+function openRestart() {
+  menu.value = false
+  restartOpen.value = true
+}
+async function confirmRestart() {
+  restarting.value = true
+  try {
+    await backend.restartProject(projectId.value)
+    restartOpen.value = false
+    router.push(`/project/${projectId.value}`)
+  } finally {
+    restarting.value = false
+  }
+}
+
 const hasBursts = computed(() => rows.value.some(r => r.burstSize > 1))
 const starChips = computed(() => {
   const chips: { label: string; value: number | null }[] = [{ label: 'すべて', value: null }]
@@ -176,7 +199,7 @@ const starChips = computed(() => {
           <v-btn icon="mdi-dots-vertical" variant="text" v-bind="menuProps" />
         </template>
         <v-list>
-          <v-list-item title="最初からやり直す" @click="router.push(`/project/${projectId}`); menu = false" />
+          <v-list-item title="最初からやり直す" @click="openRestart" />
           <v-list-item title="技術情報" @click="menu = false" />
         </v-list>
       </v-menu>
@@ -225,6 +248,19 @@ const starChips = computed(() => {
           <v-spacer />
           <v-btn variant="text" @click="confirmKind = null">やめる</v-btn>
           <v-btn color="error" @click="confirmExport">書き込む</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog :model-value="restartOpen" max-width="420" @update:model-value="(v) => { if (!v) restartOpen = v }">
+      <v-card title="選別を最初からやり直しますか">
+        <v-card-text>
+          <p class="text-error">星と進捗が消えます。連写のまとめ方もリセットされ、次回また質問します。写真そのものは変更しません。</p>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" :disabled="restarting" @click="restartOpen = false">キャンセル</v-btn>
+          <v-btn color="error" :loading="restarting" @click="confirmRestart">やり直す</v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>
@@ -278,17 +314,22 @@ const starChips = computed(() => {
       {{ capabilities.sidecar ? '星は写真のフォルダにも記録します（.photo-curator）' : 'この端末だけの結果' }}
     </p>
 
-    <v-dialog :model-value="!!zoomPath" max-width="900" @update:model-value="(v) => { if (!v) zoomPath = null }">
-      <v-card v-if="zoomPath">
-        <img :src="zoomUrl ?? ''" style="width: 100%; max-height: 80vh; object-fit: contain">
-        <v-card-actions>
-          <v-btn icon="mdi-minus" @click="bumpRating(zoomPath, -1)" />
-          <v-btn icon="mdi-plus" @click="bumpRating(zoomPath, 1)" />
-          <v-spacer />
-          <v-btn @click="zoomPath = null">閉じる</v-btn>
-        </v-card-actions>
-      </v-card>
-    </v-dialog>
+    <ZoomView
+      v-if="zoomIndex !== null"
+      :paths="zoomPaths"
+      :index="zoomIndex"
+      :display-urls="thumbUrls"
+      :resolve-original="(p) => backend.originalUrl(projectId, p)"
+      :file-size="(p) => photoByPath[p]?.size ?? null"
+      :show-keep="false"
+      @close="zoomIndex = null"
+      @move="(i) => (zoomIndex = i)"
+    >
+      <template #extra="{ path }">
+        <v-btn icon="mdi-minus" variant="tonal" @click="bumpRating(path, -1)" />
+        <v-btn icon="mdi-plus" variant="tonal" @click="bumpRating(path, 1)" />
+      </template>
+    </ZoomView>
   </div>
   <div v-else class="text-center pa-8">
     <v-progress-circular indeterminate color="primary" />
