@@ -109,13 +109,32 @@ async function bumpRating(path: string, delta: number) {
   await backend.saveSession(projectId.value, next)
 }
 
+// 取り出し先の対象（選択があればその分だけ、無ければ絞り込み後の全部）。
+const exportTargets = computed(() =>
+  (selected.value.size > 0 ? filteredSorted.value.filter(r => selected.value.has(r.relativePath)) : filteredSorted.value)
+    .map(r => ({ relativePath: r.relativePath, rating: r.rating, capturedAt: r.capturedAt }))
+)
+
+// フォルダ分け・XMP は確認を挟む（06 章 A-2/A-3）。CSV は原本に触れないので即実行。
+const confirmKind = ref<'folders' | 'xmp' | null>(null)
+
+function requestExport(kind: 'folders' | 'xmp' | 'csv') {
+  menu.value = false
+  if (kind === 'csv') { void doExport('csv'); return }
+  confirmKind.value = kind
+}
+
+async function confirmExport() {
+  const kind = confirmKind.value
+  confirmKind.value = null
+  if (kind) await doExport(kind)
+}
+
 async function doExport(kind: 'folders' | 'xmp' | 'csv') {
   if (!project.value) return
   exportBusy.value = true
-  menu.value = false
   try {
-    const targets = (selected.value.size > 0 ? filteredSorted.value.filter(r => selected.value.has(r.relativePath)) : filteredSorted.value)
-      .map(r => ({ relativePath: r.relativePath, rating: r.rating, capturedAt: r.capturedAt }))
+    const targets = exportTargets.value
     if (kind === 'folders') {
       const report = await backend.exportFolders(projectId.value, targets)
       exportMessage.value = report.errors[0] ?? `${report.processed} 枚を書き出しました。`
@@ -171,14 +190,14 @@ const starChips = computed(() => {
           <v-list-item
             :disabled="!capabilities.exportFolders"
             :title="capabilities.exportFolders ? 'フォルダ分けしてコピー' : 'フォルダ分け（PC 版で使えます）'"
-            @click="doExport('folders')"
+            @click="requestExport('folders')"
           />
           <v-list-item
             :disabled="!capabilities.writeMetadata"
             :title="capabilities.writeMetadata ? '原本の XMP に星を書く' : 'XMP に星（PC 版で使えます）'"
-            @click="doExport('xmp')"
+            @click="requestExport('xmp')"
           />
-          <v-list-item title="CSV を書き出す" @click="doExport('csv')" />
+          <v-list-item title="CSV を書き出す" @click="requestExport('csv')" />
         </v-list>
       </v-menu>
     </div>
@@ -186,6 +205,29 @@ const starChips = computed(() => {
     <v-alert v-if="exportMessage" type="info" density="compact" class="mb-3" closable @click:close="exportMessage = ''">
       {{ exportMessage }}
     </v-alert>
+
+    <v-dialog :model-value="confirmKind !== null" max-width="440" @update:model-value="(v) => { if (!v) confirmKind = null }">
+      <v-card v-if="confirmKind === 'folders'" title="フォルダ分けしてコピーしますか">
+        <v-card-text>
+          <p>{{ exportTargets.length }} 枚を星ごとのフォルダ（<code>star-0</code>〜<code>star-5</code>）へコピーします。元の場所の写真はそのまま残ります。</p>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="confirmKind = null">やめる</v-btn>
+          <v-btn color="primary" @click="confirmExport">コピーする</v-btn>
+        </v-card-actions>
+      </v-card>
+      <v-card v-else-if="confirmKind === 'xmp'" title="原本に星を書き込みますか">
+        <v-card-text>
+          <p class="text-error">原本を書き換えます。{{ exportTargets.length }} 枚の写真に、星を XMP（xmp:Rating）として直接書き込みます。取り消せません。</p>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="confirmKind = null">やめる</v-btn>
+          <v-btn color="error" @click="confirmExport">書き込む</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
 
     <div class="d-flex flex-wrap align-center mb-2" style="gap: 6px">
       <v-chip
