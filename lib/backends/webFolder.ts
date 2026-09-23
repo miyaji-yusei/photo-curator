@@ -284,6 +284,10 @@ export class WebFolderBackend implements Backend {
     const project = await idbGet<StoredProject>(`project:${id}`)
     if (project) {
       project.burstDistance = null
+      // completedAt を戻さないと、詳細画面が「結果を見る」のまま（primaryLabel が
+      // completedAt を見て分岐する）で、やり直したのに選別を開始できない
+      // （tauri 版の restart_project は completed_at を None にしている。揃える）。
+      project.completedAt = null
       project.updatedAt = Date.now()
       await idbSet(`project:${id}`, project)
     }
