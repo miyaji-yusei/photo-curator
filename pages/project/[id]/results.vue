@@ -177,13 +177,13 @@ const exportTargets = computed(() =>
     .map(r => ({ relativePath: r.relativePath, rating: r.rating, capturedAt: r.capturedAt }))
 )
 
-// フォルダ分け・XMP は確認を挟む（06 章 A-2/A-3）。CSV は原本に触れないので即実行。
+// フォルダ分け・XMP は確認を挟む（06 章 A-2/A-3）。CSV・ZIP・共有は原本に触れないので即実行。
 const confirmKind = ref<'folders' | 'xmp' | null>(null)
 
-function requestExport(kind: 'folders' | 'xmp' | 'csv') {
+function requestExport(kind: 'folders' | 'xmp' | 'csv' | 'zip' | 'share') {
   menu.value = false
-  if (kind === 'csv') { void doExport('csv'); return }
-  confirmKind.value = kind
+  if (kind === 'folders' || kind === 'xmp') { confirmKind.value = kind; return }
+  void doExport(kind)
 }
 
 async function confirmExport() {
@@ -192,7 +192,16 @@ async function confirmExport() {
   if (kind) await doExport(kind)
 }
 
-async function doExport(kind: 'folders' | 'xmp' | 'csv') {
+function downloadBlobAs(blob: Blob, fileName: string) {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = fileName
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+async function doExport(kind: 'folders' | 'xmp' | 'csv' | 'zip' | 'share') {
   if (!project.value) return
   exportBusy.value = true
   try {
@@ -203,15 +212,23 @@ async function doExport(kind: 'folders' | 'xmp' | 'csv') {
     } else if (kind === 'xmp') {
       const report = await backend.exportXmp(projectId.value, targets)
       exportMessage.value = report.errors[0] ?? `${report.processed} 枚に星を書き込みました。`
-    } else {
+    } else if (kind === 'csv') {
       const blob = await backend.exportCsv(projectId.value, targets)
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = `${project.value.name}.csv`
-      a.click()
-      URL.revokeObjectURL(url)
+      downloadBlobAs(blob, `${project.value.name}.csv`)
       exportMessage.value = 'CSV を書き出しました。'
+    } else if (kind === 'zip') {
+      const blob = await backend.exportZip(projectId.value, targets)
+      downloadBlobAs(blob, `${project.value.name}.zip`)
+      exportMessage.value = 'ZIP を書き出しました。'
+    } else {
+      const { shareFiles, canShareFiles } = await import('~/utils/shareExport')
+      const files = await backend.shareTargets(projectId.value, targets)
+      if (!canShareFiles(files)) {
+        exportMessage.value = 'この端末では共有できません。ZIP をお使いください。'
+      } else {
+        const outcome = await shareFiles(files, project.value.name)
+        exportMessage.value = outcome === 'shared' ? '共有しました。' : outcome === 'cancelled' ? '' : 'この端末では共有できません。ZIP をお使いください。'
+      }
     }
   } finally {
     exportBusy.value = false
@@ -276,6 +293,8 @@ const starChips = computed(() => {
             :title="capabilities.writeMetadata ? '原本の XMP に星を書く' : 'XMP に星（PC 版で使えます）'"
             @click="requestExport('xmp')"
           />
+          <v-list-item v-if="capabilities.share" title="共有" @click="requestExport('share')" />
+          <v-list-item v-if="capabilities.exportZip" title="ZIP を書き出す" @click="requestExport('zip')" />
           <v-list-item title="CSV を書き出す" @click="requestExport('csv')" />
         </v-list>
       </v-menu>

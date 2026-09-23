@@ -654,6 +654,38 @@ export class WebFolderBackend implements Backend {
     return new Blob([rows.join('\n')], { type: 'text/csv' })
   }
 
+  /** ZIP（star-N/ に分ける。02章の差分表。capabilities.exportZip）。
+   * 原本の handle があれば原本、無ければ表示用画像を使う。 */
+  async exportZip(projectId: string, photos: RatedPhoto[]): Promise<Blob> {
+    const { createStoredZip, uniquePath } = await import('~/utils/zip')
+    const project = await idbGet<StoredProject>(`project:${projectId}`)
+    const taken = new Set<string>()
+    const entries = []
+    for (const photo of photos) {
+      let blob: Blob | null = null
+      if (project) {
+        try {
+          const io = await this.ioFor(project)
+          const dir = photo.relativePath.includes('/') ? photo.relativePath.slice(0, photo.relativePath.lastIndexOf('/')) : ''
+          const name = photo.relativePath.includes('/') ? photo.relativePath.slice(photo.relativePath.lastIndexOf('/') + 1) : photo.relativePath
+          blob = await io.readFile(dir, name, 0)
+        } catch {
+          blob = null
+        }
+      }
+      if (!blob) blob = await idbGet<Blob>(`display:${projectId}:${photo.relativePath}`)
+      if (!blob) continue
+      const name = photo.relativePath.split('/').pop() ?? photo.relativePath
+      entries.push({ path: uniquePath(taken, `star-${photo.rating}/${name}`), blob, modifiedAt: photo.capturedAt ?? undefined })
+    }
+    return createStoredZip(entries)
+  }
+
+  /** Web フォルダは capabilities.share = false。呼ばれない想定。 */
+  async shareTargets(_projectId: string, _photos: RatedPhoto[]): Promise<File[]> {
+    return []
+  }
+
   // ---- 保存量 ----
 
   async storageUsageBytes(): Promise<number> {

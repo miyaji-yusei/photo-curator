@@ -29,6 +29,8 @@ export interface Capabilities {
   exportFolders: boolean
   /** 原本の XMP に星を書ける。原本を書き換えるので環境を絞る。 */
   writeMetadata: boolean
+  /** 星ごとの star-N/ に分けた ZIP を書き出せる（Web の差分。02章）。 */
+  exportZip: boolean
   /** サイドカー（.photo-curator/catalog.json）を読み書きできる見込みがある。
    *  Web フォルダは実際に書けるかどうかは handle の許可次第（03 章）なので、
    *  ここでは「対応し得るか」だけを表す。 */
@@ -47,6 +49,7 @@ const TABLE: Record<Environment, Capabilities> = {
     share: false,
     exportFolders: true,
     writeMetadata: true,
+    exportZip: false,
     sidecar: true
   },
   webFolder: {
@@ -60,6 +63,7 @@ const TABLE: Record<Environment, Capabilities> = {
     share: false,
     exportFolders: false,
     writeMetadata: false,
+    exportZip: true,
     sidecar: true
   },
   webPicker: {
@@ -73,6 +77,7 @@ const TABLE: Record<Environment, Capabilities> = {
     share: true,
     exportFolders: false,
     writeMetadata: false,
+    exportZip: true,
     sidecar: false
   }
 }
@@ -93,9 +98,27 @@ export function capabilitiesFor(environment: Environment): Capabilities {
  * `showDirectoryPicker` の有無で Web フォルダ／ピッカーを分ける
  * （ブラウザ名では見ない。05 章「分けるのは機能の有無」）。
  */
+const DEV_ENV_KEY = 'photo-curator:devEnv'
+
 export function detectEnvironment(): Environment {
   if (typeof window === 'undefined') return 'webFolder'
   if ('__TAURI_INTERNALS__' in window) return 'pc'
+  // 開発用の切り替え（?env=webPicker）。実機の iPad が無くても、
+  // ブラウザペインで `showDirectoryPicker` が使える PC の Chrome から
+  // Web（ピッカー）の画面を確かめるための抜け道（本番ビルドには出ない）。
+  // クエリは画面遷移で消えるので、一度指定したら sessionStorage に控えて
+  // タブを閉じるまで（別画面に移っても）同じ環境のまま確かめられるようにする。
+  if (import.meta.dev && typeof location !== 'undefined') {
+    const forced = new URLSearchParams(location.search).get('env')
+    if (forced === 'webPicker' || forced === 'webFolder') {
+      try { sessionStorage.setItem(DEV_ENV_KEY, forced) } catch { /* 無視してよい */ }
+      return forced
+    }
+    try {
+      const remembered = sessionStorage.getItem(DEV_ENV_KEY)
+      if (remembered === 'webPicker' || remembered === 'webFolder') return remembered
+    } catch { /* 無視してよい */ }
+  }
   return 'showDirectoryPicker' in window ? 'webFolder' : 'webPicker'
 }
 

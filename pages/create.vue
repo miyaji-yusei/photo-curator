@@ -32,6 +32,25 @@ const sampleCount = ref<number | null>(null)
 const sampleThumbs = ref<string[]>([])
 const sampleLoading = ref(false)
 
+// Web（ピッカー）。フォルダが無いので「写真を選ぶ」→ その場で取り込む
+// （02章「PC・Webの差分」表: 作成の左側は「写真を選ぶ」ボタン）。
+const pickedFiles = ref<File[]>([])
+const fileInput = ref<HTMLInputElement | null>(null)
+function openFilePicker() {
+  fileInput.value?.click()
+}
+function onFilesPicked(event: Event) {
+  const input = event.target as HTMLInputElement
+  const files = Array.from(input.files ?? []).filter(f => f.type.startsWith('image/'))
+  pickedFiles.value = files
+  sampleThumbs.value.forEach(url => URL.revokeObjectURL(url))
+  sampleThumbs.value = files.slice(0, 12).map(f => URL.createObjectURL(f))
+  sampleCount.value = files.length
+  selected.value = files.length > 0 ? { name: '選んだ写真', key: 'picker' } : null
+  projectName.value = files.length > 0 ? `写真 ${new Date().toLocaleDateString('ja-JP')}` : ''
+  input.value = ''
+}
+
 onMounted(async () => {
   const projects = await backend.listProjects()
   existingKeys.value = new Set(projects.map((p: Project) => p.source.key))
@@ -128,10 +147,17 @@ const alreadyCreated = computed(() => {
 })
 
 async function create() {
-  if (!root.value || !selected.value || !projectName.value.trim()) return
+  if (!selected.value || !projectName.value.trim()) return
   creating.value = true
   errorText.value = ''
   try {
+    if (environment === 'webPicker') {
+      if (!backend.importPhotos) throw new Error('この環境では写真の取り込みに対応していません。')
+      const project = await backend.importPhotos(projectName.value.trim(), pickedFiles.value)
+      await router.push(`/project/${project.id}`)
+      return
+    }
+    if (!root.value) return
     // 選んだ行までを 1 つの出所（プロジェクトの根）にする。
     // root は「フォルダを選ぶ」で選んだ絶対パス、selected.key は「中へ」で
     // 潜った分の相対パス（潜っていなければ空文字）。
@@ -175,6 +201,19 @@ async function create() {
           <v-btn v-if="capabilities.browseFolders" variant="tonal" prepend-icon="mdi-folder-open" @click="pickNative">
             フォルダを選ぶ
           </v-btn>
+          <template v-if="environment === 'webPicker'">
+            <input
+              ref="fileInput"
+              type="file"
+              multiple
+              accept="image/*"
+              style="display: none"
+              @change="onFilesPicked"
+            >
+            <v-btn variant="tonal" prepend-icon="mdi-image-multiple" @click="openFilePicker">
+              写真を選ぶ
+            </v-btn>
+          </template>
           <template v-if="environment === 'webFolder'">
             <v-text-field
               v-model="devPath"
@@ -223,6 +262,9 @@ async function create() {
           </v-list-item>
         </v-list>
 
+        <div v-else-if="environment === 'webPicker'" class="text-medium-emphasis pa-6 text-center">
+          {{ pickedFiles.length > 0 ? `${pickedFiles.length} 枚を選びました。右側で確かめてください。` : '写真を選んでください' }}
+        </div>
         <div v-else class="text-medium-emphasis pa-6 text-center">
           フォルダを選んでください
         </div>
@@ -232,7 +274,7 @@ async function create() {
 
       <div class="pa-4" :style="isWide ? 'width: 280px' : ''">
         <v-text-field v-model="projectName" label="プロジェクト名" clearable :disabled="!selected" />
-        <div v-if="selected" class="text-body-2 text-medium-emphasis mb-2">
+        <div v-if="selected && environment !== 'webPicker'" class="text-body-2 text-medium-emphasis mb-2">
           出所: {{ root?.label }}{{ subPath ? '/' + subPath : '' }}
         </div>
 

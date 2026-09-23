@@ -176,6 +176,27 @@ export class TauriBackend implements Backend {
     return new Blob([csv], { type: 'text/csv' })
   }
 
+  /** PC は capabilities.exportZip = false（フォルダ分けの方が本来の出口）。
+   * インターフェースを満たすためだけの実装。原本を convertFileSrc 経由で読んで詰める。 */
+  async exportZip(projectId: string, photos: RatedPhoto[]): Promise<Blob> {
+    const { createStoredZip, uniquePath } = await import('~/utils/zip')
+    const taken = new Set<string>()
+    const entries = []
+    for (const photo of photos) {
+      const url = (await this.originalUrl(projectId, photo.relativePath)) ?? (await this.displayUrl(projectId, photo.relativePath))
+      if (!url) continue
+      const blob = await fetch(url).then(r => r.blob())
+      const name = photo.relativePath.split('/').pop() ?? photo.relativePath
+      entries.push({ path: uniquePath(taken, `star-${photo.rating}/${name}`), blob, modifiedAt: photo.capturedAt ?? undefined })
+    }
+    return createStoredZip(entries)
+  }
+
+  /** PC は capabilities.share = false。呼ばれない想定。 */
+  async shareTargets(_projectId: string, _photos: RatedPhoto[]): Promise<File[]> {
+    return []
+  }
+
   async storageUsageBytes(): Promise<number> {
     return invoke('storage_usage_bytes')
   }

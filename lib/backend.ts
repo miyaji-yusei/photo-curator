@@ -49,6 +49,8 @@ export interface Backend {
   listProjects(): Promise<Project[]>
   getProject(id: string): Promise<Project | null>
   createProject(input: CreateProjectInput): Promise<Project>
+  /** Web ピッカーだけ。フォルダが無いので、選んだ写真をその場で取り込んで作成と準備を1つにする。 */
+  importPhotos?(name: string, files: File[]): Promise<Project>
   renameProject(id: string, name: string): Promise<void>
   /** 消える容量（バイト）を先に見積もる。実際には消さない。 */
   estimateDeleteSize(id: string): Promise<number>
@@ -106,6 +108,10 @@ export interface Backend {
   /** PC だけ。原本の XMP に星を書く。 */
   exportXmp(projectId: string, photos: RatedPhoto[]): Promise<ExportReport>
   exportCsv(projectId: string, photos: RatedPhoto[]): Promise<Blob>
+  /** Web（フォルダ・ピッカー）だけ（`capabilities.exportZip`）。星ごとの star-N/ に分けた ZIP。 */
+  exportZip(projectId: string, photos: RatedPhoto[]): Promise<Blob>
+  /** Web ピッカーだけ（`capabilities.share`）。共有シートに渡すファイルを用意する。 */
+  shareTargets(projectId: string, photos: RatedPhoto[]): Promise<File[]>
 
   // ---- 保存量 ----
   storageUsageBytes(): Promise<number>
