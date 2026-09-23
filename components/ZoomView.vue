@@ -86,7 +86,9 @@ const sizeText = computed(() => {
         {{ index + 1 }} / {{ paths.length }}
       </span>
     </div>
-    <div class="flex-grow-1" style="position: relative; min-height: 0">
+    <!-- 写真・背景をタップで閉じる（app-android Zoom.kt の「等倍なら閉じる」と同じ）。
+         左右の矢印・上下のバーは自分の click で止め、ここまで伝わらないようにする。 -->
+    <div class="flex-grow-1" style="position: relative; min-height: 0; cursor: pointer" @click="emit('close')">
       <img
         v-if="path && displayUrls[path]"
         :src="displayUrls[path]"
@@ -105,14 +107,14 @@ const sizeText = computed(() => {
         icon="mdi-chevron-left"
         variant="tonal"
         style="position: absolute; left: 12px; top: 50%; transform: translateY(-50%)"
-        @click="move(-1)"
+        @click.stop="move(-1)"
       />
       <v-btn
         v-if="index < paths.length - 1"
         icon="mdi-chevron-right"
         variant="tonal"
         style="position: absolute; right: 12px; top: 50%; transform: translateY(-50%)"
-        @click="move(1)"
+        @click.stop="move(1)"
       />
     </div>
     <div v-if="showKeep || $slots.extra" class="d-flex justify-center align-center ga-2 pa-4" style="flex-shrink: 0">
