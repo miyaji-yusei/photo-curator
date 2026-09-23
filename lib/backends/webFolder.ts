@@ -41,6 +41,11 @@ function joinPath(base: string, name: string): string {
   return base ? `${base}/${name}` : name
 }
 
+/** 何枚ごとに photos を保存し直すか。src-tauri/src/scan.rs の CHECKPOINT_EVERY と揃える
+ *（B-5 の実測で、中断するとこれより手前の meta/hash・display はやり直しになると確認済み。
+ * 50→20、2026-09-24 コーディネーター承認）。 */
+const CHECKPOINT_EVERY = 20
+
 /** 開発用。`server/api/dev-folder/` を叩くだけ。**本番には出てこない**
  *（作る場所が `pickFolder(devPath)` を通ったときだけなので）。 */
 class DevHttpFolderIO implements FolderIO {
@@ -461,7 +466,7 @@ export class WebFolderBackend implements Backend {
         failed += 1
       }
       sinceSave += 1
-      if (sinceSave >= 50) {
+      if (sinceSave >= CHECKPOINT_EVERY) {
         await idbSet(`photos:${projectId}`, photos)
         project.metaHashedCount = metaDone
         project.displayedCount = displayDone

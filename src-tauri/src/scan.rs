@@ -21,7 +21,13 @@ use crate::store;
 
 const MAX_WORKERS: usize = 4;
 const MIN_WORKERS: usize = 2;
-pub(crate) const CHECKPOINT_EVERY: usize = 50;
+/// 何枚ごとに photos.json を書き直すか。**中断すると、ここより手前の分はやり直しになる**
+/// （B-5 の実測で確認。走査そのものは別に保存されるので 0 には戻らないが、
+/// meta/hash・display はこの粒度でしか保たない）。50→20（2026-09-24、コーディネーター
+/// 承認の数値調整。書き込み回数はその分増えるが、2,000枚規模でも許容範囲）。
+/// Android（`Renders.write` 等）は生成した絵をその場でファイルへ書くので実質1枚単位。
+/// こちらは photos.json をまるごと書き直す方式のため、そこまでは詰めない。
+pub(crate) const CHECKPOINT_EVERY: usize = 20;
 /// フォルダ一覧・作成画面で「見本」や hasPhotos を判定するときだけ読む先頭バイト数。
 const SNIFF_PROBE: usize = 16;
 
