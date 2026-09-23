@@ -102,9 +102,11 @@ async function create() {
   errorText.value = ''
   try {
     // 選んだ行までを 1 つの出所（プロジェクトの根）にする。
+    // root は「フォルダを選ぶ」で選んだ絶対パス、selected.key は「中へ」で
+    // 潜った分の相対パス（潜っていなければ空文字）。
     const finalKey = root.value.key.startsWith('dev:')
       ? `dev:${root.value.key.slice(4)}${selected.value.key ? '/' + selected.value.key : ''}`
-      : selected.value.key
+      : `${root.value.key}${selected.value.key ? '/' + selected.value.key : ''}`
     const source: ProjectSource = { kind: 'folder', key: finalKey, label: selected.value.name }
     const project = await backend.createProject({ name: projectName.value.trim(), source })
     await router.push(`/project/${project.id}`)
