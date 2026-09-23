@@ -3,7 +3,7 @@
  *
  * デスクトップは広い画面とキーボードがあるので 10 枚まで一度に見比べられるが、
  * iPad は画面が狭く指で選ぶため、10 枚だと 1 枚が小さくなりすぎて選べない。
- * 9 枚（3×3）を上限に、既定は 4 枚（2×2）にする。
+ * largeGroups が無い環境（Web ピッカー等）は 2–4 枚（05 章の表）。既定は 4 枚（2×2）。
  */
 export interface GroupSizeLimits {
   /** 選別を始めるときの枚数。 */
@@ -15,8 +15,8 @@ export interface GroupSizeLimits {
 }
 
 export const DESKTOP_GROUP_SIZE: GroupSizeLimits = { default: 10, max: 10, min: 2 }
-/** iPad などブラウザで使うときの枚数。3×3 までに抑える。 */
-export const TOUCH_GROUP_SIZE: GroupSizeLimits = { default: 4, max: 9, min: 2 }
+/** largeGroups が無い環境（Web ピッカー等）で使う枚数。2–4 枚（05 章の表）。 */
+export const TOUCH_GROUP_SIZE: GroupSizeLimits = { default: 4, max: 4, min: 2 }
 
 /**
  * どちらの枚数を使うか。**画面の広さの能力だけで決める**

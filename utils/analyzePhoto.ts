@@ -9,11 +9,14 @@
  * 手順はデスクトップと同じ順序にしてある:
  * 長辺 256px へ縮小 → JPEG に符号化 → **その JPEG から dHash**。
  * 生成直後とキャッシュ読み出しで必ず同じ値になるようにするため。
+ *
+ * **指紋の計算は core（wasm）に任せる**（設計 04 章）。ここでやるのは
+ * 画素を輝度へ変換して渡すところまで（判断は core の 1 か所に集める）。
  */
 import type { CaptureTime, TimestampSource } from '~/utils/captureTime'
 import { resolveCaptureTime } from '~/utils/captureTime'
-import { D_HASH_HEIGHT, D_HASH_WIDTH, dHashFromRgba } from '~/utils/dhash'
 import { readExifCapture } from '~/utils/exifReader'
+import { dHashFromLuma, init as initCore } from '~/lib/core'
 
 /** デスクトップの `THUMBNAIL_MAX_EDGE` / `THUMBNAIL_QUALITY` と同じ値。 */
 export const THUMBNAIL_MAX_EDGE = 256
@@ -26,6 +29,10 @@ export const THUMBNAIL_QUALITY = 0.82
 export const DISPLAY_EDGE_DEFAULT = 1024
 /** EXIF は先頭付近にある。全体を読み込まずに済ませる。 */
 const EXIF_PREFIX_BYTES = 512 * 1024
+
+// core の d_hash_from_luma が受け取る大きさ（core/src/lib.rs の D_HASH_WIDTH/HEIGHT）。
+const D_HASH_WIDTH = 9
+const D_HASH_HEIGHT = 8
 
 export interface AnalyzedPhoto {
   thumbnail: Blob | null
@@ -94,8 +101,22 @@ async function readCaptureTime(file: File): Promise<CaptureTime | null> {
   return resolveCaptureTime(exif, file.name, Number.isFinite(file.lastModified) ? file.lastModified : null)
 }
 
-/** 保存したサムネイルの画素から dHash を出す。 */
-async function hashThumbnail(thumbnail: Blob): Promise<string> {
+/** RGBA から輝度へ。`image` クレート（core 側）と同じ BT.709 の重み。 */
+function lumaFromRgba(rgba: ArrayLike<number>, pixels: number): Uint8Array {
+  const luma = new Uint8Array(pixels)
+  for (let index = 0; index < pixels; index += 1) {
+    const at = index * 4
+    const r = rgba[at] ?? 0
+    const g = rgba[at + 1] ?? 0
+    const b = rgba[at + 2] ?? 0
+    luma[index] = Math.floor((2126 * r + 7152 * g + 722 * b) / 10000)
+  }
+  return luma
+}
+
+/** 保存したサムネイルの画素から dHash を出す。**指紋の計算そのものは core。** */
+async function hashThumbnail(thumbnail: Blob): Promise<string | null> {
+  await initCore()
   const bitmap = await createImageBitmap(thumbnail)
   try {
     const surface = createSurface(D_HASH_WIDTH, D_HASH_HEIGHT)
@@ -103,7 +124,8 @@ async function hashThumbnail(thumbnail: Blob): Promise<string> {
     surface.context.imageSmoothingQuality = 'high'
     surface.context.drawImage(bitmap, 0, 0, D_HASH_WIDTH, D_HASH_HEIGHT)
     const pixels = surface.context.getImageData(0, 0, D_HASH_WIDTH, D_HASH_HEIGHT)
-    return dHashFromRgba(pixels.data)
+    const luma = lumaFromRgba(pixels.data, D_HASH_WIDTH * D_HASH_HEIGHT)
+    return dHashFromLuma(luma)
   } finally {
     bitmap.close()
   }
