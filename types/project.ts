@@ -50,6 +50,8 @@ export interface Project {
   prepareWarning: string | null
   /** 学習した連写の境目。学習していなければ null。 */
   burstDistance: number | null
+  /** 「結果を見る」まで進んだ時刻。ホームの5状態（完了）に使う。未完了は null。 */
+  completedAt: number | null
 }
 
 export const DEFAULT_BURST_WINDOW_MS = 4000

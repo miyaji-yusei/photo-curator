@@ -126,6 +126,10 @@ export class TauriBackend implements Backend {
     await invoke('mark_changed', { projectId })
   }
 
+  async markCompleted(projectId: string): Promise<void> {
+    await invoke('mark_completed', { projectId })
+  }
+
   sidecarSupported(project: Project): boolean {
     return project.source.kind === 'folder'
   }

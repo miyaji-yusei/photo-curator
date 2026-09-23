@@ -78,6 +78,8 @@ export interface Backend {
   saveBurstDistance(projectId: string, distance: number): Promise<void>
   /** 判断が変わった（星・手直し・基準・やり直し）ときに呼ぶ。サイドカーの書き時の判定に使う。 */
   markChanged(projectId: string): Promise<void>
+  /** 「結果を見る」を選んだとき。ホームの完了状態に使う。 */
+  markCompleted(projectId: string): Promise<void>
 
   // ---- サイドカー ----
   sidecarSupported(project: Project): boolean

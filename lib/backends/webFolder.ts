@@ -243,6 +243,7 @@ export class WebFolderBackend implements Backend {
       displayedCount: 0,
       prepareWarning: null,
       burstDistance: null,
+      completedAt: null,
       ioKey: input.source.key
     }
     await idbSet(`project:${id}`, project)
@@ -512,6 +513,14 @@ export class WebFolderBackend implements Backend {
     const state = (await idbGet<SidecarState>(`sidecarState:${projectId}`)) ?? { seenAt: 0, seenBy: '', localChanged: false }
     state.localChanged = true
     await idbSet(`sidecarState:${projectId}`, state)
+  }
+
+  async markCompleted(projectId: string): Promise<void> {
+    const project = await idbGet<StoredProject>(`project:${projectId}`)
+    if (!project) return
+    project.completedAt = Date.now()
+    project.updatedAt = Date.now()
+    await idbSet(`project:${projectId}`, project)
   }
 
   // ---- サイドカー ----
