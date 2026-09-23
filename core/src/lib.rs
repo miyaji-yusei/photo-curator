@@ -32,8 +32,14 @@ pub struct BurstThreshold {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PairOverride {
+    /// **読むときは旧い短い形（`l`/`r`/`d`）も受け付ける。**
+    /// 2026-09-16 までの Android 版がこの名前で書いていて、NAS には
+    /// その catalog.json が残っているため（設計 03 章）。
+    #[serde(alias = "l")]
     pub left: String,
+    #[serde(alias = "r")]
     pub right: String,
+    #[serde(alias = "d")]
     pub decision: String,
 }
 
@@ -794,6 +800,126 @@ pub fn session_to_json(session: Session) -> String {
 /// 中途半端に読むより、読まずに最初からやり直す方が安全。
 pub fn session_from_json(json: String) -> Option<Session> {
     serde_json::from_str(&json).ok()
+}
+
+
+// ---------------------------------------------------------------------------
+// サイドカー（写真のフォルダに置く catalog.json）
+// ---------------------------------------------------------------------------
+//
+// **UDL には足さない。** Android は今の Kotlin（`Sidecar.kt`）のまま。
+// PC・Web は wasm 経由でここを直接呼ぶ（→ core-wasm）。
+// 中身と読み書きの形は `Sidecar.kt` と設計 03 章に合わせる。
+// 同じ NAS のファイルを Android と読み書きするので、**Android が書いた形を
+// そのまま読めること**（`left`/`right`/`decision` と旧い `l`/`r`/`d` の両方）。
+
+fn default_sidecar_version() -> i32 {
+    1
+}
+
+fn default_updated_by() -> String {
+    "?".into()
+}
+
+fn default_updated_by_name() -> String {
+    // Android の decode() が使う既定値と同じ（「別の端末」）。
+    "別の端末".into()
+}
+
+/// 1 枚ぶんの記録。**いまは星だけ**（撮影時刻・指紋は端末側で作り直すので載せない）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SidecarPhoto {
+    #[serde(default)]
+    pub rating: i32,
+}
+
+/// `sessions.tournament` だけを持つ入れ物。**キーはこの 1 つに固定。**
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SidecarSessions {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tournament: Option<Session>,
+}
+
+/// 写真のフォルダに置く `.photo-curator/catalog.json` の中身。
+///
+/// **原本には絶対に書かない。** 書き込みそのものは各環境の仕事
+/// （Android は `Smb.write`、PC・Web はそれぞれのファイル入出力）。
+/// ここは形（JSON との行き来）と、開いたときにどうするかの判断だけを持つ。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Sidecar {
+    #[serde(default = "default_sidecar_version")]
+    pub version: i32,
+    #[serde(rename = "updatedAt", default)]
+    pub updated_at: i64,
+    #[serde(rename = "updatedBy", default = "default_updated_by")]
+    pub updated_by: String,
+    #[serde(rename = "updatedByName", default = "default_updated_by_name")]
+    pub updated_by_name: String,
+    /// 相対パス → 星。
+    #[serde(default)]
+    pub photos: HashMap<String, SidecarPhoto>,
+    #[serde(rename = "burstOverrides", default)]
+    pub burst_overrides: Vec<PairOverride>,
+    #[serde(default)]
+    pub sessions: SidecarSessions,
+    /// 学習した連写の境目。学習していなければ無し。
+    #[serde(rename = "burstDistance", skip_serializing_if = "Option::is_none", default)]
+    pub burst_distance: Option<u32>,
+}
+
+/// サイドカーを文字列にする。**形は core が持つ。** 各環境が独自に組み立てない。
+pub fn sidecar_to_json(sidecar: Sidecar) -> String {
+    serde_json::to_string(&sidecar).unwrap_or_else(|_| "{}".into())
+}
+
+/// 読み戻す。**壊れていたら null。** 中途半端に読んで上書きするより、
+/// 読めないことにして人に伝える方が安全（Android の decode と同じ）。
+pub fn sidecar_from_json(json: String) -> Option<Sidecar> {
+    serde_json::from_str(&json).ok()
+}
+
+/// 開いたときにどうするか。**時刻の大小では決めない。**
+///
+/// 端末ごとに時計はずれるので「新しい方を採る」はしない。見るのは
+/// 「自分が最後に見た版と同じかどうか」だけ（設計 03 章）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum SidecarSync {
+    /// 何も起きていない。
+    Settled,
+    /// 端末の方が進んでいる。**書けばよい。**
+    Push,
+    /// サイドカーの方が進んでいる。**取り込めばよい。**
+    Pull(Sidecar),
+    /// 両方が進んでいる。**人に選ばせる。**
+    Clash(Sidecar),
+}
+
+/// 端末の控え（`seenAt`/`seenBy`・`localChanged`）と、読んだサイドカー（無ければ
+/// `None`）から、開いたときの 4 通りを返す。
+///
+/// **つながらない・読めないは対象外。** それは各環境が NAS 等から読む時点で
+/// 弾く話であって、ここは「読めた（か、まだ無い）」ところから先の判断だけ。
+pub fn sidecar_decide(
+    seen_at: i64,
+    seen_by: String,
+    local_changed: bool,
+    remote: Option<Sidecar>,
+) -> SidecarSync {
+    let Some(theirs) = remote else {
+        // まだ無い。**端末に何かあるなら置きに行く。**
+        return if local_changed {
+            SidecarSync::Push
+        } else {
+            SidecarSync::Settled
+        };
+    };
+    let same = theirs.updated_at == seen_at && theirs.updated_by == seen_by;
+    match (same, local_changed) {
+        (true, false) => SidecarSync::Settled,
+        (true, true) => SidecarSync::Push,
+        (false, false) => SidecarSync::Pull(theirs),
+        (false, true) => SidecarSync::Clash(theirs),
+    }
 }
 
 #[cfg(test)]
@@ -1759,5 +1885,177 @@ mod tests {
         let session = round(&["1", "2", "3", "4"], 4);
         let after = resize(session, 1);
         assert_eq!(after.group_size, 2);
+    }
+
+    // ---- サイドカー ----
+
+    #[test]
+    fn サイドカー_何もなければ何もしない() {
+        let outcome = sidecar_decide(0, "?".into(), false, None);
+        assert!(matches!(outcome, SidecarSync::Settled));
+    }
+
+    #[test]
+    fn サイドカー_まだ無くて端末が進んでいれば書く() {
+        let outcome = sidecar_decide(0, "?".into(), true, None);
+        assert!(matches!(outcome, SidecarSync::Push));
+    }
+
+    #[test]
+    fn サイドカー_見た版と同じで端末も進んでいなければ何もしない() {
+        let theirs = Sidecar {
+            version: 1,
+            updated_at: 100,
+            updated_by: "device-a".into(),
+            updated_by_name: "Galaxy".into(),
+            photos: HashMap::new(),
+            burst_overrides: vec![],
+            sessions: SidecarSessions::default(),
+            burst_distance: None,
+        };
+        let outcome = sidecar_decide(100, "device-a".into(), false, Some(theirs));
+        assert!(matches!(outcome, SidecarSync::Settled));
+    }
+
+    #[test]
+    fn サイドカー_見た版と同じでも端末が進んでいれば書く() {
+        let theirs = Sidecar {
+            version: 1,
+            updated_at: 100,
+            updated_by: "device-a".into(),
+            updated_by_name: "Galaxy".into(),
+            photos: HashMap::new(),
+            burst_overrides: vec![],
+            sessions: SidecarSessions::default(),
+            burst_distance: None,
+        };
+        let outcome = sidecar_decide(100, "device-a".into(), true, Some(theirs));
+        assert!(matches!(outcome, SidecarSync::Push));
+    }
+
+    #[test]
+    fn サイドカー_見た版と違って端末が進んでいなければ取り込む() {
+        let theirs = Sidecar {
+            version: 1,
+            updated_at: 200,
+            updated_by: "device-b".into(),
+            updated_by_name: "iPad".into(),
+            photos: HashMap::new(),
+            burst_overrides: vec![],
+            sessions: SidecarSessions::default(),
+            burst_distance: None,
+        };
+        let outcome = sidecar_decide(100, "device-a".into(), false, Some(theirs));
+        match outcome {
+            SidecarSync::Pull(sidecar) => assert_eq!(sidecar.updated_by, "device-b"),
+            _ => panic!("Pull のはず"),
+        }
+    }
+
+    #[test]
+    fn サイドカー_見た版と違って端末も進んでいれば食い違い() {
+        let theirs = Sidecar {
+            version: 1,
+            updated_at: 200,
+            updated_by: "device-b".into(),
+            updated_by_name: "iPad".into(),
+            photos: HashMap::new(),
+            burst_overrides: vec![],
+            sessions: SidecarSessions::default(),
+            burst_distance: None,
+        };
+        let outcome = sidecar_decide(100, "device-a".into(), true, Some(theirs));
+        match outcome {
+            SidecarSync::Clash(sidecar) => assert_eq!(sidecar.updated_by, "device-b"),
+            _ => panic!("Clash のはず"),
+        }
+    }
+
+    #[test]
+    fn サイドカー_時刻が同じでも書いた端末が違えば食い違い() {
+        // 時刻の大小・一致だけで決めない。端末も一致して初めて「同じ版」。
+        let theirs = Sidecar {
+            version: 1,
+            updated_at: 100,
+            updated_by: "device-c".into(),
+            updated_by_name: "別の端末".into(),
+            photos: HashMap::new(),
+            burst_overrides: vec![],
+            sessions: SidecarSessions::default(),
+            burst_distance: None,
+        };
+        let outcome = sidecar_decide(100, "device-a".into(), true, Some(theirs));
+        assert!(matches!(outcome, SidecarSync::Clash(_)));
+    }
+
+    #[test]
+    fn サイドカー_書いて読み戻すと同じ中身になる() {
+        let mut photos = HashMap::new();
+        photos.insert("IMG_0001.JPG".to_string(), SidecarPhoto { rating: 3 });
+        let sidecar = Sidecar {
+            version: 1,
+            updated_at: 1_700_000_000_000,
+            updated_by: "abc123".into(),
+            updated_by_name: "Galaxy Z Fold".into(),
+            photos,
+            burst_overrides: vec![PairOverride {
+                left: "IMG_0001.JPG".into(),
+                right: "IMG_0002.JPG".into(),
+                decision: "split".into(),
+            }],
+            sessions: SidecarSessions {
+                tournament: Some(round(&["1", "2"], 2)),
+            },
+            burst_distance: Some(9),
+        };
+        let json = sidecar_to_json(sidecar.clone());
+        let back = sidecar_from_json(json).expect("読み戻せるはず");
+        assert_eq!(back.updated_by, "abc123");
+        assert_eq!(back.photos.get("IMG_0001.JPG").map(|p| p.rating), Some(3));
+        assert_eq!(back.burst_overrides[0].left, "IMG_0001.JPG");
+        assert_eq!(back.burst_distance, Some(9));
+        assert!(back.sessions.tournament.is_some());
+    }
+
+    #[test]
+    fn サイドカー_旧いlrdのキーも読める() {
+        // 2026-09-16 までの Android 版が書いた形。
+        let json = r#"{
+            "version": 1,
+            "updatedAt": 1,
+            "updatedBy": "old-device",
+            "updatedByName": "旧い端末",
+            "photos": {},
+            "burstOverrides": [
+                { "l": "a.jpg", "r": "b.jpg", "d": "join" }
+            ],
+            "sessions": {}
+        }"#;
+        let sidecar = sidecar_from_json(json.into()).expect("旧い形も読めるはず");
+        assert_eq!(sidecar.burst_overrides.len(), 1);
+        assert_eq!(sidecar.burst_overrides[0].left, "a.jpg");
+        assert_eq!(sidecar.burst_overrides[0].right, "b.jpg");
+        assert_eq!(sidecar.burst_overrides[0].decision, "join");
+    }
+
+    #[test]
+    fn サイドカー_ratingが無くても0として読める() {
+        let json = r#"{
+            "version": 1,
+            "updatedAt": 1,
+            "updatedBy": "d",
+            "updatedByName": "n",
+            "photos": { "a.jpg": {} },
+            "burstOverrides": [],
+            "sessions": {}
+        }"#;
+        let sidecar = sidecar_from_json(json.into()).expect("読めるはず");
+        assert_eq!(sidecar.photos.get("a.jpg").map(|p| p.rating), Some(0));
+    }
+
+    #[test]
+    fn サイドカー_壊れたjsonはnone() {
+        assert!(sidecar_from_json("{ 壊れている".into()).is_none());
+        assert!(sidecar_from_json("not json at all".into()).is_none());
     }
 }
