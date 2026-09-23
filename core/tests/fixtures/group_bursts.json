@@ -1,0 +1,15 @@
+{
+  "_note": "連写のまとめ。a1〜a3 は時間も見た目も近いので1つに畳まれ、b1 は時間が離れているので別。cargo test と vitest（wasm）の両方がこの expected と一致することを確かめる。",
+  "photos": [
+    { "relative_path": "a1.jpg", "captured_at": 1000, "d_hash": "0000000000000000", "d_hash_version": 2 },
+    { "relative_path": "a2.jpg", "captured_at": 2000, "d_hash": "0000000000000001", "d_hash_version": 2 },
+    { "relative_path": "a3.jpg", "captured_at": 3000, "d_hash": "0000000000000003", "d_hash_version": 2 },
+    { "relative_path": "b1.jpg", "captured_at": 500000, "d_hash": "ffffffffffffffff", "d_hash_version": 2 }
+  ],
+  "threshold": { "window_ms": 4000, "distance": 6, "d_hash_version": 2 },
+  "overrides": [],
+  "expected": [
+    { "members": ["a1.jpg", "a2.jpg", "a3.jpg"], "representative": "a1.jpg" },
+    { "members": ["b1.jpg"], "representative": "b1.jpg" }
+  ]
+}

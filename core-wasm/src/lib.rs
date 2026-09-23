@@ -16,10 +16,10 @@ fn de<T: serde::de::DeserializeOwned>(value: JsValue) -> Result<T, JsValue> {
     serde_wasm_bindgen::from_value(value).map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
-/// `HashMap` を（既定の Map ではなく）ふつうの JS オブジェクトにして返す。
-/// `session_to_json` を `JSON.parse` した形と揃えるため。
+/// `HashMap` を（既定の Map ではなく）ふつうの JS オブジェクトにして返し、
+/// `Option::None` は `undefined` ではなく `null` にする（`session_to_json`＝serde_json を `JSON.parse` した形と揃えるため）。
 fn ser<T: Serialize + ?Sized>(value: &T) -> Result<JsValue, JsValue> {
-    let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+    let serializer = serde_wasm_bindgen::Serializer::json_compatible();
     value
         .serialize(&serializer)
         .map_err(|error| JsValue::from_str(&error.to_string()))

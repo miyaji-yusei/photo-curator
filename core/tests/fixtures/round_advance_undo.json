@@ -1,0 +1,51 @@
+{
+  "_note": "start_round → advance → undo の一続き。undo後はstart直後と同じ状態に戻るはず。cargo test と vitest（wasm）の両方で確かめる。",
+  "photos": [
+    { "relative_path": "1", "captured_at": 0, "d_hash": "0000000000000000", "d_hash_version": 2 },
+    { "relative_path": "2", "captured_at": 100000, "d_hash": "0000000000000000", "d_hash_version": 2 },
+    { "relative_path": "3", "captured_at": 200000, "d_hash": "0000000000000000", "d_hash_version": 2 },
+    { "relative_path": "4", "captured_at": 300000, "d_hash": "0000000000000000", "d_hash_version": 2 }
+  ],
+  "group_size": 2,
+  "target_star": 0,
+  "group_bursts_on": false,
+  "threshold": { "window_ms": 4000, "distance": 6, "d_hash_version": 2 },
+  "overrides": [],
+  "selected": ["1"],
+  "expected_after_start": {
+    "group_size": 2,
+    "target_star": 0,
+    "round": 1,
+    "queue": ["3", "4"],
+    "current": ["1", "2"],
+    "survivors": [],
+    "ratings": { "1": 0, "2": 0, "3": 0, "4": 0 },
+    "members": {},
+    "history": [],
+    "finished": false
+  },
+  "expected_after_advance": {
+    "group_size": 2,
+    "target_star": 0,
+    "round": 1,
+    "queue": [],
+    "current": ["3", "4"],
+    "survivors": ["1"],
+    "ratings": { "1": 1, "2": 0, "3": 0, "4": 0 },
+    "members": {},
+    "history": [ { "group": ["1", "2"], "chosen": ["1"], "topped": null } ],
+    "finished": false
+  },
+  "expected_after_undo": {
+    "group_size": 2,
+    "target_star": 0,
+    "round": 1,
+    "queue": ["3", "4"],
+    "current": ["1", "2"],
+    "survivors": [],
+    "ratings": { "1": 0, "2": 0, "3": 0, "4": 0 },
+    "members": {},
+    "history": [],
+    "finished": false
+  }
+}
