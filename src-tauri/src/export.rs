@@ -100,8 +100,11 @@ pub fn export_xmp(project: &Project, photos: &[RatedPhoto]) -> ExportReport {
             continue;
         }
         // 置き換える前に、書いたものが画像として開けるか確かめる。
+        // 一時ファイルの拡張子は `.photocurator-tmp` で画像として認識されないため、
+        // 拡張子ではなく中身から形式を判定する（05章「形式は中身の先頭バイトで判定する」と同じ理由）。
         if let Err(error) = image::ImageReader::open(&temporary)
             .map_err(|e| e.to_string())
+            .and_then(|reader| reader.with_guessed_format().map_err(|e| e.to_string()))
             .and_then(|reader| reader.into_dimensions().map_err(|e| e.to_string()))
         {
             let _ = fs::remove_file(&temporary);
