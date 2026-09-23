@@ -10,6 +10,7 @@ import type { Session } from '~/lib/core'
 import { comparePhotos, filterPhotos, summarizeRatings } from '~/utils/photoQuery'
 import type { PhotoSort } from '~/types/photo'
 import ZoomView from '~/components/ZoomView.vue'
+import BurstReviewView from '~/components/BurstReviewView.vue'
 
 definePageMeta({ layout: 'default' })
 
@@ -38,6 +39,10 @@ const exportMessage = ref('')
 // ここで確認ダイアログを挟んで実行する（プロジェクト詳細への遷移だけでは終わらない）。
 const restartOpen = ref(false)
 const restarting = ref(false)
+const techOpen = ref(false)
+// 連写の中身選別（02章 burst-review。app-android BurstReview.kt が見本）。
+// **選別画面と同じ「見るだけの拡大」ではなく、専用の画面。**
+const reviewTarget = ref<string | null>(null)
 
 interface Row { relativePath: string; rating: number; capturedAt: number | null; burstSize: number }
 
@@ -92,6 +97,13 @@ function tapTile(row: Row) {
     selected.value = set
     return
   }
+  // 連写の組（⧉）は中身選別、単独は拡大（02章「タイル タップ」）。
+  if (row.burstSize > 1) {
+    const mates = session.value?.members[row.relativePath] ?? [row.relativePath]
+    reviewTarget.value = row.relativePath
+    void loadReviewUrls(mates)
+    return
+  }
   openZoom(row.relativePath)
 }
 function longPress(row: Row) {
@@ -104,6 +116,32 @@ function longPress(row: Row) {
 function openZoom(path: string) {
   const at = zoomPaths.value.indexOf(path)
   if (at >= 0) zoomIndex.value = at
+}
+
+// ---- 連写の中身選別（burst-review） ----
+const reviewMembers = computed<string[]>(() => {
+  if (!reviewTarget.value || !session.value) return []
+  const mates = session.value.members[reviewTarget.value] ?? [reviewTarget.value]
+  const order = new Map(photos.value.map((p, i) => [p.relativePath, i]))
+  return [...mates].sort((a, b) => (order.get(a) ?? 0) - (order.get(b) ?? 0))
+})
+const reviewBaseStar = computed(() => {
+  if (!reviewTarget.value || !session.value) return 0
+  return session.value.ratings[reviewTarget.value] ?? 0
+})
+async function loadReviewUrls(paths: string[]) {
+  const missing = paths.filter(p => !thumbUrls.value[p])
+  if (missing.length === 0) return
+  const entries = await Promise.all(missing.map(async p => [p, await backend.displayUrl(projectId.value, p)] as const))
+  for (const [p, url] of entries) if (url) thumbUrls.value[p] = url
+}
+// 決めるまでデータは変えない。選んだ写真だけ ratings を更新（連写の仲間は道連れにしない）。
+async function applyReview(changes: Record<string, number>) {
+  if (!session.value) return
+  const next: Session = { ...session.value, ratings: { ...session.value.ratings, ...changes } }
+  session.value = next
+  await backend.saveSession(projectId.value, next)
+  reviewTarget.value = null
 }
 
 async function bumpRating(path: string | null, delta: number) {
@@ -200,7 +238,7 @@ const starChips = computed(() => {
         </template>
         <v-list>
           <v-list-item title="最初からやり直す" @click="openRestart" />
-          <v-list-item title="技術情報" @click="menu = false" />
+          <v-list-item title="技術情報" @click="menu = false; techOpen = true" />
         </v-list>
       </v-menu>
       <v-menu>
@@ -261,6 +299,22 @@ const starChips = computed(() => {
           <v-spacer />
           <v-btn variant="text" :disabled="restarting" @click="restartOpen = false">キャンセル</v-btn>
           <v-btn color="error" :loading="restarting" @click="confirmRestart">やり直す</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog :model-value="techOpen" max-width="420" @update:model-value="(v) => (techOpen = v)">
+      <v-card title="技術情報">
+        <v-card-text>
+          <div class="text-body-2">id: {{ project.id }}</div>
+          <div class="text-body-2">出所: {{ project.source.kind }} / {{ project.source.key }}</div>
+          <div class="text-body-2">枚数: {{ project.photoCount }}</div>
+          <div class="text-body-2">連写の境目: {{ project.burstDistance ?? '未学習' }}</div>
+          <div v-if="session" class="text-body-2">ROUND: {{ session.round }}（★{{ session.target_star }} を選別中）</div>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn @click="techOpen = false">閉じる</v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>
@@ -330,6 +384,15 @@ const starChips = computed(() => {
         <v-btn icon="mdi-plus" variant="tonal" @click="bumpRating(path, 1)" />
       </template>
     </ZoomView>
+
+    <BurstReviewView
+      v-if="reviewTarget"
+      :members="reviewMembers"
+      :base-star="reviewBaseStar"
+      :display-urls="thumbUrls"
+      @close="reviewTarget = null"
+      @apply="applyReview"
+    />
   </div>
   <div v-else class="text-center pa-8">
     <v-progress-circular indeterminate color="primary" />
