@@ -34,6 +34,14 @@ export interface FolderEntry {
   sample: string | null
 }
 
+/** 作成画面・選んだフォルダの右側「枚数・見本12枚」（設計 02 章「見本の絵」節）。 */
+export interface FolderSample {
+  /** 中身で写真と判定できたファイルの数（動画・非対応形式は含まない）。 */
+  count: number
+  /** 先頭から最大 `limit` 件の見本 URL。 */
+  samples: string[]
+}
+
 export interface Backend {
   readonly environment: 'pc' | 'webFolder' | 'webPicker'
 
@@ -58,6 +66,8 @@ export interface Backend {
   /** 選んだフォルダの中身（作成画面の一覧・「中へ」）。 */
   listEntries(source: ProjectSource, subPath: string): Promise<FolderEntry[]>
   recentFolders(): Promise<ProjectSource[]>
+  /** 選んだフォルダの「枚数・見本12枚」（下位フォルダも含めて数える）。 */
+  sampleFolder(source: ProjectSource, subPath: string, limit: number): Promise<FolderSample>
 
   // ---- 走査・準備 ----
   /** scan → meta/hash → display を順に行う。50 枚ごと・中断で保存。 */
@@ -68,6 +78,8 @@ export interface Backend {
   thumbnailUrl(projectId: string, relativePath: string): Promise<string | null>
   displayUrl(projectId: string, relativePath: string): Promise<string | null>
   originalUrl(projectId: string, relativePath: string): Promise<string | null>
+  /** ホームのカードの見本 1 枚。**網へ行かない**（端末に残っているサムネイルだけ）。 */
+  coverUrl(projectId: string): Promise<string | null>
 
   // ---- 選別の途中（core の Session） ----
   loadSession(projectId: string): Promise<Session | null>

@@ -184,6 +184,35 @@ pub fn list_entries(root: &str, sub_path: &str) -> Result<Vec<crate::model::Fold
     Ok(entries)
 }
 
+/// 作成画面の右側「枚数・見本12枚」（設計 02 章「見本の絵」節・PC・Web の差分表）。
+/// **下位フォルダも含めて数える**（`prepare` の `walk_all_files` と同じ範囲。
+/// 実際に準備で拾う枚数と食い違わないようにする）。原本は読まない。
+pub fn sample_folder(root: &str, sub_path: &str, limit: usize) -> Result<crate::model::FolderSample, String> {
+    let base = resolve_path(root, sub_path);
+    if !base.is_dir() {
+        return Err(format!("フォルダが見つかりません: {}", base.display()));
+    }
+    let raw = walk_all_files(&base);
+    let mut count = 0usize;
+    let mut samples = Vec::new();
+    for entry in &raw {
+        if !is_image_file(&entry.absolute_path) {
+            continue; // 動画・非対応形式は数えない（`prepare` の scan 段と同じ判定）
+        }
+        count += 1;
+        if samples.len() >= limit {
+            continue;
+        }
+        let Some(head) = read_head(&entry.absolute_path, EXIF_HEAD_PROBE) else { continue };
+        let Some(image) = image_pipeline::decode_hash_source(&entry.absolute_path, &head) else { continue };
+        let thumbnail = image_pipeline::scale_for_thumbnail(&image);
+        if let Some(bytes) = image_pipeline::encode_thumbnail(&thumbnail) {
+            samples.push(bytes);
+        }
+    }
+    Ok(crate::model::FolderSample { count, samples })
+}
+
 // ---------------------------------------------------------------------------
 // 走査（scan）
 // ---------------------------------------------------------------------------

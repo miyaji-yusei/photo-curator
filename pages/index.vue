@@ -16,6 +16,7 @@ const { isWide, isNarrow } = useLayout()
 
 const projects = ref<Project[]>([])
 const sessions = ref<Record<string, Session | null>>({})
+const covers = ref<Record<string, string | null>>({})
 const loading = ref(true)
 const renameTarget = ref<Project | null>(null)
 const renameValue = ref('')
@@ -30,6 +31,11 @@ async function load() {
     projects.value.map(async p => [p.id, await backend.loadSession(p.id)] as const)
   )
   sessions.value = Object.fromEntries(entries)
+  // 見本 1 枚（02章「見本の絵」節）。**網へ行かない**（端末に残っているサムネイルだけ）。
+  const coverEntries = await Promise.all(
+    projects.value.map(async p => [p.id, await backend.coverUrl(p.id)] as const)
+  )
+  covers.value = Object.fromEntries(coverEntries)
   loading.value = false
 }
 
@@ -119,6 +125,14 @@ const columns = computed(() => (isNarrow.value ? 1 : isWide.value ? 3 : 2))
               </v-menu>
             </template>
           </v-card-item>
+          <div style="height: 120px; background: #16181d; overflow: hidden; display: flex; align-items: center; justify-content: center">
+            <img
+              v-if="covers[project.id]"
+              :src="covers[project.id]!"
+              style="width: 100%; height: 100%; object-fit: cover"
+            >
+            <v-icon v-else icon="mdi-folder-image" size="32" color="rgba(255,255,255,.25)" />
+          </div>
           <v-card-text>
             <div class="d-flex align-center mb-1">
               <v-icon

@@ -7,7 +7,7 @@
 import { invoke, convertFileSrc } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import type {
-  Backend, CreateProjectInput, ExportReport, FolderEntry, RatedPhoto
+  Backend, CreateProjectInput, ExportReport, FolderEntry, FolderSample, RatedPhoto
 } from '~/lib/backend'
 import type { PairOverride, Session, Sidecar, SidecarSync } from '~/lib/core'
 import type {
@@ -65,6 +65,14 @@ export class TauriBackend implements Backend {
     return invoke('recent_folders')
   }
 
+  async sampleFolder(source: ProjectSource, subPath: string, limit: number): Promise<FolderSample> {
+    const result: { count: number; samples: number[][] } = await invoke('sample_folder', { source, subPath, limit })
+    return {
+      count: result.count,
+      samples: result.samples.map(bytes => URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: 'image/jpeg' })))
+    }
+  }
+
   async prepare(projectId: string, onProgress: (p: PrepareProgress) => void, signal: AbortSignal): Promise<void> {
     const unlisten = await listen<PrepareProgress>(`prepare-progress:${projectId}`, (event) => {
       onProgress(event.payload)
@@ -85,6 +93,11 @@ export class TauriBackend implements Backend {
 
   async thumbnailUrl(projectId: string, relativePath: string): Promise<string | null> {
     const path: string | null = await invoke('thumbnail_path', { projectId, relativePath })
+    return path ? convertFileSrc(path) : null
+  }
+
+  async coverUrl(projectId: string): Promise<string | null> {
+    const path: string | null = await invoke('cover_path', { projectId })
     return path ? convertFileSrc(path) : null
   }
 

@@ -5,7 +5,7 @@
 // **判断は持たない。** 星・連写のまとめ・選別の状態遷移は core（lib/core.ts）。
 
 import type {
-  Backend, CreateProjectInput, ExportReport, FolderEntry, RatedPhoto
+  Backend, CreateProjectInput, ExportReport, FolderEntry, FolderSample, RatedPhoto
 } from '~/lib/backend'
 import type { PairOverride, Session, Sidecar, SidecarSync } from '~/lib/core'
 import * as core from '~/lib/core'
@@ -340,6 +340,36 @@ export class WebFolderBackend implements Backend {
     return (await idbGet<ProjectSource[]>('recentFolders')) ?? []
   }
 
+  // 作成画面「枚数・見本12枚」（設計 02 章「見本の絵」節）。下位フォルダも
+  // 含めて数える（`prepare` の走査と同じ範囲）。原本は読むが、キャッシュには置かない。
+  async sampleFolder(source: ProjectSource, subPath: string, limit: number): Promise<FolderSample> {
+    const io = source.key.startsWith('dev:')
+      ? new DevHttpFolderIO(source.key.slice(4))
+      : new HandleFolderIO((await idbGet<FileSystemDirectoryHandle>(source.key))!)
+    const found: { subPath: string; entry: RawEntry }[] = []
+    const walk = async (path: string, depth: number) => {
+      if (depth > 6) return
+      const entries = await io.list(path)
+      for (const entry of entries) {
+        if (entry.isDirectory) await walk(joinPath(path, entry.name), depth + 1)
+        else if (!isVideoName(entry.name)) found.push({ subPath: path, entry })
+      }
+    }
+    await walk(subPath, 0)
+    const samples: string[] = []
+    for (const { subPath: dir, entry } of found) {
+      if (samples.length >= limit) break
+      try {
+        const file = await io.readFile(dir, entry.name, entry.mtimeMs)
+        const analyzed = await analyzePhotoFile(file)
+        if (analyzed.thumbnail) samples.push(URL.createObjectURL(analyzed.thumbnail))
+      } catch {
+        // 1 枚読めなくても見本づくりは続ける。
+      }
+    }
+    return { count: found.length, samples }
+  }
+
   // ---- 走査・準備 ----
 
   async prepare(projectId: string, onProgress: (p: PrepareProgress) => void, signal: AbortSignal): Promise<void> {
@@ -453,6 +483,13 @@ export class WebFolderBackend implements Backend {
     const blob = await idbGet<Blob>(`thumb:${projectId}:${relativePath}`)
     if (!blob) return null
     return this.thumbCache.get(key, blob)
+  }
+
+  async coverUrl(projectId: string): Promise<string | null> {
+    const photos = await this.listPhotos(projectId)
+    const first = photos.find(p => p.hasThumbnail)
+    if (!first) return null
+    return this.thumbnailUrl(projectId, first.relativePath)
   }
 
   async displayUrl(projectId: string, relativePath: string): Promise<string | null> {

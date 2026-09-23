@@ -27,6 +27,10 @@ const existingKeys = ref<Set<string>>(new Set())
 const selected = ref<{ name: string; key: string } | null>(null)
 const projectName = ref('')
 const creating = ref(false)
+// 見本の絵（02章「見本の絵」節）。選んだフォルダの「枚数・見本12枚」。
+const sampleCount = ref<number | null>(null)
+const sampleThumbs = ref<string[]>([])
+const sampleLoading = ref(false)
 
 onMounted(async () => {
   const projects = await backend.listProjects()
@@ -42,6 +46,7 @@ async function pickNative() {
   selected.value = { name: source.label, key: '' }
   projectName.value = source.label
   await loadEntries()
+  void loadSample()
 }
 
 async function pickDev() {
@@ -54,6 +59,31 @@ async function pickDev() {
   selected.value = { name: source.label, key: '' }
   projectName.value = source.label
   await loadEntries()
+  void loadSample()
+}
+
+/** 選んだフォルダの枚数・見本12枚。**下位フォルダも含めて数える**
+ * （実際に準備で拾う範囲と揃える）。原本は読まない。断念（出所に繋がらない等）は
+ * 静かに空のまま返す（選別を止めない。02章「断念の条件」）。 */
+async function loadSample() {
+  if (!root.value || !selected.value) {
+    sampleCount.value = null
+    sampleThumbs.value = []
+    return
+  }
+  sampleLoading.value = true
+  sampleCount.value = null
+  sampleThumbs.value = []
+  try {
+    const result = await backend.sampleFolder(root.value, selected.value.key, 12)
+    sampleCount.value = result.count
+    sampleThumbs.value = result.samples
+  } catch {
+    sampleCount.value = null
+    sampleThumbs.value = []
+  } finally {
+    sampleLoading.value = false
+  }
 }
 
 async function loadEntries() {
@@ -73,6 +103,7 @@ async function loadEntries() {
 function selectRow(entry: FolderEntry) {
   selected.value = { name: entry.name, key: entry.key }
   projectName.value = entry.name
+  void loadSample()
 }
 
 async function enter(entry: FolderEntry) {
@@ -204,6 +235,21 @@ async function create() {
         <div v-if="selected" class="text-body-2 text-medium-emphasis mb-2">
           出所: {{ root?.label }}{{ subPath ? '/' + subPath : '' }}
         </div>
+
+        <!-- 見本の絵（02章）。枚数・見本12枚。下位フォルダも含めて数える。 -->
+        <div v-if="selected" class="mb-3">
+          <p v-if="sampleLoading" class="text-caption text-medium-emphasis mb-1">見本を読み込んでいます…</p>
+          <p v-else-if="sampleCount !== null" class="text-body-2 mb-1">{{ sampleCount }} 枚</p>
+          <div v-if="sampleThumbs.length" class="d-flex ga-1" style="overflow-x: auto">
+            <img
+              v-for="(url, i) in sampleThumbs"
+              :key="i"
+              :src="url"
+              style="width: 64px; height: 64px; object-fit: cover; border-radius: 4px; flex-shrink: 0"
+            >
+          </div>
+        </div>
+
         <v-alert v-if="alreadyCreated" type="warning" density="compact" class="mb-2">
           同じ出所のプロジェクトが既にあります。写真は使い回されます。
         </v-alert>

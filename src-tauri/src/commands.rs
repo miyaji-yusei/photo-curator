@@ -137,6 +137,12 @@ pub fn recent_folders(app: AppHandle) -> Result<Vec<ProjectSource>, String> {
     store::load_recent_folders(&app)
 }
 
+/// 作成画面の右側「枚数・見本12枚」（設計 02 章「見本の絵」節）。
+#[tauri::command]
+pub fn sample_folder(source: ProjectSource, sub_path: String, limit: usize) -> Result<crate::model::FolderSample, String> {
+    scan::sample_folder(&source.key, &sub_path, limit)
+}
+
 // ---- 走査・準備 ----
 
 #[tauri::command]
@@ -167,6 +173,21 @@ pub fn list_photos(app: AppHandle, project_id: String) -> Result<Vec<ProjectPhot
 pub fn thumbnail_path(app: AppHandle, project_id: String, relative_path: String) -> Result<Option<String>, String> {
     let file = store::thumbnail_dir(&app, &project_id)?.join(store::cache_file_name(&relative_path));
     Ok(file.is_file().then(|| file.display().to_string()))
+}
+
+/// ホームのカード・見本 1 枚（設計 02 章「見本の絵」節）。**網へ行かない**。
+/// 準備で作ったサムネイルが端末に残っていれば、先頭の 1 枚を返す。
+#[tauri::command]
+pub fn cover_path(app: AppHandle, project_id: String) -> Result<Option<String>, String> {
+    let photos = store::load_photos(&app, &project_id)?;
+    let dir = store::thumbnail_dir(&app, &project_id)?;
+    for photo in photos.iter().filter(|p| p.has_thumbnail) {
+        let file = dir.join(store::cache_file_name(&photo.relative_path));
+        if file.is_file() {
+            return Ok(Some(file.display().to_string()));
+        }
+    }
+    Ok(None)
 }
 
 #[tauri::command]

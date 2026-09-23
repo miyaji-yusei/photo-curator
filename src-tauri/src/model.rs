@@ -112,6 +112,18 @@ pub struct FolderEntry {
     pub sample: Option<String>,
 }
 
+/// 選んだフォルダの見本（設計 02 章「見本の絵」節）。作成画面の右側に
+/// 「枚数・見本12枚」を出すために使う。原本は読まない（EXIF埋め込み
+/// サムネイル→縮小デコードだけ。準備の meta 段と同じ手順）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderSample {
+    /// 中身で写真と判定できたファイルの数（動画・非対応形式は含まない）。
+    pub count: usize,
+    /// 先頭から `limit` 件ぶんの、JPEG に符号化した見本（各要素がバイト列）。
+    pub samples: Vec<Vec<u8>>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RatedPhoto {
