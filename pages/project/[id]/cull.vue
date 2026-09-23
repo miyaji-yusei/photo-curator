@@ -91,6 +91,39 @@ const gridDims = computed<[number, number]>(() => {
   return gridFor(count, landscape)
 })
 
+// 選別中の「…」（optionsSheet。02章。FR-3.7）。**手を止めずに設定を変えられる場所。**
+const optionsOpen = ref(false)
+const groupSizeChoices = computed(() => {
+  const limits = groupSizeLimits(capabilities.largeGroups)
+  const out: number[] = []
+  for (let size = limits.min; size <= limits.max; size += 1) out.push(size)
+  return out
+})
+// 枚数はいまの組にすぐ効く（core.resize）。**選んだ印はそのまま残す**
+// （画面から外れた写真の分だけ落とす）。
+async function applyGroupSize(size: number) {
+  if (!session.value) return
+  groupSize.value = size
+  const next = core.resize(session.value, size)
+  session.value = next
+  selected.value = new Set([...selected.value].filter(p => next.current.includes(p)))
+  await backend.saveSession(projectId.value, next)
+  await app.save({ ...app.settings, groupSize: size })
+  await loadDisplayUrls(next.current)
+}
+// 連写まとめの on/off。core.regroup は**まだ判断していない写真だけ**組み直すので、
+// 確定済みの組（history）はリセットされない（07章 2026-09-15 の教訓）。
+async function applyGroupBursts(on: boolean) {
+  if (!session.value) return
+  groupBursts.value = on
+  const next = core.regroup(session.value, photoRefs.value, on, threshold(), overrides.value)
+  session.value = next
+  selected.value = new Set()
+  await backend.saveSession(projectId.value, next)
+  await app.save({ ...app.settings, groupBursts: on })
+  await loadDisplayUrls(next.current)
+}
+
 // 拡大（zoom）。いまの組の中を左右で見比べられる（02章 zoom シート）。
 const zoomIndex = ref<number | null>(null)
 function openZoom(path: string) {
@@ -390,6 +423,7 @@ onMounted(() => window.addEventListener('keydown', onKeydown))
         <v-btn icon="mdi-undo" variant="text" :disabled="session.history.length === 0" @click="undo" />
         <v-btn :icon="multiMode ? 'mdi-checkbox-multiple-marked' : 'mdi-checkbox-multiple-blank-outline'" variant="text" @click="multiMode = !multiMode" />
         <span class="flex-grow-1 text-center">★{{ session.target_star }} を選別中 · ROUND {{ session.round }}</span>
+        <v-btn icon="mdi-dots-vertical" variant="text" @click="optionsOpen = true" />
         <v-btn
           color="primary"
           variant="flat"
@@ -443,9 +477,43 @@ onMounted(() => window.addEventListener('keydown', onKeydown))
       :session="session"
       :representative="burstEditTarget"
       :photos="photoRefs"
+      :threshold="threshold()"
+      :group-bursts="groupBursts"
       @close="burstEditTarget = null"
       @apply="afterBurstEdit"
     />
+
+    <!-- 選別中の「…」（optionsSheet。02章）。枚数・連写まとめは、いまの組にすぐ効く。 -->
+    <v-dialog v-model="optionsOpen" max-width="420">
+      <v-card title="選別の設定">
+        <v-card-text>
+          <p class="text-body-2 mb-1">一度に見比べる枚数</p>
+          <p class="text-caption text-medium-emphasis mb-2">いまのグループにすぐ効きます。選んだ印は残ります</p>
+          <div class="d-flex flex-wrap ga-2 mb-4">
+            <v-btn
+              v-for="size in groupSizeChoices"
+              :key="size"
+              :color="session && size === session.group_size ? 'primary' : undefined"
+              :variant="session && size === session.group_size ? 'flat' : 'outlined'"
+              size="small"
+              style="min-width: 40px"
+              @click="applyGroupSize(size)"
+            >{{ size }}</v-btn>
+          </div>
+          <v-switch
+            :model-value="groupBursts"
+            label="似た連写をまとめて1枚として見る"
+            color="primary"
+            hide-details
+            @update:model-value="(v) => applyGroupBursts(!!v)"
+          />
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn @click="optionsOpen = false">閉じる</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
 
     <ZoomView
       v-if="zoomIndex !== null && session"
