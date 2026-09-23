@@ -8,5 +8,6 @@
     <NuxtLayout>
       <NuxtPage />
     </NuxtLayout>
+    <SnackbarHost />
   </v-app>
 </template>
