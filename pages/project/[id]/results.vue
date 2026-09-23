@@ -27,6 +27,8 @@ const photos = ref<ProjectPhoto[]>([])
 const session = ref<Session | null>(null)
 const thumbUrls = ref<Record<string, string>>({})
 const photoByPath = computed(() => Object.fromEntries(photos.value.map(p => [p.relativePath, p])))
+/** Amazon 出所は端末にフォルダも原本も無いので、フォルダ分け・XMP は選べない（08章）。 */
+const isAmazon = computed(() => project.value?.source.kind === 'amazon')
 
 // プロジェクト詳細の「星の行」から来たときは、その星で絞った状態で開く
 // （02章「プロジェクト詳細」の遷移表「星の行 → results（その星で絞る）」）。
@@ -284,17 +286,20 @@ const starChips = computed(() => {
         </template>
         <v-list>
           <v-list-item
+            v-if="!isAmazon"
             :disabled="!capabilities.exportFolders"
             :title="capabilities.exportFolders ? 'フォルダ分けしてコピー' : 'フォルダ分け（PC 版で使えます）'"
             @click="requestExport('folders')"
           />
           <v-list-item
+            v-if="!isAmazon"
             :disabled="!capabilities.writeMetadata"
             :title="capabilities.writeMetadata ? '原本の XMP に星を書く' : 'XMP に星（PC 版で使えます）'"
             @click="requestExport('xmp')"
           />
           <v-list-item v-if="capabilities.share" title="共有" @click="requestExport('share')" />
-          <v-list-item v-if="capabilities.exportZip" title="ZIP を書き出す" @click="requestExport('zip')" />
+          <!-- PC 通常は exportFolders が出口。Amazon 出所だけは端末にフォルダが無いので ZIP を出口にする（08章）。 -->
+          <v-list-item v-if="capabilities.exportZip || isAmazon" title="ZIP を書き出す" @click="requestExport('zip')" />
           <v-list-item title="CSV を書き出す" @click="requestExport('csv')" />
         </v-list>
       </v-menu>

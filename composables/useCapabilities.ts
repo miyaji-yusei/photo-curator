@@ -19,7 +19,10 @@ export interface Capabilities {
   fullResolution: boolean
   /** SMB で NAS に直接繋げる。PC・Web は無し（PC は Windows のフォルダとして開く）。 */
   smb: boolean
-  /** Amazon Photos の共有リンクを読める。CORS 実測待ち（段7）なので、いまは全環境 false。 */
+  /** Amazon Photos の共有リンクを読める。段7でブラウザから実測: JSON API は
+   *  CORS 開放だが画像 CDN は不可（fetch・crossOrigin="anonymous" とも拒否）。
+   *  Web からは原本はおろか見本すら安定して読めないため、PC（Rust 経由。CORS
+   *  の制約を受けない）だけ true とする。 */
   amazon: boolean
   /** OS の共有ライブラリ（お気に入り等）に書ける。 */
   mediaStoreWrite: boolean
@@ -44,7 +47,7 @@ const TABLE: Record<Environment, Capabilities> = {
     browseFolders: true,
     fullResolution: true,
     smb: false,
-    amazon: false,
+    amazon: true,
     mediaStoreWrite: false,
     share: false,
     exportFolders: true,

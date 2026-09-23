@@ -7,7 +7,7 @@
 import { invoke, convertFileSrc } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import type {
-  Backend, CreateProjectInput, ExportReport, FolderEntry, FolderSample, RatedPhoto
+  AmazonPreview, Backend, CreateProjectInput, ExportReport, FolderEntry, FolderSample, RatedPhoto
 } from '~/lib/backend'
 import type { PairOverride, Session, Sidecar, SidecarSync } from '~/lib/core'
 import type {
@@ -73,6 +73,18 @@ export class TauriBackend implements Backend {
     }
   }
 
+  /** Amazon タブでリンクを貼った直後の下見。原本は読まない（08章）。 */
+  async amazonPreview(shareUrl: string): Promise<AmazonPreview> {
+    const result: { key: string; name: string; count: number; samples: number[][] } =
+      await invoke('amazon_preview', { shareUrl })
+    return {
+      key: result.key,
+      name: result.name,
+      count: result.count,
+      samples: result.samples.map(bytes => URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: 'image/jpeg' })))
+    }
+  }
+
   async prepare(projectId: string, onProgress: (p: PrepareProgress) => void, signal: AbortSignal): Promise<void> {
     const unlisten = await listen<PrepareProgress>(`prepare-progress:${projectId}`, (event) => {
       onProgress(event.payload)
@@ -107,6 +119,16 @@ export class TauriBackend implements Backend {
   }
 
   async originalUrl(projectId: string, relativePath: string): Promise<string | null> {
+    const project = await this.getProject(projectId)
+    if (project?.source.kind === 'amazon') {
+      // 端末には置かない。開くたびに Amazon から取り直す（08章1・6）。
+      try {
+        const bytes: number[] = await invoke('amazon_original', { projectId, relativePath })
+        return URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: 'image/jpeg' }))
+      } catch {
+        return null
+      }
+    }
     const path: string | null = await invoke('original_path', { projectId, relativePath })
     return path ? convertFileSrc(path) : null
   }

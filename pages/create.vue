@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // プロジェクトを作成（設計 02 章）。**画面にする（シートにしない）**。
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useBackend } from '~/composables/useBackend'
 import { useCapabilities } from '~/composables/useCapabilities'
@@ -32,6 +32,33 @@ const sampleCount = ref<number | null>(null)
 const sampleThumbs = ref<string[]>([])
 const sampleLoading = ref(false)
 
+// Amazon Photos（PC だけ。capabilities.amazon）。共有リンクを貼って下見してから作成する（08章）。
+const amazonUrl = ref('')
+const amazonLoading = ref(false)
+const amazonSource = ref<ProjectSource | null>(null)
+
+async function loadAmazon() {
+  if (!amazonUrl.value.trim() || !backend.amazonPreview) return
+  amazonLoading.value = true
+  errorText.value = ''
+  amazonSource.value = null
+  selected.value = null
+  sampleCount.value = null
+  sampleThumbs.value = []
+  try {
+    const preview = await backend.amazonPreview(amazonUrl.value.trim())
+    amazonSource.value = { kind: 'amazon', key: preview.key, label: preview.name }
+    selected.value = { name: preview.name, key: preview.key }
+    projectName.value = preview.name
+    sampleCount.value = preview.count
+    sampleThumbs.value = preview.samples
+  } catch (cause) {
+    errorText.value = cause instanceof Error ? cause.message : 'リンクを読めませんでした。'
+  } finally {
+    amazonLoading.value = false
+  }
+}
+
 // Web（ピッカー）。フォルダが無いので「写真を選ぶ」→ その場で取り込む
 // （02章「PC・Webの差分」表: 作成の左側は「写真を選ぶ」ボタン）。
 const pickedFiles = ref<File[]>([])
@@ -54,6 +81,16 @@ function onFilesPicked(event: Event) {
 onMounted(async () => {
   const projects = await backend.listProjects()
   existingKeys.value = new Set(projects.map((p: Project) => p.source.key))
+})
+
+// タブを切り替えたら選択を捨てる（前のタブの選択を引きずって作成しないため）。
+watch(tab, () => {
+  selected.value = null
+  projectName.value = ''
+  sampleCount.value = null
+  sampleThumbs.value = []
+  amazonSource.value = null
+  errorText.value = ''
 })
 
 async function pickNative() {
@@ -138,6 +175,9 @@ async function up() {
 }
 
 const alreadyCreated = computed(() => {
+  if (tab.value === 'amazon') {
+    return !!amazonSource.value && existingKeys.value.has(amazonSource.value.key)
+  }
   if (!root.value || !selected.value) return false
   // 相対パスまで含めた鍵で確認済みかを見る（dev モードは root+subPath を連結する）。
   const combined = root.value.key.startsWith('dev:')
@@ -154,6 +194,15 @@ async function create() {
     if (environment === 'webPicker') {
       if (!backend.importPhotos) throw new Error('この環境では写真の取り込みに対応していません。')
       const project = await backend.importPhotos(projectName.value.trim(), pickedFiles.value)
+      await router.push(`/project/${project.id}`)
+      return
+    }
+    if (tab.value === 'amazon') {
+      if (!amazonSource.value) return
+      const project = await backend.createProject({
+        name: projectName.value.trim(),
+        source: { ...amazonSource.value, label: projectName.value.trim() }
+      })
       await router.push(`/project/${project.id}`)
       return
     }
@@ -191,8 +240,39 @@ async function create() {
       </v-tab>
     </v-tabs>
 
-    <div v-if="tab === 'amazon'" class="pa-6 text-medium-emphasis">
-      いまは実測していません（別の段で対応します）。
+    <div v-if="tab === 'amazon'" class="pa-6" style="max-width: 520px">
+      <v-text-field
+        v-model="amazonUrl"
+        label="Amazon Photos の共有リンク"
+        placeholder="https://www.amazon.co.jp/photos/share/..."
+        :disabled="amazonLoading"
+        clearable
+        @keyup.enter="loadAmazon"
+      />
+      <v-btn color="primary" variant="tonal" :loading="amazonLoading" :disabled="!amazonUrl.trim()" @click="loadAmazon">
+        リンクを読み込む
+      </v-btn>
+      <v-alert v-if="errorText" type="error" density="compact" class="mt-3">{{ errorText }}</v-alert>
+      <p class="text-caption text-medium-emphasis mt-3">
+        まず見本だけ読みます（原本はまだ読みません）。選別を始めると、
+        写真1枚ごとに必要なぶんだけ Amazon から取ってきます。端末には置きません。
+      </p>
+
+      <template v-if="selected">
+        <v-text-field v-model="projectName" label="プロジェクト名" clearable class="mt-4" />
+        <p v-if="sampleCount !== null" class="text-body-2 mb-1">{{ sampleCount }} 枚</p>
+        <div v-if="sampleThumbs.length" class="d-flex ga-1 flex-wrap mb-2">
+          <img
+            v-for="(url, i) in sampleThumbs"
+            :key="i"
+            :src="url"
+            style="width: 64px; height: 64px; object-fit: cover; border-radius: 4px; flex-shrink: 0"
+          >
+        </div>
+        <v-alert v-if="alreadyCreated" type="warning" density="compact">
+          同じ出所のプロジェクトが既にあります。写真は使い回されます。
+        </v-alert>
+      </template>
     </div>
 
     <div v-else class="d-flex flex-grow-1" :class="isWide ? 'flex-row' : 'flex-column'" style="min-height: 0">

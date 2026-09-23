@@ -42,6 +42,15 @@ export interface FolderSample {
   samples: string[]
 }
 
+/** 作成画面・Amazon タブでリンクを読み込んだときの下見（設計 08 章）。PC だけ（`capabilities.amazon`）。 */
+export interface AmazonPreview {
+  /** `ProjectSource.key` にそのまま使う（`"{host}|{shareId}"`）。 */
+  key: string
+  name: string
+  count: number
+  samples: string[]
+}
+
 export interface Backend {
   readonly environment: 'pc' | 'webFolder' | 'webPicker'
 
@@ -70,6 +79,8 @@ export interface Backend {
   recentFolders(): Promise<ProjectSource[]>
   /** 選んだフォルダの「枚数・見本12枚」（下位フォルダも含めて数える）。 */
   sampleFolder(source: ProjectSource, subPath: string, limit: number): Promise<FolderSample>
+  /** PC だけ（`capabilities.amazon`）。Amazon Photos の共有リンクを覗く（作成前の下見）。 */
+  amazonPreview?(shareUrl: string): Promise<AmazonPreview>
 
   // ---- 走査・準備 ----
   /** scan → meta/hash → display を順に行う。50 枚ごと・中断で保存。 */
