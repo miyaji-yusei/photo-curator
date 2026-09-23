@@ -21,11 +21,11 @@ use crate::store;
 
 const MAX_WORKERS: usize = 4;
 const MIN_WORKERS: usize = 2;
-const CHECKPOINT_EVERY: usize = 50;
+pub(crate) const CHECKPOINT_EVERY: usize = 50;
 /// フォルダ一覧・作成画面で「見本」や hasPhotos を判定するときだけ読む先頭バイト数。
 const SNIFF_PROBE: usize = 16;
 
-fn worker_count() -> usize {
+pub(crate) fn worker_count() -> usize {
     if let Ok(raw) = std::env::var("PHOTO_CURATOR_WORKERS") {
         if let Ok(n) = raw.parse::<usize>() {
             return n.max(1);
@@ -87,7 +87,7 @@ fn read_head(path: &Path, limit: usize) -> Option<Vec<u8>> {
     Some(buffer)
 }
 
-fn run_parallel<T, R, F>(items: &[T], workers: usize, cancel: &AtomicBool, work: F, mut on_result: impl FnMut(usize, R))
+pub(crate) fn run_parallel<T, R, F>(items: &[T], workers: usize, cancel: &AtomicBool, work: F, mut on_result: impl FnMut(usize, R))
 where
     T: Sync,
     R: Send,
@@ -266,12 +266,15 @@ fn walk_all_files(root: &Path) -> Vec<RawEntry> {
     out
 }
 
-fn emit_progress(app: &AppHandle, project_id: &str, progress: PrepareProgress) {
+pub(crate) fn emit_progress(app: &AppHandle, project_id: &str, progress: PrepareProgress) {
     let _ = app.emit(&format!("prepare-progress:{project_id}"), progress);
 }
 
 /// scan → meta → display を通しで行う。
 pub fn prepare(app: &AppHandle, project: &mut Project, cancel: &AtomicBool) -> Result<(), String> {
+    if project.source.kind == crate::model::SourceKind::Amazon {
+        return crate::amazon::prepare(app, project, cancel);
+    }
     let project_id = project.id.clone();
     let root = PathBuf::from(&project.source.key);
     if !root.is_dir() {

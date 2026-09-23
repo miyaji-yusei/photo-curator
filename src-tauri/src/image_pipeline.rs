@@ -65,6 +65,14 @@ pub fn decode_full(path: &Path, head: &[u8]) -> Option<DynamicImage> {
         .map(|image| apply_orientation(image, orientation))
 }
 
+/// バイト列から直接デコードする（Amazon Photos 用。設計08章。すでに Amazon 側で
+/// `viewBox` 分だけ縮小して返してくるので、ローカルファイル版のような段階的
+/// デコード（1/8 IDCT 等）は要らない。向きは Amazon の tempLink 経由の画像には
+/// 既に焼き込まれている＝ Orientation を別途適用しない）。
+pub fn decode_bytes(bytes: &[u8]) -> Option<DynamicImage> {
+    image::load_from_memory(bytes).ok()
+}
+
 pub fn scale_for_thumbnail(image: &DynamicImage) -> DynamicImage {
     if image.width().max(image.height()) <= THUMBNAIL_MAX_EDGE {
         image.clone()

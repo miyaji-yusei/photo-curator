@@ -5,6 +5,7 @@
 //! 旧版（SQLite・NAS の SMB 接続・Android の JNI 橋）は段4 の作り直しで落とした。
 //! **旧版のデータは読まない。**
 
+mod amazon;
 mod commands;
 mod exif_util;
 mod export;
@@ -36,6 +37,8 @@ pub fn run() {
             commands::list_entries,
             commands::recent_folders,
             commands::sample_folder,
+            commands::amazon_preview,
+            commands::amazon_original,
             commands::prepare,
             commands::cancel_prepare,
             commands::list_photos,

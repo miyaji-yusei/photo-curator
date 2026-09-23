@@ -108,7 +108,10 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     era * 146_097 + day_of_era - 719_468
 }
 
-fn civil_timestamp_ms(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64) -> Option<i64> {
+/// その土地の時計の値（年月日時分秒）を、offset を考えずにそのままミリ秒へ。
+/// EXIF に明示の offset が無いときはこれで済ませる（Amazon の `contentDate` の
+/// 末尾 `Z` を無視して読む処理でも同じものを使う。設計 08 章「6. 撮影時刻の末尾の Z」）。
+pub fn civil_timestamp_ms(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64) -> Option<i64> {
     if !(1900..=2999).contains(&year) {
         return None;
     }

@@ -143,6 +143,12 @@ pub fn sample_folder(source: ProjectSource, sub_path: String, limit: usize) -> R
     scan::sample_folder(&source.key, &sub_path, limit)
 }
 
+/// 作成画面の Amazon タブ（設計08章8.1）。共有リンクを読み、名前・枚数・見本12枚を返す。
+#[tauri::command]
+pub fn amazon_preview(share_url: String) -> Result<crate::amazon::AmazonPreview, String> {
+    crate::amazon::preview(&share_url, 12)
+}
+
 // ---- 走査・準備 ----
 
 #[tauri::command]
@@ -204,6 +210,14 @@ pub fn original_path(app: AppHandle, project_id: String, relative_path: String) 
         path.push(part);
     }
     Ok(path.is_file().then(|| path.display().to_string()))
+}
+
+/// Amazon だけ。**そのたびに原本を取ってきて出す。端末には置かない**（08章1・6）。
+/// ローカルファイルと違って `convertFileSrc` で出せないので、バイト列をそのまま返す。
+#[tauri::command]
+pub fn amazon_original(app: AppHandle, project_id: String, relative_path: String) -> Result<Vec<u8>, String> {
+    let project = find_project(&app, &project_id)?;
+    crate::amazon::fetch_original(&app, &project, &relative_path)
 }
 
 // ---- 選別の途中 ----

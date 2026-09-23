@@ -28,3 +28,7 @@ jpeg-decoder = "0.3"
 # 判断（星の付き方・連写のまとめ方・指紋）は core に任せる（設計 05 章
 # 2026-09-23: PC も core を直接呼ぶ）。uniffi は要らないので切る。
 photo-curator-core = { path = "../core", default-features = false }
+# Amazon Photos 共有リンク（設計 08 章・07 章 段7）。PC は Rust から直接読む
+# （ブラウザの CORS 制限を受けない）。同期・素朴な HTTP クライアントで足りる
+# （scan.rs も async ランタイムを使わず std::thread::scope で並列化している流儀に合わせる）。
+ureq = { version = "2", features = ["json"] }
