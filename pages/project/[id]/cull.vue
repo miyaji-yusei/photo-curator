@@ -120,6 +120,42 @@ async function applyGroupSize(size: number) {
   await app.save({ ...app.settings, groupSize: size })
   await loadDisplayUrls(next.current)
 }
+// 複数選択中の「この写真をまとめる」（07章 2026-09-24 追加）。選んだ代表（と、
+// それぞれの連写の仲間）を、撮影順で見て最初から最後まで隣どうし全部 "join" の
+// override にする。core.group_bursts は隣どうしのペアしか見ないため（core/src/
+// lib.rs）、離れた2枚を無理にまとめるには、その間の写真も含めて連鎖させる以外に
+// 道が無い（あいだの写真も道連れで同じ組に入る。これは仕様として07章に明記）。
+// Android版に直接の前例が無いので、既存の連写自動判定を上書きする仕組み
+// （PairOverride／BurstEditSheet.vueの確定処理）と同じ考え方で実装する。
+async function groupSelectedAsBurst() {
+  if (!session.value || selected.value.size < 2) return
+  const allMembers = new Set<string>()
+  for (const rep of selected.value) {
+    const mates = session.value.members[rep] ?? [rep]
+    for (const m of mates) allMembers.add(m)
+  }
+  const order = photoRefs.value.map(p => p.relative_path)
+  const indices = order.reduce<number[]>((acc, p, i) => { if (allMembers.has(p)) acc.push(i); return acc }, [])
+  if (indices.length < 2) return
+  const lo = Math.min(...indices)
+  const hi = Math.max(...indices)
+  const span = order.slice(lo, hi + 1)
+  const newOverrides: PairOverride[] = []
+  for (let i = 0; i < span.length - 1; i += 1) {
+    newOverrides.push({ left: span[i]!, right: span[i + 1]!, decision: 'join' })
+  }
+  const merged = overrides.value.filter(o => !newOverrides.some(n => n.left === o.left && n.right === o.right))
+  merged.push(...newOverrides)
+  overrides.value = merged
+  await backend.saveOverrides(projectId.value, merged)
+  const next = core.regroup(session.value, photoRefs.value, groupBursts.value, threshold(), merged)
+  session.value = next
+  selected.value = new Set()
+  multiMode.value = false
+  await backend.saveSession(projectId.value, next)
+  await loadDisplayUrls(next.current)
+}
+
 // 連写まとめの on/off。core.regroup は**まだ判断していない写真だけ**組み直すので、
 // 確定済みの組（history）はリセットされない（07章 2026-09-15 の教訓）。
 async function applyGroupBursts(on: boolean) {
@@ -464,6 +500,17 @@ onBeforeUnmount(() => stopAutoPush())
         <v-btn :icon="multiMode ? 'mdi-checkbox-multiple-marked' : 'mdi-checkbox-multiple-blank-outline'" variant="text" @click="multiMode = !multiMode" />
         <span class="flex-grow-1 text-center">★{{ session.target_star }} を選別中 · ROUND {{ session.round }}</span>
         <v-btn icon="mdi-dots-vertical" variant="text" @click="optionsOpen = true" />
+        <!-- 複数選択時だけ出す「この写真をまとめる」（item 2）。2枚以上選んでいるときだけ押せる。 -->
+        <v-btn
+          v-if="multiMode"
+          variant="tonal"
+          prepend-icon="mdi-link-variant"
+          class="mr-2"
+          :disabled="selected.size < 2"
+          @click="groupSelectedAsBurst"
+        >
+          この写真をまとめる
+        </v-btn>
         <v-btn
           color="primary"
           variant="flat"
