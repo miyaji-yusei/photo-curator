@@ -120,6 +120,13 @@ async function load() {
     shown.map(async r => [r.relativePath, await backend.thumbnailUrl(projectId.value, r.relativePath)] as const)
   )
   thumbUrls.value = Object.fromEntries(entries.filter(([, url]) => url) as [string, string][])
+
+  // Android版（ProjectScreen の LaunchedEffect）と同じく、開いたら準備が自動で
+  // 動き出す（「準備を始める」ボタン押下を待たない）。中断（cancelPrepare）は
+  // そのまま残し、中断後にこの画面を開き直すと自動で再開する。
+  if (needsPrepare.value && !preparing.value) {
+    void runPrepare()
+  }
 }
 
 async function runPrepare() {
