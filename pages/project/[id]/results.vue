@@ -32,8 +32,12 @@ const isAmazon = computed(() => project.value?.source.kind === 'amazon')
 
 // プロジェクト詳細の「星の行」から来たときは、その星で絞った状態で開く
 // （02章「プロジェクト詳細」の遷移表「星の行 → results（その星で絞る）」）。
+// クエリで星の指定が無いときは、既定でその結果内の一番高い星に絞る
+// （ユーザー要望。Android版 Results.kt は既定「すべて」だが、PC/Web版は
+// 「結果を見に来たらまず一番良い写真から」を優先してあえて分ける。07章参照）。
 const initialStar = Number(route.query.star)
-const filterStar = ref<number | null>(Number.isFinite(initialStar) && initialStar >= 0 && initialStar <= 5 ? initialStar : null)
+const hasQueryStar = Number.isFinite(initialStar) && initialStar >= 0 && initialStar <= 5
+const filterStar = ref<number | null>(hasQueryStar ? initialStar : null)
 const sort = ref<PhotoSort>('rating')
 const selected = ref<Set<string>>(new Set())
 const multiMode = ref(false)
@@ -90,6 +94,12 @@ async function load() {
   if (!project.value) return
   photos.value = await backend.listPhotos(projectId.value)
   session.value = await backend.loadSession(projectId.value)
+  // クエリで星を指定されていなければ、実際に付いている一番高い星に絞る。
+  // 星が1枚も付いていなければ（全部★0）「すべて」のまま。
+  if (!hasQueryStar) {
+    const highest = [5, 4, 3, 2, 1].find(s => (summary.value.counts[s] ?? 0) > 0)
+    if (highest !== undefined) filterStar.value = highest
+  }
   const paths = filteredSorted.value.slice(0, 300).map(r => r.relativePath)
   const entries = await Promise.all(paths.map(async p => [p, await backend.displayUrl(projectId.value, p)] as const))
   thumbUrls.value = Object.fromEntries(entries.filter(([, u]) => u) as [string, string][])
