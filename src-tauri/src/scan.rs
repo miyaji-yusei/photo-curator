@@ -293,14 +293,41 @@ pub fn prepare(app: &AppHandle, project: &mut Project, cancel: &AtomicBool) -> R
     let mut by_path: HashMap<String, ProjectPhoto> =
         existing.into_iter().map(|p| (p.relative_path.clone(), p)).collect();
 
+    // 種類判定（先頭 SNIFF_PROBE バイト読み）を並列化する。1 枚ずつ順番に
+    // open→read→close していたときは、NAS 越しだと待ち時間（往復）が支配的で
+    // 110枚・33ms/枚（合計3.6秒）かかっていた（実測、2026-09-24, `L:\名古屋ひとり旅`）。
+    // CPU はほぼ使わず、display 段と違って帯域も使い切っていないので、
+    // 並列化がそのまま効く（meta/display 段と同じ `run_parallel` を使う）。
+    let mut is_image_flags = vec![false; raw.len()];
+    let mut sniffed = 0usize;
+    run_parallel(
+        &raw,
+        worker_count(),
+        cancel,
+        |entry: &RawEntry| -> bool {
+            read_head(&entry.absolute_path, SNIFF_PROBE)
+                .map(|head| format::is_image(format::sniff(&head)))
+                .unwrap_or(false)
+        },
+        |index, is_image| {
+            is_image_flags[index] = is_image;
+            sniffed += 1;
+            if sniffed % CHECKPOINT_EVERY == 0 || sniffed == raw.len() {
+                emit_progress(
+                    app,
+                    &project_id,
+                    PrepareProgress { task: PrepareTask::Scan, done: sniffed, total: raw.len(), warning: None },
+                );
+            }
+        },
+    );
+
+    // 判定できた分だけを写真として数える。中断で判定前のまま残った分は
+    // 「無かったもの」と同じ扱いになる（finalize_partial に渡るのは
+    // ここまでに判定し終えた分だけ、が従来と同じ意味）。
     let mut photos: Vec<ProjectPhoto> = Vec::with_capacity(raw.len());
-    let mut scanned = 0usize;
-    for entry in &raw {
-        if cancel.load(Ordering::Relaxed) {
-            return finalize_partial(app, project, &photos, "中断しました");
-        }
-        let Some(head) = read_head(&entry.absolute_path, SNIFF_PROBE) else { continue };
-        if !format::is_image(format::sniff(&head)) {
+    for (index, entry) in raw.iter().enumerate() {
+        if !is_image_flags[index] {
             continue; // 動画・非対応形式は数えない
         }
         let prior = by_path.remove(&entry.relative_path);
@@ -322,16 +349,11 @@ pub fn prepare(app: &AppHandle, project: &mut Project, cancel: &AtomicBool) -> R
                 has_display: false,
             }
         });
-        scanned += 1;
-        if scanned % CHECKPOINT_EVERY == 0 {
-            emit_progress(
-                app,
-                &project_id,
-                PrepareProgress { task: PrepareTask::Scan, done: scanned, total: raw.len(), warning: None },
-            );
-        }
     }
     photos.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    if cancel.load(Ordering::Relaxed) {
+        return finalize_partial(app, project, &photos, "中断しました");
+    }
     store::save_photos(app, &project_id, &photos)?;
     project.photo_count = photos.len();
     project.scanned_count = photos.len();
@@ -342,9 +364,6 @@ pub fn prepare(app: &AppHandle, project: &mut Project, cancel: &AtomicBool) -> R
         &project_id,
         PrepareProgress { task: PrepareTask::Scan, done: photos.len(), total: photos.len(), warning: None },
     );
-    if cancel.load(Ordering::Relaxed) {
-        return Ok(());
-    }
 
     // ---- meta: 撮影時刻・指紋・サムネイル ----
     let thumbnail_dir = store::thumbnail_dir(app, &project_id)?;
