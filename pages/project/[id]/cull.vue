@@ -31,6 +31,9 @@ const overrides = ref<PairOverride[]>([])
 const burstDistance = ref<number | null>(null)
 // パス→写真。拡大の「n MB」表示に使う（設計 02 章 zoom シート）。
 const photoByPath = computed(() => Object.fromEntries(photos.value.map(p => [p.relativePath, p])))
+// 指紋が 1 枚も無い（Web の Amazon 出所など）と、連写は自動ではまとまらず、
+// 「まとめる強さ」も効かない。手でまとめる道（この写真をまとめる）だけが残る。
+const hasFingerprints = computed(() => photos.value.some(p => p.dHash))
 
 type Phase = 'loading' | 'start' | 'learn' | 'preview' | 'tournament' | 'roundComplete'
 const phase = ref<Phase>('loading')
@@ -433,6 +436,10 @@ onBeforeUnmount(() => stopAutoPush())
         class="mb-4"
       />
       <v-switch v-model="groupBursts" label="連写をまとめる" color="primary" />
+      <v-alert v-if="!hasFingerprints && photos.length > 0" type="info" variant="tonal" density="compact" class="mb-4">
+        この写真は中身を読めないため、連写を自動ではまとめません。選別中に複数選んで
+        「この写真をまとめる」を押すと、手でまとめられます（「連写をまとめる」はオンのままにしてください）。
+      </v-alert>
       <p class="text-body-2 text-medium-emphasis mb-4">準備が終わった {{ photos.length }} 枚から始めます</p>
       <v-btn color="primary" block size="large" @click="beginFromStart">選別を開始</v-btn>
     </div>
@@ -468,7 +475,7 @@ onBeforeUnmount(() => stopAutoPush())
         連写 {{ previewGroups.filter(g => g.members.length > 1).length }} 組
       </p>
       <v-slider
-        v-if="groupBursts"
+        v-if="groupBursts && hasFingerprints"
         v-model="previewDistance"
         :min="2"
         :max="24"
