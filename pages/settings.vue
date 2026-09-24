@@ -69,7 +69,7 @@ async function persist() {
             :max="capabilities.largeGroups ? 10 : 4"
             :step="1"
             thumb-label
-            label="枚数"
+            label="一度に見比べる枚数"
             @update:model-value="persist"
           />
           <v-switch
@@ -80,7 +80,7 @@ async function persist() {
           />
           <v-switch
             v-model="app.settings.confirmBeforeStart"
-            label="開始前に毎回確認する"
+            label="開始前に毎回この設定を確認する"
             color="primary"
             @update:model-value="persist"
           />
@@ -95,7 +95,8 @@ async function persist() {
     </v-card>
 
     <p class="text-caption text-medium-emphasis text-center mt-6">
-      原本には触れません<br>
+      Photo Curator は写真の原本を移動・削除・書き換えしません。星の書き込みと
+      フォルダ分けは、実行前に確認します。<br>
       Photo Curator · v0.1.0
     </p>
   </div>

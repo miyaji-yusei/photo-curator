@@ -29,11 +29,17 @@ const thumbUrls = ref<Record<string, string>>({})
 const photoByPath = computed(() => Object.fromEntries(photos.value.map(p => [p.relativePath, p])))
 /** Amazon 出所は端末にフォルダも原本も無いので、フォルダ分け・XMP は選べない（08章）。 */
 const isAmazon = computed(() => project.value?.source.kind === 'amazon')
+/** Web の Amazon 出所は写真をバイトとして読めない（capabilities.amazonDisplayOnly）ので、CSV だけ。 */
+const csvOnly = computed(() => isAmazon.value && capabilities.amazonDisplayOnly)
 
 // プロジェクト詳細の「星の行」から来たときは、その星で絞った状態で開く
 // （02章「プロジェクト詳細」の遷移表「星の行 → results（その星で絞る）」）。
+// クエリで星の指定が無いときは、既定でその結果内の一番高い星に絞る
+// （ユーザー要望。Android版 Results.kt は既定「すべて」だが、PC/Web版は
+// 「結果を見に来たらまず一番良い写真から」を優先してあえて分ける。07章参照）。
 const initialStar = Number(route.query.star)
-const filterStar = ref<number | null>(Number.isFinite(initialStar) && initialStar >= 0 && initialStar <= 5 ? initialStar : null)
+const hasQueryStar = Number.isFinite(initialStar) && initialStar >= 0 && initialStar <= 5
+const filterStar = ref<number | null>(hasQueryStar ? initialStar : null)
 const sort = ref<PhotoSort>('rating')
 const selected = ref<Set<string>>(new Set())
 const multiMode = ref(false)
@@ -90,6 +96,12 @@ async function load() {
   if (!project.value) return
   photos.value = await backend.listPhotos(projectId.value)
   session.value = await backend.loadSession(projectId.value)
+  // クエリで星を指定されていなければ、実際に付いている一番高い星に絞る。
+  // 星が1枚も付いていなければ（全部★0）「すべて」のまま。
+  if (!hasQueryStar) {
+    const highest = [5, 4, 3, 2, 1].find(s => (summary.value.counts[s] ?? 0) > 0)
+    if (highest !== undefined) filterStar.value = highest
+  }
   const paths = filteredSorted.value.slice(0, 300).map(r => r.relativePath)
   const entries = await Promise.all(paths.map(async p => [p, await backend.displayUrl(projectId.value, p)] as const))
   thumbUrls.value = Object.fromEntries(entries.filter(([, u]) => u) as [string, string][])
@@ -127,6 +139,18 @@ function longPress(row: Row) {
 function openZoom(path: string) {
   const at = zoomPaths.value.indexOf(path)
   if (at >= 0) zoomIndex.value = at
+}
+
+// 連写の中身選別（BurstReviewView）を開いている間の拡大は、結果一覧の並び
+// （zoomPaths）ではなく、そのまとまりの中身（reviewMembers）を対象にする。
+const reviewZooming = ref(false)
+function openReviewZoom(index: number) {
+  reviewZooming.value = true
+  zoomIndex.value = index
+}
+function closeZoom() {
+  zoomIndex.value = null
+  reviewZooming.value = false
 }
 
 // ---- 連写の中身選別（burst-review） ----
@@ -255,12 +279,21 @@ async function confirmRestart() {
 }
 
 const hasBursts = computed(() => rows.value.some(r => r.burstSize > 1))
+// Android版 Results.kt の StarChip と同じく、件数付きの文言で揃える
+// （「すべて」にも合計枚数を出す）。
 const starChips = computed(() => {
-  const chips: { label: string; value: number | null }[] = [{ label: 'すべて', value: null }]
+  const chips: { label: string; value: number | null }[] = [{ label: `すべて ${summary.value.total}`, value: null }]
   for (let s = 5; s >= 1; s -= 1) {
     if ((summary.value.counts[s] ?? 0) > 0) chips.push({ label: `★${s} · ${summary.value.counts[s]}`, value: s })
   }
   return chips
+})
+// 取り出しボタンの文言。Android版 Results.kt の targetLabel と同じ考え方
+// （「[対象] を…」。選んでいなければいまの絞り込みの対象を言う）。
+const targetLabel = computed(() => {
+  if (selected.value.size > 0) return `選んだ ${selected.value.size} 枚`
+  if (filterStar.value === null) return `すべて ${filteredSorted.value.length} 枚`
+  return `★${filterStar.value} ${filteredSorted.value.length} 枚`
 })
 </script>
 
@@ -280,8 +313,8 @@ const starChips = computed(() => {
       </v-menu>
       <v-menu>
         <template #activator="{ props: outProps }">
-          <v-btn color="primary" class="ml-2" :loading="exportBusy" v-bind="outProps">
-            {{ selected.size > 0 ? selected.size + ' 枚' : 'すべて' }} を…
+          <v-btn color="primary" class="ml-2" prepend-icon="mdi-export-variant" :loading="exportBusy" v-bind="outProps">
+            {{ targetLabel }} を…
           </v-btn>
         </template>
         <v-list>
@@ -297,9 +330,10 @@ const starChips = computed(() => {
             :title="capabilities.writeMetadata ? '原本の XMP に星を書く' : 'XMP に星（PC 版で使えます）'"
             @click="requestExport('xmp')"
           />
-          <v-list-item v-if="capabilities.share" title="共有" @click="requestExport('share')" />
+          <v-list-item v-if="capabilities.share && !csvOnly" title="共有" @click="requestExport('share')" />
           <!-- PC 通常は exportFolders が出口。Amazon 出所だけは端末にフォルダが無いので ZIP を出口にする（08章）。 -->
-          <v-list-item v-if="capabilities.exportZip || isAmazon" title="ZIP を書き出す" @click="requestExport('zip')" />
+          <v-list-item v-if="(capabilities.exportZip || isAmazon) && !csvOnly" title="ZIP を書き出す" @click="requestExport('zip')" />
+          <v-list-item v-if="csvOnly" disabled title="ZIP（PC 版で使えます）" />
           <v-list-item title="CSV を書き出す" @click="requestExport('csv')" />
         </v-list>
       </v-menu>
@@ -407,18 +441,18 @@ const starChips = computed(() => {
     </div>
 
     <p class="text-caption text-medium-emphasis text-center mt-6">
-      {{ capabilities.sidecar ? '星は写真のフォルダにも記録します（.photo-curator）' : 'この端末だけの結果' }}
+      {{ capabilities.sidecar && !isAmazon ? '星は写真のフォルダにも記録します（.photo-curator）' : 'この端末だけの結果' }}
     </p>
 
     <ZoomView
       v-if="zoomIndex !== null"
-      :paths="zoomPaths"
+      :paths="reviewZooming ? reviewMembers : zoomPaths"
       :index="zoomIndex"
       :display-urls="thumbUrls"
       :resolve-original="(p) => backend.originalUrl(projectId, p)"
       :file-size="(p) => photoByPath[p]?.size ?? null"
       :show-keep="false"
-      @close="zoomIndex = null"
+      @close="closeZoom"
       @move="(i) => (zoomIndex = i)"
     >
       <template #extra="{ path }">
@@ -430,6 +464,7 @@ const starChips = computed(() => {
     <BurstReviewView
       v-if="reviewTarget"
       :members="reviewMembers"
+      @zoom="openReviewZoom"
       :base-star="reviewBaseStar"
       :display-urls="thumbUrls"
       @close="reviewTarget = null"

@@ -32,7 +32,7 @@ const sampleCount = ref<number | null>(null)
 const sampleThumbs = ref<string[]>([])
 const sampleLoading = ref(false)
 
-// Amazon Photos（PC だけ。capabilities.amazon）。共有リンクを貼って下見してから作成する（08章）。
+// Amazon Photos（capabilities.amazon。Web は amazonDisplayOnly の縮小版）。共有リンクを貼って下見してから作成する（08章）。
 const amazonUrl = ref('')
 const amazonLoading = ref(false)
 const amazonSource = ref<ProjectSource | null>(null)
@@ -191,18 +191,19 @@ async function create() {
   creating.value = true
   errorText.value = ''
   try {
-    if (environment === 'webPicker') {
-      if (!backend.importPhotos) throw new Error('この環境では写真の取り込みに対応していません。')
-      const project = await backend.importPhotos(projectName.value.trim(), pickedFiles.value)
-      await router.push(`/project/${project.id}`)
-      return
-    }
+    // Amazon を先に見る。Web（ピッカー）でも Amazon タブからは取り込みではなく作成になる。
     if (tab.value === 'amazon') {
       if (!amazonSource.value) return
       const project = await backend.createProject({
         name: projectName.value.trim(),
         source: { ...amazonSource.value, label: projectName.value.trim() }
       })
+      await router.push(`/project/${project.id}`)
+      return
+    }
+    if (environment === 'webPicker') {
+      if (!backend.importPhotos) throw new Error('この環境では写真の取り込みに対応していません。')
+      const project = await backend.importPhotos(projectName.value.trim(), pickedFiles.value)
       await router.push(`/project/${project.id}`)
       return
     }
@@ -225,22 +226,24 @@ async function create() {
 </script>
 
 <template>
-  <div class="d-flex flex-column" style="height: calc(100vh - 0px)">
-    <div v-if="!isWide" class="d-flex align-center pa-3">
+  <div class="d-flex flex-column" style="height: 100vh; overflow: hidden">
+    <div v-if="!isWide" class="d-flex align-center pa-3" style="flex-shrink: 0">
       <v-btn icon="mdi-arrow-left" variant="text" @click="router.back()" />
       <span class="text-h6 ml-2">プロジェクトを作成</span>
     </div>
-    <span v-else class="text-h5 pa-4 pb-0">プロジェクトを作成</span>
+    <span v-else class="text-h5 pa-4 pb-0" style="flex-shrink: 0">プロジェクトを作成</span>
 
-    <v-tabs v-model="tab" class="px-4">
+    <v-tabs v-model="tab" class="px-4" style="flex-shrink: 0">
       <v-tab value="folder">フォルダ</v-tab>
       <v-tab value="amazon" :disabled="!capabilities.amazon">
         Amazon Photos
-        <span v-if="!capabilities.amazon" class="text-caption ml-1 text-medium-emphasis">（PC 版で使えます）</span>
+        <span v-if="capabilities.amazonDisplayOnly" class="text-caption ml-1 text-medium-emphasis">（表示のみ）</span>
       </v-tab>
     </v-tabs>
 
-    <div v-if="tab === 'amazon'" class="pa-6" style="max-width: 520px">
+    <!-- フォームが長くなっても（NASタブの一覧が多い等）、この中だけがスクロールし、
+         下のキャンセル・作成ボタンは常に画面内に収まる（flex-grow-1 + min-height:0 + overflow-y:auto）。 -->
+    <div v-if="tab === 'amazon'" class="pa-6 flex-grow-1" style="max-width: 520px; min-height: 0; overflow-y: auto">
       <v-text-field
         v-model="amazonUrl"
         label="Amazon Photos の共有リンク"
@@ -257,6 +260,11 @@ async function create() {
         まず見本だけ読みます（原本はまだ読みません）。選別を始めると、
         写真1枚ごとに必要なぶんだけ Amazon から取ってきます。端末には置きません。
       </p>
+      <v-alert v-if="capabilities.amazonDisplayOnly" type="info" variant="tonal" density="compact" class="mt-3">
+        Web 版では Amazon の写真を表示するだけです。写真の中身を読めないため、
+        連写は自動でまとまりません（選別中に複数選んで「この写真をまとめる」でまとめられます）。
+        書き出しは CSV だけで、選別中も通信が要ります。ZIP での書き出しは PC 版で使えます。
+      </v-alert>
 
       <template v-if="selected">
         <v-text-field v-model="projectName" label="プロジェクト名" clearable class="mt-4" />

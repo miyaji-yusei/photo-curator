@@ -1,8 +1,10 @@
 <script setup lang="ts">
-// まとまり編集シート（設計 02 章）。時間軸の帯。線を動かして分ける/つなげる、
-// 写真をタップで代表。3色巡回（単独は色を持たず巡回も進めない）。
-// 確定前に「元のn枚 → まとまりn組 ＋ 単独n枚」。
-import { computed, ref } from 'vue'
+// まとまり編集シート（設計 02 章）。時間軸の帯。線をドラッグして分ける/つなげる
+// （Android版 Burst.kt の BurstEditSheet と同じ操作感。44px相当のハンドルを
+// ドラッグすると境目が隣へ動き、タップだけでも切る/繋ぐを切り替えられる）。
+// 写真はサムネイルで見せ、タップで代表を選び直す。3色巡回（単独は色を持たず
+// 巡回も進めない）。確定前に「元のn枚 → まとまりn組 ＋ 単独n枚」。
+import { computed, onMounted, ref, watch } from 'vue'
 import { boundaryCount, blocksFromCuts } from '~/utils/burstEdit'
 import * as core from '~/lib/core'
 import type { Session, PhotoRef, PairOverride, BurstThreshold } from '~/lib/core'
@@ -36,6 +38,18 @@ function noCutsFor(r: string[]) {
 }
 const blocks = computed(() => blocksFromCuts(run.value, cuts.value))
 
+// サムネイル。バグ修正（07章）: 以前はファイル名のテキストしか出ておらず、
+// 表示用画像のURLを取得していなかった。cull.vue と同じ backend.displayUrl で取る。
+const displayUrls = ref<Record<string, string>>({})
+async function loadThumbs() {
+  const missing = run.value.filter(p => !displayUrls.value[p])
+  if (missing.length === 0) return
+  const entries = await Promise.all(missing.map(async p => [p, await backend.displayUrl(projectId, p)] as const))
+  for (const [p, url] of entries) if (url) displayUrls.value[p] = url
+}
+onMounted(loadThumbs)
+watch(run, loadThumbs)
+
 // run の各位置がどのまとまり（blocks の何番目）に属するか。
 const blockSeqOfRunIndex = computed<number[]>(() => {
   const map: number[] = []
@@ -46,6 +60,7 @@ const blockSeqOfRunIndex = computed<number[]>(() => {
 })
 // 3色巡回の色番号。**単独（1枚だけの塊）は色を持たず、巡回も進めない。**
 const BLOCK_COLORS = ['#2a3320', '#1f2a33', '#332025']
+const BLOCK_TINTS = ['#d6ff73', '#a7c8ff', '#ffb3e6']
 const colorNumOfRunIndex = computed<number[]>(() => {
   const map: number[] = []
   let cursor = 0
@@ -58,7 +73,13 @@ const colorNumOfRunIndex = computed<number[]>(() => {
 })
 function tileStyle(runIndex: number): string {
   const color = colorNumOfRunIndex.value[runIndex]!
-  return `background: ${color >= 0 ? BLOCK_COLORS[color] : '#16181d'}`
+  const grouped = color >= 0
+  const border = grouped ? `2px solid ${BLOCK_TINTS[color]}` : '2px solid transparent'
+  return `background: ${grouped ? BLOCK_COLORS[color] : '#16181d'}; border: ${border}; opacity: ${grouped ? 1 : 0.55}`
+}
+function tintOf(runIndex: number): string {
+  const color = colorNumOfRunIndex.value[runIndex]!
+  return color >= 0 ? BLOCK_TINTS[color]! : '#5f6572'
 }
 
 // 写真をタップで代表を選び直す（塊が2枚以上のときだけ意味がある）。
@@ -80,6 +101,36 @@ function toggleCut(index: number) {
   const next = [...cuts.value]
   next[index] = !next[index]
   cuts.value = next
+}
+
+// ---- ドラッグで境目を隣へ動かす（Android版 Burst.kt の Divider.onDrag と同じ考え方）。
+// **切れている境目だけ動かせる。** 繋がっている境目はタップで切ってから動かす。
+const TILE_STRIDE = 152 // タイル144px + 間隔8px（下の style と合わせる）。
+let dragIndex = -1
+let dragStartX = 0
+function onHandlePointerDown(index: number, event: PointerEvent) {
+  if (!cuts.value[index]) return
+  dragIndex = index
+  dragStartX = event.clientX
+  ;(event.target as HTMLElement).setPointerCapture(event.pointerId)
+}
+function onHandlePointerMove(event: PointerEvent) {
+  if (dragIndex < 0) return
+  const delta = event.clientX - dragStartX
+  if (Math.abs(delta) < TILE_STRIDE * 0.5) return
+  const toRight = delta > 0
+  const target = toRight ? dragIndex + 1 : dragIndex - 1
+  if (target < 0 || target > run.value.length - 2) return
+  if (cuts.value[target]) return // 隣にも境目があるなら重ねない（既に切れている）。
+  const next = [...cuts.value]
+  next[dragIndex] = false
+  next[target] = true
+  cuts.value = next
+  dragIndex = target
+  dragStartX = event.clientX
+}
+function onHandlePointerUp() {
+  dragIndex = -1
 }
 
 async function confirm() {
@@ -118,30 +169,51 @@ async function confirm() {
 </script>
 
 <template>
-  <v-dialog :model-value="true" max-width="720" @update:model-value="() => emit('close')">
-    <v-card title="まとまりを編集">
-      <v-card-text>
+  <v-dialog :model-value="true" max-width="960" @update:model-value="() => emit('close')">
+    <v-card title="まとまりを編集" style="max-height: 88vh; display: flex; flex-direction: column">
+      <v-card-text style="overflow-y: auto">
         <p class="text-caption text-medium-emphasis mb-2">
-          写真をタップすると、その塊の代表に選び直せます（★印）。はさみ/鎖のアイコンで境目を切る・繋ぐ
+          写真をタップすると、その塊の代表に選び直せます（★印）。境目のハンドルはタップで切る/繋ぐ、
+          左右にドラッグすると隣の境目へ動かせます
         </p>
-        <div class="d-flex ga-1 mb-4 flex-wrap">
+        <div class="d-flex align-center mb-4" style="overflow-x: auto; padding-bottom: 8px">
           <template v-for="(id, index) in run" :key="id">
             <div
-              :style="tileStyle(index)"
-              style="width: 72px; height: 72px; border-radius: 4px; display:flex; align-items:center; justify-content:center; cursor:pointer; position:relative"
-              class="text-caption"
+              :style="`${tileStyle(index)}; width: 144px; height: 144px; border-radius: 6px; flex-shrink: 0; position: relative; overflow: hidden; cursor: pointer`"
               @click="pickLeader(index, id)"
             >
-              {{ id.split('/').pop() }}
-              <v-icon v-if="isLeader(index, id)" icon="mdi-star" size="14" color="#d6ff73" style="position:absolute; top:2px; right:2px" />
+              <img
+                v-if="displayUrls[id]"
+                :src="displayUrls[id]"
+                :alt="id.split('/').pop()"
+                style="width: 100%; height: 100%; object-fit: cover"
+              >
+              <div v-else class="d-flex align-center justify-center text-caption text-medium-emphasis" style="width: 100%; height: 100%">
+                {{ id.split('/').pop() }}
+              </div>
+              <v-chip v-if="isLeader(index, id)" size="x-small" color="lime" class="text-black" style="position: absolute; top: 4px; right: 4px">
+                <v-icon icon="mdi-star" size="12" start />代表
+              </v-chip>
             </div>
-            <v-btn
+            <!-- 境目のハンドル。Android版の 44dp 丸ハンドルに相当（タップ=切る/繋ぐ、ドラッグ=移動）。 -->
+            <div
               v-if="index < run.length - 1"
-              :icon="cuts[index] ? 'mdi-content-cut' : 'mdi-link'"
-              size="small"
-              variant="text"
+              style="width: 32px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; height: 144px; cursor: pointer; touch-action: none"
               @click="toggleCut(index)"
-            />
+              @pointerdown="onHandlePointerDown(index, $event)"
+              @pointermove="onHandlePointerMove"
+              @pointerup="onHandlePointerUp"
+              @pointercancel="onHandlePointerUp"
+            >
+              <div
+                v-if="cuts[index]"
+                style="width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center"
+                :style="`background: ${tintOf(index - 1 >= 0 ? index - 1 : index)}`"
+              >
+                <v-icon icon="mdi-content-cut" size="16" color="black" />
+              </div>
+              <div v-else style="width: 2px; height: 100%; background: #5f6572" />
+            </div>
           </template>
         </div>
         <p class="text-body-2 text-medium-emphasis">
