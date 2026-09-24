@@ -225,14 +225,14 @@ async function create() {
 </script>
 
 <template>
-  <div class="d-flex flex-column" style="height: calc(100vh - 0px)">
-    <div v-if="!isWide" class="d-flex align-center pa-3">
+  <div class="d-flex flex-column" style="height: 100vh; overflow: hidden">
+    <div v-if="!isWide" class="d-flex align-center pa-3" style="flex-shrink: 0">
       <v-btn icon="mdi-arrow-left" variant="text" @click="router.back()" />
       <span class="text-h6 ml-2">プロジェクトを作成</span>
     </div>
-    <span v-else class="text-h5 pa-4 pb-0">プロジェクトを作成</span>
+    <span v-else class="text-h5 pa-4 pb-0" style="flex-shrink: 0">プロジェクトを作成</span>
 
-    <v-tabs v-model="tab" class="px-4">
+    <v-tabs v-model="tab" class="px-4" style="flex-shrink: 0">
       <v-tab value="folder">フォルダ</v-tab>
       <v-tab value="amazon" :disabled="!capabilities.amazon">
         Amazon Photos
@@ -240,7 +240,9 @@ async function create() {
       </v-tab>
     </v-tabs>
 
-    <div v-if="tab === 'amazon'" class="pa-6" style="max-width: 520px">
+    <!-- フォームが長くなっても（NASタブの一覧が多い等）、この中だけがスクロールし、
+         下のキャンセル・作成ボタンは常に画面内に収まる（flex-grow-1 + min-height:0 + overflow-y:auto）。 -->
+    <div v-if="tab === 'amazon'" class="pa-6 flex-grow-1" style="max-width: 520px; min-height: 0; overflow-y: auto">
       <v-text-field
         v-model="amazonUrl"
         label="Amazon Photos の共有リンク"
