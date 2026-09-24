@@ -27,6 +27,10 @@ const session = ref<Session | null>(null)
 const thumbUrls = ref<Record<string, string>>({})
 const preparing = ref(false)
 const prepareProgress = ref<PrepareProgress | null>(null)
+// 準備が失敗したら、自動ではやり直さない（「再試行」だけ）。load() が開き直すたびに
+// 準備を走らせるので、失敗を覚えておかないと出所へ問い合わせ続ける（Amazon の
+// リンクが消えたとき、3 秒で 19 回叩いていた）。
+const prepareError = ref<string | null>(null)
 const menu = ref(false)
 const renameOpen = ref(false)
 const renameValue = ref('')
@@ -124,7 +128,7 @@ async function load() {
   // Android版（ProjectScreen の LaunchedEffect）と同じく、開いたら準備が自動で
   // 動き出す（「準備を始める」ボタン押下を待たない）。中断（cancelPrepare）は
   // そのまま残し、中断後にこの画面を開き直すと自動で再開する。
-  if (needsPrepare.value && !preparing.value) {
+  if (needsPrepare.value && !preparing.value && !prepareError.value) {
     void runPrepare()
   }
 }
@@ -132,12 +136,15 @@ async function load() {
 async function runPrepare() {
   if (!project.value || preparing.value) return
   preparing.value = true
+  prepareError.value = null
   abortController = new AbortController()
   try {
     await backend.prepare(projectId.value, (p) => {
       prepareProgress.value = p
       void backend.getProject(projectId.value).then((next) => { if (next) project.value = next })
     }, abortController.signal)
+  } catch (cause) {
+    prepareError.value = cause instanceof Error ? cause.message : '準備できませんでした。'
   } finally {
     preparing.value = false
     prepareProgress.value = null
@@ -209,7 +216,10 @@ function fmtBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)}MB`
 }
 
-watch(projectId, load)
+watch(projectId, () => {
+  prepareError.value = null
+  void load()
+})
 
 // フィルタを切り替えたとき、まだ URL を取っていない分だけ追加で取る（サムネイルは出所ごとに軽い）。
 watch(filterMode, async () => {
@@ -280,8 +290,8 @@ watch(filterMode, async () => {
               class="mb-2"
             />
             <p class="text-caption text-medium-emphasis">できた写真から選別に出ます。ネットワーク越しの場合は Wi-Fi を推奨します。</p>
-            <v-alert v-if="project.prepareWarning" type="warning" density="compact" class="mt-2">
-              {{ project.prepareWarning }}
+            <v-alert v-if="project.prepareWarning || prepareError" type="warning" density="compact" class="mt-2">
+              {{ project.prepareWarning ?? prepareError }}
               <template #append>
                 <v-btn size="small" variant="text" @click="runPrepare">再試行</v-btn>
               </template>
