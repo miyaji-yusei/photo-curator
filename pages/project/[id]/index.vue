@@ -10,6 +10,7 @@ import type { Project, ProjectPhoto, PrepareProgress } from '~/types/project'
 import type { Session } from '~/lib/core'
 import { projectStatus } from '~/utils/projectStatus'
 import SidecarConflictDialog from '~/components/SidecarConflictDialog.vue'
+import ZoomView from '~/components/ZoomView.vue'
 
 definePageMeta({ layout: 'default' })
 
@@ -80,6 +81,30 @@ const starRows = computed(() => {
   for (const row of photoRows.value) counts[Math.min(5, Math.max(0, row.rating))] += 1
   return [5, 4, 3, 2, 1].map(star => ({ star, count: counts[star] ?? 0 })).filter(r => r.count > 0)
 })
+
+// タイルをタップすると大きく見られる（見るだけ。星は動かさない。app-android の
+// ProjectScreen の一覧タップと同じ。02章のプロジェクト詳細節）。絞り込んだ並びの
+// まま前後へ送れるよう、zoomPaths は filteredRows と同じ順にする。
+const photoByPath = computed(() => Object.fromEntries(photos.value.map(p => [p.relativePath, p])))
+const zoomIndex = ref<number | null>(null)
+const zoomDisplayUrls = ref<Record<string, string>>({})
+const zoomPaths = computed(() => filteredRows.value.map(r => r.relativePath))
+async function ensureZoomUrl(path: string) {
+  if (zoomDisplayUrls.value[path]) return
+  const url = await backend.displayUrl(projectId.value, path)
+  if (url) zoomDisplayUrls.value = { ...zoomDisplayUrls.value, [path]: url }
+}
+function openZoom(path: string) {
+  const at = zoomPaths.value.indexOf(path)
+  if (at < 0) return
+  zoomIndex.value = at
+  void ensureZoomUrl(path)
+}
+function moveZoom(i: number) {
+  zoomIndex.value = i
+  const p = zoomPaths.value[i]
+  if (p) void ensureZoomUrl(p)
+}
 
 async function load() {
   await app.load()
@@ -321,7 +346,8 @@ watch(filterMode, async () => {
           <div
             v-for="row in filteredRows.slice(0, 96)"
             :key="row.relativePath"
-            style="position: relative; width: 96px; height: 96px; background: #16181d; overflow: hidden; border-radius: 4px"
+            style="position: relative; width: 96px; height: 96px; background: #16181d; overflow: hidden; border-radius: 4px; cursor: pointer"
+            @click="openZoom(row.relativePath)"
           >
             <img
               v-if="thumbUrls[row.relativePath]"
@@ -404,6 +430,18 @@ watch(filterMode, async () => {
       :theirs="clash"
       @keep-mine="resolveClash('mine')"
       @keep-theirs="resolveClash('theirs')"
+    />
+
+    <ZoomView
+      v-if="zoomIndex !== null"
+      :paths="zoomPaths"
+      :index="zoomIndex"
+      :display-urls="zoomDisplayUrls"
+      :resolve-original="(p) => backend.originalUrl(projectId, p)"
+      :file-size="(p) => photoByPath[p]?.size ?? null"
+      :show-keep="false"
+      @close="zoomIndex = null"
+      @move="moveZoom"
     />
   </div>
   <div v-else class="text-center pa-8">
