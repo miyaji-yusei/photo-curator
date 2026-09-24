@@ -139,6 +139,18 @@ function openZoom(path: string) {
   if (at >= 0) zoomIndex.value = at
 }
 
+// 連写の中身選別（BurstReviewView）を開いている間の拡大は、結果一覧の並び
+// （zoomPaths）ではなく、そのまとまりの中身（reviewMembers）を対象にする。
+const reviewZooming = ref(false)
+function openReviewZoom(index: number) {
+  reviewZooming.value = true
+  zoomIndex.value = index
+}
+function closeZoom() {
+  zoomIndex.value = null
+  reviewZooming.value = false
+}
+
 // ---- 連写の中身選別（burst-review） ----
 const reviewMembers = computed<string[]>(() => {
   if (!reviewTarget.value || !session.value) return []
@@ -431,13 +443,13 @@ const targetLabel = computed(() => {
 
     <ZoomView
       v-if="zoomIndex !== null"
-      :paths="zoomPaths"
+      :paths="reviewZooming ? reviewMembers : zoomPaths"
       :index="zoomIndex"
       :display-urls="thumbUrls"
       :resolve-original="(p) => backend.originalUrl(projectId, p)"
       :file-size="(p) => photoByPath[p]?.size ?? null"
       :show-keep="false"
-      @close="zoomIndex = null"
+      @close="closeZoom"
       @move="(i) => (zoomIndex = i)"
     >
       <template #extra="{ path }">
@@ -449,6 +461,7 @@ const targetLabel = computed(() => {
     <BurstReviewView
       v-if="reviewTarget"
       :members="reviewMembers"
+      @zoom="openReviewZoom"
       :base-star="reviewBaseStar"
       :display-urls="thumbUrls"
       @close="reviewTarget = null"
