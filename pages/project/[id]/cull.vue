@@ -419,8 +419,8 @@ onBeforeUnmount(() => stopAutoPush())
         </div>
       </div>
       <div class="d-flex ga-2 justify-center mt-4" style="flex-shrink: 0">
-        <v-btn color="primary" @click="answerQuestion(true)">同じ</v-btn>
-        <v-btn variant="tonal" @click="answerQuestion(false)">別</v-btn>
+        <v-btn variant="outlined" prepend-icon="mdi-close" @click="answerQuestion(false)">別の写真</v-btn>
+        <v-btn color="primary" prepend-icon="mdi-check" @click="answerQuestion(true)">同じ連写</v-btn>
       </div>
       <v-btn variant="text" class="mt-2" style="flex-shrink: 0" @click="skipLearning">残りをスキップ</v-btn>
     </div>

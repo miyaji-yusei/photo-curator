@@ -255,12 +255,21 @@ async function confirmRestart() {
 }
 
 const hasBursts = computed(() => rows.value.some(r => r.burstSize > 1))
+// Android版 Results.kt の StarChip と同じく、件数付きの文言で揃える
+// （「すべて」にも合計枚数を出す）。
 const starChips = computed(() => {
-  const chips: { label: string; value: number | null }[] = [{ label: 'すべて', value: null }]
+  const chips: { label: string; value: number | null }[] = [{ label: `すべて ${summary.value.total}`, value: null }]
   for (let s = 5; s >= 1; s -= 1) {
     if ((summary.value.counts[s] ?? 0) > 0) chips.push({ label: `★${s} · ${summary.value.counts[s]}`, value: s })
   }
   return chips
+})
+// 取り出しボタンの文言。Android版 Results.kt の targetLabel と同じ考え方
+// （「[対象] を…」。選んでいなければいまの絞り込みの対象を言う）。
+const targetLabel = computed(() => {
+  if (selected.value.size > 0) return `選んだ ${selected.value.size} 枚`
+  if (filterStar.value === null) return `すべて ${filteredSorted.value.length} 枚`
+  return `★${filterStar.value} ${filteredSorted.value.length} 枚`
 })
 </script>
 
@@ -280,8 +289,8 @@ const starChips = computed(() => {
       </v-menu>
       <v-menu>
         <template #activator="{ props: outProps }">
-          <v-btn color="primary" class="ml-2" :loading="exportBusy" v-bind="outProps">
-            {{ selected.size > 0 ? selected.size + ' 枚' : 'すべて' }} を…
+          <v-btn color="primary" class="ml-2" prepend-icon="mdi-export-variant" :loading="exportBusy" v-bind="outProps">
+            {{ targetLabel }} を…
           </v-btn>
         </template>
         <v-list>
