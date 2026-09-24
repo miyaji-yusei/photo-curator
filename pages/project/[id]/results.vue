@@ -29,6 +29,8 @@ const thumbUrls = ref<Record<string, string>>({})
 const photoByPath = computed(() => Object.fromEntries(photos.value.map(p => [p.relativePath, p])))
 /** Amazon 出所は端末にフォルダも原本も無いので、フォルダ分け・XMP は選べない（08章）。 */
 const isAmazon = computed(() => project.value?.source.kind === 'amazon')
+/** Web の Amazon 出所は写真をバイトとして読めない（capabilities.amazonDisplayOnly）ので、CSV だけ。 */
+const csvOnly = computed(() => isAmazon.value && capabilities.amazonDisplayOnly)
 
 // プロジェクト詳細の「星の行」から来たときは、その星で絞った状態で開く
 // （02章「プロジェクト詳細」の遷移表「星の行 → results（その星で絞る）」）。
@@ -328,9 +330,10 @@ const targetLabel = computed(() => {
             :title="capabilities.writeMetadata ? '原本の XMP に星を書く' : 'XMP に星（PC 版で使えます）'"
             @click="requestExport('xmp')"
           />
-          <v-list-item v-if="capabilities.share" title="共有" @click="requestExport('share')" />
+          <v-list-item v-if="capabilities.share && !csvOnly" title="共有" @click="requestExport('share')" />
           <!-- PC 通常は exportFolders が出口。Amazon 出所だけは端末にフォルダが無いので ZIP を出口にする（08章）。 -->
-          <v-list-item v-if="capabilities.exportZip || isAmazon" title="ZIP を書き出す" @click="requestExport('zip')" />
+          <v-list-item v-if="(capabilities.exportZip || isAmazon) && !csvOnly" title="ZIP を書き出す" @click="requestExport('zip')" />
+          <v-list-item v-if="csvOnly" disabled title="ZIP（PC 版で使えます）" />
           <v-list-item title="CSV を書き出す" @click="requestExport('csv')" />
         </v-list>
       </v-menu>
@@ -438,7 +441,7 @@ const targetLabel = computed(() => {
     </div>
 
     <p class="text-caption text-medium-emphasis text-center mt-6">
-      {{ capabilities.sidecar ? '星は写真のフォルダにも記録します（.photo-curator）' : 'この端末だけの結果' }}
+      {{ capabilities.sidecar && !isAmazon ? '星は写真のフォルダにも記録します（.photo-curator）' : 'この端末だけの結果' }}
     </p>
 
     <ZoomView
