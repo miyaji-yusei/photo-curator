@@ -32,7 +32,7 @@ const sampleCount = ref<number | null>(null)
 const sampleThumbs = ref<string[]>([])
 const sampleLoading = ref(false)
 
-// Amazon Photos（PC だけ。capabilities.amazon）。共有リンクを貼って下見してから作成する（08章）。
+// Amazon Photos（capabilities.amazon。Web は amazonDisplayOnly の縮小版）。共有リンクを貼って下見してから作成する（08章）。
 const amazonUrl = ref('')
 const amazonLoading = ref(false)
 const amazonSource = ref<ProjectSource | null>(null)
@@ -191,18 +191,19 @@ async function create() {
   creating.value = true
   errorText.value = ''
   try {
-    if (environment === 'webPicker') {
-      if (!backend.importPhotos) throw new Error('この環境では写真の取り込みに対応していません。')
-      const project = await backend.importPhotos(projectName.value.trim(), pickedFiles.value)
-      await router.push(`/project/${project.id}`)
-      return
-    }
+    // Amazon を先に見る。Web（ピッカー）でも Amazon タブからは取り込みではなく作成になる。
     if (tab.value === 'amazon') {
       if (!amazonSource.value) return
       const project = await backend.createProject({
         name: projectName.value.trim(),
         source: { ...amazonSource.value, label: projectName.value.trim() }
       })
+      await router.push(`/project/${project.id}`)
+      return
+    }
+    if (environment === 'webPicker') {
+      if (!backend.importPhotos) throw new Error('この環境では写真の取り込みに対応していません。')
+      const project = await backend.importPhotos(projectName.value.trim(), pickedFiles.value)
       await router.push(`/project/${project.id}`)
       return
     }
@@ -236,7 +237,7 @@ async function create() {
       <v-tab value="folder">フォルダ</v-tab>
       <v-tab value="amazon" :disabled="!capabilities.amazon">
         Amazon Photos
-        <span v-if="!capabilities.amazon" class="text-caption ml-1 text-medium-emphasis">（PC 版で使えます）</span>
+        <span v-if="capabilities.amazonDisplayOnly" class="text-caption ml-1 text-medium-emphasis">（表示のみ）</span>
       </v-tab>
     </v-tabs>
 
@@ -259,6 +260,11 @@ async function create() {
         まず見本だけ読みます（原本はまだ読みません）。選別を始めると、
         写真1枚ごとに必要なぶんだけ Amazon から取ってきます。端末には置きません。
       </p>
+      <v-alert v-if="capabilities.amazonDisplayOnly" type="info" variant="tonal" density="compact" class="mt-3">
+        Web 版では Amazon の写真を表示するだけです。写真の中身を読めないため、
+        連写は自動でまとまりません（選別中に複数選んで「この写真をまとめる」でまとめられます）。
+        書き出しは CSV だけで、選別中も通信が要ります。ZIP での書き出しは PC 版で使えます。
+      </v-alert>
 
       <template v-if="selected">
         <v-text-field v-model="projectName" label="プロジェクト名" clearable class="mt-4" />

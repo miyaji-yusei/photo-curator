@@ -19,11 +19,14 @@ export interface Capabilities {
   fullResolution: boolean
   /** SMB で NAS に直接繋げる。PC・Web は無し（PC は Windows のフォルダとして開く）。 */
   smb: boolean
-  /** Amazon Photos の共有リンクを読める。段7でブラウザから実測: JSON API は
-   *  CORS 開放だが画像 CDN は不可（fetch・crossOrigin="anonymous" とも拒否）。
-   *  Web からは原本はおろか見本すら安定して読めないため、PC（Rust 経由。CORS
-   *  の制約を受けない）だけ true とする。 */
+  /** Amazon Photos の共有リンクを出所にできる。Web は `amazonDisplayOnly` の縮小版。 */
   amazon: boolean
+  /** Amazon の写真を「表示」はできるが「バイト」として読めない。ブラウザから実測
+   *  （2026-09-24）: JSON API は CORS 開放だが、画像 CDN は fetch も
+   *  crossOrigin="anonymous" の <img> も拒否し、素の <img src> だけが通る。
+   *  true なら指紋（連写の自動判定）・ZIP・共有は無く、取り出しは CSV だけ。
+   *  PC は Rust から読むので CORS の制約を受けない（false）。 */
+  amazonDisplayOnly: boolean
   /** OS の共有ライブラリ（お気に入り等）に書ける。 */
   mediaStoreWrite: boolean
   /** 共有シート（Web Share API）を持つ。 */
@@ -48,6 +51,7 @@ const TABLE: Record<Environment, Capabilities> = {
     fullResolution: true,
     smb: false,
     amazon: true,
+    amazonDisplayOnly: false,
     mediaStoreWrite: false,
     share: false,
     exportFolders: true,
@@ -61,7 +65,8 @@ const TABLE: Record<Environment, Capabilities> = {
     browseFolders: true,
     fullResolution: true,
     smb: false,
-    amazon: false,
+    amazon: true,
+    amazonDisplayOnly: true,
     mediaStoreWrite: false,
     share: false,
     exportFolders: false,
@@ -75,7 +80,8 @@ const TABLE: Record<Environment, Capabilities> = {
     browseFolders: false,
     fullResolution: false,
     smb: false,
-    amazon: false,
+    amazon: true,
+    amazonDisplayOnly: true,
     mediaStoreWrite: false,
     share: true,
     exportFolders: false,
