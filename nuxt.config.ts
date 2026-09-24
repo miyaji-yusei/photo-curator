@@ -32,6 +32,11 @@ export default defineNuxtConfig({
     }
   },
   devtools: { enabled: true },
+  // 開発サーバーを LAN のどこからでも開けるようにする（iPad・Android の実機確認用。
+  // `--host` を CLI で渡す方式は `pnpm tauri:dev` 経由だと二重に `--` が要って
+  // 忘れやすいので、既定をここに固定する。プライベートネットワークの外へは
+  // Windows ファイアウォールが別途守る）。
+  devServer: { host: '0.0.0.0' },
   // vite-plugin-vuetify の autoImport が入れるのはコンポーネント個別のスタイル
   // だけ。余白・flex・typography のユーティリティ（ga-4 / mb-8 / pa-7 /
   // d-flex / text-h3 など）と v-card__overlay の基準値は 'vuetify/styles' 側に

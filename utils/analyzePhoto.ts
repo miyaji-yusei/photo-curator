@@ -114,8 +114,12 @@ function lumaFromRgba(rgba: ArrayLike<number>, pixels: number): Uint8Array {
   return luma
 }
 
-/** 保存したサムネイルの画素から dHash を出す。**指紋の計算そのものは core。** */
-async function hashThumbnail(thumbnail: Blob): Promise<string | null> {
+/**
+ * 保存したサムネイルの画素から dHash を出す。**指紋の計算そのものは core。**
+ * Amazon 中継（lib/backends/amazonWeb.ts）でも、viewBox=160 の JPEG から
+ * 同じ手順で指紋を作るためにここから呼ぶ（PC 版 amazon.rs と同じ発想）。
+ */
+export async function hashThumbnail(thumbnail: Blob): Promise<string | null> {
   await initCore()
   const bitmap = await createImageBitmap(thumbnail)
   try {

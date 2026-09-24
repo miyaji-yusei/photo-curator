@@ -1,12 +1,16 @@
 // Web（フォルダ・ピッカー）で Amazon Photos の共有リンクを読む（設計 08 章の縮小版）。
 //
-// 画像 CDN が CORS 非対応で、**写真をバイトとして読めない**（lib/amazonShare.ts の冒頭）。
-// だから PC と違い、サムネイル・表示用画像を作らず、tempLink（`?viewBox=N` 付き）の
-// URL をそのまま thumbnailUrl / displayUrl として返す（素の <img src> なら出せる）。
-// その結果、次の 3 つが PC と違う（capabilities.amazonDisplayOnly）:
-//   - 指紋（dHash）が無い → 連写を自動でまとめない（選別中の「この写真をまとめる」で手で）
-//   - 取り出しは CSV だけ（ZIP・共有はバイトが要る）
-//   - 端末に絵を置かないので、選別にも網が要る（CON-6 の例外）
+// 画像 CDN が CORS 非対応で、ブラウザ単体では**写真をバイトとして読めない**
+// （lib/amazonShare.ts の冒頭）。表示（サムネイル・表示用画像・拡大）は PC と違い、
+// tempLink（`?viewBox=N` 付き）の URL をそのまま thumbnailUrl / displayUrl として
+// 返す（素の <img src> なら出せる。CORS の影響を受けない）。
+//
+// **指紋（dHash）と ZIP・共有だけは、自分のサーバー（server/api/amazon/image.get.ts）
+// を中継に使えたときだけフルで動く**（別セッションで追加。2026-09-24）。
+// GitHub Pages のような静的配信にはその経路自体が無いので、`fetchAmazonBytes` が
+// 失敗を静かに返し、指紋なし・CSV のみへ自然に落ちる（capabilities は増やさず、
+// 呼び出しごとの成否で判断する。CON-5「機能の有無で分ける」の精神をランタイムに
+// 落とし込んだもの）。
 //
 // Web の Backend は 1 つだけ選ばれる（useBackend）ので、`withAmazonWeb` で包み、
 // 出所が amazon のプロジェクトだけをここへ回す。保存の形（IndexedDB の鍵）は
@@ -20,12 +24,15 @@ import type {
   AppSettings, Project, ProjectPhoto, ProjectSource, PrepareProgress
 } from '~/types/project'
 import { idbDelete, idbGet, idbSet } from '~/lib/idb'
-import { parseContentDate, parseKey, parseShareUrl, readShare, viewBoxUrl } from '~/lib/amazonShare'
+import { fetchAmazonBytes, parseContentDate, parseKey, parseShareUrl, readShare, viewBoxUrl } from '~/lib/amazonShare'
+import { hashThumbnail } from '~/utils/analyzePhoto'
 
-/** サムネイルの長辺（08章 6「絵の 3 段」）。 */
+/** サムネイルの長辺（08章 6「絵の 3 段」）。指紋もここから作る（PC 版 amazon.rs と同じ）。 */
 const THUMB_EDGE = 160
 const SAMPLE_LIMIT = 12
-const ONLY_CSV = 'Web 版の Amazon Photos は CSV だけ書き出せます（ZIP は PC 版で使えます）。'
+/** 指紋作りを並列でいくつまで同時に投げるか。08章11「並列は控えめに」と同じ考え方。 */
+const HASH_CONCURRENCY = 4
+const ONLY_CSV = '中継サーバーが無いため、CSV だけ書き出せます。'
 
 /** 1 枚ぶんの控え。**鍵は node id**（08章 2.5・落とし穴 4）。 */
 interface AmazonEntry {
@@ -126,6 +133,42 @@ class AmazonWebProjects {
     await idbSet(`project:${projectId}`, project)
     onProgress({ task: 'scan', done: photos.length, total: photos.length, warning: null })
     onProgress({ task: 'display', done: photos.length, total: photos.length, warning: null })
+
+    // 指紋（dHash）。中継サーバーがあれば作る。**無くても選別は始められる**
+    // （連写が自動でまとまらないだけ。手動の「この写真をまとめる」は使える。
+    // cull.vue の hasFingerprints が dHash の有無だけを見て自然に切り替わる）。
+    await this.hashPhotos(projectId, photos, entries, onProgress, signal)
+  }
+
+  /** 中継（server/api/amazon/image.get.ts）経由で指紋を作る。読めない1枚は諦めて続ける。 */
+  private async hashPhotos(
+    projectId: string,
+    photos: ProjectPhoto[],
+    entries: Entries,
+    onProgress: (p: PrepareProgress) => void,
+    signal: AbortSignal
+  ): Promise<void> {
+    const total = photos.length
+    let done = 0
+    let index = 0
+    const worker = async () => {
+      while (index < photos.length) {
+        if (signal.aborted) return
+        const photo = photos[index]!
+        index += 1
+        const entry = entries[photo.relativePath]
+        const blob = entry ? await fetchAmazonBytes(entry.tempLink, THUMB_EDGE) : null
+        const hash = blob ? await hashThumbnail(blob) : null
+        if (hash) {
+          photo.dHash = hash
+          photo.dHashVersion = 2
+        }
+        done += 1
+        onProgress({ task: 'hash', done, total, warning: null })
+      }
+    }
+    await Promise.all(Array.from({ length: HASH_CONCURRENCY }, worker))
+    if (!signal.aborted) await idbSet(`photos:${projectId}`, photos)
   }
 
   async thumbnailUrl(projectId: string, relativePath: string): Promise<string | null> {
@@ -185,6 +228,26 @@ class AmazonWebProjects {
       rows.push(`${JSON.stringify(photo.relativePath)},${photo.rating ?? 0},${photo.capturedAt ?? ''},${JSON.stringify(name)}`)
     }
     return new Blob([rows.join('\n')], { type: 'text/csv' })
+  }
+
+  /**
+   * ZIP（star-N/ に分ける。02章の差分表）。中継サーバー経由で原本のバイトを取れたときだけ。
+   * **1 枚も取れなければ諦める**（中継サーバーが無い＝GitHub Pages 等の静的配信）。
+   */
+  async exportZip(projectId: string, photos: RatedPhoto[]): Promise<Blob> {
+    const entries = await this.entries(projectId)
+    const { createStoredZip, uniquePath } = await import('~/utils/zip')
+    const taken = new Set<string>()
+    const zipEntries = []
+    for (const photo of photos) {
+      const entry = entries[photo.relativePath]
+      if (!entry) continue
+      const blob = await fetchAmazonBytes(entry.tempLink)
+      if (!blob) continue
+      zipEntries.push({ path: uniquePath(taken, `star-${photo.rating}/${entry.name}`), blob, modifiedAt: photo.capturedAt ?? undefined })
+    }
+    if (zipEntries.length === 0) throw new Error(ONLY_CSV)
+    return createStoredZip(zipEntries)
   }
 }
 
@@ -321,8 +384,7 @@ class AmazonAwareBackend implements Backend {
     return (await this.isAmazon(projectId)) ? this.amazon.exportCsv(projectId, photos) : this.base.exportCsv(projectId, photos)
   }
   async exportZip(projectId: string, photos: RatedPhoto[]): Promise<Blob> {
-    if (await this.isAmazon(projectId)) throw new Error(ONLY_CSV)
-    return this.base.exportZip(projectId, photos)
+    return (await this.isAmazon(projectId)) ? this.amazon.exportZip(projectId, photos) : this.base.exportZip(projectId, photos)
   }
   async shareTargets(projectId: string, photos: RatedPhoto[]): Promise<File[]> {
     if (await this.isAmazon(projectId)) return []

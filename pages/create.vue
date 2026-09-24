@@ -261,9 +261,9 @@ async function create() {
         写真1枚ごとに必要なぶんだけ Amazon から取ってきます。端末には置きません。
       </p>
       <v-alert v-if="capabilities.amazonDisplayOnly" type="info" variant="tonal" density="compact" class="mt-3">
-        Web 版では Amazon の写真を表示するだけです。写真の中身を読めないため、
-        連写は自動でまとまりません（選別中に複数選んで「この写真をまとめる」でまとめられます）。
-        書き出しは CSV だけで、選別中も通信が要ります。ZIP での書き出しは PC 版で使えます。
+        Web 版は選別中も通信が要ります。中継サーバーが無い環境では、写真の中身を読めないため
+        連写は自動でまとまらず（選別中に複数選んで「この写真をまとめる」でまとめられます）、
+        書き出しは CSV だけになります。
       </v-alert>
 
       <template v-if="selected">
