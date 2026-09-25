@@ -26,6 +26,7 @@ import type {
 import { idbDelete, idbGet, idbSet } from '~/lib/idb'
 import { fetchAmazonBytes, parseContentDate, parseKey, parseShareUrl, readShare, viewBoxUrl } from '~/lib/amazonShare'
 import { hashThumbnail } from '~/utils/analyzePhoto'
+import { randomUUID } from '~/utils/uuid'
 
 /** サムネイルの長辺（08章 6「絵の 3 段」）。指紋もここから作る（PC 版 amazon.rs と同じ）。 */
 const THUMB_EDGE = 160
@@ -66,7 +67,7 @@ class AmazonWebProjects {
   }
 
   async create(input: CreateProjectInput): Promise<Project> {
-    const id = crypto.randomUUID()
+    const id = randomUUID()
     const now = Date.now()
     const project: Project = {
       id,

@@ -16,6 +16,7 @@ import { DEFAULT_SETTINGS } from '~/types/project'
 import { analyzePhotoFile } from '~/utils/analyzePhoto'
 import { idbDelete, idbGet, idbKeysWithPrefix, idbSet } from '~/lib/idb'
 import { ObjectUrlCache } from '~/utils/objectUrlCache'
+import { randomUUID } from '~/utils/uuid'
 
 // ---------------------------------------------------------------------------
 // FolderIO: 実フォルダへの読み書き。native（handle）と dev（HTTP）の 2 実装。
@@ -187,7 +188,7 @@ function isVideoName(name: string): boolean {
 async function deviceId(): Promise<string> {
   const existing = await idbGet<string>('deviceId')
   if (existing) return existing
-  const id = crypto.randomUUID()
+  const id = randomUUID()
   await idbSet('deviceId', id)
   return id
 }
@@ -234,7 +235,7 @@ export class WebFolderBackend implements Backend {
   }
 
   async createProject(input: CreateProjectInput): Promise<Project> {
-    const id = crypto.randomUUID()
+    const id = randomUUID()
     const now = Date.now()
     const project: StoredProject = {
       id,
@@ -319,7 +320,7 @@ export class WebFolderBackend implements Backend {
     try {
       // @ts-expect-error -- showDirectoryPicker はまだ TS 標準 lib に無い
       const handle: FileSystemDirectoryHandle = await window.showDirectoryPicker({ mode: 'readwrite' })
-      const id = crypto.randomUUID()
+      const id = randomUUID()
       await idbSet(`handle:${id}`, handle)
       return { kind: 'folder', key: `handle:${id}`, label: handle.name }
     } catch {

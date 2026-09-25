@@ -20,6 +20,7 @@ import { idbDelete, idbGet, idbKeysWithPrefix, idbSet } from '~/lib/idb'
 import { ObjectUrlCache } from '~/utils/objectUrlCache'
 import { createStoredZip } from '~/utils/zip'
 import { zipEntriesByRating } from '~/utils/shareExport'
+import { randomUUID } from '~/utils/uuid'
 
 interface StoredProject extends Project {}
 
@@ -54,7 +55,7 @@ export class WebPickerBackend implements Backend {
    * 「フォルダを選ぶ→走査する」の段が無く、選んだ瞬間に全部揃う）。
    */
   async importPhotos(name: string, files: File[]): Promise<Project> {
-    const id = crypto.randomUUID()
+    const id = randomUUID()
     const now = Date.now()
     const source: ProjectSource = { kind: 'folder', key: id, label: name }
     const photos: ProjectPhoto[] = []
