@@ -178,6 +178,18 @@ body { margin: 0; }
 .rating-row__count { min-width: 84px; text-align: right; font-variant-numeric: tabular-nums; }
 .rating-row__actions { display: flex; align-items: center; gap: 4px; }
 
+/* プロジェクトの状態の点（ホームの行・サイドバー）。色は projectStatus の STATE_COLOR と揃える。 */
+.status-dot { display: inline-block; flex: none; width: 9px; height: 9px; border-radius: 50%; background: #8b8f98; }
+.status-dot--preparing { background: rgb(var(--v-theme-secondary)); }
+.status-dot--culling { background: rgb(var(--v-theme-primary)); }
+.status-dot--done { background: rgb(var(--v-theme-success)); }
+.status-dot--error { background: rgb(var(--v-theme-error)); }
+.project-status { margin-top: 2px; }
+
+/* プロジェクトの画面の準備の進み。 */
+.prepare-line__label { min-width: 190px; }
+.prepare-line__count { min-width: 96px; text-align: right; font-variant-numeric: tabular-nums; }
+
 /* 移動ダイアログのタイル。選ばれていないものは沈ませる。 */
 .result-tile.is-unpicked { opacity: .4; }
 .result-tile__pick { position: absolute; top: 6px; left: 6px; z-index: 2; }

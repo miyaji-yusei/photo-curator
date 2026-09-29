@@ -26,6 +26,8 @@ import type { CoreInputs } from '~/utils/coreInputs'
 import { applyChanges, moveRatings, pathsWithRating, reviewChanges, setRating } from '~/utils/ratingEdit'
 import { syncRatings } from '~/utils/selectionFlow'
 import { collapseBursts } from '~/utils/collapseBursts'
+import { prepareProgress, projectStatus } from '~/utils/projectStatus'
+import type { CardState, CardStatus, PrepareLine } from '~/utils/projectStatus'
 import { exportTargetsForStars } from '~/utils/exportTargets'
 import { resultsCsv } from '~/utils/amazonCsv'
 import type { RatingChange, SavedSelection } from '~/utils/selectionFlow'
@@ -50,6 +52,10 @@ function createCurator() {
   let sidecarCheckPending: string | null = null
   let stopAutoPush: (() => void) | undefined
   const projects = ref<Project[]>([])
+  /** ホームの行・サイドバーの点が使う、プロジェクトごとの状態と見本。端末にある値だけで決める。 */
+  const projectCards = ref<Record<string, { status: CardStatus, thumbnailUrl: string | null }>>({})
+  /** 開いているプロジェクトの、まだ解析が要る枚数（準備の進み）。 */
+  const analysisBacklog = ref(0)
   const activeProject = ref<Project | null>(null)
   const previewPhotos = ref<Photo[]>([])
   const previewTotal = ref(0)
@@ -381,12 +387,93 @@ function createCurator() {
   async function refreshProjects() {
     // デスクトップは PC の DB、ブラウザは端末内の DB。どちらも一覧を返す。
     projects.value = await desktop.listProjects()
+    void refreshProjectCards()
   }
 
+  let cardsToken = 0
+  /** 各プロジェクトの状態と見本を読み直す（網へは行かない）。新しい呼び出しがあれば古い結果は捨てる。 */
+  async function refreshProjectCards() {
+    const token = ++cardsToken
+    const list = projects.value
+    const entries = await Promise.all(list.map(async (project) => {
+      try {
+        const [analysis, display, saved, summary, first] = await Promise.all([
+          desktop.getAnalysisBacklog(project.id).catch(() => 0),
+          desktop.getDisplayBacklog(project.id).catch(() => 0),
+          desktop.loadSession(project.id).catch(() => null),
+          desktop.getSelectionSummary(project.id).catch(() => null),
+          desktop.getProjectPhotoPage(project.id, 0, 1).catch(() => null)
+        ])
+        const status = projectStatus({
+          project, analysisBacklog: analysis, displayBacklog: display,
+          session: saved?.core ?? null,
+          keptCount: summary ? summary.counts.slice(1).reduce((sum, count) => sum + count, 0) : 0
+        })
+        const photo = first?.photos[0]
+        return [project.id, { status, thumbnailUrl: photo ? desktop.photoThumbnailUrl(photo) : null }] as const
+      } catch {
+        return null
+      }
+    }))
+    if (token !== cardsToken) return
+    projectCards.value = Object.fromEntries(entries.filter(entry => entry !== null))
+  }
+
+  /** 準備の進み 3 行。開いているプロジェクトの、走査の途中は走査の進みを使う。 */
+  const prepareLines = computed<PrepareLine[]>(() => {
+    const project = activeProject.value
+    if (!project) return []
+    const progress = taskProgress.value
+    const scanning = scanRunning.value && progress?.projectId === project.id
+    return prepareProgress({
+      project: scanning ? { ...project, status: 'scanning', photoCount: progress!.processed } : project,
+      analysisBacklog: analysisBacklog.value,
+      displayBacklog: displayBacklog.value,
+      session: null,
+      keptCount: 0
+    })
+  })
+
+  /** 準備の未処理の数を読み直す（進捗のイベントごとには 1 秒に 1 回まで）。 */
+  let prepareCountsAt = 0
+  async function refreshPrepareCounts(projectId: string, force = false) {
+    const now = Date.now()
+    if (!force && now - prepareCountsAt < 1000) return
+    prepareCountsAt = now
+    const [analysis, display] = await Promise.all([
+      desktop.getAnalysisBacklog(projectId).catch(() => 0),
+      desktop.getDisplayBacklog(projectId).catch(() => 0)
+    ])
+    if (activeProject.value?.id !== projectId) return
+    analysisBacklog.value = analysis
+    displayBacklog.value = display
+  }
+
+  const PREVIEW_PAGE = 120
+  let previewMoreBusy = false
+  /** 先頭から読み直す。すでにページ送りで読んだ分は、その数まで読み直す（準備の途中の更新でスクロールが戻らないように）。 */
   async function loadPreview(projectId: string) {
-    const page = await desktop.getProjectPhotoPage(projectId, 0, 80)
+    const page = await desktop.getProjectPhotoPage(projectId, 0, Math.max(PREVIEW_PAGE, previewPhotos.value.length))
+    if (activeProject.value && activeProject.value.id !== projectId) return
     previewPhotos.value = page.photos
     previewTotal.value = page.total
+  }
+
+  /** 格子の末尾が見えたら次のページ（全部を見られる）。 */
+  async function loadMorePreview() {
+    const project = activeProject.value
+    if (!project || previewMoreBusy || previewPhotos.value.length >= previewTotal.value) return
+    previewMoreBusy = true
+    try {
+      const page = await desktop.getProjectPhotoPage(project.id, previewPhotos.value.length, PREVIEW_PAGE)
+      if (activeProject.value?.id !== project.id) return
+      previewPhotos.value = [...previewPhotos.value, ...page.photos]
+      previewTotal.value = page.total
+    } catch {
+      // 次のスクロールでもう一度読む。
+    } finally {
+      previewMoreBusy = false
+    }
   }
 
   async function loadCurrentPhotos(ids = currentGroup.value) {
@@ -515,6 +602,9 @@ function createCurator() {
 
   async function openProject(project: Project) {
     activeProject.value = project
+    previewPhotos.value = []
+    previewTotal.value = 0
+    analysisBacklog.value = 0
     coreInputs.value = null
     pairOverrides = []
     view.value = 'project'
@@ -558,6 +648,7 @@ function createCurator() {
         return
       }
       const backlog = await desktop.getAnalysisBacklog(project.id).catch(() => 0)
+      analysisBacklog.value = backlog
       if (backlog > 0) desktop.startBackgroundAnalysis(project.id).catch(() => undefined)
       // 表示用画像は走査とは別に溜める。**走査に混ぜると解析が桁で遅くなる**
       // （EXIF サムネイル経路 1.72ms/枚 に対しフルデコード 132ms/枚）。
@@ -1957,6 +2048,16 @@ function createCurator() {
     await enterStage()
   }
 
+  /** ホームの行の「次の一手」。プロジェクトを開いてから、状態に合う画面へ進む。 */
+  async function openProjectAction(project: Project, state: CardState) {
+    await openProject(project)
+    if (error.value || activeProject.value?.id !== project.id) return
+    if (state === 'error') await startScan()
+    else if (state === 'culling') await resumeSession()
+    else if (state === 'done') await openResults()
+    else enterMethod()
+  }
+
   function askDeleteProject(project: Project) {
     deleteTarget.value = project
     deleteDialog.value = true
@@ -2117,6 +2218,8 @@ function createCurator() {
   // プロジェクトを閉じる（ホームへ戻る）とき、変更があれば書く。
   watch(view, (next, previous) => {
     if (next === 'home' && previous !== 'home') void sidecar.pushAuto(activeProject.value)
+    // 選別のあとに戻ったとき、行の状態・点を今の値にする。
+    if ((next === 'home' || next === 'project') && previous !== next) void refreshProjectCards()
   })
 
   async function mount() {
@@ -2148,6 +2251,7 @@ function createCurator() {
               activeProject.value = projects.value.find(project => project.id === activeProject.value?.id) ?? activeProject.value
             })
           }
+          void refreshPrepareCounts(progress.projectId, progress.phase === 'complete')
           if (progress.task === 'background') void refreshDuringPreparation(progress)
           return
         }
@@ -2158,6 +2262,7 @@ function createCurator() {
           await refreshProjects()
           activeProject.value = projects.value.find(project => project.id === activeProject.value?.id) ?? activeProject.value
           await loadPreview(progress.projectId)
+          void refreshPrepareCounts(progress.projectId, true)
           await loadCoreInputs(progress.projectId).catch(() => undefined)
           await sidecar.refreshAccess(progress.projectId)
           if (sidecarCheckPending === progress.projectId && activeProject.value) {
@@ -2199,9 +2304,13 @@ function createCurator() {
     MAX_RATING,
     desktop,
     projects,
+    projectCards,
+    openProjectAction,
+    prepareLines,
     activeProject,
     previewPhotos,
     previewTotal,
+    loadMorePreview,
     tournamentPhotos,
     session,
     view,

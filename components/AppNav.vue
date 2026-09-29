@@ -4,6 +4,7 @@ const {
   drawerRail,
   isCompact,
   openProject,
+  projectCards,
   projects,
   statusLabel,
   view
@@ -46,6 +47,7 @@ const {
       <template #activator="{ props }"><v-list-item v-bind="props" prepend-icon="mdi-folder-multiple-image" title="プロジェクト" /></template>
       <v-list-item v-for="project in projects" :key="project.id" class="project-nav-item" :title="project.name" :subtitle="statusLabel(project)" @click="openProject(project)">
         <template #prepend><v-icon size="18" icon="mdi-folder-outline" /></template>
+        <template v-if="projectCards[project.id]" #append><span class="status-dot" :class="`status-dot--${projectCards[project.id]!.status.state}`" role="img" :aria-label="projectCards[project.id]!.status.statusText" /></template>
       </v-list-item>
       <v-list-item v-if="!projects.length" title="まだありません" subtitle="ホームから作成できます" disabled />
     </v-list-group>
