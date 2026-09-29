@@ -12,8 +12,12 @@ import type { AnalyzeWorkerRequest, AnalyzeWorkerResponse } from '~/workers/anal
 /** 同時に走らせる本数の既定。復号 1 枚ぶんのメモリを考えて低めに抑える。 */
 export const DEFAULT_WORKERS = 3
 
-/** 環境に合う本数。1 グループに大きく並べられない端末（iPad など）は 2 本に絞る。 */
-export const workersFor = (largeGroups: boolean) => (largeGroups ? DEFAULT_WORKERS : 2)
+/**
+ * 環境に合う本数。フォルダを選べるブラウザ（PC の Chrome・Edge）は 3 本、
+ * それ以外（iPad の Safari など。HEIC の復号 1 枚で数十 MB 使う）は 2 本に絞る。
+ * `largeGroups` はブラウザでは常に偽なので、ここでは使わない（10章 T7 の保留を 2026-09-30 に決めた）。
+ */
+export const workersFor = (hasDirectoryPicker: boolean) => (hasDirectoryPicker ? DEFAULT_WORKERS : 2)
 
 export interface AnalysisJob {
   id: string

@@ -84,7 +84,7 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
   void fetcher
 
   const capabilities = capabilitiesFor('browser', { directoryPicker: hasDirectoryPicker() })
-  const workers = workersFor(capabilities.largeGroups)
+  const workers = workersFor(hasDirectoryPicker())
 
   /** 原本はセッション中だけ持つ（ピッカー）。リロードで消えるが、保存もしない。 */
   const originals = new Map<string, File>()
