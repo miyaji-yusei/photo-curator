@@ -8,9 +8,12 @@
  * - `projects` / `photos`（索引 projectId）… 行
  * - `states` … Session（キー `<projectId>`）とフォルダの handle（キー `handle:<projectId>`）
  * - `burstShapes` … 手で直した連写の例外（キー `overrides:<projectId>`）
+ * - `states` には、サイドカーの端末の記憶（キー `sidecar:<projectId>`）と端末の id（キー `device`）も置く
  */
 import type { PairOverride } from '~/lib/core'
 import type { SelectionResult } from '~/types/photo'
+import type { SidecarState } from '~/composables/photoBackend'
+import { randomUUID } from '~/utils/uuid'
 import { MAX_RATING } from '~/types/photo'
 import {
   STORE_BURST_SHAPES, STORE_PHOTOS, STORE_PROJECTS, STORE_STATES,
@@ -41,6 +44,12 @@ export interface WebStore {
   readPairOverrides: (projectId: string) => Promise<PairOverride[]>
   writePairOverrides: (projectId: string, overrides: PairOverride[]) => Promise<void>
 
+  /** サイドカーで端末が覚える 3 つの値。まだ無ければ「未確認・変更なし」。 */
+  readSidecarState: (projectId: string) => Promise<SidecarState>
+  writeSidecarState: (projectId: string, state: SidecarState) => Promise<void>
+  /** この端末の id。初回に作って残す。 */
+  deviceId: () => Promise<string>
+
   readHandle: (projectId: string) => Promise<FileSystemDirectoryHandle | null>
   writeHandle: (projectId: string, handle: FileSystemDirectoryHandle) => Promise<void>
 }
@@ -49,6 +58,10 @@ export interface WebStore {
 export const overridesKey = (projectId: string) => `overrides:${projectId}`
 /** フォルダの handle を置く `states` のキー。 */
 export const handleKey = (projectId: string) => `handle:${projectId}`
+/** サイドカーの端末の記憶を置く `states` のキー。 */
+export const sidecarStateKey = (projectId: string) => `sidecar:${projectId}`
+/** 端末の id を置く `states` のキー。 */
+export const DEVICE_KEY = 'device'
 
 export function createIdbStore(): WebStore {
   return {
@@ -78,6 +91,7 @@ export function createIdbStore(): WebStore {
           for (const id of photoIds) await deleteOne(transaction, STORE_PHOTOS, id)
           await deleteOne(transaction, STORE_STATES, projectId)
           await deleteOne(transaction, STORE_STATES, handleKey(projectId))
+          await deleteOne(transaction, STORE_STATES, sidecarStateKey(projectId))
           await deleteOne(transaction, STORE_BURST_SHAPES, overridesKey(projectId))
           await deleteOne(transaction, STORE_PROJECTS, projectId)
         }
@@ -168,6 +182,39 @@ export function createIdbStore(): WebStore {
           updatedAt: Date.now()
         }))
     },
+
+    readSidecarState: async projectId => {
+      const row = await withStores([STORE_STATES], 'readonly', transaction =>
+        getOne<{ seenAt?: number, seenBy?: string, localChanged?: boolean }>(
+          transaction, STORE_STATES, sidecarStateKey(projectId)
+        ))
+      return {
+        seenAt: typeof row?.seenAt === 'number' ? row.seenAt : 0,
+        seenBy: typeof row?.seenBy === 'string' ? row.seenBy : '',
+        localChanged: row?.localChanged === true
+      }
+    },
+
+    writeSidecarState: async (projectId, state) => {
+      await withStores([STORE_STATES], 'readwrite', transaction =>
+        putOne(transaction, STORE_STATES, {
+          projectId: sidecarStateKey(projectId),
+          seenAt: state.seenAt,
+          seenBy: state.seenBy,
+          localChanged: state.localChanged,
+          updatedAt: Date.now()
+        }))
+    },
+
+    deviceId: () =>
+      // 読むと作るを同じトランザクションに入れ、2 つのタブが別々の id を作らないようにする。
+      withStores([STORE_STATES], 'readwrite', async transaction => {
+        const row = await getOne<{ projectId: string, id?: string }>(transaction, STORE_STATES, DEVICE_KEY)
+        if (row?.id) return row.id
+        const id = randomUUID()
+        await putOne(transaction, STORE_STATES, { projectId: DEVICE_KEY, id, updatedAt: Date.now() })
+        return id
+      }),
 
     readHandle: async projectId => {
       const row = await withStores([STORE_STATES], 'readonly', transaction =>

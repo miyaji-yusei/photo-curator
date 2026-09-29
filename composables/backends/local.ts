@@ -22,7 +22,7 @@ import { init as initCore } from '~/lib/core'
 import { parseSavedSelection, serializeSavedSelection } from '~/utils/selectionFlow'
 import type { SavedSelection } from '~/utils/selectionFlow'
 import { MAX_RATING } from '~/types/photo'
-import type { PhotoBackend } from '~/composables/photoBackend'
+import type { DeviceIdentity, PhotoBackend, SidecarAccess, SidecarState } from '~/composables/photoBackend'
 import { analyzeAll, workersFor } from '~/utils/analysisPool'
 import type { AnalysisJob } from '~/utils/analysisPool'
 import { DISPLAY_EDGE_DEFAULT } from '~/utils/analyzePhoto'
@@ -180,6 +180,20 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
       }
     }
     return result
+  }
+
+  /**
+   * サイドカーを扱う `SourceIO`。**許可は求めない**（開くたびに呼ぶので、ダイアログを出さない）。
+   * フォルダの handle が無い・ピッカーは、書けない出所として扱う。
+   */
+  async function sidecarIO(projectId: string): Promise<SourceIO | null> {
+    const row = await store.getProject(projectId)
+    if (!row) return null
+    const source = sourceOf(row)
+    if (source.kind === 'dev') return sourceIO.forDev(source.root)
+    if (source.kind === 'picker') return sourceIO.picker
+    const handle = await store.readHandle(projectId).catch(() => null)
+    return handle ? sourceIO.forHandle(handle) : null
   }
 
   const newRow = (projectId: string, id: string, relativePath: string, name: string): StoredPhoto => ({
@@ -486,6 +500,20 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
       await initCore()
       return parseSavedSelection(raw)
     },
+
+    sidecarSupported: async (projectId: string): Promise<SidecarAccess> =>
+      (await (await sidecarIO(projectId))?.sidecarAccess()) ?? 'none',
+    readSidecar: async (projectId: string) => (await sidecarIO(projectId))?.readSidecar() ?? null,
+    writeSidecar: async (projectId: string, json: string, fileName = 'catalog.json') => {
+      const io = await sidecarIO(projectId)
+      if (!io || (await io.sidecarAccess()) !== 'readwrite') {
+        throw new Error('この出所にはサイドカーを書けません。フォルダへのアクセスを許可してください。')
+      }
+      await io.writeSidecar(json, fileName)
+    },
+    loadSidecarState: (projectId: string): Promise<SidecarState> => store.readSidecarState(projectId),
+    saveSidecarState: (projectId: string, state: SidecarState) => store.writeSidecarState(projectId, state),
+    deviceIdentity: async (): Promise<DeviceIdentity> => ({ id: await store.deviceId(), name: 'ブラウザ' }),
 
     // ブラウザでは既に表示できる URL が入っている。
     photoUrl: (path: string) => path,

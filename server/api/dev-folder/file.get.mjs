@@ -25,7 +25,13 @@ export default defineEventHandler(async (event) => {
   if (!root || !sub) throw createError({ statusCode: 400, statusMessage: 'root/path is required' })
 
   const target = join(root, sub)
-  const info = await stat(target)
+  let info
+  try {
+    info = await stat(target)
+  } catch {
+    // 無いファイル（サイドカーなど）は 404。呼ぶ側が「無い」と扱う。
+    throw createError({ statusCode: 404, statusMessage: 'Not Found' })
+  }
   const ext = extname(target).toLowerCase()
   setHeader(event, 'Content-Type', CONTENT_TYPES[ext] ?? 'application/octet-stream')
   setHeader(event, 'Content-Length', String(info.size))

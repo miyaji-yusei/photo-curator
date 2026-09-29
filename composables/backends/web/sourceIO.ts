@@ -20,10 +20,24 @@ export interface SourceIO {
   /** `subPath` は出所の根からの相対（根は空文字。区切りは `/`）。 */
   list(subPath: string): Promise<SourceEntry[]>
   readFile(subPath: string, name: string): Promise<File>
-  /** サイドカー（T8）。書ける出所だけが持つ。 */
-  writeSidecar?(json: string): Promise<void>
-  readSidecar?(): Promise<string | null>
+  /**
+   * サイドカー（`.photo-curator/catalog.json`）。写真のフォルダに置くのはこれだけ。
+   * `readwrite`＝読み書きできる／`readonly`＝読むだけ／`none`＝出所にフォルダが無い。
+   * `readwrite` は許可を求めずに確かめる（利用者の操作が無くても呼べる）。
+   */
+  sidecarAccess(): Promise<SidecarAccessKind>
+  readSidecar(): Promise<string | null>
+  /** 原子的に書く。`fileName` は `catalog.json` か退避の `catalog.<id>.json`。 */
+  writeSidecar(json: string, fileName: string): Promise<void>
 }
+
+export type SidecarAccessKind = 'readwrite' | 'readonly' | 'none'
+
+export const SIDECAR_DIR = '.photo-curator'
+export const SIDECAR_FILE = 'catalog.json'
+/** `catalog.json` か `catalog.<英数字とハイフン>.json` だけ。別の名前・場所へ書かせない。 */
+export const isSidecarFileName = (name: string) =>
+  name === SIDECAR_FILE || /^catalog\.[A-Za-z0-9-]{1,64}\.json$/.test(name)
 
 export const joinPath = (base: string, name: string) => (base ? `${base}/${name}` : name)
 
@@ -67,6 +81,19 @@ export class PickerIO implements SourceIO {
 
   delete(relativePath: string) {
     this.files.delete(relativePath)
+  }
+
+  // ピッカーにはフォルダが無い。サイドカーは読めも書けもしない。
+  sidecarAccess(): Promise<SidecarAccessKind> {
+    return Promise.resolve('none')
+  }
+
+  readSidecar(): Promise<string | null> {
+    return Promise.resolve(null)
+  }
+
+  writeSidecar(): Promise<void> {
+    return Promise.reject(new Error('この出所にはサイドカーを書けません。'))
   }
 }
 
@@ -136,6 +163,40 @@ export class HandleFolderIO implements SourceIO {
     const handle = await dir.getFileHandle(name)
     return handle.getFile()
   }
+
+  /** 書き込みの許可があれば readwrite。許可は求めない（求めるのはプロジェクトの画面のボタン）。 */
+  async sidecarAccess(): Promise<SidecarAccessKind> {
+    return (await hasHandlePermission(this.root)) ? 'readwrite' : 'readonly'
+  }
+
+  async readSidecar(): Promise<string | null> {
+    try {
+      const dir = await this.root.getDirectoryHandle(SIDECAR_DIR)
+      const file = await (await dir.getFileHandle(SIDECAR_FILE)).getFile()
+      return await file.text()
+    } catch (cause) {
+      if (cause instanceof DOMException && cause.name === 'NotFoundError') return null
+      throw cause
+    }
+  }
+
+  /**
+   * 書く。`createWritable` は `.crswap` に書いて close で置き換える（ブラウザ側で原子的）。
+   * **写真のフォルダに作るのは `.photo-curator/` だけ。**
+   */
+  async writeSidecar(json: string, fileName: string): Promise<void> {
+    if (!isSidecarFileName(fileName)) throw new Error('サイドカーのファイル名が正しくありません。')
+    const dir = await this.root.getDirectoryHandle(SIDECAR_DIR, { create: true })
+    const handle = await dir.getFileHandle(fileName, { create: true })
+    const writable = await handle.createWritable()
+    try {
+      await writable.write(json)
+      await writable.close()
+    } catch (cause) {
+      await writable.abort().catch(() => undefined)
+      throw cause
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +226,24 @@ export class DevFolderIO implements SourceIO {
     if (!response.ok) throw new Error(`読めませんでした（${response.status}）`)
     const blob = await response.blob()
     return new File([blob], name, { lastModified: this.mtimes.get(full) ?? Date.now(), type: blob.type })
+  }
+
+  // 開発用の配信は読むだけ。サイドカーも読めるが書けない。
+  sidecarAccess(): Promise<SidecarAccessKind> {
+    return Promise.resolve('readonly')
+  }
+
+  async readSidecar(): Promise<string | null> {
+    const path = `${SIDECAR_DIR}/${SIDECAR_FILE}`
+    const url = `/api/dev-folder/file?root=${encodeURIComponent(this.root)}&path=${encodeURIComponent(path)}`
+    const response = await fetch(url)
+    if (response.status === 404) return null
+    if (!response.ok) throw new Error(`サイドカーを読めませんでした（${response.status}）`)
+    return response.text()
+  }
+
+  writeSidecar(): Promise<void> {
+    return Promise.reject(new Error('開発用のフォルダにはサイドカーを書けません。'))
   }
 }
 

@@ -9,7 +9,7 @@ import type { PairOverride } from '~/lib/core'
 import { init as initCore } from '~/lib/core'
 import type { SavedSelection } from '~/utils/selectionFlow'
 import { parseSavedSelection, serializeSavedSelection } from '~/utils/selectionFlow'
-import type { DisplaySettings, PhotoBackend } from '~/composables/photoBackend'
+import type { DeviceIdentity, DisplaySettings, PhotoBackend, SidecarAccess, SidecarState } from '~/composables/photoBackend'
 import { isTauriRuntime } from '~/composables/photoBackend'
 
 async function invokeDesktop<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -86,6 +86,14 @@ export function createTauriBackend(): PhotoBackend {
       await initCore()
       return parseSavedSelection(raw)
     },
+    sidecarSupported: (projectId: string) => invokeDesktop<SidecarAccess>('sidecar_supported', { projectId }),
+    readSidecar: (projectId: string) => invokeDesktop<string | null>('read_sidecar', { projectId }),
+    writeSidecar: (projectId: string, json: string, fileName = 'catalog.json') =>
+      invokeDesktop<void>('write_sidecar', { projectId, json, fileName }),
+    loadSidecarState: (projectId: string) => invokeDesktop<SidecarState>('load_sidecar_state', { projectId }),
+    saveSidecarState: (projectId: string, state: SidecarState) =>
+      invokeDesktop<void>('save_sidecar_state', { projectId, state }),
+    deviceIdentity: () => invokeDesktop<DeviceIdentity>('device_identity'),
     photoUrl: (path: string) => isTauriRuntime() ? convertFileSrc(path) : '',
     photoThumbnailUrl: (photo: Photo) => {
       if (!isTauriRuntime()) return ''

@@ -1,4 +1,5 @@
 mod format;
+mod sidecar;
 
 use exif::{In, Reader, Tag, Value};
 use image::DynamicImage;
@@ -534,6 +535,9 @@ fn open_database(path: &Path) -> Result<Connection, String> {
          );",
     )
     .map_err(|error| error.to_string())?;
+
+    // サイドカー（T8）。端末が覚える 3 つの値。
+    sidecar::ensure_tables(&conn)?;
 
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS photos_project_visible
@@ -2571,6 +2575,12 @@ fn delete_project_blocking(app: AppHandle, project_id: String) -> Result<(), Str
         .map_err(|error| error.to_string())?;
     transaction
         .execute(
+            "DELETE FROM sidecar_state WHERE project_id=?1",
+            params![project_id],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
             "DELETE FROM photos WHERE project_id=?1",
             params![project_id],
         )
@@ -3821,6 +3831,65 @@ pub mod bench_api {
 
 }
 
+
+// ---------------------------------------------------------------------------
+// サイドカー（`.photo-curator/catalog.json`）。判断は画面側の core が行う。
+// ---------------------------------------------------------------------------
+
+fn sidecar_folder(app: &AppHandle, project_id: &str) -> Result<PathBuf, String> {
+    Ok(PathBuf::from(project_folder(app, project_id)?))
+}
+
+#[tauri::command]
+async fn sidecar_supported(app: AppHandle, project_id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(sidecar::support(&sidecar_folder(&app, &project_id)?).to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn read_sidecar(app: AppHandle, project_id: String) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || sidecar::read(&sidecar_folder(&app, &project_id)?))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn write_sidecar(
+    app: AppHandle,
+    project_id: String,
+    json: String,
+    file_name: Option<String>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let name = file_name.unwrap_or_else(|| sidecar::SIDECAR_FILE.to_string());
+        sidecar::write(&sidecar_folder(&app, &project_id)?, &name, &json)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+fn load_sidecar_state(app: AppHandle, project_id: String) -> Result<sidecar::SidecarState, String> {
+    sidecar::load_state(&connection(&app)?, &project_id)
+}
+
+#[tauri::command]
+fn save_sidecar_state(
+    app: AppHandle,
+    project_id: String,
+    state: sidecar::SidecarState,
+) -> Result<(), String> {
+    sidecar::save_state(&connection(&app)?, &project_id, &state)
+}
+
+#[tauri::command]
+fn device_identity(app: AppHandle) -> Result<sidecar::DeviceIdentity, String> {
+    sidecar::device_identity(&connection(&app)?)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -3855,7 +3924,13 @@ pub fn run() {
             start_background_analysis,
             cancel_project_task,
             save_project_state,
-            load_project_state
+            load_project_state,
+            sidecar_supported,
+            read_sidecar,
+            write_sidecar,
+            load_sidecar_state,
+            save_sidecar_state,
+            device_identity
         ])
         .run(tauri::generate_context!())
         .expect("error while running Photo Curator");

@@ -24,6 +24,7 @@ const {
   resultsTotal,
   selectResultsRating,
   selectionSummary,
+  sidecarAccess,
   view
 } = useCurator()
 </script>
@@ -34,6 +35,8 @@ const {
     <p class="text-body-2 text-medium-emphasis mt-2">
       星を選ぶと、その星の写真だけを選別できます。選ばれた写真は星が1つ上がり、選ばれなかった写真はそのままです。
     </p>
+
+    <v-chip v-if="sidecarAccess !== 'readwrite'" class="mt-3" size="small" variant="tonal" prepend-icon="mdi-note-off-outline">この端末だけの結果</v-chip>
 
     <div class="rating-board mt-6">
       <div

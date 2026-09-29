@@ -20,6 +20,7 @@ import RestartDialog from '~/components/dialogs/RestartDialog.vue'
 import ExportDialog from '~/components/dialogs/ExportDialog.vue'
 import MetadataDialog from '~/components/dialogs/MetadataDialog.vue'
 import DeleteDialog from '~/components/dialogs/DeleteDialog.vue'
+import SidecarConflictDialog from '~/components/dialogs/SidecarConflictDialog.vue'
 import AppNav from '~/components/AppNav.vue'
 
 const c = useCurator()
@@ -176,5 +177,6 @@ const {
     <ExportDialog />
     <MetadataDialog />
     <DeleteDialog />
+    <SidecarConflictDialog />
   </v-app>
 </template>

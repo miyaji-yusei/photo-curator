@@ -109,6 +109,21 @@ export interface PhotoBackend {
   /** 旧版の形（`v` が無い）は null。旧データは引き継がない。 */
   loadSession: (projectId: string) => Promise<SavedSelection | null>
 
+  // ---- サイドカー（写真のフォルダ直下の `.photo-curator/catalog.json`）----
+  // 口だけ。**4 通りの判断は持たない**（`useSidecarSync` が core の `sidecarDecide` を呼ぶ）。
+
+  /** この出所にサイドカーを書けるか。`readonly` は読むだけ、`none` は読み書きとも無い。 */
+  sidecarSupported: (projectId: string) => Promise<SidecarAccess>
+  /** サイドカーの JSON の文字列。無ければ null。 */
+  readSidecar: (projectId: string) => Promise<string | null>
+  /** 原子的に書く（一時ファイル → rename）。`fileName` は退避（`catalog.<id>.json`）のときだけ変える。 */
+  writeSidecar: (projectId: string, json: string, fileName?: string) => Promise<void>
+  /** 端末が覚える、最後に読んだ／書いたサイドカーの印と、判断が変わったか。 */
+  loadSidecarState: (projectId: string) => Promise<SidecarState>
+  saveSidecarState: (projectId: string, state: SidecarState) => Promise<void>
+  /** この端末の id と名前。id は初回に作って残す。 */
+  deviceIdentity: () => Promise<DeviceIdentity>
+
   /**
    * 原本を表示するための URL。
    * デスクトップは絶対パスを asset プロトコルへ、ブラウザは既に URL なのでそのまま。
@@ -143,6 +158,22 @@ export interface PhotoBackend {
    * iOS には永続的なファイルハンドルが無いため、**リロードすると失われる**。
    */
   originalFile?: (photoId: string) => File | null
+}
+
+export type SidecarAccess = 'readwrite' | 'readonly' | 'none'
+
+export interface SidecarState {
+  /** 最後に読んだ／書いたサイドカーの `updatedAt`。未確認は 0。 */
+  seenAt: number
+  /** 同じく `updatedBy`。未確認は空文字。 */
+  seenBy: string
+  /** 判断（星・連写の手直し・学習した距離・やり直し）が変わったか。 */
+  localChanged: boolean
+}
+
+export interface DeviceIdentity {
+  id: string
+  name: string
 }
 
 export type BackendKind = 'tauri' | 'local'

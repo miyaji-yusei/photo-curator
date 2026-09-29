@@ -3,6 +3,13 @@ import type { SourceEntry, SourceIO } from '~/composables/backends/web/sourceIO'
 import { PickerIO, joinPath } from '~/composables/backends/web/sourceIO'
 import { isVideoName, scanFolder } from '~/utils/folderScan'
 
+/** サイドカーは走査に関係しない。 */
+const noSidecar = {
+  sidecarAccess: () => Promise.resolve('none' as const),
+  readSidecar: () => Promise.resolve(null),
+  writeSidecar: () => Promise.reject(new Error('not used'))
+}
+
 /** `{ 'a/b.jpg': size, 'a/': 0 }` のような平らな表から作る偽のフォルダ。 */
 function fakeFolder(tree: Record<string, string[]>): SourceIO {
   return {
@@ -15,7 +22,8 @@ function fakeFolder(tree: Record<string, string[]>): SourceIO {
         mtimeMs: 1
       })))
     },
-    readFile: () => Promise.reject(new Error('not used'))
+    readFile: () => Promise.reject(new Error('not used')),
+    ...noSidecar
   }
 }
 
@@ -58,7 +66,8 @@ describe('scanFolder', () => {
     let calls = 0
     const io: SourceIO = {
       list: () => { calls += 1; return Promise.resolve([{ name: 'sub', isDirectory: true, size: 0, mtimeMs: 0 }]) },
-      readFile: () => Promise.reject(new Error('not used'))
+      readFile: () => Promise.reject(new Error('not used')),
+      ...noSidecar
     }
     await scanFolder(io, { isCancelled: () => calls >= 2 })
     expect(calls).toBe(2)

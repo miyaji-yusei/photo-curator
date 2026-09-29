@@ -25,7 +25,13 @@ const {
   previewTotal,
   regenerateDisplayImages,
   resumeSession,
+  saveSidecarNow,
   scanRunning,
+  sidecarAccess,
+  sidecarBusy,
+  sidecarClash,
+  sidecarMessage,
+  sidecarSavedAt,
   session,
   startScan,
   view
@@ -35,8 +41,24 @@ const activeProject = nullableActiveProject as Ref<Project>
 </script>
 
 <template>
-    <div class="d-flex align-center justify-space-between flex-wrap ga-4 mb-7"><div><v-btn variant="text" prepend-icon="mdi-arrow-left" class="px-0" @click="view = 'home'">ホーム</v-btn><h1 class="text-h4 font-weight-bold">{{ activeProject.name }}</h1><p class="text-body-2 text-medium-emphasis mt-1">{{ activeProject.folderPath }}</p></div><div class="d-flex flex-wrap ga-2"><v-btn variant="text" prepend-icon="mdi-delete-outline" @click="askDeleteProject(activeProject)">削除</v-btn><v-btn v-if="hasSelectionData" variant="text" prepend-icon="mdi-star-outline" @click="openResults">選別結果を見る</v-btn><v-btn v-if="importsByPicker" variant="outlined" prepend-icon="mdi-image-plus" :loading="scanRunning" @click="openPhotoPicker">写真を追加</v-btn><v-btn v-else-if="activeProject.folderAccess === 'needs-permission'" variant="outlined" color="warning" prepend-icon="mdi-folder-key-outline" :loading="scanRunning" @click="startScan">フォルダへのアクセスを許可</v-btn><v-btn v-else variant="outlined" prepend-icon="mdi-refresh" :loading="scanRunning" @click="startScan">写真を再読み込み</v-btn><v-btn color="primary" prepend-icon="mdi-play" :disabled="!activeProject.photoCount" @click="session ? resumeSession() : enterMethod()">{{ session ? '選別を再開' : '選別を開始' }}</v-btn></div></div>
+    <div class="d-flex align-center justify-space-between flex-wrap ga-4 mb-7"><div><v-btn variant="text" prepend-icon="mdi-arrow-left" class="px-0" @click="view = 'home'">ホーム</v-btn><h1 class="text-h4 font-weight-bold">{{ activeProject.name }}</h1><p class="text-body-2 text-medium-emphasis mt-1">{{ activeProject.folderPath }}</p></div><div class="d-flex flex-wrap ga-2"><v-btn variant="text" prepend-icon="mdi-delete-outline" @click="askDeleteProject(activeProject)">削除</v-btn><v-btn v-if="hasSelectionData" variant="text" prepend-icon="mdi-star-outline" @click="openResults">選別結果を見る</v-btn><v-btn v-if="importsByPicker" variant="outlined" prepend-icon="mdi-image-plus" :loading="scanRunning" @click="openPhotoPicker">写真を追加</v-btn><v-btn v-else-if="activeProject.folderAccess === 'needs-permission'" variant="outlined" color="warning" prepend-icon="mdi-folder-key-outline" :loading="scanRunning" @click="startScan">フォルダへのアクセスを許可</v-btn><v-btn v-else variant="outlined" prepend-icon="mdi-refresh" :loading="scanRunning" @click="startScan">写真を再読み込み</v-btn><v-btn color="primary" prepend-icon="mdi-play" :disabled="!activeProject.photoCount || !!sidecarClash" @click="session ? resumeSession() : enterMethod()">{{ session ? '選別を再開' : '選別を開始' }}</v-btn></div></div>
     <v-card class="mb-6"><v-card-text class="d-flex align-center ga-5"><v-avatar color="primary" size="50"><v-icon color="black" icon="mdi-image-multiple" /></v-avatar><div><div class="text-h6">{{ activeProject.photoCount.toLocaleString() }} 枚の写真</div><div class="text-body-2 text-medium-emphasis">{{ importsByPicker ? '星とサムネイルはこの端末に保存されます。写真ライブラリは変更しません。' : 'サブフォルダも含めて参照します。写真ファイルは変更しません。' }}</div></div></v-card-text></v-card>
+    <!-- サイドカー。写真のフォルダの `.photo-curator/catalog.json` に判断だけを記録する。 -->
+    <v-card class="mb-6">
+      <v-card-text class="d-flex align-center flex-wrap ga-4">
+        <v-avatar :color="sidecarAccess === 'readwrite' ? 'primary' : undefined" size="36">
+          <v-icon :color="sidecarAccess === 'readwrite' ? 'black' : undefined" :icon="sidecarAccess === 'readwrite' ? 'mdi-note-check-outline' : 'mdi-note-off-outline'" />
+        </v-avatar>
+        <div>
+          <div class="text-body-1">{{ sidecarAccess === 'readwrite' ? '写真のフォルダに記録しています' : 'この端末だけの結果' }}</div>
+          <div v-if="sidecarSavedAt" class="text-caption text-medium-emphasis">最後に保存 {{ new Date(sidecarSavedAt).toLocaleTimeString('ja-JP') }}</div>
+          <div v-if="sidecarMessage" class="text-caption text-error">{{ sidecarMessage }}</div>
+        </div>
+        <v-spacer />
+        <v-btn v-if="sidecarAccess === 'readwrite'" variant="outlined" prepend-icon="mdi-content-save-outline" :loading="sidecarBusy" :disabled="!!sidecarClash" @click="saveSidecarNow">今すぐ保存</v-btn>
+      </v-card-text>
+    </v-card>
+
     <!-- 選別画面に出す画像の大きさ。**解析を起こす場所の隣に置く**ので
          対応が分かりやすい。設定画面では全体の既定を決められる。 -->
     <v-card v-if=displaySettings class="mb-6">
