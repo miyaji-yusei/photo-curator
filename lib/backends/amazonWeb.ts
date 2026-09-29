@@ -33,6 +33,8 @@ const THUMB_EDGE = 160
 const SAMPLE_LIMIT = 12
 /** 指紋作りを並列でいくつまで同時に投げるか。08章11「並列は控えめに」と同じ考え方。 */
 const HASH_CONCURRENCY = 4
+/** 何枚ごとに保存し直すか（lib/backends/webFolder.ts の CHECKPOINT_EVERY と同じ）。 */
+const HASH_CHECKPOINT_EVERY = 20
 const ONLY_CSV = '中継サーバーが無いため、CSV だけ書き出せます。'
 
 /** 1 枚ぶんの控え。**鍵は node id**（08章 2.5・落とし穴 4）。 */
@@ -127,7 +129,10 @@ class AmazonWebProjects {
     await idbSet(`photos:${projectId}`, photos)
     project.photoCount = photos.length
     project.scannedCount = photos.length
-    project.metaHashedCount = photos.length
+    // 指紋が付いた枚数。ここから hashPhotos が増やしていく（準備カードの
+    // 「撮影時刻・サムネイル」の数字になる）。選別の開始は displayedCount を見る
+    // ので、指紋を待たずにできる。
+    project.metaHashedCount = 0
     project.displayedCount = photos.length
     project.prepareWarning = null
     project.updatedAt = Date.now()
@@ -138,12 +143,18 @@ class AmazonWebProjects {
     // 指紋（dHash）。中継サーバーがあれば作る。**無くても選別は始められる**
     // （連写が自動でまとまらないだけ。手動の「この写真をまとめる」は使える。
     // cull.vue の hasFingerprints が dHash の有無だけを見て自然に切り替わる）。
-    await this.hashPhotos(projectId, photos, entries, onProgress, signal)
+    await this.hashPhotos(project, photos, entries, onProgress, signal)
   }
 
-  /** 中継（server/api/amazon/image.get.ts）経由で指紋を作る。読めない1枚は諦めて続ける。 */
+  /**
+   * 中継（server/api/amazon/image.get.ts）経由で指紋を作る。読めない1枚は諦めて続ける。
+   *
+   * **中継が無い（静的配信）ときは早めに諦める。** 最初の `HASH_CONCURRENCY` 枚が
+   * 1枚も取れなければ、残りも取れないとみなして打ち切る（4000 枚ぶん空振りで
+   * 叩かない）。打ち切ったら準備カードは「済」にする（指紋が無いだけで、選別は始められる）。
+   */
   private async hashPhotos(
-    projectId: string,
+    project: Project,
     photos: ProjectPhoto[],
     entries: Entries,
     onProgress: (p: PrepareProgress) => void,
@@ -151,9 +162,20 @@ class AmazonWebProjects {
   ): Promise<void> {
     const total = photos.length
     let done = 0
+    let hashed = 0
+    let sinceSave = 0
     let index = 0
+    let giveUp = false
+
+    const save = async () => {
+      project.metaHashedCount = hashed
+      project.updatedAt = Date.now()
+      await idbSet(`photos:${project.id}`, photos)
+      await idbSet(`project:${project.id}`, project)
+    }
+
     const worker = async () => {
-      while (index < photos.length) {
+      while (index < total && !giveUp) {
         if (signal.aborted) return
         const photo = photos[index]!
         index += 1
@@ -163,13 +185,23 @@ class AmazonWebProjects {
         if (hash) {
           photo.dHash = hash
           photo.dHashVersion = 2
+          hashed += 1
         }
         done += 1
+        sinceSave += 1
+        if (done === HASH_CONCURRENCY && hashed === 0) giveUp = true
         onProgress({ task: 'hash', done, total, warning: null })
+        // 途中で止めても、ここまでの指紋は残る（webFolder の CHECKPOINT_EVERY と同じ考え）。
+        if (sinceSave >= HASH_CHECKPOINT_EVERY) {
+          sinceSave = 0
+          await save()
+        }
       }
     }
     await Promise.all(Array.from({ length: HASH_CONCURRENCY }, worker))
-    if (!signal.aborted) await idbSet(`photos:${projectId}`, photos)
+    if (signal.aborted) return
+    if (giveUp) hashed = total
+    await save()
   }
 
   async thumbnailUrl(projectId: string, relativePath: string): Promise<string | null> {
