@@ -89,8 +89,16 @@ const filteredSorted = computed(() => {
 })
 const zoomPaths = computed(() => filteredSorted.value.map(r => r.relativePath))
 
+// 保存領域を開けない等。読み込み中のまま黙って止まらず、理由を出す。
+const loadError = ref('')
+
 async function load() {
-  project.value = await backend.getProject(projectId.value)
+  try {
+    project.value = await backend.getProject(projectId.value)
+  } catch (cause) {
+    loadError.value = cause instanceof Error ? cause.message : 'プロジェクトを読み込めませんでした。'
+    return
+  }
   if (!project.value) return
   photos.value = await backend.listPhotos(projectId.value)
   session.value = await backend.loadSession(projectId.value)
@@ -475,6 +483,7 @@ const targetLabel = computed(() => {
       @apply="applyReview"
     />
   </div>
+  <v-alert v-else-if="loadError" type="error" density="compact" class="ma-4">{{ loadError }}</v-alert>
   <div v-else class="text-center pa-8">
     <v-progress-circular indeterminate color="primary" />
   </div>

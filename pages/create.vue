@@ -79,8 +79,13 @@ function onFilesPicked(event: Event) {
 }
 
 onMounted(async () => {
-  const projects = await backend.listProjects()
-  existingKeys.value = new Set(projects.map((p: Project) => p.source.key))
+  try {
+    const projects = await backend.listProjects()
+    existingKeys.value = new Set(projects.map((p: Project) => p.source.key))
+  } catch (cause) {
+    // 「作成済み」の印が出ないだけ。理由は出す（保存領域が開けない等）。
+    errorText.value = cause instanceof Error ? cause.message : '保存済みのプロジェクトを読めませんでした。'
+  }
 })
 
 // タブを切り替えたら選択を捨てる（前のタブの選択を引きずって作成しないため）。
@@ -93,29 +98,28 @@ watch(tab, () => {
   errorText.value = ''
 })
 
-async function pickNative() {
+async function choose(devFolder?: string) {
   errorText.value = ''
-  const source = await backend.pickFolder()
-  if (!source) return
-  root.value = source
-  subPath.value = ''
-  selected.value = { name: source.label, key: '' }
-  projectName.value = source.label
-  await loadEntries()
-  void loadSample()
+  try {
+    const source = await backend.pickFolder(devFolder)
+    if (!source) return
+    root.value = source
+    subPath.value = ''
+    selected.value = { name: source.label, key: '' }
+    projectName.value = source.label
+    await loadEntries()
+    void loadSample()
+  } catch (cause) {
+    // 保存領域を開けない等。黙って何も起きないと原因が分からない。
+    errorText.value = cause instanceof Error ? cause.message : 'フォルダを選べませんでした。'
+  }
 }
+
+const pickNative = () => choose()
 
 async function pickDev() {
   if (!devPath.value.trim()) return
-  errorText.value = ''
-  const source = await backend.pickFolder(devPath.value.trim())
-  if (!source) return
-  root.value = source
-  subPath.value = ''
-  selected.value = { name: source.label, key: '' }
-  projectName.value = source.label
-  await loadEntries()
-  void loadSample()
+  await choose(devPath.value.trim())
 }
 
 /** 選んだフォルダの枚数・見本12枚。**下位フォルダも含めて数える**

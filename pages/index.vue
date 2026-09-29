@@ -24,19 +24,29 @@ const deleteTarget = ref<Project | null>(null)
 const deleteBytes = ref(0)
 const techTarget = ref<Project | null>(null)
 
+// 端末の保存領域を開けなかったとき（バージョン不整合など）。読み込み中のまま
+// 黙って止まらず、理由を出す。
+const loadError = ref('')
+
 async function load() {
   loading.value = true
-  projects.value = await backend.listProjects()
-  const entries = await Promise.all(
-    projects.value.map(async p => [p.id, await backend.loadSession(p.id)] as const)
-  )
-  sessions.value = Object.fromEntries(entries)
-  // 見本 1 枚（02章「見本の絵」節）。**網へ行かない**（端末に残っているサムネイルだけ）。
-  const coverEntries = await Promise.all(
-    projects.value.map(async p => [p.id, await backend.coverUrl(p.id)] as const)
-  )
-  covers.value = Object.fromEntries(coverEntries)
-  loading.value = false
+  loadError.value = ''
+  try {
+    projects.value = await backend.listProjects()
+    const entries = await Promise.all(
+      projects.value.map(async p => [p.id, await backend.loadSession(p.id)] as const)
+    )
+    sessions.value = Object.fromEntries(entries)
+    // 見本 1 枚（02章「見本の絵」節）。**網へ行かない**（端末に残っているサムネイルだけ）。
+    const coverEntries = await Promise.all(
+      projects.value.map(async p => [p.id, await backend.coverUrl(p.id)] as const)
+    )
+    covers.value = Object.fromEntries(coverEntries)
+  } catch (cause) {
+    loadError.value = cause instanceof Error ? cause.message : 'プロジェクトを読み込めませんでした。'
+  } finally {
+    loading.value = false
+  }
 }
 
 onMounted(load)
@@ -100,6 +110,13 @@ const columns = computed(() => (isNarrow.value ? 1 : isWide.value ? 3 : 2))
     <div v-if="loading" class="text-center pa-8">
       <v-progress-circular indeterminate color="primary" />
     </div>
+
+    <v-alert v-else-if="loadError" type="error" density="compact" class="mb-4">
+      {{ loadError }}
+      <template #append>
+        <v-btn size="small" variant="text" @click="load">再読み込み</v-btn>
+      </template>
+    </v-alert>
 
     <div v-else-if="projects.length === 0" class="text-center pa-8">
       <p class="text-h6 mb-2">まだプロジェクトがありません</p>
