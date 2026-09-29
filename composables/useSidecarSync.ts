@@ -243,7 +243,26 @@ export function createSidecarSync(backend: SidecarBackend, now: () => number = D
     })
   }
 
-  return { checkOnOpen, pushIfChanged, adopt, keepMine, keepTheirs, markChanged, buildSidecar, access }
+  /**
+   * 食い違いの答えを実行する。書き込みに失敗したら、その出所を書けない共有（readonly）として扱い直し、
+   * 相手の記録を取り込む（仕様: 書けない共有ではダイアログを出さず、取り込むだけ）。
+   * 取り込みまで失敗したときは投げる（呼び出し側がダイアログを残す）。
+   */
+  async function resolveClash(
+    project: { id: string }, theirs: Sidecar, choice: 'mine' | 'theirs'
+  ): Promise<{ kind: 'done' } | { kind: 'readonly', reason: string }> {
+    try {
+      if (choice === 'mine') await keepMine(project, theirs)
+      else await keepTheirs(project, theirs)
+      return { kind: 'done' }
+    } catch (cause) {
+      const reason = cause instanceof Error ? cause.message : '記録を書けませんでした。'
+      await adopt(project, theirs)
+      return { kind: 'readonly', reason }
+    }
+  }
+
+  return { checkOnOpen, pushIfChanged, adopt, keepMine, keepTheirs, resolveClash, markChanged, buildSidecar, access }
 }
 
 // ---------------------------------------------------------------------------
@@ -326,14 +345,18 @@ export function useSidecarSync(backend: PhotoBackend) {
     if (!current) return false
     busy.value = true
     try {
-      const project = { id: current.projectId }
-      if (choice === 'mine') await sync.keepMine(project, current.theirs)
-      else await sync.keepTheirs(project, current.theirs)
+      const result = await sync.resolveClash({ id: current.projectId }, current.theirs, choice)
       clash.value = null
-      savedAt.value = Date.now()
+      if (result.kind === 'readonly') {
+        // 書けない共有だった。ダイアログを閉じ、読むだけの出所として相手を取り込んだ。
+        access.value = 'readonly'
+        message.value = `この共有には書き込めないため、共有側の記録を取り込みました（${result.reason}）`
+      } else {
+        savedAt.value = Date.now()
+      }
       return true
     } catch (cause) {
-      // 書けなかったときは選び直せるよう、ダイアログを残す。
+      // 取り込みまで失敗したときは、選び直せるようダイアログを残す。
       message.value = cause instanceof Error ? cause.message : '記録を切り替えられませんでした。'
       return false
     } finally {

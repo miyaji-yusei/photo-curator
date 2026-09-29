@@ -135,13 +135,28 @@ pub fn valid_file_name(name: &str) -> bool {
         && middle.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
-/// 書けるか。フォルダがあって、読み取り専用でなければ `readwrite`。
+/// 書けるか。**実際に書いてみて**決める（ディレクトリの読み取り専用の属性は、Windows では意味が違う）。
+///
+/// - `.photo-curator/` を作れて、その中に一時ファイル（`.probe-<乱数>`）を作って消せれば `readwrite`
+/// - 読めるが書けなければ `readonly`（読んで取り込むだけ。ダイアログは出さない）
+/// - フォルダが無い・読めなければ `none`
 pub fn support(folder: &Path) -> &'static str {
-    match fs::metadata(folder) {
-        Ok(meta) if meta.is_dir() && !meta.permissions().readonly() => "readwrite",
-        Ok(meta) if meta.is_dir() => "none",
-        _ => "none",
+    if !fs::metadata(folder).map(|meta| meta.is_dir()).unwrap_or(false) {
+        return "none";
     }
+    let dir = sidecar_dir(folder);
+    let writable = fs::create_dir_all(&dir).is_ok() && {
+        let probe = dir.join(format!(".probe-{}", Uuid::new_v4().simple()));
+        let created = fs::write(&probe, b"").is_ok();
+        // 作れたなら、消せるところまで確かめる（消せない共有には、一時ファイルが残り続ける）。
+        created && fs::remove_file(&probe).is_ok()
+    };
+    if writable {
+        return "readwrite";
+    }
+    // 書けない。読めるかどうかで readonly と none を分ける（`.photo-curator/` があればその中、無ければ写真のフォルダ）。
+    let readable = fs::read_dir(&dir).is_ok() || fs::read_dir(folder).is_ok();
+    if readable { "readonly" } else { "none" }
 }
 
 /// `catalog.json` の中身。無ければ None。
@@ -258,6 +273,38 @@ mod tests {
         let folder = temp_dir("bad");
         assert!(write(&folder, "../evil.json", "x").is_err());
         assert!(!folder.join(SIDECAR_DIR).exists());
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn support_is_readonly_when_the_sidecar_folder_cannot_be_made() {
+        // `.photo-curator` が同名のファイルだと、フォルダを作れない（書けない共有と同じ結果）。root でも通る。
+        let folder = temp_dir("support-blocked");
+        fs::write(folder.join(SIDECAR_DIR), b"not a folder").unwrap();
+        assert_eq!(support(&folder), "readonly");
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    /// root は 0o555 のディレクトリにも書けてしまい、readonly にならないため、root では走らせない。
+    /// 一般ユーザーで `cargo test -- --ignored` を実行すると確かめられる。
+    #[test]
+    #[ignore = "root ではパーミッションを無視して書けてしまう（一般ユーザーで --ignored を付けて実行する）"]
+    fn support_is_readonly_for_a_directory_without_write_permission() {
+        use std::os::unix::fs::PermissionsExt;
+        let folder = temp_dir("support-ro");
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o555)).unwrap();
+        let result = support(&folder);
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = fs::remove_dir_all(&folder);
+        assert_eq!(result, "readonly");
+    }
+
+    #[test]
+    fn support_leaves_no_probe_file_behind() {
+        let folder = temp_dir("support-probe");
+        assert_eq!(support(&folder), "readwrite");
+        let inner: Vec<_> = fs::read_dir(folder.join(SIDECAR_DIR)).unwrap().collect();
+        assert!(inner.is_empty(), "一時ファイルは消えている");
         let _ = fs::remove_dir_all(&folder);
     }
 

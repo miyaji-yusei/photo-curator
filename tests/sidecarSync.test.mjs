@@ -303,6 +303,36 @@ describe('食い違いの選択', () => {
   })
 })
 
+describe('食い違いの解決で書けなかったとき', () => {
+  async function clashedUnwritable() {
+    const backend = fakeBackend()
+    backend.rows[0].rating = 1
+    backend.files.set('catalog.json', core.sidecarToJson(remoteSidecar()))
+    backend.state = { seenAt: 100, seenBy: 'old', localChanged: true }
+    const sync = createSidecarSync(backend, nextClock)
+    const outcome = await sync.checkOnOpen(project)
+    backend.failWrite = true
+    return { backend, sync, outcome }
+  }
+
+  for (const choice of ['mine', 'theirs']) {
+    it(`${choice}: 書けなければ読むだけの出所として相手を取り込み、理由を返す`, async () => {
+      const { backend, sync, outcome } = await clashedUnwritable()
+      const result = await sync.resolveClash(project, outcome.theirs, choice)
+      expect(result).toEqual({ kind: 'readonly', reason: '書けません' })
+      expect(backend.rows.map(row => row.rating)).toEqual([0, 1, 3, 0, 0, 0])
+      expect(backend.state).toEqual({ seenAt: 500, seenBy: outcome.theirs.updatedBy, localChanged: false })
+    })
+  }
+
+  it('書ければ普通に実行する', async () => {
+    const { backend, sync, outcome } = await clashedUnwritable()
+    backend.failWrite = false
+    expect(await sync.resolveClash(project, outcome.theirs, 'mine')).toEqual({ kind: 'done' })
+    expect(backend.writes).toEqual(['catalog.zzzzzzzz-111.json', 'catalog.json'])
+  })
+})
+
 describe('書き込み', () => {
   it('変更が無ければ書かない', async () => {
     const backend = fakeBackend()
