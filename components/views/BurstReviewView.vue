@@ -10,7 +10,7 @@ const {
   burstReviewPhotos,
   burstReviewRows,
   desktop,
-  openResults,
+  returnToResults,
   openZoom,
   skipBurstReview,
   toggleBurstReviewKeep
@@ -19,7 +19,7 @@ const {
 
 <template>
     <div class="d-flex flex-wrap align-center justify-space-between ga-3 mb-3">
-      <v-btn variant="text" prepend-icon="mdi-arrow-left" class="px-0" @click="openResults">レーティングへ戻る</v-btn>
+      <v-btn variant="text" prepend-icon="mdi-arrow-left" class="px-0" @click="returnToResults">レーティングへ戻る</v-btn>
       <span v-if="burstReviewGroups.length" class="text-caption text-medium-emphasis">
         {{ (burstReviewIndex + 1).toLocaleString() }} / {{ burstReviewGroups.length.toLocaleString() }} グループ
       </span>

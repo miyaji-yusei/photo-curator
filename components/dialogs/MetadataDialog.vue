@@ -6,6 +6,7 @@ const {
   metadataError,
   metadataRatings,
   metadataResult,
+  exportPreviewCount,
   ratingCount,
   runMetadataWrite
 } = useCurator()
@@ -36,6 +37,7 @@ const {
         >★{{ rating }}（{{ ratingCount(rating).toLocaleString() }}）</v-chip>
       </div>
 
+      <p class="text-body-2 mb-3"><strong>{{ exportPreviewCount.toLocaleString() }} 枚</strong>に書き込みます（連写の仲間を含む）。</p>
       <v-checkbox
         v-model="metadataAcknowledged" hide-details density="comfortable"
         label="原本が書き換わることを理解しました"
@@ -56,7 +58,7 @@ const {
     <v-card-actions class="pa-5 pt-2">
       <v-spacer />
       <v-btn variant="outlined" :disabled="metadataBusy" @click="metadataDialog = false">閉じる</v-btn>
-      <v-btn color="error" :loading="metadataBusy" :disabled="!metadataAcknowledged || !metadataRatings.length" @click="runMetadataWrite">
+      <v-btn color="error" :loading="metadataBusy" :disabled="!metadataAcknowledged || !metadataRatings.length || !exportPreviewCount" @click="runMetadataWrite">
         書き込む
       </v-btn>
     </v-card-actions>

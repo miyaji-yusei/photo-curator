@@ -146,12 +146,21 @@ export interface PhotoBackend {
    */
   photoDisplayUrl: (photo: Photo) => string
 
-  /** 星ごとのフォルダへ書き出す。moveFiles が true なら原本を移動する。 */
-  exportByRating: (
-    projectId: string, destination: string, ratings: number[], moveFiles: boolean
+  /**
+   * 選んだ写真を星ごとのフォルダへ書き出す。moveFiles が true なら原本を移動する。
+   * **対象は `photoIds`**（画面が連写の仲間まで広げて決める。星では選ばない）。
+   * Amazon は原本を取ってきて置く（移動はできない）。
+   */
+  exportPhotos: (
+    projectId: string, destination: string, photoIds: string[], moveFiles: boolean
   ) => Promise<ExportReport>
-  /** 星を写真本体の XMP に書き込む。原本を書き換える。 */
-  writeRatingsToFiles: (projectId: string, ratings: number[]) => Promise<ExportReport>
+  /** 選んだ写真（`photoIds`）の星を、写真本体の XMP に書き込む。原本を書き換える。 */
+  writeRatingsToPhotos: (projectId: string, photoIds: string[]) => Promise<ExportReport>
+  /**
+   * CSV を保存する。PC は保存ダイアログで選んだ場所に書き、ブラウザはダウンロードにする。
+   * 保存ダイアログを閉じたら `false`。
+   */
+  saveCsv: (fileName: string, text: string) => Promise<boolean>
 
   // ---- Amazon Photos の共有リンク（PC だけ。`capabilities.amazon` が true のとき）----
   // 走査・準備・表示用・書き出しの分岐は Rust の入口が `source_kind` で行う。画面は分岐しない。
@@ -161,10 +170,10 @@ export interface PhotoBackend {
   /** 共有リンクのプロジェクトを作る（走査はこのあと `startProjectScan`）。 */
   createAmazonProject?: (name: string, shareUrl: string) => Promise<Project>
   /**
-   * Amazon の結果の取り出し（ブラウザ）。ZIP は原本を取って `star-N/` に分ける（取れなければ reject。
-   * 文に「CSV だけ書き出せます」を含む）。CSV は先頭 3 列が他と同じで、4 列目に `name`。
+   * Amazon の結果の ZIP（ブラウザ）。対象の写真（`photoIds`）の原本を取って `star-N/` に分ける
+   * （取れなければ reject。文に「CSV だけ書き出せます」を含む）。CSV は `saveCsv` で、全部の出所が同じ。
    */
-  exportAmazon?: (projectId: string, ratings: number[], format: 'zip' | 'csv') => Promise<AmazonExport>
+  exportAmazon?: (projectId: string, photoIds: string[]) => Promise<AmazonExport>
 
   // ---- ブラウザだけが持つ機能 ------------------------------------------
   // デスクトップはフォルダ走査と原本パスがあるので必要ない。

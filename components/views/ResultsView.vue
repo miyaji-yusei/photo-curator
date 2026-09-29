@@ -5,9 +5,9 @@ const {
   densityOptions,
   desktop,
   exportDialog,
-  gridClass,
-  gridStyle,
+  exportResultsCsv,
   isAmazon,
+  loadMoreResults,
   loadResultsPage,
   metadataDialog,
   openBurstReview,
@@ -19,9 +19,11 @@ const {
   restartDialog,
   resultsBusy,
   resultsDensity,
+  resultsMessage,
   resultsPhotos,
   resultsRating,
   resultsSort,
+  resultsTiles,
   resultsTotal,
   selectResultsRating,
   selectionSummary,
@@ -95,26 +97,44 @@ const {
         <!-- Amazon の写真の原本は書き換えられない。 -->
         <v-btn variant="outlined" prepend-icon="mdi-tag-text-outline" :disabled="isAmazon" @click="metadataDialog = true">メタデータに反映</v-btn>
         <span v-if="isAmazon" class="text-caption text-medium-emphasis">Amazon の写真には使えません</span>
+        <v-btn variant="outlined" prepend-icon="mdi-file-delimited-outline" @click="exportResultsCsv">CSV を書き出す</v-btn>
       </template>
       <v-btn variant="text" prepend-icon="mdi-restart" @click="restartDialog = true">最初からやり直す</v-btn>
     </div>
 
-    <div v-if="resultsPhotos.length" class="result-grid" :class="gridClass(resultsDensity)" :style="gridStyle(resultsDensity)">
-      <div
-        v-for="photo in resultsPhotos" :key="photo.id" class="result-tile"
-        :class="{ 'is-confirmed': photo.rating >= MAX_RATING, 'is-eliminated': photo.rating === 0 }"
-        role="button" tabindex="0"
-        @click="openZoom(photo, resultsPhotos)" @keydown.enter="openZoom(photo, resultsPhotos)"
-      >
-        <img :src="desktop.photoThumbnailUrl(photo)" :alt="photo.name" loading="lazy">
-        <div class="result-tile__meta">
-          <span class="result-tile__stars">
-            <v-icon v-for="star in MAX_RATING" :key="star" size="13" :icon="star <= photo.rating ? 'mdi-star' : 'mdi-star-outline'" :class="star <= photo.rating ? 'text-primary' : 'text-medium-emphasis'" />
-          </span>
+    <v-alert v-if="resultsMessage" type="success" variant="tonal" density="compact" class="mb-4" closable @click:close="resultsMessage = ''">{{ resultsMessage }}</v-alert>
+
+    <!-- 見えている行の前後 2 行だけ描く。連写は 1 タイルに畳み、`⧉N` で中身選別へ。 -->
+    <VirtualPhotoGrid
+      v-if="resultsTiles.length"
+      :items="resultsTiles" :item-key="tile => tile.photo.id" :item-url="tile => desktop.photoThumbnailUrl(tile.photo)"
+      :columns="resultsDensity" :gap="14" :tile-aspect="0.95"
+      @end="loadMoreResults"
+    >
+      <template #default="{ item: tile, url }">
+        <div
+          class="result-tile"
+          :class="{ 'is-confirmed': tile.photo.rating >= MAX_RATING, 'is-eliminated': tile.photo.rating === 0 }"
+          role="button" tabindex="0"
+          @click="openZoom(tile.photo, resultsTiles.map(entry => entry.photo))"
+          @keydown.enter="openZoom(tile.photo, resultsTiles.map(entry => entry.photo))"
+        >
+          <img :src="url" :alt="tile.photo.name" loading="lazy" decoding="async">
+          <button
+            v-if="tile.burstSize > 1" type="button" class="result-tile__burst"
+            :aria-label="`連写 ${tile.burstSize} 枚の中身を選別`"
+            @click.stop="openBurstReview(tile.photo.relativePath)"
+            @keydown.enter.stop
+          >⧉{{ tile.burstSize }}</button>
+          <div class="result-tile__meta">
+            <span class="result-tile__stars">
+              <v-icon v-for="star in MAX_RATING" :key="star" size="13" :icon="star <= tile.photo.rating ? 'mdi-star' : 'mdi-star-outline'" :class="star <= tile.photo.rating ? 'text-primary' : 'text-medium-emphasis'" />
+            </span>
+          </div>
+          <div class="result-tile__name text-caption">{{ tile.photo.name }}</div>
         </div>
-        <div class="result-tile__name text-caption">{{ photo.name }}</div>
-      </div>
-    </div>
+      </template>
+    </VirtualPhotoGrid>
     <v-card v-else-if="!resultsBusy" class="pa-10 text-center text-medium-emphasis">
       この条件に当てはまる写真はありません。
     </v-card>

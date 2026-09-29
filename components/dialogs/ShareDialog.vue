@@ -1,6 +1,7 @@
 <script setup lang="ts">
 const {
   exportCsvByRating,
+  exportPreviewCount,
   exportZipByRating,
   isAmazon,
   shareBusy,
@@ -36,6 +37,8 @@ const {
         読み込み直したあとは、写真を選び直すと書き出せます。
       </v-alert>
 
+      <p class="text-body-2 mb-4"><strong>{{ exportPreviewCount.toLocaleString() }} 枚</strong>が対象です（連写の仲間を含む）。</p>
+
       <v-list class="bg-transparent">
         <v-list-item v-if="!isAmazon" class="px-0">
           <v-list-item-title>共有シートで渡す</v-list-item-title>
@@ -57,18 +60,16 @@ const {
             <v-btn variant="outlined" :loading="shareBusy" :disabled="!shareRatings.length" @click="exportZipByRating">ZIP</v-btn>
           </template>
         </v-list-item>
-        <template v-if="isAmazon">
-          <v-divider />
-          <v-list-item class="px-0">
-            <v-list-item-title>CSV で書き出す</v-list-item-title>
-            <v-list-item-subtitle class="text-wrap">
-              写真の名前と星の一覧です（<code>relative_path,rating,captured_at,name</code>）。原本は取りません。
-            </v-list-item-subtitle>
-            <template #append>
-              <v-btn variant="outlined" :loading="shareBusy" :disabled="!shareRatings.length" @click="exportCsvByRating">CSV</v-btn>
-            </template>
-          </v-list-item>
-        </template>
+        <v-divider />
+        <v-list-item class="px-0">
+          <v-list-item-title>CSV で書き出す</v-list-item-title>
+          <v-list-item-subtitle class="text-wrap">
+            写真の名前と星の一覧です（<code>{{ isAmazon ? 'relative_path,rating,captured_at,name' : 'relative_path,rating,captured_at' }}</code>）。原本は取りません。
+          </v-list-item-subtitle>
+          <template #append>
+            <v-btn variant="outlined" :loading="shareBusy" :disabled="!shareRatings.length" @click="exportCsvByRating">CSV</v-btn>
+          </template>
+        </v-list-item>
       </v-list>
     </v-card-text>
     <v-divider />

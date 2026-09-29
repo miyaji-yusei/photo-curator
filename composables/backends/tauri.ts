@@ -1,6 +1,6 @@
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { capabilitiesFor, detectPlatform } from '~/utils/capabilities'
-import { open } from '@tauri-apps/plugin-dialog'
+import { open, save } from '@tauri-apps/plugin-dialog'
 import type {
   AmazonPreview, ExportReport, Photo, PhotoPage, PhotoSort, Project,
   ProjectProgress, ProjectTask, SelectionResult, SelectionSummary
@@ -70,10 +70,19 @@ export function createTauriBackend(): PhotoBackend {
     getSelectionSummary: (projectId: string) => invokeDesktop<SelectionSummary>('get_selection_summary', { projectId }),
     getPhotosByIds: (projectId: string, photoIds: string[]) => invokeDesktop<Photo[]>('get_photos_by_ids', { projectId, photoIds }),
     getCoreInputs: (projectId: string) => invokeDesktop<Photo[]>('get_core_inputs', { projectId }),
-    exportByRating: (projectId: string, destination: string, ratings: number[], moveFiles: boolean) =>
-      invokeDesktop<ExportReport>('export_by_rating', { projectId, destination, ratings, moveFiles }),
-    writeRatingsToFiles: (projectId: string, ratings: number[]) =>
-      invokeDesktop<ExportReport>('write_ratings_to_files', { projectId, ratings }),
+    exportPhotos: (projectId: string, destination: string, photoIds: string[], moveFiles: boolean) =>
+      invokeDesktop<ExportReport>('export_photos', { projectId, destination, photoIds, moveFiles }),
+    writeRatingsToPhotos: (projectId: string, photoIds: string[]) =>
+      invokeDesktop<ExportReport>('write_ratings_to_photos', { projectId, photoIds }),
+    saveCsv: async (fileName: string, text: string) => {
+      if (!isTauriRuntime()) throw new Error('CSV の保存はデスクトップアプリで使えます。')
+      const chosen = await save({
+        title: 'CSV を保存', defaultPath: fileName, filters: [{ name: 'CSV', extensions: ['csv'] }]
+      })
+      if (!chosen) return false
+      await invokeDesktop<void>('write_text_file', { path: chosen, text })
+      return true
+    },
     saveBurstThreshold: (projectId: string, threshold: number) =>
       invokeDesktop<void>('save_burst_threshold', { projectId, threshold }),
     clearBurstThreshold: (projectId: string) => invokeDesktop<void>('clear_burst_threshold', { projectId }),

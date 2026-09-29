@@ -6,10 +6,13 @@ const {
   exportDialog,
   exportError,
   exportMode,
+  exportMoveConfirm,
+  exportPreviewCount,
   exportRatings,
   exportResult,
   isAmazon,
   ratingCount,
+  requestExport,
   runExport
 } = useCurator()
 </script>
@@ -32,6 +35,9 @@ const {
           @click="exportRatings.includes(rating) ? exportRatings.splice(exportRatings.indexOf(rating), 1) : exportRatings.push(rating)"
         >★{{ rating }}（{{ ratingCount(rating).toLocaleString() }}）</v-chip>
       </div>
+
+      <!-- 連写の仲間まで広げたあとの枚数（書き出す枚数）。 -->
+      <p class="text-body-2 mb-4"><strong>{{ exportPreviewCount.toLocaleString() }} 枚</strong>を書き出します（連写の仲間を含む）。</p>
 
       <v-radio-group v-model="exportMode" hide-details class="mb-2">
         <v-radio value="copy" label="コピーする（原本はそのまま残る）" />
@@ -60,9 +66,28 @@ const {
       <v-btn variant="outlined" :disabled="exportBusy" @click="exportDialog = false">閉じる</v-btn>
       <v-btn
         :color="exportMode === 'move' ? 'error' : 'primary'"
-        :loading="exportBusy" :disabled="!exportDestination || !exportRatings.length"
-        @click="runExport"
+        :loading="exportBusy" :disabled="!exportDestination || !exportRatings.length || !exportPreviewCount"
+        @click="requestExport"
       >{{ exportMode === 'move' ? '移動する' : 'コピーする' }}</v-btn>
+    </v-card-actions>
+  </v-card>
+</v-dialog>
+
+<!-- 移動の確認。移動は原本フォルダから写真が消えるので、実行の前に必ず確認する。 -->
+<v-dialog v-model="exportMoveConfirm" max-width="480">
+  <v-card title="原本を移動しますか？">
+    <v-card-text class="pt-4">
+      <p class="text-error font-weight-bold mb-3">原本を移動します</p>
+      <p class="text-body-2">
+        <strong>{{ exportPreviewCount.toLocaleString() }} 枚</strong>が、元のフォルダから
+        <code>{{ exportDestination }}</code> の <code>star-N</code> フォルダへ移ります。
+        元のフォルダには残りません。
+      </p>
+    </v-card-text>
+    <v-card-actions class="pa-5 pt-2">
+      <v-spacer />
+      <v-btn variant="outlined" @click="exportMoveConfirm = false">やめる</v-btn>
+      <v-btn color="error" @click="runExport">原本を移動する</v-btn>
     </v-card-actions>
   </v-card>
 </v-dialog>

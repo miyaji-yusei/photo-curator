@@ -195,6 +195,9 @@ body { margin: 0; }
 .result-tile__stars { display: inline-flex; }
 .result-tile__badge { margin-left: auto; background: rgb(var(--v-theme-secondary)); color: #101114; border-radius: 999px; padding: 1px 8px; font-size: 11px; font-weight: 700; }
 .result-tile__badge.is-out { background: #3a3f48; color: #cfd3da; }
+/* 連写を畳んだタイル。左上の ⧉N を押すと、その連写の中身選別が開く。 */
+.result-tile__burst { position: absolute; top: 6px; left: 6px; z-index: 2; border: 0; cursor: pointer; background: rgba(16, 17, 20, .78); color: #fff; border-radius: 999px; padding: 1px 9px; font-size: 12px; font-weight: 700; line-height: 20px; }
+.result-tile__burst:hover, .result-tile__burst:focus-visible { background: rgb(var(--v-theme-primary)); color: #101114; outline: none; }
 .result-tile__name { padding: 2px 8px 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* ---- レスポンシブ ---------------------------------------------------- */

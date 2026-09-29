@@ -25,11 +25,10 @@ import { MAX_RATING } from '~/types/photo'
 import type { DeviceIdentity, PhotoBackend, SidecarAccess, SidecarState } from '~/composables/photoBackend'
 import { analyzeAll, workersFor } from '~/utils/analysisPool'
 import { fetchPool } from '~/utils/amazonPool'
-import { amazonCsv } from '~/utils/amazonCsv'
 import { keyFor, parseContentDate, parseKey, parseShareUrl, readShare, viewBoxUrl } from '~/lib/amazonShare'
 import { resolveCaptureTime } from '~/utils/captureTime'
 import { createStoredZip } from '~/utils/zip'
-import { zipEntriesByRating } from '~/utils/shareExport'
+import { downloadBlob, zipEntriesByRating } from '~/utils/shareExport'
 import type { AnalysisJob } from '~/utils/analysisPool'
 import { DISPLAY_EDGE_DEFAULT, hashThumbnail } from '~/utils/analyzePhoto'
 import { capabilitiesFor, hasDirectoryPicker } from '~/utils/capabilities'
@@ -528,25 +527,16 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
     await store.patchProject(projectId, {})
   }
 
-  /** Amazon の結果を書き出す。ZIP は中継で原本を取る。CSV は端末の中だけで作る。 */
-  async function exportAmazon(projectId: string, ratings: number[], format: 'zip' | 'csv'): Promise<AmazonExport> {
+  /** Amazon の結果を ZIP にする。原本は中継で取る（CSV は全部の出所が `saveCsv`）。 */
+  async function exportAmazon(projectId: string, photoIds: string[]): Promise<AmazonExport> {
     const links = await linksOf(projectId)
     if (!links) throw new Error('Amazon のプロジェクトではありません。')
-    const wanted = new Set(ratings)
+    const wanted = new Set(photoIds)
     const rows = (await store.photosOfProject(projectId))
-      .filter(row => !row.isMissing && wanted.has(row.rating))
+      .filter(row => !row.isMissing && wanted.has(row.id))
       .sort((left, right) => right.rating - left.rating || (left.relativePath < right.relativePath ? -1 : 1))
     if (!rows.length) throw new Error('対象の写真がありません。')
     const stamp = new Date().toISOString().slice(0, 10)
-    if (format === 'csv') {
-      const text = amazonCsv(rows.map(row => ({
-        relativePath: row.relativePath, rating: row.rating, capturedAt: row.capturedAt, name: row.name
-      })))
-      return {
-        blob: new Blob([text], { type: 'text/csv' }), fileName: `photo-curator-${stamp}.csv`,
-        count: rows.length, skipped: 0
-      }
-    }
     const got = new Map<string, Blob>()
     await fetchPool({
       items: rows,
@@ -833,8 +823,12 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
     startDisplayGeneration: () => Promise.resolve(),
     resetDisplayImages: () => Promise.resolve(),
 
-    exportByRating: (): Promise<ExportReport> => unsupported('フォルダ分け'),
-    writeRatingsToFiles: (): Promise<ExportReport> => unsupported('メタデータへの書き込み'),
+    exportPhotos: (): Promise<ExportReport> => unsupported('フォルダ分け'),
+    writeRatingsToPhotos: (): Promise<ExportReport> => unsupported('メタデータへの書き込み'),
+    saveCsv: async (fileName: string, text: string) => {
+      downloadBlob(new Blob([text], { type: 'text/csv' }), fileName)
+      return true
+    },
 
     /**
      * 写真ピッカーで選ばれたファイルを取り込み、そのまま解析する。

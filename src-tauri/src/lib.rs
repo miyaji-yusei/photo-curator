@@ -3377,30 +3377,33 @@ impl ExportReport {
     }
 }
 
-/// 対象の写真を星ごとに取り出す。`ratings` が空なら全部。
+/// 対象の写真を取り出す。**対象は TS が決めた写真の id**（連写の仲間まで広げたあと）で、
+/// 星では選ばない。id が空なら何も返さない。並びは相対パス順。
 fn photos_for_export(
     conn: &Connection,
     project_id: &str,
-    ratings: &[i64],
+    photo_ids: &[String],
 ) -> Result<Vec<(String, i64)>, String> {
+    if photo_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let wanted: std::collections::HashSet<&str> = photo_ids.iter().map(String::as_str).collect();
     let mut statement = conn
-        .prepare("SELECT path,rating FROM photos WHERE project_id=?1 AND is_missing=0 ORDER BY relative_path")
+        .prepare("SELECT id,path,rating FROM photos WHERE project_id=?1 AND is_missing=0 ORDER BY relative_path")
         .map_err(|error| error.to_string())?;
     let rows = statement
         .query_map(params![project_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
         })
         .map_err(|error| error.to_string())?;
-    let all = rows
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    Ok(if ratings.is_empty() {
-        all
-    } else {
-        all.into_iter()
-            .filter(|(_, rating)| ratings.contains(rating))
-            .collect()
-    })
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, path, rating) = row.map_err(|error| error.to_string())?;
+        if wanted.contains(id.as_str()) {
+            out.push((path, rating));
+        }
+    }
+    Ok(out)
 }
 
 /// 出力先に同名があるとき、`name (2).jpg` のように連番を付ける。
@@ -3427,24 +3430,25 @@ fn unique_destination(directory: &Path, file_name: &str) -> PathBuf {
     candidate
 }
 
-/// 星ごとのフォルダへ書き出す。`star-5` `star-4` … を出力先に作る。
+/// 選んだ写真を星ごとのフォルダへ書き出す。`star-5` `star-4` … を出力先に作る。
+/// 対象は `photo_ids`（TS が連写の仲間まで広げて決める）。
 ///
 /// `move_files` が false ならコピー。true なら移動で、**原本フォルダから写真が
 /// 消える**。移動は「コピーしてから元を消す」順で行い、コピーに失敗したら
 /// 元は残す。同じボリュームなら rename を試し、失敗したらコピーへ落とす。
 #[tauri::command]
-async fn export_by_rating(app: AppHandle, project_id: String, destination: String, ratings: Vec<i64>, move_files: bool) -> Result<ExportReport, String> {
+async fn export_photos(app: AppHandle, project_id: String, destination: String, photo_ids: Vec<String>, move_files: bool) -> Result<ExportReport, String> {
     // 重い処理（ディスクと SQLite）はメインスレッドから外す。
-    tauri::async_runtime::spawn_blocking(move || export_by_rating_blocking(app, project_id, destination, ratings, move_files))
+    tauri::async_runtime::spawn_blocking(move || export_photos_blocking(app, project_id, destination, photo_ids, move_files))
         .await
         .map_err(|e| e.to_string())?
 }
 
-fn export_by_rating_blocking(
+fn export_photos_blocking(
     app: AppHandle,
     project_id: String,
     destination: String,
-    ratings: Vec<i64>,
+    photo_ids: Vec<String>,
     move_files: bool,
 ) -> Result<ExportReport, String> {
     let root = PathBuf::from(&destination);
@@ -3456,7 +3460,7 @@ fn export_by_rating_blocking(
         if move_files {
             return Err(AMAZON_UNSUPPORTED.into());
         }
-        return export_amazon_copy(&app, &project_id, book, &root, &ratings);
+        return export_amazon_copy(&app, &project_id, book, &root, &photo_ids);
     }
     // 出力先が写真フォルダの中だと、書き出した先をまた読んでしまう。
     let folder = project_folder(&app, &project_id)?;
@@ -3465,7 +3469,7 @@ fn export_by_rating_blocking(
     }
 
     let conn = connection(&app)?;
-    let targets = photos_for_export(&conn, &project_id, &ratings)?;
+    let targets = photos_for_export(&conn, &project_id, &photo_ids)?;
     let mut report = ExportReport::default();
 
     for (path, rating) in &targets {
@@ -3525,21 +3529,22 @@ fn export_amazon_copy(
     project_id: &str,
     book: Arc<amazon::LinkBook>,
     root: &Path,
-    ratings: &[i64],
+    photo_ids: &[String],
 ) -> Result<ExportReport, String> {
     let conn = connection(app)?;
-    let targets: Vec<(String, String, i64)> = {
+    let targets: Vec<(String, String, String, i64)> = {
         let mut statement = conn
-            .prepare("SELECT path,name,rating FROM photos WHERE project_id=?1 AND is_missing=0 ORDER BY relative_path")
+            .prepare("SELECT id,path,name,rating FROM photos WHERE project_id=?1 AND is_missing=0 ORDER BY relative_path")
             .map_err(|error| error.to_string())?;
         let rows = statement
-            .query_map(params![project_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .query_map(params![project_id], |row| Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
             .map_err(|error| error.to_string())?;
         rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?
     };
+    let wanted: std::collections::HashSet<&str> = photo_ids.iter().map(String::as_str).collect();
     let mut report = ExportReport::default();
-    for (node_id, name, rating) in targets {
-        if !ratings.is_empty() && !ratings.contains(&rating) {
+    for (id, node_id, name, rating) in targets {
+        if !wanted.contains(id.as_str()) {
             continue;
         }
         let directory = root.join(format!("star-{rating}"));
@@ -3666,25 +3671,26 @@ fn jpeg_with_rating(original: &[u8], rating: i64) -> Result<Vec<u8>, String> {
 ///
 /// 一時ファイルへ書いてから中身を検証し、問題なければ置き換える。
 /// 途中で失敗しても原本はそのまま残る。JPEG 以外は触らない。
+/// 対象は `photo_ids`（TS が連写の仲間まで広げて決める）。
 #[tauri::command]
-async fn write_ratings_to_files(app: AppHandle, project_id: String, ratings: Vec<i64>) -> Result<ExportReport, String> {
+async fn write_ratings_to_photos(app: AppHandle, project_id: String, photo_ids: Vec<String>) -> Result<ExportReport, String> {
     // 重い処理（ディスクと SQLite）はメインスレッドから外す。
-    tauri::async_runtime::spawn_blocking(move || write_ratings_to_files_blocking(app, project_id, ratings))
+    tauri::async_runtime::spawn_blocking(move || write_ratings_to_photos_blocking(app, project_id, photo_ids))
         .await
         .map_err(|e| e.to_string())?
 }
 
-fn write_ratings_to_files_blocking(
+fn write_ratings_to_photos_blocking(
     app: AppHandle,
     project_id: String,
-    ratings: Vec<i64>,
+    photo_ids: Vec<String>,
 ) -> Result<ExportReport, String> {
     let conn = connection(&app)?;
     // Amazon の写真の原本は書き換えられない。
     if amazon_source_of(&conn, &project_id)?.is_some() {
         return Err(AMAZON_UNSUPPORTED.into());
     }
-    let targets = photos_for_export(&conn, &project_id, &ratings)?;
+    let targets = photos_for_export(&conn, &project_id, &photo_ids)?;
     let mut report = ExportReport::default();
 
     for (path, rating) in &targets {
@@ -3745,6 +3751,25 @@ fn write_ratings_to_files_blocking(
         }
     }
     Ok(report)
+}
+
+/// 結果の CSV を、保存ダイアログで選ばれた場所へ書く。**書けるのは `.csv` だけ**
+/// （画面が渡すのは保存ダイアログの結果と、TS が作った CSV の文）。
+#[tauri::command]
+async fn write_text_file(path: String, text: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let target = PathBuf::from(&path);
+        let is_csv = target
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("csv"));
+        if !is_csv {
+            return Err("CSV のファイルにだけ書けます。".to_string());
+        }
+        fs::write(&target, text.as_bytes()).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -4559,8 +4584,9 @@ pub fn run() {
             reset_selection_results,
             move_rating,
             get_selection_summary,
-            export_by_rating,
-            write_ratings_to_files,
+            export_photos,
+            write_ratings_to_photos,
+            write_text_file,
             get_display_settings,
             save_display_edge,
             save_project_display_edge,
@@ -7164,6 +7190,24 @@ mod tests {
         assert_eq!(ratings, 0, "星は消える");
         assert_eq!(hashes, 4, "d_hash は消さない");
         assert_eq!(thumbs, 4, "サムネイルは消さない");
+
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn export_targets_are_the_given_photo_ids() {
+        let directory = test_directory("export-ids");
+        let conn = rated_fixture(&directory.join("e.sqlite3"));
+
+        let ids = vec!["three-b".to_string(), "five".to_string(), "missing".to_string()];
+        let targets = photos_for_export(&conn, "p1", &ids).expect("targets");
+        // 相対パス順（c-three, e-five）。星は写真自身の星。
+        assert_eq!(
+            targets.iter().map(|(path, rating)| (path.as_str(), *rating)).collect::<Vec<_>>(),
+            vec![("C:/photos/c-three.jpg", 3), ("C:/photos/e-five.jpg", 5)]
+        );
+        assert!(photos_for_export(&conn, "p1", &[]).expect("empty").is_empty(), "id が空なら何も書き出さない");
 
         drop(conn);
         fs::remove_dir_all(&directory).expect("remove test directory");

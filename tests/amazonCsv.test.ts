@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { amazonCsv, csvCell } from '~/utils/amazonCsv'
+import { amazonCsv, csvCell, resultsCsv } from '~/utils/amazonCsv'
 
 describe('amazonCsv', () => {
   it('先頭 3 列は他の出所と同じで、4 列目に name', () => {
@@ -21,5 +21,10 @@ describe('amazonCsv', () => {
     expect(csvCell('日本語 名前.jpg')).toBe('日本語 名前.jpg')
     const text = amazonCsv([{ relativePath: 'n', rating: 3, capturedAt: null, name: 'a,"b".jpg' }])
     expect(text.split('\n')[1]).toBe('n,3,,"a,""b"".jpg"')
+  })
+
+  it('Amazon 以外は 3 列だけ（name を出さない）', () => {
+    const text = resultsCsv([{ relativePath: 'a/b.jpg', rating: 2, capturedAt: 5, name: 'b.jpg' }], false)
+    expect(text.split('\n')).toEqual(['relative_path,rating,captured_at', 'a/b.jpg,2,5', ''])
   })
 })

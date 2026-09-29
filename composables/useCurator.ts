@@ -25,6 +25,9 @@ import {
 import type { CoreInputs } from '~/utils/coreInputs'
 import { applyChanges, moveRatings, pathsWithRating, reviewChanges, setRating } from '~/utils/ratingEdit'
 import { syncRatings } from '~/utils/selectionFlow'
+import { collapseBursts } from '~/utils/collapseBursts'
+import { exportTargetsForStars } from '~/utils/exportTargets'
+import { resultsCsv } from '~/utils/amazonCsv'
 import type { RatingChange, SavedSelection } from '~/utils/selectionFlow'
 import { clampGroupSize, groupSizeLimits } from '~/utils/groupSize'
 import {
@@ -1390,15 +1393,66 @@ function createCurator() {
     }
   }
 
+  /**
+   * 書き出しの対象を決める（フォルダ分け・メタデータ・共有・ZIP・CSV の全部が使う）。
+   *
+   * 選んだ星の写真を、連写ごとに畳んだ行にして仲間まで広げ、**その 1 枚自身の星が選んだ星に合う
+   * ものだけ**にする（`utils/exportTargets.ts`）。連写の中身を選別した組は、選んだものだけが出る。
+   * 行は全部を読み直して使う（結果の格子はページ送りで、全部は持っていないので）。
+   */
+  async function exportPhotosFor(stars: readonly number[]): Promise<Photo[]> {
+    const projectId = activeProject.value?.id
+    if (!projectId || !stars.length) return []
+    const rows = [...await desktop.getCoreInputs(projectId)]
+      .sort((left, right) => (left.relativePath < right.relativePath ? -1 : left.relativePath > right.relativePath ? 1 : 0))
+    const byPath = new Map(rows.map(row => [row.relativePath, row]))
+    return exportTargetsForStars(rows, coreSession.value?.members, stars)
+      .map(target => byPath.get(target.relativePath))
+      .filter((photo): photo is Photo => !!photo)
+  }
+
+  /**
+   * ダイアログに出す枚数のための、広げたあとの写真。ダイアログを開いたときと、星を選び直したときに
+   * 読み直す（`exportPreviewFor`）。星ごとの枚数 `ratingCount` は広げる前の行の数。
+   */
+  const exportPreviewRows = shallowRef<Photo[]>([])
+  const exportPreviewStars = ref<number[]>([])
+  let exportPreviewToken = 0
+  async function refreshExportPreview() {
+    const token = ++exportPreviewToken
+    const stars = [...exportPreviewStars.value]
+    const rows = stars.length && activeProject.value ? await exportPhotosFor(stars).catch(() => []) : []
+    if (token === exportPreviewToken) exportPreviewRows.value = rows
+  }
+  /** いま開いているダイアログが、どの星の一覧を見せるか。閉じたら空。 */
+  const exportPreviewCount = computed(() => exportPreviewRows.value.length)
+  watch(
+    () => exportDialog.value ? [...exportRatings.value]
+      : metadataDialog.value ? [...metadataRatings.value]
+        : shareDialog.value ? [...shareRatings.value] : [],
+    stars => { exportPreviewStars.value = stars; void refreshExportPreview() },
+    { immediate: true }
+  )
+
+  /** 「移動」を押したときの確認。コピーは確認なしで実行する。 */
+  const exportMoveConfirm = ref(false)
+  function requestExport() {
+    if (exportMode.value === 'move') exportMoveConfirm.value = true
+    else void runExport()
+  }
+
   async function runExport() {
+    exportMoveConfirm.value = false
     if (!activeProject.value || !exportDestination.value) return
     exportBusy.value = true
     exportResult.value = null
     exportError.value = ''
     try {
-      exportResult.value = await desktop.exportByRating(
+      const photos = await exportPhotosFor(exportRatings.value)
+      if (!photos.length) throw new Error('対象の写真がありません。')
+      exportResult.value = await desktop.exportPhotos(
         activeProject.value.id, exportDestination.value,
-        [...exportRatings.value], exportMode.value === 'move'
+        photos.map(photo => photo.id), exportMode.value === 'move'
       )
       if (exportMode.value === 'move') await refreshProjects()
     } catch (cause) {
@@ -1415,8 +1469,10 @@ function createCurator() {
     metadataResult.value = null
     metadataError.value = ''
     try {
-      metadataResult.value = await desktop.writeRatingsToFiles(
-        activeProject.value.id, [...metadataRatings.value]
+      const photos = await exportPhotosFor(metadataRatings.value)
+      if (!photos.length) throw new Error('対象の写真がありません。')
+      metadataResult.value = await desktop.writeRatingsToPhotos(
+        activeProject.value.id, photos.map(photo => photo.id)
       )
     } catch (cause) {
       metadataError.value = cause instanceof Error ? cause.message : 'メタデータを書き込めませんでした。'
@@ -1425,13 +1481,61 @@ function createCurator() {
     }
   }
 
+  /**
+   * CSV を書き出す。全部の出所で同じ（先頭 3 列は `relative_path,rating,captured_at`、Amazon は 4 列目に `name`）。
+   * PC は保存ダイアログ、ブラウザはダウンロード。**原本には触れない。**
+   */
+  async function saveResultsCsv(stars: readonly number[]): Promise<string> {
+    const photos = await exportPhotosFor(stars)
+    if (!photos.length) throw new Error('対象の写真がありません。')
+    const stamp = new Date().toISOString().slice(0, 10)
+    const text = resultsCsv(photos.map(photo => ({
+      relativePath: photo.relativePath, rating: photo.rating, capturedAt: photo.capturedAt, name: photo.name
+    })), isAmazon.value)
+    const saved = await desktop.saveCsv(`photo-curator-${stamp}.csv`, text)
+    return saved ? `${photos.length.toLocaleString()} 枚を CSV にしました。` : ''
+  }
+
+  /** 結果の画面の「CSV を書き出す」。いまの絞り込み（すべてなら全部の星）が対象。 */
+  const resultsMessage = ref('')
+  async function exportResultsCsv() {
+    resultsMessage.value = ''
+    try {
+      resultsMessage.value = await saveResultsCsv(resultsRating.value === null ? [5, 4, 3, 2, 1, 0] : [resultsRating.value])
+    } catch (cause) {
+      error.value = cause instanceof Error ? cause.message : 'CSV を書き出せませんでした。'
+    }
+  }
+
   /** 選別結果の一覧。中断中でも開ける。 */
-  async function openResults() {
+  async function openResults(rating?: unknown) {
     if (!activeProject.value) return
     view.value = 'results'
     resultsOffset.value = 0
     resultsPhotos.value = []
-    await Promise.all([loadResultsPage(true), loadSummary()])
+    resultsMessage.value = ''
+    await loadSummary()
+    // 星の指定が無ければ、その結果で実際に付いている一番高い星に絞る（全部 ★0 なら「すべて」）。
+    // プロジェクトの画面の星の行から来たときは、その星のまま。
+    // （`@click="openResults"` はイベントを渡してくるので、数値か null だけを指定とみなす。）
+    resultsRating.value = rating === null || typeof rating === 'number' ? rating : highestRating()
+    await loadResultsPage(true)
+  }
+
+  /** 結果へ戻る（絞り込みはそのまま）。 */
+  const returnToResults = () => openResults(resultsRating.value)
+
+  /** 実際に付いている一番高い星（1〜5）。1 枚も付いていなければ null。 */
+  function highestRating(): number | null {
+    return [5, 4, 3, 2, 1].find(star => ratingCount(star) > 0) ?? null
+  }
+
+  /** 結果の格子のタイル。連写は、読み込んだ行の中で星が一番高い 1 枚に畳む。 */
+  const resultsTiles = computed(() => collapseBursts(resultsPhotos.value, coreSession.value?.members))
+
+  /** ページの末尾が見えたら次のページ。 */
+  function loadMoreResults() {
+    if (!resultsBusy.value && resultsPhotos.value.length < resultsTotal.value) void loadResultsPage()
   }
 
   async function loadSummary() {
@@ -1478,7 +1582,7 @@ function createCurator() {
    * 連写の見直しを開く。**まとめは保存していない**ので、学習済みの閾値から
    * その場で引き直す。2枚以上のものだけが対象。
    */
-  async function openBurstReview() {
+  async function openBurstReview(focus?: unknown) {
     if (!activeProject.value) return
     view.value = 'burst-review'
     burstReviewLoaded.value = false
@@ -1495,6 +1599,12 @@ function createCurator() {
       burstReviewGroups.value = groups
         .filter(group => group.members.length > 1)
         .map(group => toViewGroup(group, inputs))
+      // 結果の格子の `⧉N` から来たときは、その連写から始める（`focus` は仲間の 1 枚の relativePath）。
+      if (typeof focus === 'string') {
+        const id = idOf(focus)
+        const at = id ? burstReviewGroups.value.findIndex(group => group.photoIds.includes(id)) : -1
+        if (at > 0) burstReviewIndex.value = at
+      }
       await loadBurstReviewPhotos()
     } catch (cause) {
       error.value = cause instanceof Error ? cause.message : '連写を読み込めませんでした。'
@@ -1533,7 +1643,7 @@ function createCurator() {
   /** 次のまとめへ。最後まで来たら結果画面に戻す。 */
   async function advanceBurstReview() {
     if (burstReviewIndex.value + 1 >= burstReviewGroups.value.length) {
-      await openResults()
+      await returnToResults()
       return
     }
     burstReviewIndex.value += 1
@@ -1721,7 +1831,7 @@ function createCurator() {
   // ---- ライブラリへの反映（ブラウザ） --------------------------------------
 
   /**
-   * 書き出しの対象を集める。
+   * 書き出しの対象を集める（共有・ZIP）。対象の決め方は `exportPhotosFor`（連写の仲間まで広げる）。
    *
    * **原本はこのセッションで取り込んだぶんしか手元に無い。** iOS には永続的な
    * ファイルハンドルが無いため、リロードすると参照が切れる。書き出せる枚数と
@@ -1732,18 +1842,10 @@ function createCurator() {
     if (!project) return { rows: [], files: [], missing: 0 }
     const rows: { name: string, rating: number, capturedAt: number | null, file: File }[] = []
     let missing = 0
-    for (const rating of [...shareRatings.value].sort((left, right) => right - left)) {
-      let offset = 0
-      for (;;) {
-        const page = await desktop.getProjectPhotoPage(project.id, offset, 200, rating, 'name')
-        for (const photo of page.photos) {
-          const file = desktop.originalFile?.(photo.id) ?? null
-          if (file) rows.push({ name: photo.name, rating: photo.rating, capturedAt: photo.capturedAt, file })
-          else missing += 1
-        }
-        offset += page.photos.length
-        if (!page.photos.length || offset >= page.total) break
-      }
+    for (const photo of await exportPhotosFor(shareRatings.value)) {
+      const file = desktop.originalFile?.(photo.id) ?? null
+      if (file) rows.push({ name: photo.name, rating: photo.rating, capturedAt: photo.capturedAt, file })
+      else missing += 1
     }
     return { rows, files: rows.map(row => row.file), missing }
   }
@@ -1776,20 +1878,20 @@ function createCurator() {
   }
 
   /**
-   * Amazon の結果の書き出し（ZIP は原本を取る・CSV は端末の中だけ）。
-   * ZIP で原本が 1 枚も取れないときは、その理由が `shareError` に出る（CSV だけ書き出せます）。
+   * Amazon の結果の ZIP（原本を取る）。原本が 1 枚も取れないときは、その理由が `shareError` に出る
+   * （CSV だけ書き出せます）。
    */
-  async function exportAmazonResults(format: 'zip' | 'csv') {
+  async function exportAmazonZip() {
     const project = activeProject.value
     if (!project || !desktop.exportAmazon) return
     shareBusy.value = true
     shareError.value = ''
     shareMessage.value = ''
     try {
-      const out = await desktop.exportAmazon(project.id, [...shareRatings.value], format)
+      const photos = await exportPhotosFor(shareRatings.value)
+      const out = await desktop.exportAmazon(project.id, photos.map(photo => photo.id))
       downloadBlob(out.blob, out.fileName)
-      const what = format === 'zip' ? 'ZIP' : 'CSV'
-      shareMessage.value = `${out.count} 枚を ${what} にしました${out.skipped ? `（原本を取れなかった ${out.skipped} 枚は除いています）` : ''}。`
+      shareMessage.value = `${out.count} 枚を ZIP にしました${out.skipped ? `（原本を取れなかった ${out.skipped} 枚は除いています）` : ''}。`
     } catch (cause) {
       shareError.value = cause instanceof Error ? cause.message : '書き出せませんでした。'
     } finally {
@@ -1797,12 +1899,23 @@ function createCurator() {
     }
   }
 
-  /** Amazon の結果を CSV で書き出す。 */
-  const exportCsvByRating = () => exportAmazonResults('csv')
+  /** 書き出しダイアログの CSV。全部の出所で同じ。 */
+  async function exportCsvByRating() {
+    shareBusy.value = true
+    shareError.value = ''
+    shareMessage.value = ''
+    try {
+      shareMessage.value = await saveResultsCsv(shareRatings.value)
+    } catch (cause) {
+      shareError.value = cause instanceof Error ? cause.message : 'CSV を書き出せませんでした。'
+    } finally {
+      shareBusy.value = false
+    }
+  }
 
   /** 星ごとのフォルダに分けた ZIP を書き出す。 */
   async function exportZipByRating() {
-    if (isAmazon.value) return exportAmazonResults('zip')
+    if (isAmazon.value) return exportAmazonZip()
     shareBusy.value = true
     shareError.value = ''
     shareMessage.value = ''
@@ -2313,6 +2426,14 @@ function createCurator() {
     shareSelectedPhotos,
     exportZipByRating,
     exportCsvByRating,
+    exportResultsCsv,
+    resultsMessage,
+    resultsTiles,
+    loadMoreResults,
+    returnToResults,
+    exportPreviewCount,
+    exportMoveConfirm,
+    requestExport,
     openShareDialog,
     resumeSession,
     sidecarAccess,
