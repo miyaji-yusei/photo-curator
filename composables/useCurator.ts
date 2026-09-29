@@ -25,7 +25,7 @@ import {
 } from '~/utils/coreInputs'
 import type { CoreInputs } from '~/utils/coreInputs'
 import { applyChanges, moveRatings, pathsWithRating, reviewChanges, setRating } from '~/utils/ratingEdit'
-import { syncRatings } from '~/utils/selectionFlow'
+import { healRatings, syncRatings } from '~/utils/selectionFlow'
 import { collapseBursts } from '~/utils/collapseBursts'
 import { prepareProgress, projectStatus } from '~/utils/projectStatus'
 import type { CardState, CardStatus, PrepareLine } from '~/utils/projectStatus'
@@ -614,6 +614,9 @@ function createCurator() {
   async function applyCore(next: Session) {
     const previous = session.value?.core ?? null
     setCore(next)
+    // Session を先に待ち行列へ入れる。行の星の書き込みの途中で終了しても、Session は新しい組になる
+    // （逆順だと、行の星だけ進んで Session が前の組のまま残り、次に開いて同じ組を確定すると +1 が重なる）。
+    saveSession()
     await writeRatings(syncRatings(previous, next))
   }
 
@@ -631,6 +634,23 @@ function createCurator() {
       ?? core.startRound([], clampGroupSize(settings.groupSize, groupLimits), 0, false, thresholdFor(currentDistance()), [])
     const base = applyChanges(held, Object.fromEntries(rows.map(row => [row.relativePath, row.rating])))
     return { base: markRaw(base), inputs, rows }
+  }
+
+  /**
+   * 開いたとき、行の星が Session とずれていたら Session に合わせる（自己修復）。
+   * 組を確定した直後の強制終了で、行の星と封筒が食い違ったまま残るのを直す。
+   */
+  async function healRowRatings(projectId: string) {
+    const current = session.value?.core
+    if (!current) return
+    try {
+      const entries = healRatings(await desktop.getCoreInputs(projectId), current)
+      if (!entries.length) return
+      await desktop.saveSelectionResults(projectId, entries)
+      noteJudgementChanged(projectId)
+    } catch (cause) {
+      error.value = cause instanceof Error ? cause.message : '星を Session に合わせられませんでした。'
+    }
   }
 
   /** 開いたときのサイドカーの確認。Push・Pull は片付け、食い違いだけダイアログを出す。 */
@@ -695,6 +715,7 @@ function createCurator() {
           session.value = value
         })
       ])
+      await healRowRatings(project.id)
       // 開いた時点から少しずつ解析を進めておく。「選別を開始」で待たされないように。
       // ただし**やることが無いなら起動しない**。以前は無条件に呼んでいたため、
       // 解析済みのプロジェクトを開くたびに進捗イベントだけが飛び、解析中の帯が
@@ -1206,11 +1227,12 @@ function createCurator() {
   async function advanceWith(next: Session) {
     const current = session.value
     if (!current) return
-    await applyCore(next)
+    // 封筒に写る画面の状態は、Session を差し替える前に整える（applyCore が先に封筒を待ち行列へ入れる）。
     current.selectedInGroup = []
     current.multiSelect = false
+    if (next.finished) current.stage = 'result'
+    await applyCore(next)
     if (next.finished) {
-      current.stage = 'result'
       view.value = 'result'
     } else {
       await loadCurrentPhotos()
@@ -1894,11 +1916,12 @@ function createCurator() {
         .filter(photo => burstReviewKept.value.includes(photo.id))
         .map(photo => photo.relativePath)
       const next = markRaw(applyChanges(base, reviewChanges(base, shown, kept)))
-      await writeRatings(syncRatings(base, next))
+      // Session を先に待ち行列へ入れてから、行の星を書く（applyCore と同じ順。途中で終了しても開き直しで揃う）。
       if (session.value) {
         setCore(next)
-        await saveSession()
+        saveSession()
       }
+      await writeRatings(syncRatings(base, next))
       await loadSummary()
       await advanceBurstReview()
     } catch (cause) {

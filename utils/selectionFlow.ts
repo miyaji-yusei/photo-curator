@@ -106,3 +106,24 @@ export function syncRatings(previous: Session | null, next: Session): RatingChan
   // core の ratings は HashMap 由来で順が不定。書く順を決めておく。
   return changes.sort((left, right) => (left.relativePath < right.relativePath ? -1 : left.relativePath > right.relativePath ? 1 : 0))
 }
+
+/**
+ * 開いたときの自己修復。組を確定した直後に強制終了すると、行の星だけ書けて Session が前の組のまま、
+ * またはその逆になりうる。Session（封筒）を正として、食い違う行を Session の星に合わせる。
+ *
+ * `syncRatings` と同じ仕組み（前を「行の星」、後を「Session」として差分を取る）。
+ * Session の `ratings` に無い写真は触らない。返すのは行の id と星。
+ */
+export function healRatings(
+  rows: ReadonlyArray<{ id: string, relativePath: string, rating: number }>,
+  session: Session
+): Array<{ id: string, rating: number }> {
+  const before = { ratings: Object.fromEntries(rows.map(row => [row.relativePath, row.rating])) } as Session
+  const idOf = new Map(rows.map(row => [row.relativePath, row.id]))
+  const entries: Array<{ id: string, rating: number }> = []
+  for (const change of syncRatings(before, session)) {
+    const id = idOf.get(change.relativePath)
+    if (id) entries.push({ id, rating: change.rating })
+  }
+  return entries
+}

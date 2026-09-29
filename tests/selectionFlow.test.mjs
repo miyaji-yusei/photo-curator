@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { beforeAll, describe, expect, it } from 'vitest'
 import * as core from '~/lib/core'
 import {
-  parseSavedSelection, serializeSavedSelection, syncRatings
+  healRatings, parseSavedSelection, serializeSavedSelection, syncRatings
 } from '~/utils/selectionFlow'
 
 const wasmPath = join(import.meta.dirname, '..', 'core-wasm', 'pkg', 'photo_curator_core_wasm_bg.wasm')
@@ -34,6 +34,32 @@ function envelope() {
     updatedAt: 123
   }
 }
+
+describe('healRatings（開いたときの自己修復）', () => {
+  const start = () => core.startRound(refs(6), 4, 0, false, threshold, [])
+  const rowsOf = ratings => refs(6).map((ref, index) => ({
+    id: `id-${index}`, relativePath: ref.relative_path, rating: ratings[ref.relative_path] ?? 0
+  }))
+
+  it('行の星が Session に追いついていなければ、Session に合わせる（行だけ +1 された逆は戻す）', () => {
+    const session = core.advance(start(), ['IMG_1.JPG'])
+    // 行だけ先に IMG_1 が ★1、さらに IMG_2 が食い違って ★3。Session は IMG_1 = 1・IMG_2 = 0。
+    const entries = healRatings(rowsOf({ 'IMG_1.JPG': 2, 'IMG_2.JPG': 3 }), session)
+    expect(entries).toEqual([{ id: 'id-1', rating: 1 }, { id: 'id-2', rating: 0 }])
+  })
+
+  it('Session が進んでいて行が前のままなら、行を進める', () => {
+    const session = core.advance(start(), ['IMG_1.JPG'])
+    expect(healRatings(rowsOf({}), session)).toEqual([{ id: 'id-1', rating: 1 }])
+  })
+
+  it('揃っていれば何も書かない。Session に無い写真は触らない', () => {
+    const session = core.advance(start(), ['IMG_1.JPG'])
+    expect(healRatings(rowsOf({ 'IMG_1.JPG': 1 }), session)).toEqual([])
+    const rows = [...rowsOf({ 'IMG_1.JPG': 1 }), { id: 'other', relativePath: 'OTHER.JPG', rating: 4 }]
+    expect(healRatings(rows, session)).toEqual([])
+  })
+})
 
 describe('syncRatings', () => {
   it('確定すると、選んだ写真の星だけが差として出る', () => {
