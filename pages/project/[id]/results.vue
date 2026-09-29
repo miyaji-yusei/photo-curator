@@ -9,6 +9,7 @@ import { registerAutoPush } from '~/composables/useSidecarSync'
 import type { Project, ProjectPhoto } from '~/types/project'
 import type { Session } from '~/lib/core'
 import { comparePhotos, filterPhotos, summarizeRatings } from '~/utils/photoQuery'
+import { expandExportTargets } from '~/utils/exportTargets'
 import type { PhotoSort } from '~/types/photo'
 import ZoomView from '~/components/ZoomView.vue'
 import BurstReviewView from '~/components/BurstReviewView.vue'
@@ -25,12 +26,13 @@ const projectId = computed(() => String(route.params.id))
 const project = ref<Project | null>(null)
 const photos = ref<ProjectPhoto[]>([])
 const session = ref<Session | null>(null)
+/** タイル用（サムネイル）。見えたものだけ入る。 */
 const thumbUrls = ref<Record<string, string>>({})
+/** 拡大・連写の中身選別用（表示用画像）。開いたものだけ入る。 */
+const displayUrls = ref<Record<string, string>>({})
 const photoByPath = computed(() => Object.fromEntries(photos.value.map(p => [p.relativePath, p])))
 /** Amazon 出所は端末にフォルダも原本も無いので、フォルダ分け・XMP は選べない（08章）。 */
 const isAmazon = computed(() => project.value?.source.kind === 'amazon')
-/** Web の Amazon 出所は写真をバイトとして読めない（capabilities.amazonDisplayOnly）ので、CSV だけ。 */
-const csvOnly = computed(() => isAmazon.value && capabilities.amazonDisplayOnly)
 
 // プロジェクト詳細の「星の行」から来たときは、その星で絞った状態で開く
 // （02章「プロジェクト詳細」の遷移表「星の行 → results（その星で絞る）」）。
@@ -56,7 +58,7 @@ const techOpen = ref(false)
 // **選別画面と同じ「見るだけの拡大」ではなく、専用の画面。**
 const reviewTarget = ref<string | null>(null)
 
-interface Row { relativePath: string; rating: number; capturedAt: number | null; burstSize: number }
+interface Row { relativePath: string; rating: number; capturedAt: number | null; burstSize: number; mates: string[] }
 
 const rows = computed<Row[]>(() => {
   if (!session.value) return []
@@ -75,10 +77,10 @@ const rows = computed<Row[]>(() => {
         if (r > bestRating) { bestRating = r; best = m }
       }
       const bestPhoto = photos.value.find(p => p.relativePath === best) ?? photo
-      out.push({ relativePath: bestPhoto.relativePath, rating: bestRating, capturedAt: bestPhoto.capturedAt, burstSize: mates.length })
+      out.push({ relativePath: bestPhoto.relativePath, rating: bestRating, capturedAt: bestPhoto.capturedAt, burstSize: mates.length, mates })
     } else {
       seen.add(photo.relativePath)
-      out.push({ relativePath: photo.relativePath, rating: session.value.ratings[photo.relativePath] ?? 0, capturedAt: photo.capturedAt, burstSize: 1 })
+      out.push({ relativePath: photo.relativePath, rating: session.value.ratings[photo.relativePath] ?? 0, capturedAt: photo.capturedAt, burstSize: 1, mates: [photo.relativePath] })
     }
   }
   return out
@@ -91,8 +93,16 @@ const filteredSorted = computed(() => {
 })
 const zoomPaths = computed(() => filteredSorted.value.map(r => r.relativePath))
 
+// 保存領域を開けない等。読み込み中のまま黙って止まらず、理由を出す。
+const loadError = ref('')
+
 async function load() {
-  project.value = await backend.getProject(projectId.value)
+  try {
+    project.value = await backend.getProject(projectId.value)
+  } catch (cause) {
+    loadError.value = cause instanceof Error ? cause.message : 'プロジェクトを読み込めませんでした。'
+    return
+  }
   if (!project.value) return
   photos.value = await backend.listPhotos(projectId.value)
   session.value = await backend.loadSession(projectId.value)
@@ -102,11 +112,48 @@ async function load() {
     const highest = [5, 4, 3, 2, 1].find(s => (summary.value.counts[s] ?? 0) > 0)
     if (highest !== undefined) filterStar.value = highest
   }
-  const paths = filteredSorted.value.slice(0, 300).map(r => r.relativePath)
-  const entries = await Promise.all(paths.map(async p => [p, await backend.displayUrl(projectId.value, p)] as const))
-  thumbUrls.value = Object.fromEntries(entries.filter(([, u]) => u) as [string, string][])
+  // タイルの絵は、見えたものだけ observeTile が取る（ここでは取らない）。
 }
 onMounted(load)
+
+// ---- 絵を取るのは見えたタイルだけ ----
+// 300 枚ぶんの表示用画像（長辺 1024）を最初に一度に取ると、Amazon では網から
+// 何十 MB も読む。タイルには小さいサムネイル（Amazon は viewBox=160 で約 7KB）で
+// 足り、表示用画像は拡大と連写の中身選別のときだけ取る。
+const requestedThumbs = new Set<string>()
+async function ensureThumb(path: string) {
+  if (requestedThumbs.has(path)) return
+  requestedThumbs.add(path)
+  const url = (await backend.thumbnailUrl(projectId.value, path)) ?? (await backend.displayUrl(projectId.value, path))
+  if (url) thumbUrls.value = { ...thumbUrls.value, [path]: url }
+}
+async function ensureDisplay(paths: string[]) {
+  const missing = paths.filter(p => !displayUrls.value[p])
+  if (missing.length === 0) return
+  const entries = await Promise.all(missing.map(async p => [p, await backend.displayUrl(projectId.value, p)] as const))
+  const next = { ...displayUrls.value }
+  for (const [p, url] of entries) if (url) next[p] = url
+  displayUrls.value = next
+}
+
+let tileObserver: IntersectionObserver | null = null
+const observedTiles = new WeakSet<Element>()
+function observeTile(el: unknown, path: string) {
+  if (!(el instanceof Element) || observedTiles.has(el)) return
+  if (typeof IntersectionObserver === 'undefined') { void ensureThumb(path); return }
+  tileObserver ??= new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue
+      tileObserver?.unobserve(entry.target)
+      const target = (entry.target as HTMLElement).dataset.path
+      if (target) void ensureThumb(target)
+    }
+  }, { rootMargin: '400px' }) // 少し先まで読んで、スクロールで空白が見えないようにする
+  observedTiles.add(el)
+  ;(el as HTMLElement).dataset.path = path
+  tileObserver.observe(el)
+}
+onBeforeUnmount(() => tileObserver?.disconnect())
 
 // 書き時「画面を離れる・背面へ回る・窓を閉じる」（設計02章）。結果画面での★上げ下げ・
 // 連写中身選別・やり直しも、ここを離れるときに書く。
@@ -124,7 +171,7 @@ function tapTile(row: Row) {
   if (row.burstSize > 1) {
     const mates = session.value?.members[row.relativePath] ?? [row.relativePath]
     reviewTarget.value = row.relativePath
-    void loadReviewUrls(mates)
+    void ensureDisplay(mates)
     return
   }
   openZoom(row.relativePath)
@@ -138,7 +185,16 @@ function longPress(row: Row) {
 
 function openZoom(path: string) {
   const at = zoomPaths.value.indexOf(path)
-  if (at >= 0) zoomIndex.value = at
+  if (at >= 0) moveZoom(at)
+}
+// 拡大が今開いている一覧（結果の並び、または連写の中身）。
+const activeZoomPaths = computed(() => (reviewZooming.value ? reviewMembers.value : zoomPaths.value))
+// 拡大は表示用画像を先に出し、原本が届いたら差し替える（ZoomView）。先に出す絵は
+// ここで、開いた 1 枚（と前後 1 枚）だけ取る。
+function moveZoom(index: number) {
+  zoomIndex.value = index
+  const paths = activeZoomPaths.value
+  void ensureDisplay([paths[index], paths[index - 1], paths[index + 1]].filter((p): p is string => !!p))
 }
 
 // 連写の中身選別（BurstReviewView）を開いている間の拡大は、結果一覧の並び
@@ -146,7 +202,7 @@ function openZoom(path: string) {
 const reviewZooming = ref(false)
 function openReviewZoom(index: number) {
   reviewZooming.value = true
-  zoomIndex.value = index
+  moveZoom(index)
 }
 function closeZoom() {
   zoomIndex.value = null
@@ -164,12 +220,6 @@ const reviewBaseStar = computed(() => {
   if (!reviewTarget.value || !session.value) return 0
   return session.value.ratings[reviewTarget.value] ?? 0
 })
-async function loadReviewUrls(paths: string[]) {
-  const missing = paths.filter(p => !thumbUrls.value[p])
-  if (missing.length === 0) return
-  const entries = await Promise.all(missing.map(async p => [p, await backend.displayUrl(projectId.value, p)] as const))
-  for (const [p, url] of entries) if (url) thumbUrls.value[p] = url
-}
 // 決めるまでデータは変えない。選んだ写真だけ ratings を更新（連写の仲間は道連れにしない）。
 //
 // **必ず toRaw(session.value) から組み立てる。** session は ref なので、代入した
@@ -198,9 +248,13 @@ async function bumpRating(path: string | null, delta: number) {
 }
 
 // 取り出し先の対象（選択があればその分だけ、無ければ絞り込み後の全部）。
+// 連写は仲間も含める。ただし中身を選別した組は、選んだものだけ（utils/exportTargets.ts）。
 const exportTargets = computed(() =>
-  (selected.value.size > 0 ? filteredSorted.value.filter(r => selected.value.has(r.relativePath)) : filteredSorted.value)
-    .map(r => ({ relativePath: r.relativePath, rating: r.rating, capturedAt: r.capturedAt }))
+  expandExportTargets(
+    selected.value.size > 0 ? filteredSorted.value.filter(r => selected.value.has(r.relativePath)) : filteredSorted.value,
+    session.value?.ratings ?? {},
+    path => photoByPath.value[path]?.capturedAt ?? null
+  )
 )
 
 // フォルダ分け・XMP は確認を挟む（06 章 A-2/A-3）。CSV・ZIP・共有は原本に触れないので即実行。
@@ -243,9 +297,15 @@ async function doExport(kind: 'folders' | 'xmp' | 'csv' | 'zip' | 'share') {
       downloadBlobAs(blob, `${project.value.name}.csv`)
       exportMessage.value = 'CSV を書き出しました。'
     } else if (kind === 'zip') {
-      const blob = await backend.exportZip(projectId.value, targets)
-      downloadBlobAs(blob, `${project.value.name}.zip`)
-      exportMessage.value = 'ZIP を書き出しました。'
+      // Web の Amazon 出所は中継サーバーが無いと失敗しうる（lib/backends/amazonWeb.ts）。
+      // その理由をそのまま出す（黙って失敗させない）。
+      try {
+        const blob = await backend.exportZip(projectId.value, targets)
+        downloadBlobAs(blob, `${project.value.name}.zip`)
+        exportMessage.value = 'ZIP を書き出しました。'
+      } catch (cause) {
+        exportMessage.value = cause instanceof Error ? cause.message : 'ZIP を書き出せませんでした。'
+      }
     } else {
       const { shareFiles, canShareFiles } = await import('~/utils/shareExport')
       const files = await backend.shareTargets(projectId.value, targets)
@@ -290,10 +350,12 @@ const starChips = computed(() => {
 })
 // 取り出しボタンの文言。Android版 Results.kt の targetLabel と同じ考え方
 // （「[対象] を…」。選んでいなければいまの絞り込みの対象を言う）。
+// 枚数は書き出す実数（連写の仲間を含む）。タイルの数とは違うことがある。
 const targetLabel = computed(() => {
-  if (selected.value.size > 0) return `選んだ ${selected.value.size} 枚`
-  if (filterStar.value === null) return `すべて ${filteredSorted.value.length} 枚`
-  return `★${filterStar.value} ${filteredSorted.value.length} 枚`
+  const count = exportTargets.value.length
+  if (selected.value.size > 0) return `選んだ ${count} 枚`
+  if (filterStar.value === null) return `すべて ${count} 枚`
+  return `★${filterStar.value} ${count} 枚`
 })
 </script>
 
@@ -330,10 +392,10 @@ const targetLabel = computed(() => {
             :title="capabilities.writeMetadata ? '原本の XMP に星を書く' : 'XMP に星（PC 版で使えます）'"
             @click="requestExport('xmp')"
           />
-          <v-list-item v-if="capabilities.share && !csvOnly" title="共有" @click="requestExport('share')" />
-          <!-- PC 通常は exportFolders が出口。Amazon 出所だけは端末にフォルダが無いので ZIP を出口にする（08章）。 -->
-          <v-list-item v-if="(capabilities.exportZip || isAmazon) && !csvOnly" title="ZIP を書き出す" @click="requestExport('zip')" />
-          <v-list-item v-if="csvOnly" disabled title="ZIP（PC 版で使えます）" />
+          <v-list-item v-if="capabilities.share" title="共有" @click="requestExport('share')" />
+          <!-- PC 通常は exportFolders が出口。Amazon 出所だけは端末にフォルダが無いので ZIP を出口にする（08章）。
+               Web の Amazon は中継サーバーがあるときだけ実際に書き出せる。無ければ doExport が理由を出す。 -->
+          <v-list-item v-if="capabilities.exportZip || isAmazon" title="ZIP を書き出す" @click="requestExport('zip')" />
           <v-list-item title="CSV を書き出す" @click="requestExport('csv')" />
         </v-list>
       </v-menu>
@@ -429,12 +491,19 @@ const targetLabel = computed(() => {
       <div
         v-for="row in filteredSorted"
         :key="row.relativePath"
+        :ref="(el) => observeTile(el, row.relativePath)"
         style="position: relative; width: 140px; height: 140px; background: #16181d; border-radius: 4px; overflow: hidden; cursor: pointer"
         :style="selected.has(row.relativePath) ? 'outline: 3px solid #d6ff73' : (row.burstSize > 1 ? 'outline: 2px solid white' : '')"
         @click="tapTile(row)"
         @contextmenu.prevent="longPress(row)"
       >
-        <img v-if="thumbUrls[row.relativePath]" :src="thumbUrls[row.relativePath]" style="width: 100%; height: 100%; object-fit: cover">
+        <img
+          v-if="thumbUrls[row.relativePath]"
+          :src="thumbUrls[row.relativePath]"
+          loading="lazy"
+          decoding="async"
+          style="width: 100%; height: 100%; object-fit: cover"
+        >
         <span class="text-caption" style="position: absolute; left: 4px; bottom: 4px; background: rgba(0,0,0,.6); padding: 0 4px">★{{ row.rating }}</span>
         <span v-if="row.burstSize > 1" class="text-caption" style="position: absolute; left: 4px; top: 4px; background: rgba(0,0,0,.6); padding: 0 4px">⧉{{ row.burstSize }}</span>
       </div>
@@ -446,14 +515,14 @@ const targetLabel = computed(() => {
 
     <ZoomView
       v-if="zoomIndex !== null"
-      :paths="reviewZooming ? reviewMembers : zoomPaths"
+      :paths="activeZoomPaths"
       :index="zoomIndex"
-      :display-urls="thumbUrls"
+      :display-urls="displayUrls"
       :resolve-original="(p) => backend.originalUrl(projectId, p)"
       :file-size="(p) => photoByPath[p]?.size ?? null"
       :show-keep="false"
       @close="closeZoom"
-      @move="(i) => (zoomIndex = i)"
+      @move="moveZoom"
     >
       <template #extra="{ path }">
         <v-btn icon="mdi-minus" variant="tonal" @click="bumpRating(path, -1)" />
@@ -466,11 +535,12 @@ const targetLabel = computed(() => {
       :members="reviewMembers"
       @zoom="openReviewZoom"
       :base-star="reviewBaseStar"
-      :display-urls="thumbUrls"
+      :display-urls="displayUrls"
       @close="reviewTarget = null"
       @apply="applyReview"
     />
   </div>
+  <v-alert v-else-if="loadError" type="error" density="compact" class="ma-4">{{ loadError }}</v-alert>
   <div v-else class="text-center pa-8">
     <v-progress-circular indeterminate color="primary" />
   </div>

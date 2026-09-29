@@ -64,6 +64,32 @@ export function viewBoxUrl(tempLink: string, edge: number): string {
   return `${tempLink}?viewBox=${edge},${edge}`
 }
 
+/**
+ * 自分のサーバー（server/api/amazon/image.get.ts）を経由した URL。
+ * バイトが要る（指紋・ZIP）ときだけ使う。静的配信（GitHub Pages）には
+ * この経路が無いので、失敗は `fetchAmazonBytes` 側で飲み込む。
+ */
+function relayUrl(tempLink: string, edge?: number): string {
+  const params = new URLSearchParams({ tempLink })
+  if (edge !== undefined) params.set('edge', String(edge))
+  return `/api/amazon/image?${params.toString()}`
+}
+
+/**
+ * 画像をバイトとして読む。中継（Nitro）経由でしか読めないので、
+ * 経路が無い・失敗したときは **例外を投げず null を返す**（呼ぶ側は
+ * 「この1枚は読めなかった」として続ける。08章の「1枚失敗しても止めない」と同じ）。
+ */
+export async function fetchAmazonBytes(tempLink: string, edge?: number): Promise<Blob | null> {
+  try {
+    const response = await fetch(relayUrl(tempLink, edge))
+    if (!response.ok) return null
+    return await response.blob()
+  } catch {
+    return null
+  }
+}
+
 export function isImageNode(node: AmazonNode): boolean {
   return node.kind === 'FILE' && (node.contentProperties?.contentType ?? '').startsWith('image/')
 }

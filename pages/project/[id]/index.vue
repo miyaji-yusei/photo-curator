@@ -110,9 +110,18 @@ function moveZoom(i: number) {
   if (p) void ensureZoomUrl(p)
 }
 
+// 保存領域を開けない等。読み込み中のまま黙って止まらず、理由を出す。
+const loadError = ref('')
+
 async function load() {
-  await app.load()
-  project.value = await backend.getProject(projectId.value)
+  loadError.value = ''
+  try {
+    await app.load()
+    project.value = await backend.getProject(projectId.value)
+  } catch (cause) {
+    loadError.value = cause instanceof Error ? cause.message : 'プロジェクトを読み込めませんでした。'
+    return
+  }
   if (!project.value) return
   // 開いたときに4通りを確かめる。Push・Pull は自動で片付き、Clash だけ2択を出す。
   await checkOnOpen(project.value)
@@ -256,7 +265,10 @@ watch(filterMode, async () => {
       <div :style="isNarrow ? '' : 'width: 340px; flex-shrink: 0'">
         <v-card class="mb-4">
           <v-card-item>
-            <template #prepend><v-icon icon="mdi-folder" /></template>
+            <template #prepend>
+              <!-- 出所の印（08章 8.6）。Amazon は雲、それ以外はフォルダ。 -->
+              <v-icon :icon="project.source.kind === 'amazon' ? 'mdi-cloud-outline' : 'mdi-folder'" />
+            </template>
             <template #title>{{ project.source.label }}</template>
             <template #subtitle>{{ project.photoCount }} 枚</template>
           </v-card-item>
@@ -461,6 +473,7 @@ watch(filterMode, async () => {
       @move="moveZoom"
     />
   </div>
+  <v-alert v-else-if="loadError" type="error" density="compact" class="ma-4">{{ loadError }}</v-alert>
   <div v-else class="text-center pa-8">
     <v-progress-circular indeterminate color="primary" />
   </div>

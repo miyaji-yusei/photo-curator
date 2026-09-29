@@ -197,10 +197,18 @@ async function loadDisplayUrls(paths: string[]) {
   for (const [p, url] of entries) if (url) displayUrls.value[p] = url
 }
 
+// 保存領域を開けない等。読み込み中のまま黙って止まらず、理由を出す。
+const loadError = ref('')
+
 onMounted(async () => {
-  await core.init()
-  await app.load()
-  project.value = await backend.getProject(projectId.value)
+  try {
+    await core.init()
+    await app.load()
+    project.value = await backend.getProject(projectId.value)
+  } catch (cause) {
+    loadError.value = cause instanceof Error ? cause.message : 'プロジェクトを読み込めませんでした。'
+    return
+  }
   if (!project.value) return
   photos.value = await backend.listPhotos(projectId.value)
   photoRefs.value = photos.value
@@ -417,7 +425,8 @@ onBeforeUnmount(() => stopAutoPush())
 <template>
   <div class="d-flex flex-column" style="height: 100vh">
     <div v-if="phase === 'loading'" class="flex-grow-1 d-flex align-center justify-center">
-      <v-progress-circular indeterminate color="primary" />
+      <v-alert v-if="loadError" type="error" density="compact" class="ma-4">{{ loadError }}</v-alert>
+      <v-progress-circular v-else indeterminate color="primary" />
     </div>
 
     <!-- 開始シート -->

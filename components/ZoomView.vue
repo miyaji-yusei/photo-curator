@@ -52,10 +52,17 @@ function move(step: number) {
 }
 
 function onKeydown(event: KeyboardEvent) {
+  // 扱ったキーは上へ伝えない。伝えると、close で拡大が閉じたあとに
+  // 親（cull.vue の window の keydown）が同じ Esc を「選別を抜ける」と読む。
+  const handled = ['ArrowLeft', 'ArrowRight', 'Escape'].includes(event.key)
+    || (event.key === 'Enter' && props.showKeep && !!path.value)
+  if (!handled) return
+  event.stopPropagation()
+  event.preventDefault()
   if (event.key === 'ArrowLeft') move(-1)
   else if (event.key === 'ArrowRight') move(1)
   else if (event.key === 'Escape') emit('close')
-  else if (event.key === 'Enter' && props.showKeep && path.value) emit('keep', path.value)
+  else if (path.value) emit('keep', path.value)
 }
 
 const sizeText = computed(() => {

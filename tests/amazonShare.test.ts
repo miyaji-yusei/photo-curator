@@ -1,6 +1,6 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
-  keyFor, parseContentDate, parseKey, parseShareUrl, readShare, viewBoxUrl, type AmazonNode
+  fetchAmazonBytes, keyFor, parseContentDate, parseKey, parseShareUrl, readShare, viewBoxUrl, type AmazonNode
 } from '~/lib/amazonShare'
 
 describe('parseShareUrl', () => {
@@ -109,5 +109,31 @@ describe('readShare', () => {
   it('網が無ければそう言う', async () => {
     const fetcher = async () => { throw new TypeError('Failed to fetch') }
     await expect(readShare({ host: 'www.amazon.co.jp', shareId: 'x' }, fetcher)).rejects.toThrow('ネットワークにつながっていません。')
+  })
+})
+
+describe('fetchAmazonBytes', () => {
+  const originalFetch = globalThis.fetch
+  afterEach(() => { globalThis.fetch = originalFetch })
+
+  it('中継が読めれば Blob を返す', async () => {
+    const blob = new Blob(['abc'], { type: 'image/jpeg' })
+    globalThis.fetch = vi.fn(async (url: string) => {
+      expect(url).toBe('/api/amazon/image?tempLink=https%3A%2F%2Fcdn%2Fx&edge=160')
+      return new Response(blob, { status: 200 })
+    }) as typeof fetch
+    const result = await fetchAmazonBytes('https://cdn/x', 160)
+    expect(result).not.toBeNull()
+    expect(await result!.text()).toBe('abc')
+  })
+
+  it('中継が無い（404 等）なら例外を投げず null を返す', async () => {
+    globalThis.fetch = vi.fn(async () => new Response('not found', { status: 404 })) as typeof fetch
+    expect(await fetchAmazonBytes('https://cdn/x')).toBeNull()
+  })
+
+  it('通信自体が失敗しても null を返す（静的配信で経路が無いときと同じ扱い）', async () => {
+    globalThis.fetch = vi.fn(async () => { throw new TypeError('Failed to fetch') }) as typeof fetch
+    expect(await fetchAmazonBytes('https://cdn/x')).toBeNull()
   })
 })
