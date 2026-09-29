@@ -1,5 +1,5 @@
 import type {
-  BurstGroup, ExportReport, Photo, PhotoSort, Project, ProjectProgress,
+  AmazonPreview, BurstGroup, ExportReport, Photo, PhotoSort, Project, ProjectProgress,
   SelectionResult, SelectionSummary, TournamentSettings
 } from '~/types/photo'
 import { MAX_RATING } from '~/types/photo'
@@ -63,6 +63,12 @@ function createCurator() {
   const loading = ref(false)
   const error = ref('')
   const createDialog = ref(false)
+  /** 作成ダイアログのタブ。Amazon は `capabilities.amazon` が true のときだけ選べる。 */
+  const createTab = ref<'folder' | 'amazon'>('folder')
+  const amazonUrl = ref('')
+  const amazonPreview = ref<AmazonPreview | null>(null)
+  const amazonLoading = ref(false)
+  const amazonError = ref('')
   const projectName = ref('')
   const folderPath = ref('')
   /** (開発用) フォルダの絶対パス。`pnpm dev` のときだけ作成ダイアログに出す。 */
@@ -190,6 +196,8 @@ function createCurator() {
 
   // 書き出し
   const exportDialog = ref(false)
+  // Amazon の写真は移動できない（原本は Amazon にある）。開くたびにコピーへ戻す。
+  watch(exportDialog, open => { if (open && isAmazon.value) exportMode.value = 'copy' })
   const exportMode = ref<'copy' | 'move'>('copy')
   const exportDestination = ref('')
   const exportRatings = ref<number[]>([5, 4, 3, 2, 1])
@@ -360,8 +368,12 @@ function createCurator() {
   function statusLabel(project: Project) {
     if (project.status === 'ready') return `${project.photoCount.toLocaleString()} 枚`
     if (project.status === 'scanning') return '読み込み中'
+    if (project.status === 'missing' && project.sourceKind === 'amazon') return 'リンクが無効'
     return '未読み込み'
   }
+
+  /** いま開いているプロジェクトは Amazon Photos の共有リンクか。 */
+  const isAmazon = computed(() => activeProject.value?.sourceKind === 'amazon')
 
   async function refreshProjects() {
     // デスクトップは PC の DB、ブラウザは端末内の DB。どちらも一覧を返す。
@@ -532,8 +544,14 @@ function createCurator() {
       // ダイアログが閉じられなくなり、リロードしないと戻れなくなっていた。
       // フォルダの許可が切れているときは、ここで求めても通らない（許可は利用者の操作の中でだけ）。
       // プロジェクトの画面の「フォルダへのアクセスを許可」を押してもらう。
-      if (!project.photoCount && !importsByPicker.value && !scanRunning.value && project.folderAccess !== 'needs-permission') {
+      // リンクが消えた Amazon のプロジェクトは、開くたびに読みにいかない（「写真を再読み込み」で試す）。
+      const linkGone = project.sourceKind === 'amazon' && project.status === 'missing'
+      if (!project.photoCount && !importsByPicker.value && !scanRunning.value && project.folderAccess !== 'needs-permission' && !linkGone) {
         await startScan()
+        return
+      }
+      if (linkGone) {
+        await loadSummary()
         return
       }
       const backlog = await desktop.getAnalysisBacklog(project.id).catch(() => 0)
@@ -607,7 +625,62 @@ function createCurator() {
     }
   }
 
+  /** リンクを読み込み、名前・枚数・見本を出す。 */
+  async function loadAmazonPreview() {
+    const url = amazonUrl.value.trim()
+    if (!url || !desktop.amazonPreview || amazonLoading.value) return
+    amazonLoading.value = true
+    amazonError.value = ''
+    amazonPreview.value = null
+    try {
+      const preview = await desktop.amazonPreview(url)
+      amazonPreview.value = preview
+      // 名前は共有の名前を初期値にする（あとで直せる）。
+      if (!projectName.value.trim()) projectName.value = preview.name
+    } catch (cause) {
+      amazonError.value = cause instanceof Error ? cause.message : 'Amazon Photos のリンクを読めませんでした。'
+    } finally {
+      amazonLoading.value = false
+    }
+  }
+
+  function resetAmazonDraft() {
+    amazonUrl.value = ''
+    amazonPreview.value = null
+    amazonError.value = ''
+    createTab.value = 'folder'
+  }
+
+  // リンクを書き換えたら、前の読み込みの結果は古い。
+  watch(amazonUrl, () => {
+    amazonPreview.value = null
+    amazonError.value = ''
+  })
+  watch(createDialog, open => { if (!open) resetAmazonDraft() })
+
+  /** Amazon のプロジェクトを作る。作ると走査が始まる（`openProject` が読み込みを始める）。 */
+  async function createAmazonProject() {
+    const preview = amazonPreview.value
+    if (!preview || !desktop.createAmazonProject) return
+    loading.value = true
+    try {
+      const project = await desktop.createAmazonProject(projectName.value.trim() || preview.name, amazonUrl.value.trim())
+      createDialog.value = false
+      projectName.value = ''
+      await refreshProjects()
+      await openProject(project)
+    } catch (cause) {
+      error.value = cause instanceof Error ? cause.message : 'プロジェクトを作成できませんでした。'
+    } finally {
+      loading.value = false
+    }
+  }
+
   async function createProject() {
+    if (createTab.value === 'amazon' && desktop.capabilities.amazon) {
+      await createAmazonProject()
+      return
+    }
     // フォルダを選べないブラウザでは、名前だけ決めて作り、続けて写真を選ばせる。
     // フォルダ（選んだもの・開発用の絶対パス）があれば、そこから読む。
     const devPath = isDev ? devFolderPath.value.trim() : ''
@@ -999,6 +1072,41 @@ function createCurator() {
     zoomPhoto.value = photo
     zoomList.value = list.length ? [...list] : [photo]
   }
+
+  /**
+   * 拡大に出す画像。**原本**（Amazon は取ってきて端末に置いたもの）。取れるまでの間だけ表示用を見せる。
+   * 写真が変わったら、遅れて届いた前の写真の結果は捨てる。
+   */
+  const zoomSrc = ref('')
+  const zoomError = ref('')
+  const zoomLoading = ref(false)
+  let zoomToken = 0
+  watch(zoomPhoto, async (photo) => {
+    const token = ++zoomToken
+    zoomError.value = ''
+    zoomLoading.value = false
+    zoomSrc.value = ''
+    if (!photo) return
+    const pending = desktop.photoOriginalUrl(photo)
+    let arrived = false
+    // すぐ着く（フォルダの写真）ときは途中の絵を挟まない。時間がかかるときだけ表示用を先に見せる。
+    const timer = setTimeout(() => {
+      if (arrived || token !== zoomToken) return
+      zoomLoading.value = true
+      zoomSrc.value = desktop.photoDisplayUrl(photo)
+    }, 80)
+    try {
+      const url = await pending
+      arrived = true
+      if (token === zoomToken) zoomSrc.value = url
+    } catch (cause) {
+      arrived = true
+      if (token === zoomToken) zoomError.value = cause instanceof Error ? cause.message : '原本を読み込めませんでした。'
+    } finally {
+      clearTimeout(timer)
+      if (token === zoomToken) zoomLoading.value = false
+    }
+  })
 
   const zoomIndex = computed(() =>
     zoomPhoto.value ? zoomList.value.findIndex(item => item.id === zoomPhoto.value!.id) : -1
@@ -1895,7 +2003,12 @@ function createCurator() {
           analysisFailures.value = progress.failed
           // 警告は解析中の1イベントにしか乗らないので、別に保持して出し続ける。
           if (progress.warning) taskWarning.value = progress.warning
-          if (progress.phase === 'error') error.value = progress.message
+          if (progress.phase === 'error') {
+            error.value = progress.message
+            void refreshProjects().then(() => {
+              activeProject.value = projects.value.find(project => project.id === activeProject.value?.id) ?? activeProject.value
+            })
+          }
           if (progress.task === 'background') void refreshDuringPreparation(progress)
           return
         }
@@ -1917,7 +2030,12 @@ function createCurator() {
         }
         if (progress.phase === 'cancelled' || progress.phase === 'error') {
           taskDialog.value = false
-          if (progress.phase === 'error') error.value = progress.message
+          if (progress.phase === 'error') {
+            error.value = progress.message
+            // リンクが消えたときなど、状態が変わっているので取り直す。
+            await refreshProjects()
+            activeProject.value = projects.value.find(project => project.id === activeProject.value?.id) ?? activeProject.value
+          }
         }
       })
     } catch (cause) {
@@ -1951,6 +2069,16 @@ function createCurator() {
     loading,
     error,
     createDialog,
+    createTab,
+    amazonUrl,
+    amazonPreview,
+    amazonLoading,
+    amazonError,
+    loadAmazonPreview,
+    isAmazon,
+    zoomSrc,
+    zoomError,
+    zoomLoading,
     projectName,
     folderPath,
     taskProgress,

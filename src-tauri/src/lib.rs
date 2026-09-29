@@ -1,3 +1,4 @@
+mod amazon;
 mod format;
 mod sidecar;
 
@@ -40,6 +41,10 @@ const THUMBNAIL_DIR: &str = "thumbnails";
 // 写真の良し悪しを判断できず、かといって原本(6.7MB)を毎回読むと
 // Android では 1 ラウンドで 13.4GB 流れる。その中間をここに作る。
 const DISPLAY_DIR: &str = "display";
+/// Amazon の共有リンクの原本の置き場（プロジェクトごとの下に node id で置く）。
+const AMAZON_CACHE_DIR: &str = "amazon-cache";
+/// 作成画面の見本の置き場。
+const SAMPLES_DIR: &str = "samples";
 /// 既定の長辺。Galaxy Z Fold 8 の実機計測で 1 グループ 3〜4 枚なら 733px、
 /// 9 枚なら 489px あれば足りる。普段使いはこれで過不足ない。
 const DISPLAY_EDGE_DEFAULT: u32 = 1024;
@@ -250,6 +255,8 @@ struct Project {
     /// 連写まとめの学習済み閾値。未学習なら None。
     burst_threshold: Option<i64>,
     burst_threshold_learned_at: Option<i64>,
+    /// 写真の出所。`folder`（PC のフォルダ）か `amazon`（Amazon Photos の共有リンク）。
+    source_kind: String,
 }
 
 #[derive(Serialize)]
@@ -345,6 +352,17 @@ fn display_dir(app: &AppHandle) -> Result<PathBuf, String> {
         .app_data_dir()
         .map_err(|error| error.to_string())?
         .join(DISPLAY_DIR);
+    fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    Ok(dir)
+}
+
+/// アプリのデータフォルダの下の置き場（なければ作る）。
+fn data_subdir(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?
+        .join(name);
     fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     Ok(dir)
 }
@@ -496,6 +514,10 @@ fn open_database(path: &Path) -> Result<Connection, String> {
     add_column_if_missing(&conn, "photos", "display_edge", "INTEGER")?;
     // プロジェクトごとの上書き。NULL なら全体の設定に従う。
     add_column_if_missing(&conn, "projects", "display_edge", "INTEGER")?;
+    // 写真の出所（T9）。既存のプロジェクトはすべてフォルダ。Amazon は `source_key` に
+    // `"{host}|{shareId}"` を持ち、`folder_path` にはリンクの URL を置く。
+    add_column_if_missing(&conn, "projects", "source_kind", "TEXT NOT NULL DEFAULT 'folder'")?;
+    add_column_if_missing(&conn, "projects", "source_key", "TEXT")?;
     // d_hash の算出方式。旧ビルドの行は NULL になり、キャッシュとして使われない。
     // 古い方式のハッシュと新しい方式のハッシュが混ざると連写判定が壊れるため、
     // 値を消さずに「使わない」ことで移行する。
@@ -538,6 +560,8 @@ fn open_database(path: &Path) -> Result<Connection, String> {
 
     // サイドカー（T8）。端末が覚える 3 つの値。
     sidecar::ensure_tables(&conn)?;
+    // Amazon の共有リンクの tempLink の控え（T9）。
+    amazon::ensure_tables(&conn)?;
 
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS photos_project_visible
@@ -1880,6 +1904,10 @@ fn project_folder(app: &AppHandle, project_id: &str) -> Result<String, String> {
 }
 
 fn run_scan(app: AppHandle, registry: &TaskRegistry, project_id: String) -> Result<(), String> {
+    // 出所で分ける。Amazon の共有リンクは、一覧を読むことが走査になる。
+    if let Some(source) = amazon_source_of(&connection(&app)?, &project_id)? {
+        return run_amazon_scan(app, registry, project_id, source);
+    }
     let task_key = format!("scan:{project_id}");
     let folder = project_folder(&app, &project_id)?;
     let entries: Vec<PathBuf> = list_photo_files(&folder);
@@ -2006,6 +2034,123 @@ fn run_scan(app: AppHandle, registry: &TaskRegistry, project_id: String) -> Resu
     Ok(())
 }
 
+/// Amazon の写真の行を登録・更新する。`path` と `relative_path` は node id。
+/// 撮影時刻は一覧の `contentDate`（その土地の時計）をそのまま入れる。
+/// 大きさ（`fingerprint_size`）が変わった行だけ、解析の結果を捨てる。
+fn upsert_amazon_photo(
+    conn: &Connection,
+    project_id: &str,
+    node: &amazon::AmazonNode,
+) -> Result<(), String> {
+    let size = node
+        .content_properties
+        .as_ref()
+        .and_then(|properties| properties.size)
+        .map(|size| size as i64);
+    let stem = Path::new(&node.name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    let (captured_at, source) = match amazon::captured_at_of(node) {
+        Some(at) => (Some(at), TimestampSource::ExifOriginal),
+        None => match filename_capture_time_of(stem) {
+            Some(at) => (Some(at), TimestampSource::FilenameInferred),
+            None => (None, TimestampSource::Unknown),
+        },
+    };
+    conn.execute(
+        "INSERT INTO photos (id,project_id,path,relative_path,name,captured_at,timestamp_source,d_hash,rating,fingerprint_mtime,fingerprint_size,is_missing)
+         VALUES (?1,?2,?3,?3,?4,?5,?6,NULL,0,NULL,?7,0)
+         ON CONFLICT(project_id,path) DO UPDATE SET
+           relative_path=excluded.relative_path, name=excluded.name, is_missing=0,
+           captured_at=excluded.captured_at, timestamp_source=excluded.timestamp_source,
+           d_hash=CASE WHEN photos.fingerprint_size IS excluded.fingerprint_size THEN photos.d_hash ELSE NULL END,
+           d_hash_version=CASE WHEN photos.fingerprint_size IS excluded.fingerprint_size THEN photos.d_hash_version ELSE NULL END,
+           thumbnail_path=CASE WHEN photos.fingerprint_size IS excluded.fingerprint_size THEN photos.thumbnail_path ELSE NULL END,
+           thumbnail_version=CASE WHEN photos.fingerprint_size IS excluded.fingerprint_size THEN photos.thumbnail_version ELSE NULL END,
+           display_path=CASE WHEN photos.fingerprint_size IS excluded.fingerprint_size THEN photos.display_path ELSE NULL END,
+           display_edge=CASE WHEN photos.fingerprint_size IS excluded.fingerprint_size THEN photos.display_edge ELSE NULL END,
+           analysis_error=CASE WHEN photos.fingerprint_size IS excluded.fingerprint_size THEN photos.analysis_error ELSE NULL END,
+           analysis_error_at=CASE WHEN photos.fingerprint_size IS excluded.fingerprint_size THEN photos.analysis_error_at ELSE NULL END,
+           fingerprint_size=excluded.fingerprint_size",
+        params![
+            Uuid::new_v4().to_string(),
+            project_id,
+            node.id,
+            node.name,
+            captured_at,
+            source.as_str(),
+            size
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// `run_scan` の Amazon 版。共有 → アルバム → FILE の一覧を読み、写真の行と tempLink を作る。
+/// 共有リンクが消えていたら、状態を `missing` にして理由を返す（自動ではやり直さない）。
+fn run_amazon_scan(
+    app: AppHandle,
+    registry: &TaskRegistry,
+    project_id: String,
+    source: amazon::AmazonSource,
+) -> Result<(), String> {
+    let task_key = format!("scan:{project_id}");
+    progress(&app, &project_id, "scan", "indexing", 0, 0, "Amazon Photos の一覧を読んでいます…");
+    let conn = connection(&app)?;
+    conn.execute(
+        "UPDATE projects SET status='scanning', updated_at=?1 WHERE id=?2",
+        params![now(), project_id],
+    )
+    .map_err(|error| error.to_string())?;
+
+    let listed = amazon::fetch_share_root(&source)
+        .and_then(|root| amazon::list_photos(&source, &root.node_id));
+    let nodes = match listed {
+        Ok(nodes) => nodes,
+        Err(message) => {
+            if message == amazon::GONE_MESSAGE {
+                mark_amazon_gone(&conn, &project_id);
+            } else {
+                settle_project_status(&conn, &project_id);
+            }
+            return Err(message);
+        }
+    };
+    let total = nodes.len();
+    if registry.is_cancelled(&task_key) {
+        settle_project_status(&conn, &project_id);
+        progress(&app, &project_id, "scan", "cancelled", 0, total, "Scanning was cancelled.");
+        return Ok(());
+    }
+
+    conn.execute("UPDATE photos SET is_missing=1 WHERE project_id=?1", params![project_id])
+        .map_err(|error| error.to_string())?;
+    let transaction = conn.unchecked_transaction().map_err(|error| error.to_string())?;
+    for (index, node) in nodes.iter().enumerate() {
+        upsert_amazon_photo(&transaction, &project_id, node)?;
+        if (index + 1) % 250 == 0 || index + 1 == total {
+            progress(&app, &project_id, "scan", "indexing", index + 1, total, "Recording photo locations…");
+        }
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    // tempLink は node id で控える。拡大のたびに一覧をたどり直さないため。
+    amazon::save_links(&conn, &project_id, &amazon::links_of(&nodes))?;
+    let count = recount_photos(&conn, &project_id)?;
+    conn.execute(
+        "UPDATE projects SET status='ready',updated_at=?1 WHERE id=?2",
+        params![now(), project_id],
+    )
+    .map_err(|error| error.to_string())?;
+    progress(&app, &project_id, "scan", "complete", count as usize, count as usize, "写真の読み込みが完了しました。");
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let registry = handle.state::<TaskRegistry>();
+        let _ = spawn_analysis(handle.clone(), &registry, project_id, AnalysisMode::Background);
+    });
+    Ok(())
+}
+
 /// 撮影時刻の段の worker 1本ぶん。先頭 64KB を 1 回だけ読み、画像かどうかと
 /// 撮影時刻を決める。**DB には触れない。**
 fn metadata_one(index: usize, job: &MetadataJob) -> PhotoWork {
@@ -2101,6 +2246,63 @@ fn hash_one(thumbnails: &Path, index: usize, record: &HashRecord) -> PhotoWork {
     result
 }
 
+/// `hash_one` の Amazon 版。`viewBox=160` の画像を取り、旧版と同じサムネイルと指紋にする。
+/// サムネイルが残っていて版も合えば、網を使わない。**DB には触れない。**
+fn hash_one_amazon(
+    book: &amazon::LinkBook,
+    thumbnails: &Path,
+    index: usize,
+    record: &HashRecord,
+) -> PhotoWork {
+    let mut result = PhotoWork::new(index, &record.id);
+    let file = thumbnail_file(thumbnails, &record.id);
+    let stored = file.to_string_lossy().to_string();
+    let cached = &record.cached;
+    if cached.thumbnail_path.as_deref() == Some(stored.as_str())
+        && cached.thumbnail_version == Some(THUMBNAIL_VERSION)
+        && file.is_file()
+    {
+        if cached.d_hash.is_some() && cached.d_hash_version == Some(D_HASH_VERSION) {
+            result.d_hash = cached.d_hash.clone();
+            result.thumbnail_path = Some(stored);
+            result.hash_reused = true;
+            return result;
+        }
+        if let Some(hash) = fs::read(&file).ok().as_deref().and_then(hash_thumbnail_bytes) {
+            result.d_hash = Some(hash);
+            result.thumbnail_path = Some(stored);
+            return result;
+        }
+    }
+    let bytes = match book.fetch(&record.path, Some(AMAZON_THUMBNAIL_EDGE)) {
+        Ok(bytes) => bytes,
+        Err(message) => {
+            result.error = Some(message);
+            return result;
+        }
+    };
+    let Some(image) = image::load_from_memory(&bytes).ok() else {
+        result.error = Some("画像を読み取れませんでした（破損または非対応の形式）。".into());
+        return result;
+    };
+    let Some(thumbnail) = encode_thumbnail(&scale_for_thumbnail(&image)) else {
+        result.error = Some("画像を読み取れませんでした（破損または非対応の形式）。".into());
+        return result;
+    };
+    result.d_hash = hash_thumbnail_bytes(&thumbnail);
+    if write_atomically(&file, &thumbnail).is_ok() {
+        result.thumbnail_path = Some(stored);
+        result.thumbnail_source = Some("amazon");
+    }
+    if result.d_hash.is_none() {
+        result.error = Some("画像を読み取れませんでした（破損または非対応の形式）。".into());
+    }
+    result
+}
+
+/// Amazon に縮小させるときの長辺（サムネイルと指紋のもと）。
+const AMAZON_THUMBNAIL_EDGE: u32 = 160;
+
 /// 解析できなかった写真の件数。UI へそのまま渡す。
 fn failed_photo_count(conn: &Connection, project_id: &str) -> Result<usize, String> {
     conn.query_row(
@@ -2132,6 +2334,14 @@ fn run_burst_analysis(
     let thumbnails = thumbnail_dir(&app)?;
     // ネットワークのフォルダは worker 数を抑えるので、フォルダの場所を先に知る。
     let folder = project_folder(&app, &project_id)?;
+    // Amazon の共有リンクは、撮影時刻を一覧の contentDate から走査で入れてあり、
+    // サムネイル・指紋は viewBox=160 の画像から作る。並列は 4。
+    let amazon_book = amazon_book_of(&app, &project_id)?;
+    let workers = if amazon_book.is_some() {
+        amazon::WORKERS
+    } else {
+        mode.workers(Path::new(&folder))
+    };
     let conn = connection(&app)?;
     let records: Vec<MetadataRecord> = {
         let mut statement = conn
@@ -2150,7 +2360,9 @@ fn run_burst_analysis(
     // （EXIF 読取は 0.14 ms/枚）。既に両方ある行は仕事そのものを作らない。
     let metadata_jobs: Vec<MetadataJob> = records
         .iter()
-        .filter(|(_, _, captured_at, source)| captured_at.is_none() || source.is_none())
+        .filter(|(_, _, captured_at, source)| {
+            amazon_book.is_none() && (captured_at.is_none() || source.is_none())
+        })
         .map(|(id, path, _, _)| MetadataJob {
             id: id.clone(),
             path: path.clone(),
@@ -2176,7 +2388,7 @@ fn run_burst_analysis(
         let apply = apply_metadata;
         let outcome = run_in_parallel(
             Arc::new(metadata_jobs),
-            mode.workers(Path::new(&folder)),
+            workers,
             timeout,
             &should_stop,
             // worker はファイルを読むだけ。DB には触れない。
@@ -2246,14 +2458,20 @@ fn run_burst_analysis(
 
     let candidates: Vec<HashRecord> = {
         let conn = connection(&app)?;
+        // Amazon は撮影時刻の無い写真にもサムネイルが要る（一覧の絵になる）ので絞らない。
+        let dated_only = if amazon_book.is_some() {
+            ""
+        } else {
+            "AND captured_at IS NOT NULL"
+        };
         let mut statement = conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT id,path,captured_at,timestamp_source,d_hash,d_hash_version,
                         thumbnail_path,thumbnail_mtime,thumbnail_size,thumbnail_version
                  FROM photos
-                 WHERE project_id=?1 AND is_missing=0 AND captured_at IS NOT NULL
-                 ORDER BY captured_at",
-            )
+                 WHERE project_id=?1 AND is_missing=0 {dated_only}
+                 ORDER BY captured_at IS NULL, captured_at, path"
+            ))
             .map_err(|error| error.to_string())?;
         let rows = statement
             .query_map(params![project_id], |row| {
@@ -2261,7 +2479,7 @@ fn run_burst_analysis(
                 Ok(HashRecord {
                     id: row.get(0)?,
                     path: row.get(1)?,
-                    captured_at: row.get(2)?,
+                    captured_at: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
                     source: TimestampSource::parse(source.as_deref()),
                     cached: CachedAnalysis {
                         d_hash: row.get(4)?,
@@ -2290,13 +2508,18 @@ fn run_burst_analysis(
             })
             .collect::<Vec<_>>(),
     );
-    let needed_records: Vec<_> = candidates
-        .iter()
-        .filter(|record| selection.ids.contains(&record.id))
-        .cloned()
-        .collect();
+    let needed_records: Vec<_> = if amazon_book.is_some() {
+        // Amazon は小さい画像を取るだけなので、近い写真に絞らず全部を作る。
+        candidates.clone()
+    } else {
+        candidates
+            .iter()
+            .filter(|record| selection.ids.contains(&record.id))
+            .cloned()
+            .collect()
+    };
     let needed_total = needed_records.len();
-    let warning = selection.narrowed.then(|| {
+    let warning = (selection.narrowed && amazon_book.is_none()).then(|| {
         format!(
             "撮影間隔が近い写真が多すぎたため、連写とみなす時間の幅を {:.1} 秒に狭めました（候補 {} / {} 枚）。",
             selection.window_ms as f64 / 1000.0,
@@ -2319,9 +2542,32 @@ fn run_burst_analysis(
     let interval = progress_interval(needed_total.max(1));
     let mut pending: Vec<PhotoWork> = Vec::with_capacity(ANALYSIS_CHUNK_SIZE);
     let mut committed = 0usize;
+    let is_amazon = amazon_book.is_some();
     let apply = |tx: &Connection, item: &PhotoWork| -> Result<(), String> {
         // 据え置きで済んだ1枚は、書き込む理由が無い。
         if item.hash_reused {
+            return Ok(());
+        }
+        if is_amazon {
+            // 原本の mtime は無い。走査が入れた大きさ（fingerprint_size）は触らない。
+            tx.execute(
+                "UPDATE photos SET d_hash=?1,d_hash_version=?2,thumbnail_path=?3,
+                   thumbnail_source=COALESCE(?4,thumbnail_source),
+                   thumbnail_version=?5,
+                   analysis_error=?6,analysis_error_at=?7
+                 WHERE id=?8",
+                params![
+                    item.d_hash,
+                    item.d_hash.as_ref().map(|_| D_HASH_VERSION),
+                    item.thumbnail_path,
+                    item.thumbnail_source,
+                    item.thumbnail_path.as_ref().map(|_| THUMBNAIL_VERSION),
+                    item.error,
+                    item.error.as_ref().map(|_| now()),
+                    item.photo_id
+                ],
+            )
+            .map_err(|error| error.to_string())?;
             return Ok(());
         }
         // metadata が読めない場合は fingerprint を NULL のままにする。(0,0) を
@@ -2366,13 +2612,17 @@ fn run_burst_analysis(
         Ok(())
     };
     let thumbnails_for_workers = thumbnails.clone();
+    let book_for_workers = amazon_book.clone();
     let outcome = run_in_parallel(
         Arc::new(needed_records),
-        mode.workers(Path::new(&folder)),
+        workers,
         timeout,
         &should_stop,
         // worker はファイルを読んでサムネイルを書くだけ。DB には触れない。
-        move |index, record: &HashRecord| hash_one(&thumbnails_for_workers, index, record),
+        move |index, record: &HashRecord| match &book_for_workers {
+            Some(book) => hash_one_amazon(book, &thumbnails_for_workers, index, record),
+            None => hash_one(&thumbnails_for_workers, index, record),
+        },
         &mut |item| {
             if item.error.is_some() {
                 failed += 1;
@@ -2415,6 +2665,11 @@ fn run_burst_analysis(
         },
     )?;
     committed += flush_results(&conn, &mut pending, &apply)?;
+    // リンクが消えていたら、ここで止めて理由を伝える。開いたときに自動では続けない。
+    if amazon_book.as_ref().is_some_and(|book| book.is_gone()) {
+        mark_amazon_gone(&conn, &project_id);
+        return Err(amazon::GONE_MESSAGE.to_string());
+    }
     if outcome.cancelled {
         progress_note(
             &app,
@@ -2453,7 +2708,7 @@ fn run_burst_analysis(
 fn list_projects(app: AppHandle) -> Result<Vec<Project>, String> {
     let conn = connection(&app)?;
     let mut statement = conn
-        .prepare("SELECT id,name,folder_path,photo_count,status,created_at,updated_at,burst_threshold,burst_threshold_learned_at FROM projects ORDER BY updated_at DESC")
+        .prepare("SELECT id,name,folder_path,photo_count,status,created_at,updated_at,burst_threshold,burst_threshold_learned_at,source_kind FROM projects ORDER BY updated_at DESC")
         .map_err(|error| error.to_string())?;
     let rows = statement
         .query_map([], |row| {
@@ -2467,6 +2722,7 @@ fn list_projects(app: AppHandle) -> Result<Vec<Project>, String> {
                 updated_at: row.get(6)?,
                 burst_threshold: row.get(7)?,
                 burst_threshold_learned_at: row.get(8)?,
+                source_kind: row.get(9)?,
             })
         })
         .map_err(|error| error.to_string())?;
@@ -2491,14 +2747,202 @@ fn create_project(app: AppHandle, name: String, folder_path: String) -> Result<P
         updated_at: now(),
         burst_threshold: None,
         burst_threshold_learned_at: None,
+        source_kind: SOURCE_FOLDER.into(),
     };
     connection(&app)?
         .execute(
-            "INSERT INTO projects (id,name,folder_path,photo_count,status,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-            params![project.id, project.name, project.folder_path, project.photo_count, project.status, project.created_at, project.updated_at],
+            "INSERT INTO projects (id,name,folder_path,photo_count,status,created_at,updated_at,source_kind) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![project.id, project.name, project.folder_path, project.photo_count, project.status, project.created_at, project.updated_at, project.source_kind],
         )
         .map_err(|error| error.to_string())?;
     Ok(project)
+}
+
+// ---------------------------------------------------------------------------
+// Amazon Photos の共有リンク（T9）。ログインしない。公開の JSON を読むだけ。
+// 分岐は Rust の入口（走査・解析・表示用・書き出し・サイドカー）で `source_kind` を見て行い、
+// 画面側には持たせない。
+// ---------------------------------------------------------------------------
+
+const SOURCE_FOLDER: &str = "folder";
+const SOURCE_AMAZON: &str = "amazon";
+const AMAZON_UNSUPPORTED: &str = "Amazon の写真には使えません。";
+
+/// 写真の出所の種類と鍵。
+fn project_source(conn: &Connection, project_id: &str) -> Result<(String, Option<String>), String> {
+    conn.query_row(
+        "SELECT source_kind,source_key FROM projects WHERE id=?1",
+        params![project_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .map_err(|_| "Project was not found.".to_string())
+}
+
+/// Amazon のプロジェクトなら共有リンクの出所を返す。フォルダなら None。
+fn amazon_source_of(conn: &Connection, project_id: &str) -> Result<Option<amazon::AmazonSource>, String> {
+    let (kind, key) = project_source(conn, project_id)?;
+    if kind != SOURCE_AMAZON {
+        return Ok(None);
+    }
+    key.as_deref()
+        .and_then(amazon::parse_key)
+        .map(Some)
+        .ok_or_else(|| "Amazon Photos のリンクの情報を読めません。".to_string())
+}
+
+/// Amazon のプロジェクトの tempLink の控えと取り直し。フォルダなら None。
+fn amazon_book_of(app: &AppHandle, project_id: &str) -> Result<Option<Arc<amazon::LinkBook>>, String> {
+    let conn = connection(app)?;
+    let Some(source) = amazon_source_of(&conn, project_id)? else {
+        return Ok(None);
+    };
+    let book = amazon::LinkBook::load(db_path(app)?, &conn, project_id, source)?;
+    Ok(Some(Arc::new(book)))
+}
+
+/// リンクが消えていたと分かったとき。以後、開いたときに自動では読みにいかない。
+fn mark_amazon_gone(conn: &Connection, project_id: &str) {
+    let _ = conn.execute(
+        "UPDATE projects SET status='missing',updated_at=?1 WHERE id=?2",
+        params![now(), project_id],
+    );
+}
+
+/// 走査を途中でやめたとき・失敗したときの状態。写真があれば ready、なければ new。
+fn settle_project_status(conn: &Connection, project_id: &str) {
+    let _ = conn.execute(
+        "UPDATE projects SET status=CASE WHEN photo_count>0 THEN 'ready' ELSE 'new' END,updated_at=?1 WHERE id=?2",
+        params![now(), project_id],
+    );
+}
+
+/// 作成画面の見本。バイト列は JSON に載せず、ファイルに書いてパスを返す。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AmazonPreviewInfo {
+    key: String,
+    name: String,
+    count: usize,
+    /// 見本の JPEG のパス（アプリのデータフォルダの `samples/`）。
+    samples: Vec<String>,
+}
+
+const AMAZON_SAMPLE_LIMIT: usize = 12;
+
+fn clear_dir(path: &Path) {
+    let _ = fs::remove_dir_all(path);
+}
+
+fn amazon_preview_blocking(app: AppHandle, share_url: String) -> Result<AmazonPreviewInfo, String> {
+    let preview = amazon::preview(&share_url, AMAZON_SAMPLE_LIMIT)?;
+    let dir = data_subdir(&app, SAMPLES_DIR)?;
+    // 前の見本は要らない。名前を毎回変えるので、画面が古い画像を覚えていても取り違えない。
+    clear_dir(&dir);
+    fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    let batch = Uuid::new_v4();
+    let mut samples = Vec::new();
+    for (index, bytes) in preview.samples.iter().enumerate() {
+        let file = dir.join(format!("{batch}-{index}.jpg"));
+        if fs::write(&file, bytes).is_ok() {
+            samples.push(file.to_string_lossy().to_string());
+        }
+    }
+    Ok(AmazonPreviewInfo { key: preview.key, name: preview.name, count: preview.count, samples })
+}
+
+#[tauri::command]
+async fn amazon_preview(app: AppHandle, share_url: String) -> Result<AmazonPreviewInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || amazon_preview_blocking(app, share_url))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn create_amazon_project_blocking(app: AppHandle, name: String, share_url: String) -> Result<Project, String> {
+    let source = amazon::parse_share_url(&share_url)
+        .ok_or_else(|| "Amazon Photos の共有リンクの形ではありません。".to_string())?;
+    let name = name.trim();
+    let project = Project {
+        id: Uuid::new_v4().to_string(),
+        name: if name.is_empty() { "Amazon Photos".to_string() } else { name.to_string() },
+        folder_path: share_url.trim().to_string(),
+        photo_count: 0,
+        status: "new".into(),
+        created_at: now(),
+        updated_at: now(),
+        burst_threshold: None,
+        burst_threshold_learned_at: None,
+        source_kind: SOURCE_AMAZON.into(),
+    };
+    connection(&app)?
+        .execute(
+            "INSERT INTO projects (id,name,folder_path,photo_count,status,created_at,updated_at,source_kind,source_key) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![project.id, project.name, project.folder_path, project.photo_count, project.status, project.created_at, project.updated_at, project.source_kind, amazon::key_for(&source)],
+        )
+        .map_err(|error| error.to_string())?;
+    // 見本はもう要らない。
+    if let Ok(dir) = data_subdir(&app, SAMPLES_DIR) {
+        clear_dir(&dir);
+    }
+    Ok(project)
+}
+
+#[tauri::command]
+async fn create_amazon_project(app: AppHandle, name: String, share_url: String) -> Result<Project, String> {
+    tauri::async_runtime::spawn_blocking(move || create_amazon_project_blocking(app, name, share_url))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+/// 原本を `amazon-cache/<project_id>/<node_id>.jpg` に置いてパスを返す。あれば使い回す。
+/// 取れなかったら一覧を読み直して tempLink を取り直し、1 回だけやり直す（`LinkBook::fetch`）。
+fn amazon_original_blocking(app: AppHandle, project_id: String, photo_id: String) -> Result<String, String> {
+    let conn = connection(&app)?;
+    let node_id: String = conn
+        .query_row(
+            "SELECT path FROM photos WHERE id=?1 AND project_id=?2",
+            params![photo_id, project_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| "この写真は見つかりませんでした。".to_string())?;
+    let Some(book) = amazon_book_of(&app, &project_id)? else {
+        return Err("Amazon の写真ではありません。".into());
+    };
+    let dir = data_subdir(&app, AMAZON_CACHE_DIR)?.join(&project_id);
+    let file = dir.join(format!("{}.jpg", amazon::safe_file_stem(&node_id)));
+    if file.is_file() {
+        return Ok(file.to_string_lossy().to_string());
+    }
+    let bytes = match book.fetch(&node_id, None) {
+        Ok(bytes) => bytes,
+        Err(message) => {
+            if book.is_gone() {
+                mark_amazon_gone(&conn, &project_id);
+            }
+            return Err(message);
+        }
+    };
+    write_atomically(&file, &bytes)?;
+    Ok(file.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+async fn amazon_original(app: AppHandle, project_id: String, photo_id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || amazon_original_blocking(app, project_id, photo_id))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+/// 一時ファイルに書いてから置き換える。途中で切れた半端なファイルを残さない。
+fn write_atomically(file: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = file.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let temporary = file.with_extension("part");
+    fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
+    fs::rename(&temporary, file).map_err(|error| {
+        let _ = fs::remove_file(&temporary);
+        error.to_string()
+    })
 }
 
 /// まだ解析が必要な写真の枚数。0 なら事前生成を起動する意味がない。
@@ -2508,18 +2952,24 @@ fn create_project(app: AppHandle, name: String, folder_path: String) -> Result<P
 /// 一瞬出ていた。
 #[tauri::command]
 fn get_analysis_backlog(app: AppHandle, project_id: String) -> Result<i64, String> {
-    connection(&app)?
-        .query_row(
+    let conn = connection(&app)?;
+    // Amazon の撮影時刻は走査で入る（contentDate が無い写真は空のまま）ので、空でも「未解析」に数えない。
+    let time_missing = if amazon_source_of(&conn, &project_id)?.is_some() {
+        "0"
+    } else {
+        "(captured_at IS NULL OR timestamp_source IS NULL)"
+    };
+    conn.query_row(
+            &format!(
             "SELECT COUNT(*) FROM photos
              WHERE project_id=?1 AND is_missing=0
-               AND (captured_at IS NULL
-                 OR timestamp_source IS NULL
+               AND ({time_missing}
                  OR d_hash IS NULL
                  OR d_hash_version IS NULL
                  OR d_hash_version <> ?2
                  OR thumbnail_path IS NULL
                  OR thumbnail_version IS NULL
-                 OR thumbnail_version <> ?3)",
+                 OR thumbnail_version <> ?3)"),
             params![project_id, D_HASH_VERSION, THUMBNAIL_VERSION],
             |row| row.get(0),
         )
@@ -2579,6 +3029,7 @@ fn delete_project_blocking(app: AppHandle, project_id: String) -> Result<(), Str
             params![project_id],
         )
         .map_err(|error| error.to_string())?;
+    amazon::delete_links(&transaction, &project_id)?;
     transaction
         .execute(
             "DELETE FROM photos WHERE project_id=?1",
@@ -2592,6 +3043,13 @@ fn delete_project_blocking(app: AppHandle, project_id: String) -> Result<(), Str
 
     if deleted == 0 {
         return Err("プロジェクトが見つかりませんでした。".into());
+    }
+    // Amazon の原本の置き場と、作成画面の見本。フォルダのプロジェクトでは無いので何も起きない。
+    if let Ok(dir) = data_subdir(&app, AMAZON_CACHE_DIR) {
+        clear_dir(&dir.join(&project_id));
+    }
+    if let Ok(dir) = data_subdir(&app, SAMPLES_DIR) {
+        clear_dir(&dir);
     }
     eprintln!("削除: プロジェクト {project_id} / サムネイル {removed} 件");
     Ok(())
@@ -2993,6 +3451,13 @@ fn export_by_rating_blocking(
     if !root.is_dir() {
         return Err("出力先フォルダが見つかりません。".into());
     }
+    // Amazon の写真は、原本を取ってきて書き出し先に置く（移動はできない）。
+    if let Some(book) = amazon_book_of(&app, &project_id)? {
+        if move_files {
+            return Err(AMAZON_UNSUPPORTED.into());
+        }
+        return export_amazon_copy(&app, &project_id, book, &root, &ratings);
+    }
     // 出力先が写真フォルダの中だと、書き出した先をまた読んでしまう。
     let folder = project_folder(&app, &project_id)?;
     if root.starts_with(Path::new(&folder)) {
@@ -3049,6 +3514,64 @@ fn export_by_rating_blocking(
             params![project_id],
         )
         .map_err(|error| error.to_string())?;
+    }
+    Ok(report)
+}
+
+/// Amazon の写真を星ごとのフォルダへコピーする。原本を Amazon から取り、書き出し先に直接置く
+/// （端末の `amazon-cache` は使わない）。失敗した 1 枚で止めない。
+fn export_amazon_copy(
+    app: &AppHandle,
+    project_id: &str,
+    book: Arc<amazon::LinkBook>,
+    root: &Path,
+    ratings: &[i64],
+) -> Result<ExportReport, String> {
+    let conn = connection(app)?;
+    let targets: Vec<(String, String, i64)> = {
+        let mut statement = conn
+            .prepare("SELECT path,name,rating FROM photos WHERE project_id=?1 AND is_missing=0 ORDER BY relative_path")
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![project_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?
+    };
+    let mut report = ExportReport::default();
+    for (node_id, name, rating) in targets {
+        if !ratings.is_empty() && !ratings.contains(&rating) {
+            continue;
+        }
+        let directory = root.join(format!("star-{rating}"));
+        if let Err(error) = fs::create_dir_all(&directory) {
+            report.fail(&name, error);
+            continue;
+        }
+        // 名前に区切りが入っていても、書き出し先の外には出さない。
+        let file_name = Path::new(&name)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("photo.jpg");
+        match book.fetch(&node_id, None) {
+            Ok(bytes) => {
+                let target = unique_destination(&directory, file_name);
+                match fs::write(&target, &bytes) {
+                    Ok(()) => report.processed += 1,
+                    Err(error) => {
+                        let _ = fs::remove_file(&target);
+                        report.fail(&name, error);
+                    }
+                }
+            }
+            Err(message) => {
+                report.fail(&name, message);
+                // リンクが消えていたら、残りを 1 枚ずつ試さない。
+                if book.is_gone() {
+                    mark_amazon_gone(&conn, project_id);
+                    break;
+                }
+            }
+        }
     }
     Ok(report)
 }
@@ -3157,6 +3680,10 @@ fn write_ratings_to_files_blocking(
     ratings: Vec<i64>,
 ) -> Result<ExportReport, String> {
     let conn = connection(&app)?;
+    // Amazon の写真の原本は書き換えられない。
+    if amazon_source_of(&conn, &project_id)?.is_some() {
+        return Err(AMAZON_UNSUPPORTED.into());
+    }
     let targets = photos_for_export(&conn, &project_id, &ratings)?;
     let mut report = ExportReport::default();
 
@@ -3473,6 +4000,15 @@ fn run_display_generation(
             .map_err(|error| error.to_string())?
     };
 
+    // Amazon は縮小を Amazon にさせる（`viewBox=<長辺>`）。原本は読まない。
+    if let Some(book) = amazon_book_of(&app, &project_id)? {
+        let targets = pending
+            .into_iter()
+            .map(|(photo_id, node_id, _, _)| (photo_id, node_id))
+            .collect();
+        return run_amazon_display(&app, registry, &project_id, book, edge, &dir, targets);
+    }
+
     let total = pending.len();
     progress(
         &app,
@@ -3548,6 +4084,108 @@ fn run_display_generation(
         total,
         total,
         "選別用の画像がそろいました。",
+    );
+    Ok(())
+}
+
+/// `run_display_generation` の Amazon 版。`viewBox=<表示用の長辺>` のバイトを、そのまま表示用のファイルに書く。
+/// 並列 4。まとまり（16 枚）ごとに DB へ書き、中断とリンク切れを見る。
+fn run_amazon_display(
+    app: &AppHandle,
+    registry: &TaskRegistry,
+    project_id: &str,
+    book: Arc<amazon::LinkBook>,
+    edge: u32,
+    dir: &Path,
+    pending: Vec<(String, String)>,
+) -> Result<(), String> {
+    let task_key = format!("display:{project_id}");
+    let total = pending.len();
+    let message = "選別用の画像を作っています…";
+    progress(app, project_id, "display", "hashing", 0, total, message);
+    let mut done = 0usize;
+    let mut failed = 0usize;
+    for batch in pending.chunks(amazon::WORKERS * 4) {
+        if registry.is_cancelled(&task_key) {
+            progress_note(
+                app,
+                project_id,
+                "display",
+                "cancelled",
+                done,
+                total,
+                format!("中断しました。{done} 件まで作成済みです。"),
+                ProgressNote { warning: None, failed },
+            );
+            return Ok(());
+        }
+        if book.is_gone() {
+            break;
+        }
+        let next = AtomicUsize::new(0);
+        let saved: Mutex<Vec<(usize, bool)>> = Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for _ in 0..amazon::WORKERS.min(batch.len()) {
+                scope.spawn(|| loop {
+                    let index = next.fetch_add(1, Ordering::SeqCst);
+                    let Some((photo_id, node_id)) = batch.get(index) else { break };
+                    let ok = book
+                        .fetch(node_id, Some(edge))
+                        .ok()
+                        // 画像として読める形のときだけ置く（エラーの文書を表示用にしない）。
+                        .filter(|bytes| image::guess_format(bytes).is_ok())
+                        .is_some_and(|bytes| write_atomically(&display_file(dir, photo_id), &bytes).is_ok());
+                    if let Ok(mut list) = saved.lock() {
+                        list.push((index, ok));
+                    }
+                });
+            }
+        });
+        let results = saved.into_inner().map_err(|_| "表示用画像の結果を読めません。".to_string())?;
+        let conn = connection(app)?;
+        for (index, ok) in results {
+            let photo_id = &batch[index].0;
+            if ok {
+                conn.execute(
+                    "UPDATE photos SET display_path=?1, display_edge=?2 WHERE id=?3",
+                    params![display_file(dir, photo_id).to_string_lossy().to_string(), edge as i64, photo_id],
+                )
+                .map_err(|error| error.to_string())?;
+            } else {
+                // 作れなかった写真は次回また拾えるよう、印を残さない。
+                failed += 1;
+                conn.execute(
+                    "UPDATE photos SET display_path=NULL, display_edge=NULL WHERE id=?1",
+                    params![photo_id],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+        }
+        done += batch.len();
+        progress_note(
+            app,
+            project_id,
+            "display",
+            "hashing",
+            done,
+            total,
+            message,
+            ProgressNote { warning: None, failed },
+        );
+    }
+    if book.is_gone() {
+        mark_amazon_gone(&connection(app)?, project_id);
+        return Err(amazon::GONE_MESSAGE.to_string());
+    }
+    progress_note(
+        app,
+        project_id,
+        "display",
+        "complete",
+        total,
+        total,
+        "選別用の画像がそろいました。",
+        ProgressNote { warning: None, failed },
     );
     Ok(())
 }
@@ -3843,6 +4481,10 @@ fn sidecar_folder(app: &AppHandle, project_id: &str) -> Result<PathBuf, String> 
 #[tauri::command]
 async fn sidecar_supported(app: AppHandle, project_id: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        // Amazon の共有リンクには、書く場所が無い。
+        if amazon_source_of(&connection(&app)?, &project_id)?.is_some() {
+            return Ok("none".to_string());
+        }
         Ok(sidecar::support(&sidecar_folder(&app, &project_id)?).to_string())
     })
     .await
@@ -3851,7 +4493,12 @@ async fn sidecar_supported(app: AppHandle, project_id: String) -> Result<String,
 
 #[tauri::command]
 async fn read_sidecar(app: AppHandle, project_id: String) -> Result<Option<String>, String> {
-    tauri::async_runtime::spawn_blocking(move || sidecar::read(&sidecar_folder(&app, &project_id)?))
+    tauri::async_runtime::spawn_blocking(move || {
+        if amazon_source_of(&connection(&app)?, &project_id)?.is_some() {
+            return Ok(None);
+        }
+        sidecar::read(&sidecar_folder(&app, &project_id)?)
+    })
         .await
         .map_err(|error| error.to_string())?
 }
@@ -3864,6 +4511,9 @@ async fn write_sidecar(
     file_name: Option<String>,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
+        if amazon_source_of(&connection(&app)?, &project_id)?.is_some() {
+            return Err("Amazon の共有リンクにはサイドカーを書けません。".to_string());
+        }
         let name = file_name.unwrap_or_else(|| sidecar::SIDECAR_FILE.to_string());
         sidecar::write(&sidecar_folder(&app, &project_id)?, &name, &json)
     })
@@ -3899,6 +4549,9 @@ pub fn run() {
             list_projects,
             create_project,
             delete_project,
+            amazon_preview,
+            create_amazon_project,
+            amazon_original,
             get_analysis_backlog,
             get_project_photo_page,
             get_photos_by_ids,
@@ -6651,5 +7304,164 @@ mod tests {
         // SOI はあるが長さが壊れている。
         let broken = vec![0xFF, 0xD8, 0xFF, 0xE1, 0xFF, 0xFE, 0x00];
         assert!(jpeg_with_rating(&broken, 3).is_err());
+    }
+
+    // ---- Amazon（T9）----
+
+    fn amazon_node(id: &str, name: &str, date: Option<&str>, size: u64) -> amazon::AmazonNode {
+        amazon::AmazonNode {
+            id: id.into(),
+            name: name.into(),
+            kind: "FILE".into(),
+            content_properties: Some(amazon::ContentProperties {
+                content_type: Some("image/jpeg".into()),
+                content_date: date.map(str::to_owned),
+                size: Some(size),
+            }),
+            temp_link: Some(format!("https://content.example/{id}")),
+        }
+    }
+
+    fn amazon_test_db(label: &str) -> (PathBuf, Connection) {
+        let directory = test_directory(label);
+        fs::create_dir_all(&directory).expect("create test directory");
+        let database = directory.join("db.sqlite3");
+        let conn = open_database(&database).expect("open database");
+        conn.execute(
+            "INSERT INTO projects (id,name,folder_path,photo_count,status,created_at,updated_at,source_kind,source_key)
+             VALUES ('p1','x','https://www.amazon.co.jp/photos/share/abc',0,'new',0,0,'amazon','www.amazon.co.jp|abc')",
+            [],
+        )
+        .expect("insert project");
+        (directory, conn)
+    }
+
+    #[test]
+    fn a_legacy_project_becomes_a_folder_project_and_amazon_tables_exist() {
+        let directory = test_directory("amazon-migrate");
+        fs::create_dir_all(&directory).expect("create test directory");
+        let path = directory.join("legacy.sqlite3");
+        let legacy = Connection::open(&path).expect("open legacy database");
+        legacy
+            .execute_batch(
+                "CREATE TABLE projects (
+                   id TEXT PRIMARY KEY, name TEXT NOT NULL, folder_path TEXT NOT NULL,
+                   photo_count INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'new',
+                   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+                 );
+                 INSERT INTO projects (id,name,folder_path,created_at,updated_at) VALUES ('old','旧','/photos',0,0);",
+            )
+            .expect("create legacy schema");
+        drop(legacy);
+        let conn = open_database(&path).expect("migrate");
+        let (kind, key) = project_source(&conn, "old").expect("source");
+        assert_eq!(kind, "folder");
+        assert_eq!(key, None);
+        assert!(amazon_source_of(&conn, "old").unwrap().is_none());
+        amazon::save_links(&conn, "old", &[("n".into(), "l".into())]).expect("amazon_links exists");
+        fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn an_amazon_scan_row_uses_the_node_id_and_the_local_clock() {
+        let (directory, conn) = amazon_test_db("amazon-scan");
+        upsert_amazon_photo(&conn, "p1", &amazon_node("n1", "IMG_1.jpg", Some("2021-07-23T13:13:29.000Z"), 100))
+            .expect("upsert");
+        let (path, relative, name, captured, source): (String, String, String, Option<i64>, String) = conn
+            .query_row(
+                "SELECT path,relative_path,name,captured_at,timestamp_source FROM photos WHERE project_id='p1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .expect("row");
+        assert_eq!((path.as_str(), relative.as_str(), name.as_str()), ("n1", "n1", "IMG_1.jpg"));
+        // Z を信じず、その土地の時計のまま。
+        assert_eq!(captured, civil_timestamp_ms(2021, 7, 23, 13, 13, 29));
+        assert_eq!(source, "exif_original");
+
+        // 日付が無ければ、ファイル名から。それも無ければ空。
+        upsert_amazon_photo(&conn, "p1", &amazon_node("n2", "IMG_20260630_181932.jpg", None, 1)).unwrap();
+        upsert_amazon_photo(&conn, "p1", &amazon_node("n3", "photo.jpg", None, 1)).unwrap();
+        let read = |id: &str| -> (Option<i64>, String) {
+            conn.query_row(
+                "SELECT captured_at,timestamp_source FROM photos WHERE path=?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(read("n2"), (civil_timestamp_ms(2026, 6, 30, 18, 19, 32), "filename_inferred".to_string()));
+        assert_eq!(read("n3"), (None, "unknown".to_string()));
+        fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn a_rescan_keeps_the_analysis_only_while_the_size_is_unchanged() {
+        let (directory, conn) = amazon_test_db("amazon-rescan");
+        let node = amazon_node("n1", "a.jpg", Some("2021-07-23T13:13:29.000Z"), 100);
+        upsert_amazon_photo(&conn, "p1", &node).unwrap();
+        conn.execute(
+            "UPDATE photos SET rating=3,d_hash='00ff',d_hash_version=?1,thumbnail_path='/t.jpg',thumbnail_version=?2,display_path='/d.jpg',display_edge=1024",
+            params![D_HASH_VERSION, THUMBNAIL_VERSION],
+        )
+        .unwrap();
+        upsert_amazon_photo(&conn, "p1", &node).unwrap();
+        let (rating, hash, thumb, display): (i64, Option<String>, Option<String>, Option<String>) = conn
+            .query_row("SELECT rating,d_hash,thumbnail_path,display_path FROM photos", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap();
+        assert_eq!((rating, hash.as_deref(), thumb.as_deref(), display.as_deref()), (3, Some("00ff"), Some("/t.jpg"), Some("/d.jpg")));
+
+        upsert_amazon_photo(&conn, "p1", &amazon_node("n1", "a.jpg", Some("2021-07-23T13:13:29.000Z"), 999)).unwrap();
+        let (rating, hash, thumb, display): (i64, Option<String>, Option<String>, Option<String>) = conn
+            .query_row("SELECT rating,d_hash,thumbnail_path,display_path FROM photos", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap();
+        // 星は残り、絵と指紋は作り直しになる。
+        assert_eq!((rating, hash, thumb, display), (3, None, None, None));
+        fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn an_amazon_thumbnail_that_is_already_there_needs_no_network() {
+        let (directory, conn) = amazon_test_db("amazon-hash");
+        let source = amazon::parse_key("www.amazon.co.jp|abc").unwrap();
+        let book = amazon::LinkBook::load(directory.join("db.sqlite3"), &conn, "p1", source).unwrap();
+        let thumbnails = directory.join("thumbnails");
+        fs::create_dir_all(&thumbnails).unwrap();
+        let image = DynamicImage::ImageRgb8(image::RgbImage::from_fn(64, 48, |x, y| image::Rgb([(x * 4) as u8, (y * 5) as u8, 90])));
+        let bytes = encode_thumbnail(&image).unwrap();
+        let file = thumbnail_file(&thumbnails, "photo-1");
+        fs::write(&file, &bytes).unwrap();
+        let expected = hash_thumbnail_bytes(&bytes);
+        assert!(expected.is_some());
+        let record = HashRecord {
+            id: "photo-1".into(),
+            path: "n1".into(),
+            captured_at: 0,
+            source: TimestampSource::ExifOriginal,
+            cached: CachedAnalysis {
+                d_hash: expected.clone(),
+                d_hash_version: Some(D_HASH_VERSION),
+                thumbnail_path: Some(file.to_string_lossy().to_string()),
+                thumbnail_mtime: None,
+                thumbnail_size: None,
+                thumbnail_version: Some(THUMBNAIL_VERSION),
+            },
+        };
+        // 網が無い（tempLink も無い）ので、取りにいけば失敗する。それでも成功する = 使い回した。
+        let reused = hash_one_amazon(&book, &thumbnails, 0, &record);
+        assert!(reused.error.is_none() && reused.hash_reused);
+        assert_eq!(reused.d_hash, expected);
+
+        // 版が古い指紋は、サムネイルから作り直す（網は使わない）。
+        let mut old = record.clone();
+        old.cached.d_hash_version = Some(D_HASH_VERSION - 1);
+        let rebuilt = hash_one_amazon(&book, &thumbnails, 0, &old);
+        assert!(rebuilt.error.is_none() && !rebuilt.hash_reused);
+        assert_eq!(rebuilt.d_hash, expected);
+        fs::remove_dir_all(&directory).ok();
     }
 }

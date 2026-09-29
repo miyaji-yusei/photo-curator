@@ -44,9 +44,12 @@ const {
   stepZoom,
   taskWarning,
   view,
+  zoomError,
   zoomIndex,
   zoomList,
-  zoomPhoto
+  zoomLoading,
+  zoomPhoto,
+  zoomSrc
 } = c
 </script>
 
@@ -150,7 +153,7 @@ const {
             aria-label="前の写真" :disabled="zoomIndex <= 0"
             @click.stop="stepZoom(-1)"
           />
-          <img :src="desktop.photoUrl(zoomPhoto.path)" :alt="zoomPhoto.name">
+          <img :src="zoomSrc" :alt="zoomPhoto.name">
           <v-btn
             class="zoom-overlay__step" icon="mdi-chevron-right" variant="text" size="large"
             aria-label="次の写真" :disabled="zoomIndex < 0 || zoomIndex >= zoomList.length - 1"
@@ -160,6 +163,8 @@ const {
         <div class="zoom-overlay__caption text-caption">
           <span v-if="zoomList.length > 1" class="zoom-overlay__position">{{ zoomIndex + 1 }} / {{ zoomList.length }}</span>
           {{ zoomPhoto.name }}
+          <template v-if="zoomLoading"> ・ 原本を読み込み中…</template>
+          <span v-if="zoomError" class="text-error"> ・ {{ zoomError }}</span>
           <template v-if="zoomList.length > 1"> ・ ← → で前後</template>
           ・ クリックか他のキーで閉じる
         </div>

@@ -8,6 +8,7 @@ const {
   exportMode,
   exportRatings,
   exportResult,
+  isAmazon,
   ratingCount,
   runExport
 } = useCurator()
@@ -34,8 +35,9 @@ const {
 
       <v-radio-group v-model="exportMode" hide-details class="mb-2">
         <v-radio value="copy" label="コピーする（原本はそのまま残る）" />
-        <v-radio value="move" label="移動する（原本フォルダから写真が無くなる）" />
+        <v-radio value="move" label="移動する（原本フォルダから写真が無くなる）" :disabled="isAmazon" />
       </v-radio-group>
+      <p v-if="isAmazon" class="text-caption text-medium-emphasis mb-2">移動は Amazon の写真には使えません。コピーは原本を Amazon から取ってきて、出力先に置きます。</p>
       <v-alert v-if="exportMode === 'move'" type="warning" variant="tonal" density="comfortable" class="mt-3">
         移動すると<strong>元のフォルダから写真が無くなります</strong>。移動後はプロジェクトの索引が古くなるため、
         「写真を再読み込み」が必要になります。

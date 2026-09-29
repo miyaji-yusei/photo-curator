@@ -8,7 +8,7 @@ export interface DisplaySettings {
   largeEdge: number
 }
 import type {
-  ExportReport, Photo, PhotoPage, PhotoSort, Project,
+  AmazonPreview, ExportReport, Photo, PhotoPage, PhotoSort, Project,
   ProjectProgress, ProjectTask, SelectionResult, SelectionSummary
 } from '~/types/photo'
 import type { PairOverride } from '~/lib/core'
@@ -130,6 +130,12 @@ export interface PhotoBackend {
    */
   photoUrl: (path: string) => string
   /**
+   * 拡大のときだけ使う、原本の URL。フォルダの写真は `photoUrl(photo.path)` と同じ。
+   * Amazon の写真は、ここで原本を取ってきて端末に置き（あれば使い回す）、そのパスの URL を返す。
+   * 取れなければ reject する（リンクが消えていたら「このリンクは削除されたか、無効です。」）。
+   */
+  photoOriginalUrl: (photo: Photo) => Promise<string>
+  /**
    * 一覧に並べるための URL。解析時に作った 256px のサムネイルを使い回すので
    * 追加のデコードは無い。まだ解析していない写真は原本へ落ちる。
    */
@@ -146,6 +152,14 @@ export interface PhotoBackend {
   ) => Promise<ExportReport>
   /** 星を写真本体の XMP に書き込む。原本を書き換える。 */
   writeRatingsToFiles: (projectId: string, ratings: number[]) => Promise<ExportReport>
+
+  // ---- Amazon Photos の共有リンク（PC だけ。`capabilities.amazon` が true のとき）----
+  // 走査・準備・表示用・書き出しの分岐は Rust の入口が `source_kind` で行う。画面は分岐しない。
+
+  /** 共有リンクを読み、名前・枚数・見本（最大 12 枚）を返す。 */
+  amazonPreview?: (shareUrl: string) => Promise<AmazonPreview>
+  /** 共有リンクのプロジェクトを作る（走査はこのあと `startProjectScan`）。 */
+  createAmazonProject?: (name: string, shareUrl: string) => Promise<Project>
 
   // ---- ブラウザだけが持つ機能 ------------------------------------------
   // デスクトップはフォルダ走査と原本パスがあるので必要ない。

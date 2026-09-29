@@ -120,6 +120,8 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
       updatedAt: row.updatedAt,
       burstThreshold: row.burstThreshold,
       burstThresholdLearnedAt: row.burstThresholdLearnedAt,
+      // ブラウザに Amazon の出所は無い（画像本体が CORS で読めない）。
+      sourceKind: 'folder',
       source: source.kind,
       ...(folderAccess ? { folderAccess } : {})
     }
@@ -517,6 +519,7 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
 
     // ブラウザでは既に表示できる URL が入っている。
     photoUrl: (path: string) => path,
+    photoOriginalUrl: async (photo: Photo) => photo.path,
     photoThumbnailUrl: (photo: Photo) => photo.thumbnailPath ?? photo.path,
     photoDisplayUrl: (photo: Photo) => photo.displayPath ?? photo.thumbnailPath ?? photo.path,
 

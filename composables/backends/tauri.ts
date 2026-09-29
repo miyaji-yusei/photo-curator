@@ -2,7 +2,7 @@ import { convertFileSrc } from '@tauri-apps/api/core'
 import { capabilitiesFor, detectPlatform } from '~/utils/capabilities'
 import { open } from '@tauri-apps/plugin-dialog'
 import type {
-  ExportReport, Photo, PhotoPage, PhotoSort, Project,
+  AmazonPreview, ExportReport, Photo, PhotoPage, PhotoSort, Project,
   ProjectProgress, ProjectTask, SelectionResult, SelectionSummary
 } from '~/types/photo'
 import type { PairOverride } from '~/lib/core'
@@ -29,6 +29,12 @@ async function invokeDesktop<T>(command: string, args?: Record<string, unknown>)
  * `#[tauri::command]` と 1:1 で対応する。
  */
 export function createTauriBackend(): PhotoBackend {
+  /** 出所の種類。原本の URL を取るとき、Amazon かどうかを引く（`listProjects`・作成で更新する）。 */
+  const sourceKinds = new Map<string, Project['sourceKind']>()
+  const remember = (projects: Project[]) => {
+    for (const project of projects) sourceKinds.set(project.id, project.sourceKind)
+    return projects
+  }
   return {
     kind: 'tauri',
     // Android も Tauri なので、UA まで見て初めて desktop と分かれる。
@@ -45,8 +51,12 @@ export function createTauriBackend(): PhotoBackend {
       const { listen } = await import('@tauri-apps/api/event')
       return listen<ProjectProgress>('project-progress', event => callback(event.payload))
     },
-    listProjects: () => invokeDesktop<Project[]>('list_projects'),
-    createProject: (name: string, folderPath: string) => invokeDesktop<Project>('create_project', { name, folderPath }),
+    listProjects: async () => remember(await invokeDesktop<Project[]>('list_projects')),
+    createProject: async (name: string, folderPath: string) =>
+      remember([await invokeDesktop<Project>('create_project', { name, folderPath })])[0]!,
+    amazonPreview: (shareUrl: string) => invokeDesktop<AmazonPreview>('amazon_preview', { shareUrl }),
+    createAmazonProject: async (name: string, shareUrl: string) =>
+      remember([await invokeDesktop<Project>('create_amazon_project', { name, shareUrl })])[0]!,
     deleteProject: (projectId: string) => invokeDesktop<void>('delete_project', { projectId }),
     getProjectPhotoPage: (projectId: string, offset = 0, limit = 80, rating: number | null = null, sort: PhotoSort = 'name') =>
       invokeDesktop<PhotoPage>('get_project_photo_page', { projectId, offset, limit, rating, sort }),
@@ -95,13 +105,27 @@ export function createTauriBackend(): PhotoBackend {
       invokeDesktop<void>('save_sidecar_state', { projectId, state }),
     deviceIdentity: () => invokeDesktop<DeviceIdentity>('device_identity'),
     photoUrl: (path: string) => isTauriRuntime() ? convertFileSrc(path) : '',
+    photoOriginalUrl: async (photo: Photo) => {
+      if (!isTauriRuntime()) return ''
+      if (sourceKinds.get(photo.projectId) !== 'amazon') return convertFileSrc(photo.path)
+      const path = await invokeDesktop<string>('amazon_original', { projectId: photo.projectId, photoId: photo.id })
+      return convertFileSrc(path)
+    },
+    // Amazon の写真の `path` は node id で、ファイルではない。絵がまだ無いときは空にする。
     photoThumbnailUrl: (photo: Photo) => {
       if (!isTauriRuntime()) return ''
+      if (sourceKinds.get(photo.projectId) === 'amazon') {
+        return photo.thumbnailPath ? convertFileSrc(photo.thumbnailPath) : ''
+      }
       return convertFileSrc(photo.thumbnailPath ?? photo.path)
     },
     // 表示用 → サムネイル → 原本。原本まで落ちるのは生成が追いつく前だけ。
     photoDisplayUrl: (photo: Photo) => {
       if (!isTauriRuntime()) return ''
+      if (sourceKinds.get(photo.projectId) === 'amazon') {
+        const path = photo.displayPath ?? photo.thumbnailPath
+        return path ? convertFileSrc(path) : ''
+      }
       return convertFileSrc(photo.displayPath ?? photo.thumbnailPath ?? photo.path)
     },
     getDisplaySettings: () => invokeDesktop<DisplaySettings>('get_display_settings'),

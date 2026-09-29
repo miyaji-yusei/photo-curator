@@ -28,6 +28,8 @@ export interface BackendCapabilities {
   exportFolders: boolean
   /** 原本の XMP に星を書ける。**原本を書き換えるので、触れる環境を絞る。** */
   writeMetadata: boolean
+  /** Amazon Photos の共有リンクを出所にできる（読み取りだけ。ログインしない）。PC だけ。 */
+  amazon: boolean
 }
 
 /** このブラウザに `showDirectoryPicker` があるか（`capabilitiesFor` の `directoryPicker` に渡す）。 */
@@ -53,7 +55,8 @@ export function capabilitiesFor(
         largeGroups: true,
         fullResolution: true,
         exportFolders: true,
-        writeMetadata: true
+        writeMetadata: true,
+        amazon: true
       }
     case 'android':
       return {
@@ -64,7 +67,8 @@ export function capabilitiesFor(
         fullResolution: true,
         exportFolders: true,
         // 原本の書き換えは、まず PC だけに留める。
-        writeMetadata: false
+        writeMetadata: false,
+        amazon: false
       }
     case 'browser':
       return {
@@ -75,7 +79,9 @@ export function capabilitiesFor(
         // 原本はセッション中しか持てないので、リロード後は表示用までしか出せない。
         fullResolution: false,
         exportFolders: false,
-        writeMetadata: false
+        writeMetadata: false,
+        // 画像本体はブラウザから読めない（CORS）。PC だけ。
+        amazon: false
       }
   }
 }

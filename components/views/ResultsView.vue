@@ -7,6 +7,7 @@ const {
   exportDialog,
   gridClass,
   gridStyle,
+  isAmazon,
   loadResultsPage,
   metadataDialog,
   openBurstReview,
@@ -91,7 +92,9 @@ const {
       </template>
       <template v-else>
         <v-btn variant="outlined" prepend-icon="mdi-folder-move-outline" @click="exportDialog = true">フォルダ分け</v-btn>
-        <v-btn variant="outlined" prepend-icon="mdi-tag-text-outline" @click="metadataDialog = true">メタデータに反映</v-btn>
+        <!-- Amazon の写真の原本は書き換えられない。 -->
+        <v-btn variant="outlined" prepend-icon="mdi-tag-text-outline" :disabled="isAmazon" @click="metadataDialog = true">メタデータに反映</v-btn>
+        <span v-if="isAmazon" class="text-caption text-medium-emphasis">Amazon の写真には使えません</span>
       </template>
       <v-btn variant="text" prepend-icon="mdi-restart" @click="restartDialog = true">最初からやり直す</v-btn>
     </div>

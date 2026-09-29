@@ -70,6 +70,13 @@ describe('capabilitiesFor', () => {
     expect(capabilitiesFor('android').fullResolution).toBe(true)
   })
 
+  it('Amazon の共有リンクを出所にできるのは PC だけ', () => {
+    expect(capabilitiesFor('desktop').amazon).toBe(true)
+    expect(capabilitiesFor('android').amazon).toBe(false)
+    expect(capabilitiesFor('browser').amazon).toBe(false)
+    expect(capabilitiesFor('browser', { directoryPicker: true }).amazon).toBe(false)
+  })
+
   it('デスクトップだけが大きなグループを持つ', () => {
     expect(capabilitiesFor('desktop').largeGroups).toBe(true)
     expect(capabilitiesFor('android').largeGroups).toBe(false)

@@ -79,12 +79,27 @@ export interface Project {
   burstThreshold: number | null
   burstThresholdLearnedAt: number | null
   /**
+   * 写真の出所の種類。`folder` はフォルダ（PC のフォルダ・ブラウザの取り込み）、
+   * `amazon` は Amazon Photos の共有リンク（PC だけ）。Amazon のとき `folderPath` はリンクの URL。
+   */
+  sourceKind: 'folder' | 'amazon'
+  /**
    * 写真の出所（ブラウザだけ）。省略はデスクトップ（フォルダ参照）。
    * `picker` は写真ピッカー、`folder` は File System Access のフォルダ、`dev` は開発用の HTTP。
    */
   source?: 'picker' | 'folder' | 'dev'
   /** `folder` のとき、次に読む許可がまだ無ければ 'needs-permission'（ボタンで許可を求める）。 */
   folderAccess?: 'granted' | 'needs-permission'
+}
+
+/** Amazon Photos の共有リンクを読んだ結果（作成画面）。 */
+export interface AmazonPreview {
+  /** `"{host}|{shareId}"`。 */
+  key: string
+  name: string
+  count: number
+  /** 見本（最大 12 枚）の JPEG のパス。`photoUrl` で表示する。 */
+  samples: string[]
 }
 
 export interface TournamentSettings {
