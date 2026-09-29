@@ -11,28 +11,25 @@
  *   利用者の操作を経由する。
  */
 import type {
-  BurstGroup, BurstPair, ExportReport, Photo, PhotoPage, PhotoSort, Project,
-  ProjectProgress, ProjectTask, SelectionResult, SelectionSeed, SelectionSession, SelectionSummary
+  ExportReport, Photo, PhotoPage, PhotoSort, Project,
+  ProjectProgress, ProjectTask, SelectionResult, SelectionSummary
 } from '~/types/photo'
+import { init as initCore } from '~/lib/core'
+import { parseSavedSelection, serializeSavedSelection } from '~/utils/selectionFlow'
+import type { SavedSelection } from '~/utils/selectionFlow'
 import { MAX_RATING } from '~/types/photo'
 import type { PhotoBackend } from '~/composables/photoBackend'
-import { normalizeSession } from '~/utils/tournament'
 import { analyzeAll } from '~/utils/analysisPool'
 import { DISPLAY_EDGE_DEFAULT } from '~/utils/analyzePhoto'
 import {
-  BURST_WINDOW_MS, HASH_DISTANCE_LIMIT, buildBurstGroups, buildBurstPairs,
-  pairJoinsByThreshold, pairKey
-} from '~/utils/burstAnalysis'
-import type { BurstEntry } from '~/utils/burstAnalysis'
-import {
-  STORE_DISPLAYS, STORE_PHOTOS, STORE_PROJECTS, STORE_STATES, STORE_THUMBNAILS,
-  deleteOne, getAll, getOne, photosOfProject, putOne, readPairOverrides, readSession,
+  STORE_BURST_SHAPES, STORE_DISPLAYS, STORE_PHOTOS, STORE_PROJECTS, STORE_STATES, STORE_THUMBNAILS,
+  deleteOne, overridesKey, getAll, getOne, photosOfProject, putOne, readPairOverrides, readSession,
   requestPersistence, toPhoto, withStores, writePairOverrides, writeSession
 } from '~/utils/browserStore'
 import type { StoredPhoto, StoredProject } from '~/utils/browserStore'
 import { ObjectUrlCache } from '~/utils/objectUrlCache'
 import {
-  compareByCaptureOrder, comparePhotos, filterPhotos, pagePhotos, summarizeRatings
+  comparePhotos, filterPhotos, pagePhotos, summarizeRatings
 } from '~/utils/photoQuery'
 
 /** 原本はセッション中だけ持つ。リロードで消えるが、保存もしない。 */
@@ -95,25 +92,6 @@ async function decorate(rows: StoredPhoto[]): Promise<Photo[]> {
   })
 }
 
-/** 連写判定に使える写真だけを撮影順で取り出す。 */
-function burstEntries(rows: StoredPhoto[]): BurstEntry[] {
-  return rows
-    .filter(row => !row.isMissing && row.capturedAt !== null && row.dHash !== null)
-    .sort(compareByCaptureOrder)
-    .map(row => ({
-      id: row.id,
-      capturedAt: row.capturedAt!,
-      dHash: row.dHash!,
-      source: row.timestampSource
-    }))
-}
-
-async function loadProject(projectId: string): Promise<StoredProject | undefined> {
-  return withStores([STORE_PROJECTS], 'readonly', transaction =>
-    getOne<StoredProject>(transaction, STORE_PROJECTS, projectId)
-  )
-}
-
 async function patchProject(projectId: string, patch: Partial<StoredProject>) {
   await withStores([STORE_PROJECTS], 'readwrite', async transaction => {
     const row = await getOne<StoredProject>(transaction, STORE_PROJECTS, projectId)
@@ -169,7 +147,7 @@ export function createLocalBackend(): PhotoBackend {
         photosOfProject(transaction, projectId)
       )
       await withStores(
-        [STORE_PROJECTS, STORE_PHOTOS, STORE_THUMBNAILS, STORE_DISPLAYS, STORE_STATES], 'readwrite',
+        [STORE_PROJECTS, STORE_PHOTOS, STORE_THUMBNAILS, STORE_DISPLAYS, STORE_STATES, STORE_BURST_SHAPES], 'readwrite',
         async transaction => {
           for (const row of rows) {
             thumbnailUrls.release(row.id)
@@ -181,6 +159,7 @@ export function createLocalBackend(): PhotoBackend {
             await deleteOne(transaction, STORE_DISPLAYS, row.id)
           }
           await deleteOne(transaction, STORE_STATES, projectId)
+          await deleteOne(transaction, STORE_BURST_SHAPES, overridesKey(projectId))
           await deleteOne(transaction, STORE_PROJECTS, projectId)
         }
       )
@@ -208,14 +187,12 @@ export function createLocalBackend(): PhotoBackend {
       return decorate(ordered)
     },
 
-    getSelectionSeed: async (projectId: string, rating?: number): Promise<SelectionSeed[]> => {
+    getCoreInputs: async (projectId: string): Promise<Photo[]> => {
       const rows = await withStores([STORE_PHOTOS], 'readonly', transaction =>
         photosOfProject(transaction, projectId)
       )
-      // 選別の並びは撮影順。似た構図が隣り合うようにする。
-      return filterPhotos(rows, rating ?? null)
-        .sort(compareByCaptureOrder)
-        .map(row => ({ id: row.id, rating: row.rating }))
+      // 4,000 枚でもサムネイルの実体は読まない。core が要るのは鍵・時刻・指紋だけ。
+      return rows.filter(row => !row.isMissing).map(row => toPhoto(row, null, null, null))
     },
 
     saveSelectionResults: async (projectId: string, entries: SelectionResult[]) => {
@@ -275,77 +252,6 @@ export function createLocalBackend(): PhotoBackend {
       return summarizeRatings(rows)
     },
 
-    getBurstGroups: async (projectId: string, threshold?: number): Promise<BurstGroup[]> => {
-      const [rows, project, overrides] = await Promise.all([
-        withStores([STORE_PHOTOS], 'readonly', transaction => photosOfProject(transaction, projectId)),
-        loadProject(projectId),
-        readPairOverrides(projectId)
-      ])
-      const limit = threshold ?? project?.burstThreshold ?? HASH_DISTANCE_LIMIT
-      return buildBurstGroups(burstEntries(rows), limit, overrides)
-    },
-
-    getBurstNeighborhood: async (
-      projectId: string, photoIds: string[], windowMs = BURST_WINDOW_MS
-    ): Promise<Photo[]> => {
-      if (!photoIds.length) return []
-      const rows = await withStores([STORE_PHOTOS], 'readonly', transaction =>
-        photosOfProject(transaction, projectId)
-      )
-      // まとめの判定に使える写真だけを対象にする。デスクトップ側と同じ絞り込み。
-      const usable = rows.filter(
-        row => !row.isMissing && row.capturedAt !== null && row.dHash !== null
-      )
-      const target = new Set(photoIds)
-      const times = usable.filter(row => target.has(row.id)).map(row => row.capturedAt!)
-      if (!times.length) return []
-      const low = Math.min(...times) - Math.max(0, windowMs)
-      const high = Math.max(...times) + Math.max(0, windowMs)
-      return decorate(
-        usable
-          .filter(row => row.capturedAt! >= low && row.capturedAt! <= high)
-          .sort(compareByCaptureOrder)
-      )
-    },
-
-    saveBurstShape: async (
-      projectId: string, orderedPhotoIds: string[], blocks: string[][]
-    ): Promise<void> => {
-      if (orderedPhotoIds.length < 2) return
-      const [rows, project, overrides] = await Promise.all([
-        withStores([STORE_PHOTOS], 'readonly', transaction => photosOfProject(transaction, projectId)),
-        loadProject(projectId),
-        readPairOverrides(projectId)
-      ])
-      const threshold = project?.burstThreshold ?? HASH_DISTANCE_LIMIT
-      const byId = new Map(burstEntries(rows).map(entry => [entry.id, entry]))
-      const blockOf = new Map<string, number>()
-      blocks.forEach((block, index) => {
-        for (const id of block) blockOf.set(id, index)
-      })
-      // 閾値だけで出る素の判定と食い違うペアだけを残す。一致するものは消すので、
-      // 切ってから元に戻しても無意味な例外が溜まらない（デスクトップと同じ規則）。
-      for (let index = 0; index + 1 < orderedPhotoIds.length; index += 1) {
-        const left = byId.get(orderedPhotoIds[index]!)
-        const right = byId.get(orderedPhotoIds[index + 1]!)
-        if (!left || !right) continue
-        const raw = pairJoinsByThreshold(left, right, threshold)
-        const leftBlock = blockOf.get(left.id)
-        const wanted = leftBlock !== undefined && leftBlock === blockOf.get(right.id)
-        const key = pairKey(left.id, right.id)
-        if (wanted === raw) overrides.delete(key)
-        else overrides.set(key, wanted)
-      }
-      await writePairOverrides(projectId, overrides)
-    },
-
-    getBurstPairs: async (projectId: string): Promise<BurstPair[]> => {
-      const rows = await withStores([STORE_PHOTOS], 'readonly', transaction =>
-        photosOfProject(transaction, projectId)
-      )
-      return buildBurstPairs(burstEntries(rows))
-    },
-
     saveBurstThreshold: (projectId: string, threshold: number) =>
       patchProject(projectId, { burstThreshold: threshold, burstThresholdLearnedAt: Date.now() }),
 
@@ -353,6 +259,9 @@ export function createLocalBackend(): PhotoBackend {
       patchProject(projectId, { burstThreshold: null, burstThresholdLearnedAt: null }),
 
     // 取り込みのときに解析まで済ませるので、あとから走らせる処理は無い。
+    getPairOverrides: (projectId: string) => readPairOverrides(projectId),
+    savePairOverrides: (projectId: string, overrides) => writePairOverrides(projectId, overrides),
+
     startProjectScan: () => Promise.resolve(),
     startBurstAnalysis: () => Promise.resolve(),
     startBackgroundAnalysis: () => Promise.resolve(),
@@ -369,11 +278,14 @@ export function createLocalBackend(): PhotoBackend {
       return Promise.resolve()
     },
 
-    saveSession: (session: SelectionSession) => writeSession(session),
+    saveSession: (projectId: string, selection: SavedSelection | null) =>
+      writeSession(projectId, selection ? serializeSavedSelection(selection) : 'null'),
     loadSession: async (projectId: string) => {
       const raw = await readSession(projectId)
       if (!raw) return null
-      return normalizeSession(JSON.parse(raw) as SelectionSession)
+      // 読み戻しは core（wasm）が行う。旧版の形は null（最初から）。
+      await initCore()
+      return parseSavedSelection(raw)
     },
 
     // ブラウザでは既に表示できる URL が入っている。

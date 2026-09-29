@@ -8,9 +8,11 @@ export interface DisplaySettings {
   largeEdge: number
 }
 import type {
-  BurstGroup, BurstPair, ExportReport, Photo, PhotoPage, PhotoSort, Project,
-  ProjectProgress, ProjectTask, SelectionResult, SelectionSeed, SelectionSession, SelectionSummary
+  ExportReport, Photo, PhotoPage, PhotoSort, Project,
+  ProjectProgress, ProjectTask, SelectionResult, SelectionSummary
 } from '~/types/photo'
+import type { PairOverride } from '~/lib/core'
+import type { SavedSelection } from '~/utils/selectionFlow'
 
 /**
  * 画面が使うデータ操作の全体。**フロントとバックエンドの唯一の接点**で、
@@ -49,8 +51,12 @@ export interface PhotoBackend {
     rating?: number | null, sort?: PhotoSort
   ) => Promise<PhotoPage>
   getPhotosByIds: (projectId: string, photoIds: string[]) => Promise<Photo[]>
-  /** rating を渡すとその星の写真だけ。選別対象は星で決まる。 */
-  getSelectionSeed: (projectId: string, rating?: number) => Promise<SelectionSeed[]>
+  /**
+   * core に渡す写真の行。**その星に関係なく全件**（欠損を除く）を 1 回で返す。
+   * 並べ替えは呼び出し側（`utils/coreInputs.ts`）が撮影順にする。
+   * サムネイルなどの URL は持たない（写真そのものの表示は `getPhotosByIds`）。
+   */
+  getCoreInputs: (projectId: string) => Promise<Photo[]>
 
   /** 判定したグループぶんだけを書く。全件を毎回送らない。 */
   saveSelectionResults: (projectId: string, entries: SelectionResult[]) => Promise<void>
@@ -67,28 +73,17 @@ export interface PhotoBackend {
   ) => Promise<number>
   getSelectionSummary: (projectId: string) => Promise<SelectionSummary>
 
-  /** threshold を省くとプロジェクトの学習値、それも無ければ既定値が使われる。 */
-  getBurstGroups: (projectId: string, threshold?: number) => Promise<BurstGroup[]>
-  /** 閾値学習の出題元。距離での足切りはされていない。 */
-  getBurstPairs: (projectId: string) => Promise<BurstPair[]>
+  /** 学習した連写の距離をプロジェクトに覚えさせる（次の選別で質問を省く）。 */
   saveBurstThreshold: (projectId: string, threshold: number) => Promise<void>
   clearBurstThreshold: (projectId: string) => Promise<void>
   /**
-   * まとまりを見直すための「1続きの写真」。指定した写真の前後 `windowMs` に
-   * 入るものを撮影順で返す。まとめの中身も、まとめに入れられる近くの写真も、
-   * どちらもこの1本の並びの上にある。
+   * 手で直した連写の例外（core の `PairOverride`、鍵は relativePath）。
+   * **例外そのもの**を保存する。「こう分かれていてほしい」という形からの
+   * 導き方は `utils/burstShape.ts`。
    */
-  getBurstNeighborhood: (
-    projectId: string, photoIds: string[], windowMs?: number
-  ) => Promise<Photo[]>
-  /**
-   * 見直した結果の形を保存する。渡すのは**例外そのものではなく「こう分かれて
-   * いてほしい」という形**で、閾値との食い違いだけが例外として残る。
-   * 何度保存しても結果が変わらない。
-   */
-  saveBurstShape: (
-    projectId: string, orderedPhotoIds: string[], blocks: string[][]
-  ) => Promise<void>
+  getPairOverrides: (projectId: string) => Promise<PairOverride[]>
+  /** そのプロジェクトの手直しを、渡したものに丸ごと入れ替える。 */
+  savePairOverrides: (projectId: string, overrides: PairOverride[]) => Promise<void>
 
   /** 表示用画像の設定と生成。 */
   getDisplaySettings: () => Promise<DisplaySettings>
@@ -109,8 +104,10 @@ export interface PhotoBackend {
   startBackgroundAnalysis: (projectId: string) => Promise<void>
   cancelProjectTask: (projectId: string, task: ProjectTask) => Promise<void>
 
-  saveSession: (session: SelectionSession) => Promise<void>
-  loadSession: (projectId: string) => Promise<SelectionSession | null>
+  /** 封筒（`v: 2`）ごと保存する。`core` は core の Session そのまま。null は途中の選別を消す。 */
+  saveSession: (projectId: string, selection: SavedSelection | null) => Promise<void>
+  /** 旧版の形（`v` が無い）は null。旧データは引き継がない。 */
+  loadSession: (projectId: string) => Promise<SavedSelection | null>
 
   /**
    * 原本を表示するための URL。

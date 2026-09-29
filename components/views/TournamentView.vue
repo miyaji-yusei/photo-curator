@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import type { Ref } from 'vue'
-import type { SelectionSession } from '~/types/photo'
+import type { SavedSelection } from '~/utils/selectionFlow'
 
 const {
   MAX_RATING,
   burstSizeOf,
+  canUndo,
   confirmChoices,
   confirmPhoto,
   desktop,
@@ -15,10 +16,13 @@ const {
   openZoom,
   remainingGroups,
   remainingPhotos,
+  roundNumber,
+  roundProgress,
   saveSession,
   selectedCount,
   session: nullableSession,
   skipGroup,
+  targetStar,
   toggleChoice,
   tournamentColumns,
   tournamentPhotos,
@@ -27,22 +31,22 @@ const {
   view
 } = useCurator()
 // 親の `v-if` で null を除いているので、ここでは non-null として扱う。
-const session = nullableSession as Ref<SelectionSession>
+const session = nullableSession as Ref<SavedSelection>
 </script>
 
 <template>
     <div class="d-flex align-center justify-space-between flex-wrap ga-3 mb-3">
       <div>
-        <div class="text-overline text-primary">★{{ session.targetRating }} を選別中 &middot; Round {{ session.round }}</div>
+        <div class="text-overline text-primary">★{{ targetStar }} を選別中 &middot; Round {{ roundNumber }}</div>
         <h1 class="text-h6 text-md-h5">残り {{ remainingPhotos.toLocaleString() }} 枚 / {{ remainingGroups.toLocaleString() }} グループ</h1>
       </div>
       <div class="d-flex flex-wrap ga-2">
-        <v-btn variant="text" prepend-icon="mdi-undo" :disabled="!session.history.length" @click="undoChoice">1つ戻す<span class="ms-1 text-caption">⌫</span></v-btn>
+        <v-btn variant="text" prepend-icon="mdi-undo" :disabled="!canUndo" @click="undoChoice">1つ戻す<span class="ms-1 text-caption">⌫</span></v-btn>
         <v-btn variant="text" prepend-icon="mdi-view-grid-outline" @click="openGroupSizeDialog">表示枚数</v-btn>
         <v-btn variant="text" prepend-icon="mdi-pause-circle-outline" @click="view = 'project'">中断して戻る</v-btn>
       </div>
     </div>
-    <v-progress-linear :model-value="session.groups.length ? (session.groupIndex / session.groups.length) * 100 : 100" color="primary" height="6" rounded class="mb-2" />
+    <v-progress-linear :model-value="roundProgress" color="primary" height="6" rounded class="mb-2" />
     <div class="d-flex justify-space-between text-caption text-medium-emphasis mb-4"><span>選択済み {{ selectedCount }} 枚</span><span>このグループ {{ tournamentPhotos.length }} 枚</span></div>
 
     <div
@@ -54,7 +58,7 @@ const session = nullableSession as Ref<SelectionSession>
         :key="photo.id"
         class="tournament-card"
         :class="{
-          'is-selected': session.selectedInGroup.includes(photo.id),
+          'is-selected': session.selectedInGroup.includes(photo.relativePath),
           'is-confirmed': isConfirmed(photo.id),
           'is-burst': burstSizeOf(photo.id) > 1
         }"
@@ -96,7 +100,7 @@ const session = nullableSession as Ref<SelectionSession>
           <v-icon icon="mdi-chevron-right" size="16" />
         </button>
 
-        <span v-if="session.selectedInGroup.includes(photo.id)" class="tournament-card__check">
+        <span v-if="session.selectedInGroup.includes(photo.relativePath)" class="tournament-card__check">
           <v-icon icon="mdi-check-bold" size="20" />
         </span>
         <span v-if="isConfirmed(photo.id)" class="tournament-card__confirmed">確定</span>

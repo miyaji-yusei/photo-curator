@@ -1,6 +1,6 @@
 import type {
-  BurstGroup, BurstPair, ExportReport, Photo, PhotoSort, Project, ProjectProgress,
-  SelectionResult, SelectionSession, SelectionSummary, TournamentSettings
+  BurstGroup, ExportReport, Photo, PhotoSort, Project, ProjectProgress,
+  SelectionResult, SelectionSummary, TournamentSettings
 } from '~/types/photo'
 import { MAX_RATING } from '~/types/photo'
 import type { DisplaySettings } from '~/composables/photoBackend'
@@ -10,34 +10,27 @@ import {
   createMoveSelection, isSelected as isMovePicked, selectedCount as countMoveSelection,
   setSelectAll, toMoveArgs, toggleSelection
 } from '~/utils/ratingMove'
-import {
-  collapseBursts,
-  insertIntoUpcoming,
-  makeSession,
-  prepareRound,
-  regroupRemaining,
-  resolveChosen,
-  reviewBurstRatings,
-  spreadBurstRatings,
-  undoLastStep
-} from '~/utils/tournament'
+import * as core from '~/lib/core'
+import type { BurstThreshold, PairOverride, PhotoRef, Session } from '~/lib/core'
 import {
   blocksFromCuts, cutAll, cutAroundSelection, cutsFromGroups, joinAt
 } from '~/utils/burstEdit'
+import { buildBurstQuestions } from '~/utils/burstQuestions'
+import { burstNeighborhood } from '~/utils/burstNeighborhood'
+import { overridesFromShape } from '~/utils/burstShape'
+import {
+  BURST_WINDOW_MS, D_HASH_VERSION, DEFAULT_BURST_DISTANCE,
+  buildCoreInputs, maxNeighborDistance, toPhotoRef
+} from '~/utils/coreInputs'
+import type { CoreInputs } from '~/utils/coreInputs'
+import { applyChanges, moveRatings, pathsWithRating, reviewChanges, setRating } from '~/utils/ratingEdit'
+import { syncRatings } from '~/utils/selectionFlow'
+import type { RatingChange, SavedSelection } from '~/utils/selectionFlow'
 import { clampGroupSize, groupSizeLimits } from '~/utils/groupSize'
 import {
   SHARE_FILE_LIMIT, downloadBlob, shareFiles, zipEntriesByRating
 } from '~/utils/shareExport'
 import { createStoredZip } from '~/utils/zip'
-import {
-  DEFAULT_THRESHOLD_OPTIONS,
-  MAX_HASH_DISTANCE,
-  applyAnswer,
-  inferThreshold,
-  nextPair,
-  shouldStop,
-  skipPair
-} from '~/utils/burstThreshold'
 
 type View = 'home' | 'project' | 'method' | 'settings' | 'burst-threshold' | 'burst-preview' | 'tournament' | 'result' | 'results' | 'burst-review'
 
@@ -48,7 +41,14 @@ function createCurator() {
   const previewPhotos = ref<Photo[]>([])
   const previewTotal = ref(0)
   const tournamentPhotos = ref<Photo[]>([])
-  const session = ref<SelectionSession | null>(null)
+  /**
+   * 選別の途中（封筒）。`core` が core の Session そのもの。
+   * **core の Session は必ず丸ごと置き換える**（`setCore`）。中身を書き換えない。
+   */
+  const session = ref<SavedSelection | null>(null)
+  // core に渡す全写真（撮影順）と、relativePath / id の対応表。星は持たない（古くなるので）。
+  const coreInputs = shallowRef<CoreInputs | null>(null)
+  let pairOverrides: PairOverride[] = []
   const view = ref<View>('home')
   const loading = ref(false)
   const error = ref('')
@@ -104,10 +104,12 @@ function createCurator() {
   }
 
   // 閾値の学習・確認まわり
-  const currentPair = ref<BurstPair | null>(null)
   const pairPhotos = ref<Photo[]>([])
   const previewThreshold = ref(0)
   const previewBusy = ref(false)
+  /** 確認画面に出す、まとまった連写（2 枚以上）。core の `groupBursts` の結果を写したもの。 */
+  const burstPreviewGroups = ref<BurstGroup[]>([])
+  const previewMaxDistance = ref(64)
 
   // 選別中の枚数変更とプロジェクト削除
   const groupSizeDialog = ref(false)
@@ -256,25 +258,67 @@ function createCurator() {
     Math.max(1, Math.ceil(burstReviewPhotos.value.length / burstReviewColumns.value))
   )
 
-  /** 星が最大なら「確定」扱い。別のフラグは持たない。 */
-  const isConfirmed = (photoId: string) => (session.value?.ratings[photoId] ?? 0) >= MAX_RATING
-  /** その写真が代表しているまとめの枚数。1 なら単独。 */
-  const burstSizeOf = (photoId: string) => session.value?.burstMembers[photoId]?.length ?? 1
+  // ---- core（判断）との橋 --------------------------------------------------
+  //
+  // 判断は全部 core（wasm）が行う。ここでは core に渡す・返ってきたものを画面と
+  // 保存に写すだけ。写真の鍵は relativePath、画面の行（Photo）の id は uuid。
 
-  const currentGroup = computed(() => session.value?.groups[session.value.groupIndex] ?? [])
-  const remainingGroups = computed(() => Math.max(0, (session.value?.groups.length ?? 0) - (session.value?.groupIndex ?? 0)))
-  const remainingPhotos = computed(() => session.value ? session.value.groups.slice(session.value.groupIndex).reduce((total, group) => total + group.length, 0) : 0)
-  const selectedCount = computed(() => session.value?.survivors.length ?? 0)
-  const askedCount = computed(() => session.value?.burstThresholdState.answers.length ?? 0)
-  const maxQuestions = DEFAULT_THRESHOLD_OPTIONS.maxQuestions
+  /** core の Session。無ければ null。 */
+  const coreSession = computed<Session | null>(() => session.value?.core ?? null)
+  const pathOf = (photoId: string) => coreInputs.value?.byId.get(photoId)?.relativePath ?? null
+  const idOf = (path: string) => coreInputs.value?.byPath.get(path)?.id ?? null
+  const idsOf = (paths: string[]) => paths.map(idOf).filter((id): id is string => id !== null)
+
+  /** 星が最大なら「確定」扱い。別のフラグは持たない。 */
+  const isConfirmed = (photoId: string) => {
+    const path = pathOf(photoId)
+    return path !== null && (coreSession.value?.ratings[path] ?? 0) >= MAX_RATING
+  }
+  /** その写真が代表しているまとめの枚数。1 なら単独。 */
+  const burstSizeOf = (photoId: string) => {
+    const path = pathOf(photoId)
+    return (path !== null ? coreSession.value?.members[path]?.length : undefined) ?? 1
+  }
+
+  /** 今の組（写真の id）。core の `current` を対応表で写したもの。 */
+  const currentGroup = computed(() => idsOf(coreSession.value?.current ?? []))
+  const targetStar = computed(() => coreSession.value?.target_star ?? 0)
+  const roundNumber = computed(() => coreSession.value?.round ?? 1)
+  const canUndo = computed(() => (coreSession.value?.history.length ?? 0) > 0)
+  const survivorCount = computed(() => coreSession.value?.survivors.length ?? 0)
+  const remainingGroups = computed(() => {
+    const current = coreSession.value
+    if (!current) return 0
+    return (current.current.length ? 1 : 0) + Math.ceil(current.queue.length / Math.max(1, current.group_size))
+  })
+  const remainingPhotos = computed(() =>
+    coreSession.value ? coreSession.value.current.length + coreSession.value.queue.length : 0
+  )
+  /** このラウンドで済んだ組の割合（%）。 */
+  const roundProgress = computed(() => {
+    const done = coreSession.value?.history.length ?? 0
+    const total = done + remainingGroups.value
+    return total ? (done / total) * 100 : 100
+  })
+  const selectedCount = computed(() => coreSession.value?.survivors.length ?? 0)
+  // 連写の学習。質問と答えは封筒（`learning`）に持つので、リロードしても続きから。
+  const askedCount = computed(() => session.value?.learning?.answers.length ?? 0)
+  const learningPosition = computed(() => (session.value?.learning?.index ?? 0) + 1)
+  const learningTotal = computed(() => session.value?.learning?.questions.length ?? 0)
+  const currentQuestion = computed(() => {
+    const learning = session.value?.learning
+    return learning ? learning.questions[learning.index] ?? null : null
+  })
+  const currentPair = computed(() => {
+    const question = currentQuestion.value
+    if (!question) return null
+    return { gapMs: Math.abs((question.left.captured_at ?? 0) - (question.right.captured_at ?? 0)) }
+  })
+  const burstGroupCount = computed(() => burstPreviewGroups.value.length)
   const groupedPhotoCount = computed(() =>
-    (session.value?.burstGroups ?? []).reduce((total, group) => total + group.photoIds.length, 0)
+    burstPreviewGroups.value.reduce((total, group) => total + group.photoIds.length, 0)
   )
-  const maxPairDistance = computed(() =>
-    session.value?.burstPairs.length
-      ? Math.max(...session.value.burstPairs.map(pair => pair.distance))
-      : MAX_HASH_DISTANCE
-  )
+  const maxPairDistance = computed(() => Math.max(previewMaxDistance.value, previewThreshold.value))
   const progressValue = computed(() => {
     const progress = taskProgress.value
     return progress && progress.total > 0 ? Math.round((progress.processed / progress.total) * 100) : 0
@@ -323,12 +367,98 @@ function createCurator() {
     tournamentPhotos.value = await desktop.getPhotosByIds(activeProject.value.id, ids)
   }
 
+  /**
+   * core に渡す全写真を取り直す。**その星に関係なく全件を 1 回で**。
+   * 星は持たない（選別中に古くなる）。星が要るときは呼び出し側が行から読む。
+   */
+  async function loadCoreInputs(projectId = activeProject.value?.id) {
+    if (!projectId) return null
+    const inputs = buildCoreInputs(await desktop.getCoreInputs(projectId))
+    if (activeProject.value?.id === projectId) coreInputs.value = inputs
+    return inputs
+  }
+
+  /** 対応表が無ければ（リロード直後など）読む。 */
+  async function ensureCoreInputs(): Promise<CoreInputs> {
+    const known = coreInputs.value
+    if (known) return known
+    const loaded = await loadCoreInputs()
+    if (!loaded) throw new Error('プロジェクトが開かれていません。')
+    return loaded
+  }
+
+  async function loadPairOverrides() {
+    pairOverrides = activeProject.value ? await desktop.getPairOverrides(activeProject.value.id) : []
+    return pairOverrides
+  }
+
+  /** 連写の基準。学習した距離（この選別 → プロジェクト）→ 既定の順。 */
+  const currentDistance = () =>
+    session.value?.burstDistance ?? activeProject.value?.burstThreshold ?? DEFAULT_BURST_DISTANCE
+  const thresholdFor = (distance: number): BurstThreshold => ({
+    window_ms: BURST_WINDOW_MS, distance, d_hash_version: D_HASH_VERSION
+  })
+
+  /** core の Session を丸ごと置き換える。中身は変えない（返ってきた値をそのまま持つ）。 */
+  function setCore(next: Session) {
+    if (session.value) session.value.core = markRaw(next)
+  }
+
+  /** 前後の星を比べ、変わった写真の行だけ書く。`undo` も同じ。 */
+  async function writeRatings(changes: RatingChange[]) {
+    const projectId = activeProject.value?.id
+    if (!projectId || !changes.length) return
+    const entries: SelectionResult[] = []
+    for (const change of changes) {
+      const id = idOf(change.relativePath)
+      if (id) entries.push({ id, rating: change.rating })
+    }
+    if (!entries.length) return
+    try {
+      await desktop.saveSelectionResults(projectId, entries)
+      await loadSummary()
+    } catch (cause) {
+      error.value = cause instanceof Error ? cause.message : '選別結果を保存できませんでした。'
+    }
+  }
+
+  /** core の新しい Session を受け取り、星を行にも写す。 */
+  async function applyCore(next: Session) {
+    const previous = session.value?.core ?? null
+    setCore(next)
+    await writeRatings(syncRatings(previous, next))
+  }
+
+  /**
+   * 星を行の値から入れた Session。行が星の持ち主（結果・移動・書き出しが読む）なので、
+   * 人が星を手直しするときはここを土台にする。Session が無ければ空の土台。
+   */
+  async function sessionWithRowRatings(): Promise<{ base: Session, inputs: CoreInputs, rows: Photo[] }> {
+    const projectId = activeProject.value?.id
+    if (!projectId) throw new Error('プロジェクトが開かれていません。')
+    const rows = await desktop.getCoreInputs(projectId)
+    const inputs = buildCoreInputs(rows)
+    if (activeProject.value?.id === projectId) coreInputs.value = inputs
+    const held = session.value?.core
+      ?? core.startRound([], clampGroupSize(settings.groupSize, groupLimits), 0, false, thresholdFor(currentDistance()), [])
+    const base = applyChanges(held, Object.fromEntries(rows.map(row => [row.relativePath, row.rating])))
+    return { base: markRaw(base), inputs, rows }
+  }
+
   async function openProject(project: Project) {
     activeProject.value = project
+    coreInputs.value = null
+    pairOverrides = []
     view.value = 'project'
     loading.value = true
     try {
-      await Promise.all([loadPreview(project.id), desktop.loadSession(project.id).then(value => { session.value = value })])
+      await Promise.all([
+        loadPreview(project.id),
+        desktop.loadSession(project.id).then(value => {
+          if (value) value.core = markRaw(value.core)
+          session.value = value
+        })
+      ])
       // 開いた時点から少しずつ解析を進めておく。「選別を開始」で待たされないように。
       // ただし**やることが無いなら起動しない**。以前は無条件に呼んでいたため、
       // 解析済みのプロジェクトを開くたびに進捗イベントだけが飛び、解析中の帯が
@@ -400,7 +530,11 @@ function createCurator() {
       taskDialog.value = false
       await refreshProjects()
       activeProject.value = projects.value.find(item => item.id === activeProject.value?.id) ?? activeProject.value
-      if (activeProject.value) await loadPreview(activeProject.value.id)
+      if (activeProject.value) {
+        await loadPreview(activeProject.value.id)
+        // 写真が増えたので core に渡す列も取り直す。
+        await loadCoreInputs().catch(() => undefined)
+      }
     }
   }
 
@@ -470,25 +604,22 @@ function createCurator() {
   }
 
   async function finishTournamentStart() {
-    if (!activeProject.value || !pendingTournamentSettings.value) return
+    const project = activeProject.value
+    const chosen = pendingTournamentSettings.value
+    if (!project || !chosen) return
     loading.value = true
     try {
       // 最初から選び直すので、前回の星と落選は消す。数字を膨らませない。
-      await desktop.resetSelectionResults(activeProject.value.id).catch(() => undefined)
-      const [seed, burstPairs] = await Promise.all([
-        desktop.getSelectionSeed(activeProject.value.id),
-        pendingTournamentSettings.value.groupBursts
-          ? desktop.getBurstPairs(activeProject.value.id)
-          : Promise.resolve<BurstPair[]>([])
-      ])
-      if (!seed.length) throw new Error('選別できる写真がありません。')
-      session.value = makeSession(
-        activeProject.value.id,
-        seed,
-        pendingTournamentSettings.value,
-        burstPairs,
-        activeProject.value.burstThreshold
+      await desktop.resetSelectionResults(project.id).catch(() => undefined)
+      const inputs = await loadCoreInputs(project.id)
+      if (!inputs?.refs.length) throw new Error('選別できる写真がありません。')
+      await loadPairOverrides()
+      const learned = project.burstThreshold
+      const initial = core.startRound(
+        inputs.refs, chosen.groupSize, 0, chosen.groupBursts,
+        thresholdFor(learned ?? DEFAULT_BURST_DISTANCE), pairOverrides
       )
+      openSelection(initial, chosen, inputs)
       await enterStage()
       await saveSession()
     } catch (cause) {
@@ -499,88 +630,132 @@ function createCurator() {
     }
   }
 
+  /**
+   * 始めた選別を封筒に入れる。開始時の行き先を決める。
+   * - 連写をまとめない設定 / 候補ペアが無い → そのまま選別
+   * - 学習済みの距離がある → 質問を飛ばして確認画面へ
+   * - それ以外 → 連写の学習から
+   * 学習・確認の間の Session は既定か学習済みの距離で組んだ仮のもので、
+   * 「この設定で選別を始める」で `regroup` して確定する。
+   */
+  function openSelection(initial: Session, chosen: TournamentSettings, inputs: CoreInputs) {
+    const learned = activeProject.value?.burstThreshold ?? null
+    const questions = chosen.groupBursts ? buildBurstQuestions(inputs.refs) : []
+    const stage = !chosen.groupBursts || !questions.length
+      ? 'tournament'
+      : learned === null ? 'burst-threshold' : 'burst-preview'
+    session.value = {
+      v: 2,
+      core: markRaw(initial),
+      stage,
+      settings: { ...chosen },
+      multiSelect: false,
+      selectedInGroup: [],
+      learning: stage === 'burst-threshold' ? { questions, index: 0, answers: [] } : null,
+      burstDistance: chosen.groupBursts ? learned : null,
+      updatedAt: Date.now()
+    }
+  }
+
   /** セッションの stage に合わせて画面と必要なデータを揃える。 */
   async function enterStage() {
-    if (!session.value) return
-    if (session.value.stage === 'burst-threshold') {
+    const current = session.value
+    if (!current) return
+    await ensureCoreInputs()
+    if (current.stage === 'burst-threshold') {
       view.value = 'burst-threshold'
       await showNextPair()
       return
     }
-    if (session.value.stage === 'burst-preview') {
+    if (current.stage === 'burst-preview') {
       view.value = 'burst-preview'
-      await refreshBurstPreview(session.value.burstThreshold ?? inferCurrentThreshold())
+      await loadPairOverrides()
+      await refreshBurstPreview(currentDistance())
       return
     }
-    if (session.value.stage === 'result') {
+    if (current.stage === 'result' || current.core.finished) {
+      current.stage = 'result'
       view.value = 'result'
       return
     }
-    if (!session.value.groups.length) prepareRound(session.value)
+    current.stage = 'tournament'
     view.value = 'tournament'
     await loadCurrentPhotos()
   }
 
-  function inferCurrentThreshold() {
-    if (!session.value) return 0
-    return inferThreshold(session.value.burstThresholdState.answers, maxPairDistance.value)
-  }
-
   /** 次の出題を用意する。出し尽くしたら確認画面へ進む。 */
   async function showNextPair() {
-    if (!session.value) return
-    const state = session.value.burstThresholdState
-    if (shouldStop(session.value.burstPairs, state, DEFAULT_THRESHOLD_OPTIONS)) {
-      await finishThresholdLearning()
-      return
+    const current = session.value
+    const learning = current?.learning
+    if (!current || !learning) return
+    while (learning.index < learning.questions.length) {
+      const question = learning.questions[learning.index]!
+      const ids = idsOf([question.left.relative_path, question.right.relative_path])
+      const photos = activeProject.value && ids.length === 2
+        ? await desktop.getPhotosByIds(activeProject.value.id, ids)
+        : []
+      if (photos.length === 2) {
+        pairPhotos.value = photos
+        return
+      }
+      // 行が見つからない（消えた・欠損）問いは飛ばす。
+      learning.index += 1
     }
-    const pair = nextPair(session.value.burstPairs, state)
-    if (!pair) {
-      await finishThresholdLearning()
-      return
-    }
-    currentPair.value = pair
-    pairPhotos.value = activeProject.value
-      ? await desktop.getPhotosByIds(activeProject.value.id, [pair.leftPhotoId, pair.rightPhotoId])
-      : []
+    await finishThresholdLearning()
   }
 
   async function answerPair(grouped: boolean) {
-    if (!session.value || !currentPair.value) return
-    session.value.burstThresholdState = applyAnswer(
-      session.value.burstPairs,
-      session.value.burstThresholdState,
-      currentPair.value,
-      grouped
-    )
+    const learning = session.value?.learning
+    const question = currentQuestion.value
+    if (!learning || !question) return
+    learning.answers = [...learning.answers, { distance: question.distance, same: grouped }]
+    learning.index += 1
     await showNextPair()
     await saveSession()
   }
 
-  /** 判断できないペアは学習に使わない。区間は動かさず次を出す。 */
+  /** 判断できない問いは学習に使わない。答えに入れず次を出す。 */
   async function skipCurrentPair() {
-    if (!session.value || !currentPair.value) return
-    session.value.burstThresholdState = skipPair(session.value.burstThresholdState, currentPair.value)
+    const learning = session.value?.learning
+    if (!learning || !currentQuestion.value) return
+    learning.index += 1
     await showNextPair()
     await saveSession()
   }
 
   async function finishThresholdLearning() {
-    if (!session.value) return
-    currentPair.value = null
-    session.value.stage = 'burst-preview'
+    const current = session.value
+    if (!current) return
+    const answers = (current.learning?.answers ?? []).map(answer => ({ ...answer }))
+    // 答えから距離を決めるのは core。答えが無ければ既定値のまま。
+    const distance = core.learnDistance(answers, DEFAULT_BURST_DISTANCE)
+    pairPhotos.value = []
+    current.stage = 'burst-preview'
     view.value = 'burst-preview'
-    await refreshBurstPreview(inferCurrentThreshold())
+    await loadPairOverrides()
+    await refreshBurstPreview(distance)
+    await saveSession()
   }
 
-  /** 閾値を当てはめた結果を取り直す。スライダー操作からも呼ぶ。 */
-  async function refreshBurstPreview(threshold: number) {
-    if (!session.value || !activeProject.value) return
-    previewThreshold.value = threshold
+  let previewMaxFor: CoreInputs | null = null
+
+  /** 距離を当てた結果を取り直す。スライダー操作からも呼ぶ（core は同期で速い）。 */
+  async function refreshBurstPreview(distance: number) {
+    const current = session.value
+    if (!current || !activeProject.value) return
+    previewThreshold.value = distance
     previewBusy.value = true
     try {
-      session.value.burstGroups = await desktop.getBurstGroups(activeProject.value.id, threshold)
-      session.value.burstThreshold = threshold
+      const inputs = await ensureCoreInputs()
+      if (previewMaxFor !== inputs) {
+        previewMaxDistance.value = maxNeighborDistance(inputs.refs, BURST_WINDOW_MS, core.hashDistance)
+        previewMaxFor = inputs
+      }
+      const groups = core.groupBursts(inputs.refs, thresholdFor(distance), pairOverrides)
+      burstPreviewGroups.value = groups
+        .filter(group => group.members.length > 1)
+        .map(group => toViewGroup(group, inputs))
+      current.burstDistance = distance
     } catch (cause) {
       error.value = cause instanceof Error ? cause.message : '連写のまとめ結果を取得できませんでした。'
     } finally {
@@ -588,30 +763,70 @@ function createCurator() {
     }
   }
 
-  /** さらに質問して閾値を詰める。 */
+  /** core のまとまりを、画面が使う `BurstGroup`（写真の id）に写す。 */
+  function toViewGroup(group: core.BurstGroup, inputs: CoreInputs): BurstGroup {
+    const times = group.members
+      .map(path => inputs.byPath.get(path)?.capturedAt)
+      .filter((at): at is number => typeof at === 'number')
+    return {
+      id: group.representative,
+      photoIds: idsOf(group.members),
+      capturedSpanMs: times.length ? Math.max(...times) - Math.min(...times) : 0,
+      similarity: 0,
+      accepted: null
+    }
+  }
+
+  /** さらに質問して距離を詰める。 */
   async function askMorePairs() {
-    if (!session.value) return
-    session.value.stage = 'burst-threshold'
+    const current = session.value
+    if (!current) return
+    const inputs = await ensureCoreInputs()
+    current.learning = {
+      questions: current.learning?.questions ?? buildBurstQuestions(inputs.refs),
+      index: 0,
+      answers: []
+    }
+    current.stage = 'burst-threshold'
     view.value = 'burst-threshold'
     await showNextPair()
     await saveSession()
   }
 
-  /** 確認した閾値を保存し、選別へ進む。 */
+  /** 確認した距離を保存し、選別へ進む。 */
   async function acceptBurstThreshold() {
-    if (!session.value || !activeProject.value) return
+    const current = session.value
+    if (!current || !activeProject.value) return
+    const distance = previewThreshold.value
     try {
-      await desktop.saveBurstThreshold(activeProject.value.id, previewThreshold.value)
-      activeProject.value.burstThreshold = previewThreshold.value
+      await desktop.saveBurstThreshold(activeProject.value.id, distance)
+      activeProject.value.burstThreshold = distance
       await refreshProjects()
     } catch (cause) {
       error.value = cause instanceof Error ? cause.message : '閾値を保存できませんでした。'
     }
-    // まとめた連写は代表1枚に畳み込む。以降は1カードとして扱う。
-    collapseBursts(session.value)
-    prepareRound(session.value)
-    view.value = 'tournament'
-    await loadCurrentPhotos()
+    const inputs = await ensureCoreInputs()
+    // まとめた連写は代表 1 枚に畳む。まだ何も決めていないので、組み直しで足りる。
+    setCore(core.regroup(current.core, inputs.refs, true, thresholdFor(distance), pairOverrides))
+    current.burstDistance = distance
+    current.learning = null
+    current.selectedInGroup = []
+    current.multiSelect = false
+    await enterTournamentAfterRebuild()
+  }
+
+  /** core の組が変わったあと、画面を今の組に合わせる。 */
+  async function enterTournamentAfterRebuild() {
+    const current = session.value
+    if (!current) return
+    if (current.core.finished) {
+      current.stage = 'result'
+      view.value = 'result'
+    } else {
+      current.stage = 'tournament'
+      view.value = 'tournament'
+      await loadCurrentPhotos()
+    }
     await saveSession()
   }
 
@@ -628,52 +843,46 @@ function createCurator() {
   }
 
   async function saveSession() {
-    if (!session.value) return
+    if (!session.value || !activeProject.value) return
     session.value.updatedAt = Date.now()
-    await desktop.saveSession(session.value)
+    await desktop.saveSession(activeProject.value.id, session.value)
   }
 
   async function toggleChoice(photoId: string) {
-    if (!session.value) return
-    if (!session.value.multiSelect) {
-      session.value.selectedInGroup = [photoId]
+    const current = session.value
+    const path = pathOf(photoId)
+    if (!current || !path) return
+    if (!current.multiSelect) {
+      current.selectedInGroup = [path]
       await confirmChoices()
       return
     }
-    const index = session.value.selectedInGroup.indexOf(photoId)
-    if (index >= 0) session.value.selectedInGroup.splice(index, 1)
-    else session.value.selectedInGroup.push(photoId)
+    const index = current.selectedInGroup.indexOf(path)
+    if (index >= 0) current.selectedInGroup.splice(index, 1)
+    else current.selectedInGroup.push(path)
     await saveSession()
   }
 
   /**
-   * このグループの判断を確定して次へ進む。
-   * `selectedInGroup` が空でも進める。良い写真が1枚も無いグループはあるので、
-   * その場合は「1枚も通さない」という判断として記録する。
+   * このグループの判断を確定して次へ進む。**判断は core の `advance`。**
+   * 選んだ写真が空でも進める。良い写真が 1 枚も無いグループはあるので、
+   * その場合は「1 枚も通さない」という判断として記録される。
    */
   async function confirmChoices() {
-    if (!session.value) return
-    const group = [...currentGroup.value]
-    // 選択した写真に加え、このグループで★5に確定した写真も通す。
-    const chosen = resolveChosen(session.value.selectedInGroup, group, session.value.ratings, MAX_RATING)
-    for (const id of chosen) {
-      session.value.survivors.push(id)
-      // 星は 1 ラウンド通過ごとに +1 で、MAX_RATING で頭打ち。
-      session.value.ratings[id] = Math.min(MAX_RATING, (session.value.ratings[id] ?? 0) + 1)
-    }
-    // 代表に付いた星を、まとめられた仲間にも配る。**survivors には入れない。**
-    // 入れると同じラウンドの次の回にまとめの全員が出てきて、畳んだ意味が消える。
-    // 星が揃うので、次に「その星を選別」したときには自然に一緒に出てくる。
-    const spread = spreadBurstRatings(session.value, chosen)
-    // 戻すときは仲間の星も一緒に戻す。survivors に居ない id は undo 側で読み飛ばされる。
-    session.value.history.push({ groupIndex: session.value.groupIndex, chosen: [...chosen, ...spread] })
-    await persistGroupResults([...group, ...spread])
-    session.value.groupIndex += 1
-    session.value.selectedInGroup = []
-    session.value.multiSelect = false
-    if (session.value.groupIndex >= session.value.groups.length) {
-      session.value.candidates = [...new Set(session.value.survivors)]
-      session.value.stage = 'result'
+    const current = session.value
+    if (!current) return
+    await advanceWith(core.advance(current.core, [...current.selectedInGroup]))
+  }
+
+  /** core が返した次の Session を受け取り、星を行に写して次の組へ。 */
+  async function advanceWith(next: Session) {
+    const current = session.value
+    if (!current) return
+    await applyCore(next)
+    current.selectedInGroup = []
+    current.multiSelect = false
+    if (next.finished) {
+      current.stage = 'result'
       view.value = 'result'
     } else {
       await loadCurrentPhotos()
@@ -681,26 +890,7 @@ function createCurator() {
     await saveSession()
   }
 
-  /**
-   * 判定したグループぶんだけ DB へ書く。最大10行なので毎回書いても軽い。
-   * 全件を書き出す方式にすると 5,000 行の IPC が毎クリック発生する。
-   */
-  async function persistGroupResults(group: string[]) {
-    if (!session.value || !activeProject.value || !group.length) return
-    // 選ばれなかった写真の星は据え置き。下げない。
-    const entries: SelectionResult[] = group.map(id => ({
-      id,
-      rating: Math.min(MAX_RATING, session.value!.ratings[id] ?? 0)
-    }))
-    try {
-      await desktop.saveSelectionResults(activeProject.value.id, entries)
-      await loadSummary()
-    } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : '選別結果を保存できませんでした。'
-    }
-  }
-
-  /** このグループからは1枚も通さない。 */
+  /** このグループからは 1 枚も通さない。 */
   async function skipGroup() {
     if (!session.value) return
     session.value.selectedInGroup = []
@@ -708,29 +898,16 @@ function createCurator() {
   }
 
   /**
-   * 迷う必要のない1枚を「確定」にする。最高レーティングを付けて通し、
-   * 以降のラウンドでは判定に出さない。
-   *
-   * 複数枚選択中は**トグル**として振る舞う。★5 を付け外しするだけで
-   * 次の選別へは進まないので、同じグループの他の写真もそのまま選び続けられる。
-   * 決定（Enter）を押すまでグループは確定しない。
-   * 単数選択のときは、その1枚を確定して即座に次へ進む（従来どおり）。
+   * 迷う必要のない 1 枚を ★5 で確定する。**判断は core の `keepAndTop`**。
+   * 複数枚選択中は、選んでいた写真も残したままその組を確定する。
+   * 以降のラウンドには出ない。「1 つ戻す」で元の星に返る。
    */
   async function confirmPhoto(photoId: string) {
-    if (!session.value) return
-    if (session.value.multiSelect) {
-      // ラウンド開始時、表示中の写真の星はすべて targetRating。だから確定を
-      // 外したら targetRating に戻す。★5 は以降どの星の選別にも出てこないので、
-      // 「確定」という別状態を持たずに星だけで表せる。
-      session.value.ratings[photoId] = isConfirmed(photoId)
-        ? session.value.targetRating
-        : MAX_RATING
-      await saveSession()
-      return
-    }
-    session.value.ratings[photoId] = MAX_RATING
-    session.value.selectedInGroup = [photoId]
-    await confirmChoices()
+    const current = session.value
+    const path = pathOf(photoId)
+    if (!current || !path || !current.core.current.includes(path)) return
+    const selected = current.multiSelect ? [...current.selectedInGroup] : []
+    await advanceWith(core.keepAndTop(current.core, selected, path))
   }
 
   /**
@@ -761,22 +938,27 @@ function createCurator() {
    * 「切る」「繋ぐ」の 2 つだけで分割・切り離し・追加・全解除がすべて表せる。
    */
   async function openBurst(photo: Photo | null) {
-    if (!photo || !session.value || !activeProject.value || burstSizeOf(photo.id) < 2) return
-    const members = session.value.burstMembers[photo.id] ?? []
+    const current = session.value
+    if (!photo || !current || !activeProject.value || burstSizeOf(photo.id) < 2) return
+    const memberPaths = current.core.members[photo.relativePath] ?? []
     burstOwner.value = photo
     burstDialog.value = true
     burstBusy.value = true
     burstPicked.value = []
     burstReps.value = []
     try {
-      const run = await desktop.getBurstNeighborhood(activeProject.value.id, members)
+      const inputs = await ensureCoreInputs()
+      // 撮影順の全写真から、前後 4 秒に入る 1 続きを切り出す（時刻で絞るだけ）。
+      const run = burstNeighborhood(inputs.photos, memberPaths, BURST_WINDOW_MS)
       // 近くに何も無ければ、まとめの中身だけで組む。
-      burstPhotos.value = run.length ? run : await desktop.getPhotosByIds(activeProject.value.id, members)
-      const ids = burstPhotos.value.map(item => item.id)
+      const ids = run.length ? run.map(item => item.id) : idsOf(memberPaths)
+      burstPhotos.value = await desktop.getPhotosByIds(activeProject.value.id, ids)
+      const shown = burstPhotos.value.map(item => item.id)
       // いまのまとまり方を境目に起こす。まとめに属さない近くの写真は、
-      // それぞれ1枚のまとまりとして並ぶ。
-      burstCuts.value = cutsFromGroups(ids, Object.values(session.value.burstMembers))
-      burstOriginal.value = ids.filter(id => members.includes(id))
+      // それぞれ 1 枚のまとまりとして並ぶ。
+      burstCuts.value = cutsFromGroups(shown, Object.values(current.core.members).map(idsOf))
+      const memberIds = new Set(idsOf(memberPaths))
+      burstOriginal.value = shown.filter(id => memberIds.has(id))
     } catch (cause) {
       error.value = cause instanceof Error ? cause.message : 'まとめを読み込めませんでした。'
       burstPhotos.value = []
@@ -833,35 +1015,29 @@ function createCurator() {
   }
 
   /**
-   * まとめの中で1枚の星を決める。★5 の確定と、明らかな脱落（−1）。
+   * まとめの中で 1 枚の星を決める。★5 の確定と、明らかな脱落（−1）。
    *
-   * 決めた写真は `burstSettled` に入れる。**これが無いとグループを確定した
-   * 瞬間に `spreadBurstRatings` が代表の星で塗り潰してしまう。**
+   * **人が星を直接決める手直し**なので `ratingEdit` で Session の星を書き換え、
+   * 行へも写す。もう一度押したら取り消し（この回の星に戻す）。
+   * 仲間の星は動かさない。core の確定は仲間の星を差分で動かすので、
+   * ここで付けた差は次の確定でも保たれる。
    */
-  async function settleBurstPhoto(photoId: string, rating: number) {
-    if (!session.value || !activeProject.value) return
-    const current = session.value.ratings[photoId] ?? 0
-    // もう一度押したら取り消し。まとめの外に出すわけではないので星だけ戻す。
-    const settled = session.value.burstSettled.includes(photoId)
-    const next = settled && current === rating ? session.value.targetRating : rating
-    session.value.ratings[photoId] = next
-    session.value.burstSettled = next === session.value.targetRating
-      ? session.value.burstSettled.filter(id => id !== photoId)
-      : [...new Set([...session.value.burstSettled, photoId])]
+  async function settleBurstPhoto(photoId: string, decide: (star: number, target: number) => number) {
+    const current = session.value
+    const path = pathOf(photoId)
+    if (!current || !path || !activeProject.value) return
+    const star = current.core.ratings[path] ?? 0
+    const next = setRating(current.core, path, decide(star, current.core.target_star))
     const photo = burstPhotoOf(photoId)
-    if (photo) photo.rating = next
-    try {
-      await desktop.saveSelectionResults(activeProject.value.id, [{ id: photoId, rating: next }])
-      await loadSummary()
-    } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : '星を保存できませんでした。'
-    }
+    if (photo) photo.rating = next.ratings[path] ?? star
+    await applyCore(next)
     await saveSession()
   }
 
-  const confirmBurstPhoto = (photoId: string) => settleBurstPhoto(photoId, MAX_RATING)
+  const confirmBurstPhoto = (photoId: string) =>
+    settleBurstPhoto(photoId, (star, target) => (star >= MAX_RATING ? target : MAX_RATING))
   const dropBurstPhoto = (photoId: string) =>
-    settleBurstPhoto(photoId, Math.max(0, (session.value?.targetRating ?? 0) - 1))
+    settleBurstPhoto(photoId, (star, target) => (star < target ? target : star - 1))
 
   /**
    * 選んだ1枚をそのまとまりの代表に指名する。
@@ -877,73 +1053,45 @@ function createCurator() {
   }
 
   /**
-   * まとまりを代表1枚に畳む。並びの中で**最初に出会った位置に代表を置き**、
-   * 残りのメンバーは取り除く。位置が動かないので撮影順の意味が保たれる。
-   */
-  function collapseTo(ids: string[], members: Set<string>, representative: string): string[] {
-    let placed = false
-    const out: string[] = []
-    for (const id of ids) {
-      if (!members.has(id)) {
-        out.push(id)
-        continue
-      }
-      if (!placed) {
-        out.push(representative)
-        placed = true
-      }
-    }
-    return out
-  }
-
-  /**
    * 直した形を確定して選別画面へ戻す。
    *
-   * 保存するのは**例外そのものではなく「こう分かれていてほしい」という形**で、
-   * 閾値との食い違いだけがバックエンドで例外として残る。何度押しても結果は同じ。
+   * 保存するのは**手直しそのもの**（基準との食い違いだけ）。何度押しても結果は同じ。
+   * 反映は core の `regroup`（まだ判断していない写真だけを組み直す）。
+   * 代表の指名は core の `setRepresentative` で。
    */
   async function applyBurstShape() {
-    if (!session.value || !activeProject.value) return
+    const current = session.value
+    const project = activeProject.value
+    if (!current || !project) return
     burstBusy.value = true
     try {
-      const ids = burstPhotos.value.map(photo => photo.id)
-      await desktop.saveBurstShape(activeProject.value.id, ids, burstBlocks.value)
+      const inputs = await ensureCoreInputs()
+      const threshold = thresholdFor(currentDistance())
+      const runRefs = burstPhotos.value.map(toPhotoRef)
+      const blocks = burstBlocks.value.map(block => block.map(pathOf).filter((path): path is string => path !== null))
+      const existing = await loadPairOverrides()
+      const overrides = overridesFromShape(
+        runRefs, blocks, existing,
+        (left, right) => core.isSameBurst({ left, right }, threshold)
+      )
+      await desktop.savePairOverrides(project.id, overrides)
+      pairOverrides = overrides
 
-      // セッション側のまとめを組み直す。2枚以上の塊だけが「まとめ」になる。
-      // この並びに関わる古いまとめは、いったん全部落としてから作り直す。
-      const owned = new Set(burstOriginal.value)
-      for (const id of ids) delete session.value.burstMembers[id]
-
-      const released: string[] = []
-      for (const block of burstBlocks.value) {
-        if (block.length < 2) {
-          // 元のまとめから外れて1枚になった写真は、選別に出し直す必要がある。
-          if (owned.has(block[0]!)) released.push(block[0]!)
-          continue
-        }
-        const representative = representativeOf(block)
-        session.value.burstMembers[representative] = [
-          representative, ...block.filter(id => id !== representative)
-        ]
-        // 代表以外を畳む。**代表が入れ替わってもカードの位置は動かない。**
-        const members = new Set(block)
-        session.value.candidates = collapseTo(session.value.candidates, members, representative)
-        session.value.groups = session.value.groups.map(
-          group => collapseTo(group, members, representative)
-        )
-        session.value.survivors = collapseTo(session.value.survivors, members, representative)
-        session.value.selectedInGroup = collapseTo(
-          session.value.selectedInGroup, members, representative
-        )
+      let next = core.regroup(current.core, inputs.refs, current.settings.groupBursts, threshold, overrides)
+      // 指名された代表を、組み直したあとのまとまりに当てる（当てられないものは無視）。
+      for (const id of burstReps.value) {
+        const wanted = pathOf(id)
+        if (!wanted) continue
+        const shown = Object.keys(next.members).find(key => next.members[key]?.includes(wanted))
+        if (!shown || shown === wanted) continue
+        next = core.setRepresentative(next, shown, wanted) ?? next
       }
-
-      // 外した写真は**今見ているグループを崩さず**、次に見る分の先頭へ。
-      insertIntoUpcoming(session.value, released)
+      setCore(next)
+      current.selectedInGroup = []
 
       burstDialog.value = false
       burstOwner.value = null
-      await loadCurrentPhotos()
-      await saveSession()
+      await enterTournamentAfterRebuild()
     } catch (cause) {
       error.value = cause instanceof Error ? cause.message : 'まとめの形を保存できませんでした。'
     } finally {
@@ -951,35 +1099,30 @@ function createCurator() {
     }
   }
 
-  /** 直前の1グループぶんの判断を取り消してやり直す。 */
+  /** 直前の 1 グループぶんの判断を取り消してやり直す。**判断は core の `undo`。** */
   async function undoChoice() {
-    if (!session.value || !session.value.history.length) return
-    // 戻す対象を**先に**控える。`undoLastStep` が履歴から取り出してしまうため。
-    // まとめの仲間は表示中のグループに居ないので、これが無いと画面の星だけ戻って
-    // DB には上がったままの星が残る。
-    const restored = [...(session.value.history[session.value.history.length - 1]?.chosen ?? [])]
-    undoLastStep(session.value)
-    // 戻したぶんの星と落選を DB からも取り消す。まだ判定していない状態に戻す。
-    const group = session.value.groups[session.value.groupIndex] ?? []
-    await persistGroupResults([...new Set([...group, ...restored])])
+    const current = session.value
+    if (!current || !current.core.history.length) return
+    // 戻した星（仲間の分も）は、前後の差で行にも戻る。
+    await applyCore(core.undo(current.core))
+    current.selectedInGroup = []
+    current.multiSelect = false
+    current.stage = 'tournament'
     view.value = 'tournament'
     await loadCurrentPhotos()
     await saveSession()
   }
 
-  /** 選別の途中で1グループの表示枚数を変える。済んだぶんはそのまま。 */
+  /** 選別の途中で 1 グループの表示枚数を変える。済んだぶんはそのまま。 */
   async function applyGroupSize(size: number) {
-    if (!session.value) return
-    regroupRemaining(session.value, size)
+    const current = session.value
+    if (!current) return
+    setCore(core.resize(current.core, size))
+    current.settings = { ...current.settings, groupSize: size }
+    current.selectedInGroup = []
+    current.multiSelect = false
     groupSizeDialog.value = false
-    if (session.value.groupIndex >= session.value.groups.length) {
-      session.value.candidates = [...new Set(session.value.survivors)]
-      session.value.stage = 'result'
-      view.value = 'result'
-    } else {
-      await loadCurrentPhotos()
-    }
-    await saveSession()
+    await enterTournamentAfterRebuild()
   }
 
   function openNextRoundDialog(rating: number) {
@@ -996,27 +1139,28 @@ function createCurator() {
    * いたため、一度分かれると二度と一緒に選別できなかった。
    */
   async function startRatingSelection(rating: number) {
-    if (!activeProject.value) return
+    const project = activeProject.value
+    if (!project) return
     nextRoundDialog.value = false
     loading.value = true
     try {
-      const settingsToUse = session.value?.settings ?? { ...settings }
-      if (nextRoundGroupSize.value >= 2) settingsToUse.groupSize = nextRoundGroupSize.value
+      const chosen: TournamentSettings = { ...(session.value?.settings ?? settings) }
+      if (nextRoundGroupSize.value >= 2) chosen.groupSize = nextRoundGroupSize.value
 
-      const [seed, burstPairs] = await Promise.all([
-        desktop.getSelectionSeed(activeProject.value.id, rating),
-        settingsToUse.groupBursts
-          ? desktop.getBurstPairs(activeProject.value.id)
-          : Promise.resolve<BurstPair[]>([])
-      ])
-      if (seed.length < 2) {
-        error.value = `★${rating} の写真が ${seed.length} 枚しかないため、選別できません。`
+      // 星は行が持ち主。行の星を入れた土台から、その星ちょうどの写真で始める。
+      const { base, inputs } = await sessionWithRowRatings()
+      await loadPairOverrides()
+      const count = inputs.photos.filter(photo => base.ratings[photo.relativePath] === rating).length
+      const distance = session.value?.burstDistance ?? project.burstThreshold ?? DEFAULT_BURST_DISTANCE
+      const started = core.roundFor(
+        core.resize(base, chosen.groupSize), inputs.refs, rating,
+        chosen.groupBursts, thresholdFor(distance), pairOverrides
+      )
+      if (!started) {
+        error.value = `★${rating} の写真が ${count} 枚しかないため、選別できません。`
         return
       }
-      session.value = makeSession(
-        activeProject.value.id, seed, settingsToUse, burstPairs,
-        activeProject.value.burstThreshold, rating
-      )
+      openSelection(started, chosen, inputs)
       await enterStage()
       await saveSession()
     } catch (cause) {
@@ -1033,7 +1177,8 @@ function createCurator() {
     try {
       await desktop.resetSelectionResults(activeProject.value.id)
       session.value = null
-      await desktop.saveSession({ ...(session.value ?? {}) } as SelectionSession).catch(() => undefined)
+      // 途中の選別も消す。残すと、リロードで星の無い写真に古い Session が戻る。
+      await desktop.saveSession(activeProject.value.id, null).catch(() => undefined)
       await loadSummary()
       restartDialog.value = false
       view.value = 'project'
@@ -1152,8 +1297,14 @@ function createCurator() {
     burstReviewIndex.value = 0
     burstReviewPhotos.value = []
     try {
-      const groups = await desktop.getBurstGroups(activeProject.value.id)
-      burstReviewGroups.value = groups.filter(group => group.photoIds.length > 1)
+      const inputs = await loadCoreInputs()
+      if (!inputs) throw new Error('プロジェクトが開かれていません。')
+      const overrides = await loadPairOverrides()
+      // 判断は core の `groupBursts`。2 枚以上のものだけが対象。
+      const groups = core.groupBursts(inputs.refs, thresholdFor(currentDistance()), overrides)
+      burstReviewGroups.value = groups
+        .filter(group => group.members.length > 1)
+        .map(group => toViewGroup(group, inputs))
       await loadBurstReviewPhotos()
     } catch (cause) {
       error.value = cause instanceof Error ? cause.message : '連写を読み込めませんでした。'
@@ -1207,12 +1358,18 @@ function createCurator() {
     if (!activeProject.value || !burstReviewKept.value.length) return
     burstReviewBusy.value = true
     try {
-      const entries = reviewBurstRatings(
-        burstReviewPhotos.value.map(photo => ({ id: photo.id, rating: photo.rating })),
-        burstReviewKept.value,
-        MAX_RATING
-      )
-      await desktop.saveSelectionResults(activeProject.value.id, entries)
+      // 人が星を決める手直し。行の星を土台に `ratingEdit` で +1 / −1 して、変わった行だけ書く。
+      const { base } = await sessionWithRowRatings()
+      const shown = burstReviewPhotos.value.map(photo => photo.relativePath)
+      const kept = burstReviewPhotos.value
+        .filter(photo => burstReviewKept.value.includes(photo.id))
+        .map(photo => photo.relativePath)
+      const next = markRaw(applyChanges(base, reviewChanges(base, shown, kept)))
+      await writeRatings(syncRatings(base, next))
+      if (session.value) {
+        setCore(next)
+        await saveSession()
+      }
       await loadSummary()
       await advanceBurstReview()
     } catch (cause) {
@@ -1347,10 +1504,15 @@ function createCurator() {
       const moved = await desktop.moveRating(
         activeProject.value.id, moveFrom.value, moveTo.value, includeIds, excludeIds
       )
-      // 進行中のセッションが持つ星も合わせる。移した写真が分かるとき（明示指定）
-      // だけメモリ上を直し、それ以外は件数を読み直すことで整合を取る。
-      if (session.value && includeIds) {
-        for (const id of includeIds) session.value.ratings[id] = moveTo.value
+      // 進行中のセッションが持つ星も合わせる。人が星を決める手直しなので `ratingEdit` で。
+      // Session に無い写真は飛ばす。行への書き込みは上の `moveRating` が済ませている。
+      if (session.value) {
+        await ensureCoreInputs()
+        const excluded = new Set(excludeIds.map(pathOf))
+        const paths = includeIds
+          ? includeIds.map(pathOf).filter((path): path is string => path !== null)
+          : pathsWithRating(session.value.core, moveFrom.value).filter(path => !excluded.has(path))
+        setCore(moveRatings(session.value.core, paths, moveTo.value))
         await saveSession()
       }
       moveDialog.value = false
@@ -1457,7 +1619,9 @@ function createCurator() {
   async function resumeSession() {
     if (!session.value) return openSettings()
     // 別の環境で作られたセッションは、この端末の上限を超える枚数を持ちうる。
-    session.value.settings.groupSize = clampGroupSize(session.value.settings.groupSize, groupLimits)
+    const clamped = clampGroupSize(session.value.settings.groupSize, groupLimits)
+    session.value.settings.groupSize = clamped
+    if (session.value.core.group_size !== clamped) setCore(core.resize(session.value.core, clamped))
     await enterStage()
   }
 
@@ -1474,6 +1638,7 @@ function createCurator() {
       await desktop.deleteProject(target.id)
       if (activeProject.value?.id === target.id) {
         activeProject.value = null
+        coreInputs.value = null
         session.value = null
         previewPhotos.value = []
         tournamentPhotos.value = []
@@ -1605,6 +1770,8 @@ function createCurator() {
 
   async function mount() {
     try {
+      // 判断（core）は wasm。最初に 1 回だけ読み込む。
+      await core.init()
       await refreshProjects()
       stopProgressListener = await desktop.onProjectProgress(async (progress) => {
         if (!activeProject.value || progress.projectId !== activeProject.value.id) return
@@ -1624,6 +1791,7 @@ function createCurator() {
           await refreshProjects()
           activeProject.value = projects.value.find(project => project.id === activeProject.value?.id) ?? activeProject.value
           await loadPreview(progress.projectId)
+          await loadCoreInputs(progress.projectId).catch(() => undefined)
         }
         if (progress.phase === 'cancelled' || progress.phase === 'error') {
           taskDialog.value = false
@@ -1767,7 +1935,14 @@ function createCurator() {
     remainingPhotos,
     selectedCount,
     askedCount,
-    maxQuestions,
+    learningPosition,
+    learningTotal,
+    burstGroupCount,
+    targetStar,
+    roundNumber,
+    canUndo,
+    survivorCount,
+    roundProgress,
     groupedPhotoCount,
     maxPairDistance,
     progressValue,
@@ -1794,7 +1969,6 @@ function createCurator() {
     beginTournament,
     finishTournamentStart,
     enterStage,
-    inferCurrentThreshold,
     showNextPair,
     answerPair,
     skipCurrentPair,
@@ -1806,7 +1980,6 @@ function createCurator() {
     saveSession,
     toggleChoice,
     confirmChoices,
-    persistGroupResults,
     skipGroup,
     confirmPhoto,
     openZoom,
@@ -1826,7 +1999,6 @@ function createCurator() {
     confirmBurstPhoto,
     dropBurstPhoto,
     makeBurstRepresentative,
-    collapseTo,
     applyBurstShape,
     undoChoice,
     applyGroupSize,

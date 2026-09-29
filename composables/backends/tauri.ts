@@ -2,10 +2,13 @@ import { convertFileSrc } from '@tauri-apps/api/core'
 import { capabilitiesFor, detectPlatform } from '~/utils/capabilities'
 import { open } from '@tauri-apps/plugin-dialog'
 import type {
-  BurstGroup, BurstPair, ExportReport, Photo, PhotoPage, PhotoSort, Project,
-  ProjectProgress, ProjectTask, SelectionResult, SelectionSeed, SelectionSession, SelectionSummary
+  ExportReport, Photo, PhotoPage, PhotoSort, Project,
+  ProjectProgress, ProjectTask, SelectionResult, SelectionSummary
 } from '~/types/photo'
-import { normalizeSession } from '~/utils/tournament'
+import type { PairOverride } from '~/lib/core'
+import { init as initCore } from '~/lib/core'
+import type { SavedSelection } from '~/utils/selectionFlow'
+import { parseSavedSelection, serializeSavedSelection } from '~/utils/selectionFlow'
 import type { DisplaySettings, PhotoBackend } from '~/composables/photoBackend'
 import { isTauriRuntime } from '~/composables/photoBackend'
 
@@ -56,34 +59,32 @@ export function createTauriBackend(): PhotoBackend {
     ) => invokeDesktop<number>('move_rating', { projectId, fromRating, toRating, includeIds, excludeIds }),
     getSelectionSummary: (projectId: string) => invokeDesktop<SelectionSummary>('get_selection_summary', { projectId }),
     getPhotosByIds: (projectId: string, photoIds: string[]) => invokeDesktop<Photo[]>('get_photos_by_ids', { projectId, photoIds }),
-    getSelectionSeed: (projectId: string, rating?: number) =>
-      invokeDesktop<SelectionSeed[]>('get_selection_seed', { projectId, rating: rating ?? null }),
+    getCoreInputs: (projectId: string) => invokeDesktop<Photo[]>('get_core_inputs', { projectId }),
     exportByRating: (projectId: string, destination: string, ratings: number[], moveFiles: boolean) =>
       invokeDesktop<ExportReport>('export_by_rating', { projectId, destination, ratings, moveFiles }),
     writeRatingsToFiles: (projectId: string, ratings: number[]) =>
       invokeDesktop<ExportReport>('write_ratings_to_files', { projectId, ratings }),
-    getBurstGroups: (projectId: string, threshold?: number) =>
-      invokeDesktop<BurstGroup[]>('get_burst_groups', { projectId, threshold: threshold ?? null }),
-    getBurstPairs: (projectId: string) => invokeDesktop<BurstPair[]>('get_burst_pairs', { projectId }),
     saveBurstThreshold: (projectId: string, threshold: number) =>
       invokeDesktop<void>('save_burst_threshold', { projectId, threshold }),
     clearBurstThreshold: (projectId: string) => invokeDesktop<void>('clear_burst_threshold', { projectId }),
-    getBurstNeighborhood: (projectId: string, photoIds: string[], windowMs?: number) =>
-      invokeDesktop<Photo[]>('get_burst_neighborhood', { projectId, photoIds, windowMs: windowMs ?? null }),
-    saveBurstShape: (projectId: string, orderedPhotoIds: string[], blocks: string[][]) =>
-      invokeDesktop<void>('save_burst_shape', { projectId, orderedPhotoIds, blocks }),
+    getPairOverrides: (projectId: string) => invokeDesktop<PairOverride[]>('get_pair_overrides', { projectId }),
+    savePairOverrides: (projectId: string, overrides: PairOverride[]) =>
+      invokeDesktop<void>('save_pair_overrides', { projectId, overrides }),
     startProjectScan: (projectId: string) => invokeDesktop<void>('start_project_scan', { projectId }),
     startBurstAnalysis: (projectId: string) => invokeDesktop<void>('start_burst_analysis', { projectId }),
     getAnalysisBacklog: (projectId: string) => invokeDesktop<number>('get_analysis_backlog', { projectId }),
     startBackgroundAnalysis: (projectId: string) => invokeDesktop<void>('start_background_analysis', { projectId }),
     cancelProjectTask: (projectId: string, task: ProjectTask) => invokeDesktop<void>('cancel_project_task', { projectId, task }),
-    saveSession: (session: SelectionSession) =>
-      invokeDesktop<void>('save_project_state', { projectId: session.projectId, stateJson: JSON.stringify(session) }),
+    saveSession: (projectId: string, selection: SavedSelection | null) =>
+      invokeDesktop<void>('save_project_state', {
+        projectId, stateJson: selection ? serializeSavedSelection(selection) : 'null'
+      }),
     loadSession: async (projectId: string) => {
       const raw = await invokeDesktop<string | null>('load_project_state', { projectId })
       if (!raw) return null
-      // 閾値学習を入れる前に保存された JSON が残っていることがある。
-      return normalizeSession(JSON.parse(raw) as SelectionSession)
+      // Session の読み戻しは core（wasm）が行う。旧版の形は null（最初から）。
+      await initCore()
+      return parseSavedSelection(raw)
     },
     photoUrl: (path: string) => isTauriRuntime() ? convertFileSrc(path) : '',
     photoThumbnailUrl: (photo: Photo) => {

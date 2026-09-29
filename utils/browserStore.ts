@@ -11,7 +11,8 @@
  * サムネイルは**別ストア**に置く。一覧のために行を読むだけのとき、
  * 画像の実体まで引きずらないため。
  */
-import type { Photo, SelectionSession } from '~/types/photo'
+import type { Photo } from '~/types/photo'
+import type { PairOverride } from '~/lib/core'
 import type { TimestampSource } from '~/utils/captureTime'
 
 const DATABASE_NAME = 'photo-curator'
@@ -147,33 +148,37 @@ export async function readSession(projectId: string): Promise<string | null> {
   })
 }
 
-export async function writeSession(session: SelectionSession): Promise<void> {
+export async function writeSession(projectId: string, stateJson: string): Promise<void> {
   await withStores([STORE_STATES], 'readwrite', transaction =>
-    putOne(transaction, STORE_STATES, {
-      projectId: session.projectId,
-      stateJson: JSON.stringify(session),
-      updatedAt: Date.now()
-    })
+    putOne(transaction, STORE_STATES, { projectId, stateJson, updatedAt: Date.now() })
   )
 }
 
-/** 手で直したまとめの例外。キーは `pairKey`、値は繋ぐ(true)/切る(false)。 */
-export async function readPairOverrides(projectId: string): Promise<Map<string, boolean>> {
+/**
+ * 手で直した連写の例外（core の `PairOverride`、鍵は relativePath）。
+ *
+ * 新しい store を足すと DB の版上げが要るので、既存の `burstShapes` に
+ * `overrides:<projectId>` のキーで 1 プロジェクト 1 行に畳んで置く。
+ * 旧版の行（キーが素の projectId、photo id の組）は読まない。
+ */
+export const overridesKey = (projectId: string) => `overrides:${projectId}`
+
+export async function readPairOverrides(projectId: string): Promise<PairOverride[]> {
   const row = await withStores([STORE_BURST_SHAPES], 'readonly', transaction =>
-    getOne<{ projectId: string, overrides: Record<string, boolean> }>(
-      transaction, STORE_BURST_SHAPES, projectId
+    getOne<{ projectId: string, overrides: PairOverride[] }>(
+      transaction, STORE_BURST_SHAPES, overridesKey(projectId)
     )
   )
-  return new Map(Object.entries(row?.overrides ?? {}))
+  return Array.isArray(row?.overrides) ? row.overrides : []
 }
 
 export async function writePairOverrides(
-  projectId: string, overrides: Map<string, boolean>
+  projectId: string, overrides: PairOverride[]
 ): Promise<void> {
   await withStores([STORE_BURST_SHAPES], 'readwrite', transaction =>
     putOne(transaction, STORE_BURST_SHAPES, {
-      projectId,
-      overrides: Object.fromEntries(overrides),
+      projectId: overridesKey(projectId),
+      overrides,
       updatedAt: Date.now()
     })
   )

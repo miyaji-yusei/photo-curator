@@ -21,6 +21,7 @@ use walkdir::WalkDir;
 const PROGRESS_EVENT: &str = "project-progress";
 const PAGE_SIZE_LIMIT: i64 = 200;
 const BURST_WINDOW_MS: i64 = 4_000;
+#[cfg_attr(not(feature = "bench"), allow(dead_code))]
 const HASH_DISTANCE_LIMIT: u32 = 14;
 // 候補率がこれを超えたら時間窓を自動的に狭める。撮影間隔がほぼ全て窓の内側に
 // 収まるフォルダでは「時間が近いものだけハッシュする」最適化が原理的に効かず、
@@ -230,16 +231,6 @@ struct PhotoPage {
 struct SelectionSeed {
     id: String,
     rating: i64,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BurstGroup {
-    id: String,
-    photo_ids: Vec<String>,
-    captured_span_ms: i64,
-    similarity: i64,
-    accepted: Option<bool>,
 }
 
 #[derive(Clone, Serialize)]
@@ -484,13 +475,14 @@ fn open_database(path: &Path) -> Result<Connection, String> {
     .map_err(|error| error.to_string())?;
 
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS burst_pair_overrides (
+        // 手で直した連写の例外。core の `PairOverride`（鍵は relativePath）をそのまま持つ。
+        // 旧版の `burst_pair_overrides`（photo id の組）は使わない。既存の DB には残るが読まない。
+        "CREATE TABLE IF NOT EXISTS pair_overrides (
            project_id TEXT NOT NULL,
-           left_photo_id TEXT NOT NULL,
-           right_photo_id TEXT NOT NULL,
+           left_path TEXT NOT NULL,
+           right_path TEXT NOT NULL,
            decision TEXT NOT NULL,
-           updated_at INTEGER NOT NULL,
-           PRIMARY KEY (project_id, left_photo_id, right_photo_id)
+           PRIMARY KEY (project_id, left_path, right_path)
          );",
     )
     .map_err(|error| error.to_string())?;
@@ -1566,6 +1558,7 @@ fn analyse_photo(
     }
 }
 
+#[cfg_attr(not(feature = "bench"), allow(dead_code))]
 fn hash_distance(left: &str, right: &str) -> u32 {
     u64::from_str_radix(left, 16)
         .ok()
@@ -1607,7 +1600,7 @@ pub enum PairEligibility {
 }
 
 /// 候補判定の一次審査。`candidates_within`（解析対象の絞り込み）と
-/// `build_burst_pairs`（閾値学習の出題元）が同じ規則を使うために切り出してある。
+/// 以前は閾値学習の出題元も同じ規則を使っていた（いまは core が判断する）。
 /// 二重実装すると、片方だけ直したときに学習と本番でズレる。
 fn pair_eligibility(
     left: &CandidateInput,
@@ -2410,6 +2403,12 @@ fn delete_project(app: AppHandle, project_id: String) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     transaction
         .execute(
+            "DELETE FROM pair_overrides WHERE project_id=?1",
+            params![project_id],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
             "DELETE FROM photos WHERE project_id=?1",
             params![project_id],
         )
@@ -3093,239 +3092,86 @@ fn get_selection_seed(
         .map_err(|error| error.to_string())
 }
 
-/// 閾値の学習に使う、隣り合う2枚。
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BurstPair {
-    id: String,
-    left_photo_id: String,
-    right_photo_id: String,
-    /// dHash のハミング距離。小さいほど構図が近い。
-    distance: u32,
-    gap_ms: i64,
-}
-
-/// 撮影時刻順に並んだ写真。`captured_at` と `d_hash` が揃っているものだけ。
-type BurstEntry = (String, i64, String, TimestampSource);
-
-fn load_burst_entries(app: &AppHandle, project_id: &str) -> Result<Vec<BurstEntry>, String> {
-    let conn = connection(app)?;
-    let mut statement = conn
-        .prepare("SELECT id,captured_at,d_hash,timestamp_source FROM photos WHERE project_id=?1 AND is_missing=0 AND captured_at IS NOT NULL AND d_hash IS NOT NULL ORDER BY captured_at")
-        .map_err(|error| error.to_string())?;
-    let entries = statement
-        .query_map(params![project_id], |row| {
-            let source: Option<String> = row.get(3)?;
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                TimestampSource::parse(source.as_deref()),
-            ))
-        })
-        .map_err(|error| error.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    Ok(entries)
-}
-
-/// 閾値の学習に出題する候補ペア。構図の距離は付けるが、閾値による足切りは
-/// しない。どこで切るかを決めるのがこの後の学習なので、ここで絞ってはいけない。
+/// core に渡す写真の行。**その星に関係なく全件**（欠損を除く）を 1 回で返す。
+/// 並べ替えはフロント（`utils/coreInputs.ts`）が撮影順にする。
 #[tauri::command]
-fn get_burst_pairs(app: AppHandle, project_id: String) -> Result<Vec<BurstPair>, String> {
-    Ok(build_burst_pairs(&load_burst_entries(&app, &project_id)?))
-}
-
-fn build_burst_pairs(entries: &[BurstEntry]) -> Vec<BurstPair> {
-    let mut pairs = Vec::new();
-    for window in entries.windows(2) {
-        let [left, right] = window else { continue };
-        let left_input = CandidateInput {
-            id: left.0.clone(),
-            captured_at: left.1,
-            source: left.3,
-        };
-        let right_input = CandidateInput {
-            id: right.0.clone(),
-            captured_at: right.1,
-            source: right.3,
-        };
-        if pair_eligibility(&left_input, &right_input, BURST_WINDOW_MS) != PairEligibility::Eligible
-        {
-            continue;
-        }
-        pairs.push(BurstPair {
-            id: format!("{}:{}", left.0, right.0),
-            left_photo_id: left.0.clone(),
-            right_photo_id: right.0.clone(),
-            distance: hash_distance(&left.2, &right.2),
-            gap_ms: right.1 - left.1,
-        });
-    }
-    pairs
-}
-
-/// `threshold` が `None` のときは、プロジェクトに保存された学習値、
-/// それも無ければ既定の `HASH_DISTANCE_LIMIT` を使う。
-#[tauri::command]
-fn get_burst_groups(
-    app: AppHandle,
-    project_id: String,
-    threshold: Option<u32>,
-) -> Result<Vec<BurstGroup>, String> {
-    let entries = load_burst_entries(&app, &project_id)?;
-    let threshold = match threshold {
-        Some(value) => value,
-        None => load_burst_threshold(&app, &project_id)?.unwrap_or(HASH_DISTANCE_LIMIT),
-    };
-    let overrides = load_pair_overrides(&app, &project_id)?;
-    Ok(build_burst_groups(
-        entries
-            .into_iter()
-            .map(|(id, captured_at, hash, _)| (id, captured_at, hash))
-            .collect(),
-        threshold,
-        &overrides,
-    ))
-}
-
-fn load_pair_overrides(app: &AppHandle, project_id: &str) -> Result<PairOverrides, String> {
-    let conn = connection(app)?;
-    let mut statement = conn
-        .prepare(
-            "SELECT left_photo_id,right_photo_id,decision FROM burst_pair_overrides WHERE project_id=?1",
-        )
-        .map_err(|error| error.to_string())?;
-    let rows = statement
-        .query_map(params![project_id], |row| {
-            let left: String = row.get(0)?;
-            let right: String = row.get(1)?;
-            let decision: String = row.get(2)?;
-            Ok(((left, right), decision == "join"))
-        })
-        .map_err(|error| error.to_string())?;
-    rows.collect::<Result<PairOverrides, _>>()
-        .map_err(|error| error.to_string())
-}
-
-/// まとまりを見直すための「1続きの写真」。指定した写真の前後 `window_ms` に入る
-/// ものを撮影順で返す。まとめの判定に使う写真だけを対象にするので、
-/// `load_burst_entries` と同じ絞り込み（撮影時刻とハッシュがある・欠損でない）にする。
-#[tauri::command]
-fn get_burst_neighborhood(
-    app: AppHandle,
-    project_id: String,
-    photo_ids: Vec<String>,
-    window_ms: Option<i64>,
-) -> Result<Vec<Photo>, String> {
-    if photo_ids.is_empty() {
-        return Ok(Vec::new());
-    }
+fn get_core_inputs(app: AppHandle, project_id: String) -> Result<Vec<Photo>, String> {
     let conn = connection(&app)?;
-    let window = window_ms.unwrap_or(BURST_WINDOW_MS).max(0);
-
-    // 与えられた写真が占める時間の幅を求め、そこから前後へ広げる。
-    let mut span: Option<(i64, i64)> = None;
-    {
-        let mut statement = conn
-            .prepare("SELECT captured_at FROM photos WHERE project_id=?1 AND id=?2")
-            .map_err(|error| error.to_string())?;
-        for id in &photo_ids {
-            let at: Option<i64> = statement
-                .query_row(params![project_id, id], |row| row.get(0))
-                .unwrap_or(None);
-            let Some(at) = at else { continue };
-            span = Some(match span {
-                Some((low, high)) => (low.min(at), high.max(at)),
-                None => (at, at),
-            });
-        }
-    }
-    let Some((low, high)) = span else {
-        return Ok(Vec::new());
-    };
-
     let mut statement = conn
         .prepare(&format!(
-            "SELECT {PHOTO_COLUMNS} FROM photos
-             WHERE project_id=?1 AND is_missing=0
-               AND captured_at IS NOT NULL AND d_hash IS NOT NULL
-               AND captured_at BETWEEN ?2 AND ?3
-             ORDER BY captured_at"
+            "SELECT {PHOTO_COLUMNS} FROM photos WHERE project_id=?1 AND is_missing=0"
         ))
         .map_err(|error| error.to_string())?;
     let rows = statement
-        .query_map(params![project_id, low - window, high + window], photo_from_row)
+        .query_map(params![project_id], photo_from_row)
         .map_err(|error| error.to_string())?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())
 }
 
-/// 見直した結果のまとまりを保存する。
-///
-/// **受け取るのは「こう分かれていてほしい」という形だけ**で、例外そのものではない。
-/// 閾値だけで出る素の判定と突き合わせ、**食い違うペアだけ**を例外として残し、
-/// 一致するペアの例外は消す。こうすると、
-/// - 切ってから元に戻したときに、無意味な例外が溜まらない
-/// - 同じ形を何度保存しても結果が変わらない（冪等）
-/// - 閾値を学習し直しても、利用者が触っていないペアは新しい閾値に従う
+/// 手で直した連写の例外（core の `PairOverride`）。鍵は relativePath。
+#[derive(Clone, Serialize, serde::Deserialize)]
+struct PairOverrideRow {
+    left: String,
+    right: String,
+    decision: String,
+}
+
 #[tauri::command]
-fn save_burst_shape(
+fn get_pair_overrides(app: AppHandle, project_id: String) -> Result<Vec<PairOverrideRow>, String> {
+    let conn = connection(&app)?;
+    let mut statement = conn
+        .prepare(
+            "SELECT left_path,right_path,decision FROM pair_overrides WHERE project_id=?1
+             ORDER BY left_path,right_path",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params![project_id], |row| {
+            Ok(PairOverrideRow {
+                left: row.get(0)?,
+                right: row.get(1)?,
+                decision: row.get(2)?,
+            })
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+/// そのプロジェクトの例外を、渡したものに丸ごと入れ替える。
+#[tauri::command]
+fn save_pair_overrides(
     app: AppHandle,
     project_id: String,
-    ordered_photo_ids: Vec<String>,
-    blocks: Vec<Vec<String>>,
+    overrides: Vec<PairOverrideRow>,
 ) -> Result<(), String> {
-    if ordered_photo_ids.len() < 2 {
-        return Ok(());
-    }
-    let threshold = load_burst_threshold(&app, &project_id)?.unwrap_or(HASH_DISTANCE_LIMIT);
-    let entries = load_burst_entries(&app, &project_id)?;
-    let by_id: std::collections::HashMap<&str, (i64, &str)> = entries
-        .iter()
-        .map(|(id, at, hash, _)| (id.as_str(), (*at, hash.as_str())))
-        .collect();
-    let block_of: std::collections::HashMap<&str, usize> = blocks
-        .iter()
-        .enumerate()
-        .flat_map(|(index, block)| block.iter().map(move |id| (id.as_str(), index)))
-        .collect();
-
     let mut conn = connection(&app)?;
+    replace_pair_overrides(&mut conn, &project_id, &overrides)
+}
+
+fn replace_pair_overrides(
+    conn: &mut Connection,
+    project_id: &str,
+    overrides: &[PairOverrideRow],
+) -> Result<(), String> {
     let tx = conn.transaction().map_err(|error| error.to_string())?;
-    let now = now();
-    for window in ordered_photo_ids.windows(2) {
-        let [left, right] = window else { continue };
-        let (Some(left_entry), Some(right_entry)) =
-            (by_id.get(left.as_str()), by_id.get(right.as_str()))
-        else {
-            continue;
-        };
-        let raw = pair_joins_by_threshold(*left_entry, *right_entry, threshold);
-        // 同じ塊に居るなら繋がっていてほしい、という意味。
-        let wanted = match (block_of.get(left.as_str()), block_of.get(right.as_str())) {
-            (Some(a), Some(b)) => a == b,
-            _ => false,
-        };
-        if wanted == raw {
-            tx.execute(
-                "DELETE FROM burst_pair_overrides WHERE project_id=?1 AND left_photo_id=?2 AND right_photo_id=?3",
-                params![project_id, left, right],
-            )
-            .map_err(|error| error.to_string())?;
-        } else {
-            tx.execute(
-                "INSERT INTO burst_pair_overrides (project_id,left_photo_id,right_photo_id,decision,updated_at)
-                 VALUES (?1,?2,?3,?4,?5)
-                 ON CONFLICT(project_id,left_photo_id,right_photo_id)
-                 DO UPDATE SET decision=excluded.decision, updated_at=excluded.updated_at",
-                params![project_id, left, right, if wanted { "join" } else { "split" }, now],
-            )
-            .map_err(|error| error.to_string())?;
-        }
+    tx.execute(
+        "DELETE FROM pair_overrides WHERE project_id=?1",
+        params![project_id],
+    )
+    .map_err(|error| error.to_string())?;
+    for item in overrides {
+        // 同じ組が重ねて来ても、後のものが勝つ。
+        tx.execute(
+            "INSERT INTO pair_overrides (project_id,left_path,right_path,decision)
+             VALUES (?1,?2,?3,?4)
+             ON CONFLICT(project_id,left_path,right_path) DO UPDATE SET decision=excluded.decision",
+            params![project_id, item.left, item.right, item.decision],
+        )
+        .map_err(|error| error.to_string())?;
     }
-    tx.commit().map_err(|error| error.to_string())?;
-    Ok(())
+    tx.commit().map_err(|error| error.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -3579,18 +3425,6 @@ fn reset_display_images(app: AppHandle, project_id: String) -> Result<(), String
     Ok(())
 }
 
-fn load_burst_threshold(app: &AppHandle, project_id: &str) -> Result<Option<u32>, String> {
-    let conn = connection(app)?;
-    let stored: Option<i64> = conn
-        .query_row(
-            "SELECT burst_threshold FROM projects WHERE id=?1",
-            params![project_id],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
-    Ok(stored.map(|value| value.clamp(0, 64) as u32))
-}
-
 #[tauri::command]
 fn save_burst_threshold(app: AppHandle, project_id: String, threshold: u32) -> Result<(), String> {
     connection(&app)?
@@ -3611,76 +3445,6 @@ fn clear_burst_threshold(app: AppHandle, project_id: String) -> Result<(), Strin
         )
         .map_err(|error| error.to_string())?;
     Ok(())
-}
-
-// グルーピング本体。DB アクセスと分けてあるのは計測ハーネス（feature = "bench"）
-// から実コードそのものを呼べるようにするため。挙動は分離前と同一。
-/// 手で直したまとめ。隣り合うペアに対する例外だけを持つ。
-/// キーは (左の写真, 右の写真) で、**撮影順の左→右**。
-pub type PairOverrides = std::collections::HashMap<(String, String), bool>;
-
-/// 隣り合う 2 枚を、閾値だけで見たときに繋ぐか。**例外を当てる前の素の判定。**
-/// `build_burst_groups` と `save_burst_shape` が同じ規則を使うよう、1 か所に出す。
-fn pair_joins_by_threshold(
-    left: (i64, &str),
-    right: (i64, &str),
-    threshold: u32,
-) -> bool {
-    right.0 - left.0 <= BURST_WINDOW_MS && hash_distance(right.1, left.1) <= threshold
-}
-
-fn build_burst_groups(
-    entries: Vec<(String, i64, String)>,
-    threshold: u32,
-    overrides: &PairOverrides,
-) -> Vec<BurstGroup> {
-    let mut groups = Vec::new();
-    let mut current: Vec<(String, i64, String)> = Vec::new();
-    let mut push = |photos: &mut Vec<(String, i64, String)>| {
-        if photos.len() < 2 {
-            return;
-        }
-        let first = &photos[0];
-        let last = photos.last().expect("group has a first item");
-        let average = photos
-            .iter()
-            .skip(1)
-            .map(|photo| hash_distance(&first.2, &photo.2) as f64)
-            .sum::<f64>()
-            / (photos.len() - 1) as f64;
-        groups.push(BurstGroup {
-            id: Uuid::new_v4().to_string(),
-            photo_ids: photos.iter().map(|photo| photo.0.clone()).collect(),
-            captured_span_ms: last.1 - first.1,
-            similarity: ((1.0 - average / 64.0).max(0.0) * 100.0).round() as i64,
-            accepted: None,
-        });
-    };
-    for entry in entries {
-        let is_near = current
-            .last()
-            .map(|previous| {
-                // 利用者が手で決めた境目があれば、閾値より優先する。
-                overrides
-                    .get(&(previous.0.clone(), entry.0.clone()))
-                    .copied()
-                    .unwrap_or_else(|| {
-                        pair_joins_by_threshold(
-                            (previous.1, &previous.2),
-                            (entry.1, &entry.2),
-                            threshold,
-                        )
-                    })
-            })
-            .unwrap_or(false);
-        if !current.is_empty() && !is_near {
-            push(&mut current);
-            current.clear();
-        }
-        current.push(entry);
-    }
-    push(&mut current);
-    groups
 }
 
 #[tauri::command]
@@ -3903,18 +3667,6 @@ pub mod bench_api {
         super::upsert_photo(conn, project_id, absolute, relative, name, mtime, size)
     }
 
-    /// 本物のグルーピングを走らせ、グループごとの photo_ids だけを返す。
-    /// `BurstGroup` の各フィールドを公開せずに件数と規模を測れる。
-    pub fn build_burst_groups(
-        entries: Vec<(String, i64, String)>,
-        threshold: u32,
-    ) -> Vec<Vec<String>> {
-        // 計測では手の入った例外を当てない。素の閾値だけを測る。
-        super::build_burst_groups(entries, threshold, &super::PairOverrides::new())
-            .into_iter()
-            .map(|group| group.photo_ids)
-            .collect()
-    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -3942,10 +3694,9 @@ pub fn run() {
             get_display_backlog,
             start_display_generation,
             reset_display_images,
-            get_burst_groups,
-            get_burst_neighborhood,
-            save_burst_shape,
-            get_burst_pairs,
+            get_core_inputs,
+            get_pair_overrides,
+            save_pair_overrides,
             save_burst_threshold,
             clear_burst_threshold,
             start_project_scan,
@@ -5880,144 +5631,47 @@ mod tests {
         fs::remove_dir_all(&directory).expect("remove test directory");
     }
 
-    // -----------------------------------------------------------------------
-    // 連写まとめの閾値学習
-    // -----------------------------------------------------------------------
-
-    fn burst_entry(id: &str, captured_at: i64, hash: &str, source: TimestampSource) -> BurstEntry {
-        (id.to_string(), captured_at, hash.to_string(), source)
-    }
-
     #[test]
-    fn burst_pairs_only_include_adjacent_photos_with_strong_evidence() {
-        let entries = vec![
-            // 通常の連写。EXIF 由来で時間も近い。
-            burst_entry("a", 0, "0000000000000000", TimestampSource::ExifOriginal),
-            burst_entry(
-                "b",
-                1_000,
-                "0000000000000003",
-                TimestampSource::ExifOriginal,
-            ),
-            // 時間窓の外。
-            burst_entry(
-                "c",
-                60_000,
-                "0000000000000003",
-                TimestampSource::ExifOriginal,
-            ),
-            // mtime 同士。時間が近くても連写の根拠にしない。
-            burst_entry(
-                "d",
-                61_000,
-                "0000000000000003",
-                TimestampSource::FilesystemMtime,
-            ),
-            burst_entry(
-                "e",
-                61_500,
-                "0000000000000003",
-                TimestampSource::FilesystemMtime,
-            ),
-        ];
-        let pairs = build_burst_pairs(&entries);
-
-        let ids: Vec<&str> = pairs.iter().map(|pair| pair.id.as_str()).collect();
-        assert_eq!(ids, vec!["a:b", "c:d"], "窓外と弱い根拠のペアを除外する");
-        assert_eq!(pairs[0].distance, 2, "ハミング距離が入る");
-        assert_eq!(pairs[0].gap_ms, 1_000);
-    }
-
-    #[test]
-    fn burst_pairs_are_not_filtered_by_any_distance_threshold() {
-        // どこで切るかを決めるのが学習なので、出題元を閾値で絞ってはいけない。
-        // 既定の閾値 14 を大きく超える距離のペアも候補に残る必要がある。
-        let entries = vec![
-            burst_entry("a", 0, "0000000000000000", TimestampSource::ExifOriginal),
-            burst_entry("b", 500, "ffffffffffffffff", TimestampSource::ExifOriginal),
-        ];
-        let pairs = build_burst_pairs(&entries);
-        assert_eq!(pairs.len(), 1);
-        assert_eq!(pairs[0].distance, 64);
-        assert!(pairs[0].distance > HASH_DISTANCE_LIMIT);
-    }
-
-    #[test]
-    fn grouping_follows_the_given_threshold() {
-        let entries = vec![
-            ("a".to_string(), 0, "0000000000000000".to_string()),
-            ("b".to_string(), 1_000, "0000000000000003".to_string()), // a から 2
-            ("c".to_string(), 2_000, "000000000000003f".to_string()), // b から 4
-        ];
-        let sizes = |threshold: u32| -> Vec<usize> {
-            build_burst_groups(entries.clone(), threshold, &PairOverrides::new())
-                .iter()
-                .map(|group| group.photo_ids.len())
-                .collect()
+    fn pair_overrides_are_replaced_per_project() {
+        let directory = test_directory("pair-overrides");
+        let mut conn = open_database(&directory.join("overrides.sqlite3")).expect("open database");
+        let row = |left: &str, right: &str, decision: &str| PairOverrideRow {
+            left: left.to_string(),
+            right: right.to_string(),
+            decision: decision.to_string(),
+        };
+        let read = |conn: &Connection, project: &str| -> Vec<(String, String, String)> {
+            let mut statement = conn
+                .prepare(
+                    "SELECT left_path,right_path,decision FROM pair_overrides
+                     WHERE project_id=?1 ORDER BY left_path,right_path",
+                )
+                .expect("prepare");
+            statement
+                .query_map(params![project], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .expect("query")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect")
         };
 
-        assert!(sizes(0).is_empty(), "閾値 0 では何もまとまらない");
-        assert_eq!(sizes(2), vec![2], "a-b だけがまとまる");
-        assert_eq!(sizes(64), vec![3], "閾値を上げ切れば1グループ");
-    }
+        replace_pair_overrides(&mut conn, "p1", &[row("a.jpg", "b.jpg", "join"), row("b.jpg", "c.jpg", "split")])
+            .expect("save p1");
+        replace_pair_overrides(&mut conn, "p2", &[row("a.jpg", "b.jpg", "split")]).expect("save p2");
+        assert_eq!(read(&conn, "p1").len(), 2);
 
-    /// 手で直したまとめは閾値より優先される。ここが効かないと、
-    /// 解除したはずのまとまりが次のラウンドで復活する。
-    #[test]
-    fn hand_edited_pairs_win_over_the_threshold() {
-        let entries = vec![
-            ("a".to_string(), 0, "0000000000000000".to_string()),
-            ("b".to_string(), 1_000, "0000000000000003".to_string()), // a から 2
-            ("c".to_string(), 2_000, "000000000000003f".to_string()), // b から 4
-        ];
-        let shapes = |threshold: u32, overrides: &PairOverrides| -> Vec<Vec<String>> {
-            build_burst_groups(entries.clone(), threshold, overrides)
-                .into_iter()
-                .map(|group| group.photo_ids)
-                .collect()
-        };
-        let pair = |left: &str, right: &str, join: bool| {
-            PairOverrides::from([((left.to_string(), right.to_string()), join)])
-        };
-
-        // 閾値 64 なら素では 1 グループ。a-b を切ると 2 枚だけが残る。
+        // 入れ替えは丸ごと。前にあって今回無いものは消え、他のプロジェクトは触らない。
+        replace_pair_overrides(&mut conn, "p1", &[row("b.jpg", "c.jpg", "join")]).expect("replace p1");
         assert_eq!(
-            shapes(64, &pair("a", "b", false)),
-            vec![vec!["b".to_string(), "c".to_string()]],
-            "切った境目で分かれていない"
+            read(&conn, "p1"),
+            vec![("b.jpg".to_string(), "c.jpg".to_string(), "join".to_string())]
         );
-        // 真ん中を両側から切ると b が独立し、1 枚のまとまりは消える。
-        let split_both = PairOverrides::from([
-            (("a".to_string(), "b".to_string()), false),
-            (("b".to_string(), "c".to_string()), false),
-        ]);
-        assert!(shapes(64, &split_both).is_empty(), "b を外しきれていない");
+        assert_eq!(read(&conn, "p2").len(), 1, "他のプロジェクトは変わらない");
 
-        // 逆に、閾値では切れるペアも繋げる。
-        assert_eq!(
-            shapes(0, &pair("a", "b", true)),
-            vec![vec!["a".to_string(), "b".to_string()]],
-            "繋いだ境目が閾値に潰されている"
-        );
+        replace_pair_overrides(&mut conn, "p1", &[]).expect("clear p1");
+        assert!(read(&conn, "p1").is_empty());
 
-        // 例外が無ければ従来どおり。
-        assert_eq!(shapes(64, &PairOverrides::new()).len(), 1);
-    }
-
-    /// 例外の向きは撮影順の左→右。逆順のキーを拾ってしまうと、
-    /// 切ったつもりが別の境目に効いてしまう。
-    #[test]
-    fn pair_overrides_are_keyed_left_to_right() {
-        let entries = vec![
-            ("a".to_string(), 0, "0000000000000000".to_string()),
-            ("b".to_string(), 1_000, "0000000000000003".to_string()),
-        ];
-        let reversed = PairOverrides::from([(("b".to_string(), "a".to_string()), false)]);
-        assert_eq!(
-            build_burst_groups(entries, 64, &reversed).len(),
-            1,
-            "逆向きのキーが効いてしまっている"
-        );
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
     }
 
     #[test]

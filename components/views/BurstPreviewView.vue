@@ -1,25 +1,20 @@
 <script setup lang="ts">
-import type { Ref } from 'vue'
-import type { SelectionSession } from '~/types/photo'
-
 const {
   acceptBurstThreshold,
   askMorePairs,
   askedCount,
+  burstGroupCount,
   groupedPhotoCount,
   maxPairDistance,
   previewBusy,
   previewThreshold,
-  refreshBurstPreview,
-  session: nullableSession
+  refreshBurstPreview
 } = useCurator()
-// 親の `v-if` で null を除いているので、ここでは non-null として扱う。
-const session = nullableSession as Ref<SelectionSession>
 </script>
 
 <template>
     <div class="text-overline text-primary">連写のまとめ方</div>
-    <h1 class="text-h5 text-md-h4">{{ session.burstGroups.length.toLocaleString() }} グループ / {{ groupedPhotoCount.toLocaleString() }} 枚にまとまりました</h1>
+    <h1 class="text-h5 text-md-h4">{{ burstGroupCount.toLocaleString() }} グループ / {{ groupedPhotoCount.toLocaleString() }} 枚にまとまりました</h1>
     <p class="text-body-2 text-medium-emphasis mt-2">
       {{ askedCount }} 問の回答から、まとめる基準を {{ previewThreshold }} と判断しました。ここで微調整できます。
     </p>

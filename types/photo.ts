@@ -51,11 +51,6 @@ export interface PhotoPage {
   total: number
 }
 
-export interface SelectionSeed {
-  id: string
-  rating: number
-}
-
 /** `background` は scan 完了後の事前生成。UI をブロックしない。 */
 export type ProjectTask = 'scan' | 'burst' | 'background' | 'display'
 
@@ -98,45 +93,6 @@ export interface BurstGroup {
   accepted: boolean | null
 }
 
-/**
- * 隣り合う2枚。判断の単位はグループではなくこのペア。
- * グループは「連続するペアがすべて閾値を満たす区間」として導かれるので、
- * 「1枚目はまとめないが2と3枚目はまとめる」はペア単位の判断だけで表現できる。
- */
-export interface BurstPair {
-  id: string
-  leftPhotoId: string
-  rightPhotoId: string
-  /** dHash のハミング距離。小さいほど構図が近い。 */
-  distance: number
-  gapMs: number
-}
-
-export interface PairAnswer {
-  pairId: string
-  distance: number
-  grouped: boolean
-}
-
-/** 距離順に並べた候補ペアに対する二分探索の状態。 */
-export interface ThresholdState {
-  lowIdx: number
-  highIdx: number
-  answers: PairAnswer[]
-  skipped: string[]
-}
-
-/**
- * 1グループぶんの判断。選び間違えたときに1手ずつ戻すために積む。
- * survivors と ratings は差分で戻せるので、スナップショットは持たない。
- * 大量写真では survivors が数千件になり、毎クリック保存する JSON が肥大化する。
- */
-export interface SelectionStep {
-  groupIndex: number
-  /** そのグループで通した写真。1枚も選ばなかったときは空。 */
-  chosen: string[]
-}
-
 export type SelectionStage =
   | 'settings'
   | 'burst-threshold'
@@ -144,43 +100,3 @@ export type SelectionStage =
   | 'tournament'
   | 'result'
   | 'burst-final'
-
-export interface SelectionSession {
-  projectId: string
-  settings: TournamentSettings
-  candidates: string[]
-  groups: string[][]
-  groupIndex: number
-  selectedInGroup: string[]
-  multiSelect: boolean
-  ratings: Record<string, number>
-  survivors: string[]
-  /** 1手戻すための履歴。ラウンドをまたいでは戻せないので開始時に空にする。 */
-  history: SelectionStep[]
-  /** この回で選別している星。ここに集まった写真だけが対象になる。 */
-  targetRating: number
-  /**
-   * まとめた連写。キーが代表写真の id、値は代表を含む全メンバー。
-   * トーナメントには代表だけを出し、1カードとして扱う。
-   */
-  burstMembers: Record<string, string[]>
-  /**
-   * まとめの中で**もう星が決まった**写真。★5 で確定したものと、明らかに脱落と
-   * して下げたものが入る。
-   *
-   * これが無いと `spreadBurstRatings` が「代表と同じ星」を配るときに上書きして
-   * しまい、せっかく下げた星が元に戻る。
-   */
-  burstSettled: string[]
-  round: number
-  /** 閾値を適用した結果のグループ。確認画面と、以降のまとめ処理で使う。 */
-  burstGroups: BurstGroup[]
-  /** 距離順に並べた候補ペア。出題元。 */
-  burstPairs: BurstPair[]
-  burstThresholdState: ThresholdState
-  /** 学習・調整済みの閾値。未決定なら null。 */
-  burstThreshold: number | null
-  stage: SelectionStage
-  updatedAt: number
-  seed?: number
-}

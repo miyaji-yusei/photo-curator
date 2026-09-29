@@ -1,10 +1,10 @@
 <script setup lang="ts">
 const {
   answerPair,
-  askedCount,
   currentPair,
   desktop,
-  maxQuestions,
+  learningPosition,
+  learningTotal,
   pairPhotos,
   skipCurrentPair,
   view
@@ -14,7 +14,7 @@ const {
 <template>
     <div class="d-flex align-center justify-space-between flex-wrap ga-3 mb-2">
       <div>
-        <div class="text-overline text-primary">連写のまとめ方を学習中 &middot; {{ askedCount + 1 }} / 最大 {{ maxQuestions }} 問</div>
+        <div class="text-overline text-primary">連写のまとめ方を学習中 &middot; {{ learningPosition }} / {{ learningTotal }} 問</div>
         <h1 class="text-h5 text-md-h4">この2枚は同じ連写ですか？</h1>
       </div>
       <v-btn variant="text" prepend-icon="mdi-pause-circle-outline" @click="view = 'project'">中断して戻る</v-btn>
@@ -22,7 +22,7 @@ const {
     <p class="text-body-2 text-medium-emphasis mb-5">
       数問だけ答えると、残りは同じ基準で自動的にまとまります。全部を確認する必要はありません。
     </p>
-    <v-progress-linear :model-value="(askedCount / maxQuestions) * 100" color="primary" height="6" rounded class="mb-6" />
+    <v-progress-linear :model-value="((learningPosition - 1) / Math.max(1, learningTotal)) * 100" color="primary" height="6" rounded class="mb-6" />
 
     <template v-if="currentPair && pairPhotos.length === 2">
       <div class="compare-pair">
