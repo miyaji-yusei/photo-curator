@@ -35,3 +35,6 @@ build-out/
 # core-wasm の出力（wasm-pack build）
 core-wasm/target/
 core-wasm/pkg/
+
+# Node が作るコンパイルのキャッシュ（nuxt 実行時にできる）
+node-compile-cache/
