@@ -350,6 +350,21 @@ describe('書き込み', () => {
     expect(backend.state.seenBy).toBe(backend.identity.id)
   })
 
+  it('載せる行が 0 件なら書かない。localChanged も落とさない', async () => {
+    const backend = fakeBackend()
+    const sync = createSidecarSync(backend, nextClock)
+    await sync.markChanged('p1')
+    const rows = backend.rows
+    backend.rows = []
+    expect(await sync.pushIfChanged(project)).toBe(false)
+    expect(backend.writes).toEqual([])
+    expect(backend.state.localChanged).toBe(true)
+    // 行が戻れば、残っていた変更が書かれる。
+    backend.rows = rows
+    expect(await sync.pushIfChanged(project)).toBe(true)
+    expect(backend.state.localChanged).toBe(false)
+  })
+
   it('書けない出所（readonly）へは書かない', async () => {
     const backend = fakeBackend({ access: 'readonly' })
     const sync = createSidecarSync(backend, nextClock)

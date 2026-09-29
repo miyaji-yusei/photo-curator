@@ -153,6 +153,9 @@ export function createSidecarSync(backend: SidecarBackend, now: () => number = D
     if (!state.localChanged) return false
     const before = generationOf(projectId)
     const sidecar = await buildSidecar(project, now())
+    // 載せる行が 0 件（例: 全部が欠損扱いの間）なら書かない。空の記録で共有を上書きしない。
+    // localChanged も落とさず、行が戻ったあとの書き出しに残す。
+    if (Object.keys(sidecar.photos).length === 0) return false
     await backend.writeSidecar(projectId, core.sidecarToJson(sidecar))
     // 書けたときだけ印を更新する。書いている間にまた変わっていたら、変更ありのまま残す。
     const changedMeanwhile = generationOf(projectId) !== before

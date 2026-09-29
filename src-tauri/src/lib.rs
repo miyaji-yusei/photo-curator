@@ -3383,7 +3383,7 @@ fn photos_for_export(
     conn: &Connection,
     project_id: &str,
     photo_ids: &[String],
-) -> Result<Vec<(String, i64)>, String> {
+) -> Result<Vec<(String, String, i64)>, String> {
     if photo_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -3400,10 +3400,23 @@ fn photos_for_export(
     for row in rows {
         let (id, path, rating) = row.map_err(|error| error.to_string())?;
         if wanted.contains(id.as_str()) {
-            out.push((path, rating));
+            out.push((id, path, rating));
         }
     }
     Ok(out)
+}
+
+/// 移動できた写真の行だけを欠損にする（場所が古くなったので、次の scan で拾い直させる）。
+/// 移動しなかった写真や、失敗した写真は、そのまま。
+fn mark_photos_missing(conn: &Connection, project_id: &str, ids: &[String]) -> Result<(), String> {
+    for id in ids {
+        conn.execute(
+            "UPDATE photos SET is_missing=1 WHERE project_id=?1 AND id=?2",
+            params![project_id, id],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 /// 出力先に同名があるとき、`name (2).jpg` のように連番を付ける。
@@ -3472,7 +3485,8 @@ fn export_photos_blocking(
     let targets = photos_for_export(&conn, &project_id, &photo_ids)?;
     let mut report = ExportReport::default();
 
-    for (path, rating) in &targets {
+    let mut moved_ids: Vec<String> = Vec::new();
+    for (id, path, rating) in &targets {
         let source = Path::new(path);
         if !source.is_file() {
             report.skipped += 1;
@@ -3493,11 +3507,15 @@ fn export_photos_blocking(
             // 同じボリュームなら rename が速くて安全。失敗したらコピー＋削除。
             if fs::rename(source, &target).is_ok() {
                 report.processed += 1;
+                moved_ids.push(id.clone());
                 continue;
             }
             match fs::copy(source, &target) {
                 Ok(_) => match fs::remove_file(source) {
-                    Ok(()) => report.processed += 1,
+                    Ok(()) => {
+                        report.processed += 1;
+                        moved_ids.push(id.clone());
+                    }
                     // コピーは済んでいるので写真は失われない。元が残るだけ。
                     Err(error) => report.fail(path, format!("複製後に元を削除できません: {error}")),
                 },
@@ -3512,12 +3530,8 @@ fn export_photos_blocking(
     }
 
     // 移動したなら DB の場所が古くなる。次の scan で拾い直させる。
-    if move_files && report.processed > 0 {
-        conn.execute(
-            "UPDATE photos SET is_missing=1 WHERE project_id=?1",
-            params![project_id],
-        )
-        .map_err(|error| error.to_string())?;
+    if move_files {
+        mark_photos_missing(&conn, &project_id, &moved_ids)?;
     }
     Ok(report)
 }
@@ -3693,7 +3707,7 @@ fn write_ratings_to_photos_blocking(
     let targets = photos_for_export(&conn, &project_id, &photo_ids)?;
     let mut report = ExportReport::default();
 
-    for (path, rating) in &targets {
+    for (_id, path, rating) in &targets {
         let source = Path::new(path);
         let is_jpeg = matches!(
             source
@@ -7204,11 +7218,39 @@ mod tests {
         let targets = photos_for_export(&conn, "p1", &ids).expect("targets");
         // 相対パス順（c-three, e-five）。星は写真自身の星。
         assert_eq!(
-            targets.iter().map(|(path, rating)| (path.as_str(), *rating)).collect::<Vec<_>>(),
+            targets.iter().map(|(_id, path, rating)| (path.as_str(), *rating)).collect::<Vec<_>>(),
             vec![("C:/photos/c-three.jpg", 3), ("C:/photos/e-five.jpg", 5)]
         );
         assert!(photos_for_export(&conn, "p1", &[]).expect("empty").is_empty(), "id が空なら何も書き出さない");
 
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn moving_one_photo_marks_only_that_photo_missing() {
+        let directory = test_directory("move-missing");
+        let conn = rated_fixture(&directory.join("m.sqlite3"));
+
+        mark_photos_missing(&conn, "p1", &["three-b".to_string()]).expect("mark");
+
+        let mut statement = conn
+            .prepare("SELECT id FROM photos WHERE project_id='p1' AND is_missing=1")
+            .expect("prepare");
+        let missing: Vec<String> = statement
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("collect");
+        assert_eq!(missing, vec!["three-b".to_string()], "移動した 1 枚だけが欠損");
+
+        mark_photos_missing(&conn, "p1", &[]).expect("mark none");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM photos WHERE is_missing=1", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(count, 1, "何も移動しなければ増えない");
+
+        drop(statement);
         drop(conn);
         fs::remove_dir_all(&directory).expect("remove test directory");
     }
