@@ -1,0 +1,223 @@
+package app.photocurator.next
+
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.SystemBarStyle
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import coil.compose.AsyncImage
+import coil.request.ImageRequest
+
+class MainActivity : ComponentActivity() {
+    private val requestPhotos =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        // 画面の端まで描き、余白はここではなく Compose の insets で取る。
+        // **明暗は端末の設定に合わせない。** 既定の enableEdgeToEdge() は
+        // 端末が明るいテーマだとナビゲーションバーに白い膜を敷く。この画面は
+        // 常に暗いので、下端だけ白く残って「見切れている」ように見えていた。
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+        )
+        super.onCreate(savedInstanceState)
+        // 網の状態を言い分けるために預ける。**ここでしか渡さない。**
+        Smb.remember(this)
+        requestPhotoPermissions()
+        take(intent)
+        setContent { App() }
+    }
+
+    /** もう開いているときに共有されたら、ここに来る（singleTask）。 */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        take(intent)
+    }
+
+    /** 共有で受け取った文を預ける。**受け取るのは文だけ**（設計 08 章 8.2）。 */
+    private fun take(intent: Intent?) {
+        if (intent?.action != Intent.ACTION_SEND) return
+        Incoming.text.value = intent.getStringExtra(Intent.EXTRA_TEXT) ?: return
+    }
+
+    private fun requestPhotoPermissions() {
+        val wanted = when {
+            Build.VERSION.SDK_INT >= 34 -> arrayOf(
+                Manifest.permission.READ_MEDIA_IMAGES,
+                "android.permission.READ_MEDIA_VISUAL_USER_SELECTED"
+            )
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU ->
+                arrayOf(Manifest.permission.READ_MEDIA_IMAGES)
+            else -> arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
+        }
+        val missing = wanted.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isNotEmpty()) requestPhotos.launch(missing.toTypedArray())
+    }
+}
+
+/** 共有で受け取った文。**受け口は MainActivity だけ**で、画面はこれを見て動く。 */
+object Incoming {
+    val text = kotlinx.coroutines.flow.MutableStateFlow<String?>(null)
+}
+
+/** 配色は Tauri 版と揃える。同じアプリだと分かること。 */
+val Ink = androidx.compose.ui.graphics.Color(0xFF101114)
+val Surface = androidx.compose.ui.graphics.Color(0xFF191B20)
+val Tile = androidx.compose.ui.graphics.Color(0xFF16181D)
+val Lime = androidx.compose.ui.graphics.Color(0xFFD6FF73)
+val Faint = androidx.compose.ui.graphics.Color(0xFF9AA0AA)
+
+/** 準備中（secondary）。**まだ動いている**ことを緑と分けて言うための色。 */
+val Sky = androidx.compose.ui.graphics.Color(0xFFA7C8FF)
+
+/** つまずき（error）。原本を変える操作の警告にも使う。 */
+val Warn = androidx.compose.ui.graphics.Color(0xFFFFB4AB)
+
+/**
+ * いまどの画面か。**ホーム → プロジェクト → 選別 / 結果** の 1 本道。
+ *
+ * 単位はアルバムではなくプロジェクト。同じアルバムから 2 つ作れるし、
+ * 出所が端末でも NAS でも同じ道を通る。
+ */
+private sealed interface Screen {
+    data object Home : Screen
+    data object Settings : Screen
+    /** [link] は共有で受け取った Amazon の共有リンク。**あれば Amazon のタブで開く。** */
+    data class Create(val link: String? = null) : Screen
+    data class Detail(val project: Project) : Screen
+    data class Learn(val project: Project) : Screen
+    data class Cull(val project: Project, val againFromStar: Int? = null) : Screen
+    data class Results(val project: Project, val star: Int) : Screen
+}
+
+@Composable
+private fun App() {
+    // **背面へ回るときに書く。** Android は畳んだ・他のアプリへ移った時点で
+    // 止められるので、その前に渡しておく（設計 03「中断されたときは必ず書く」）。
+    val context = LocalContext.current
+    val owner = LocalLifecycleOwner.current
+    DisposableEffect(owner) {
+        val watch = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) {
+                for (project in Projects.cached()) Sidecar.pushIfChanged(context, project)
+            }
+        }
+        owner.lifecycle.addObserver(watch)
+        onDispose { owner.lifecycle.removeObserver(watch) }
+    }
+
+    MaterialTheme(colorScheme = darkColorScheme(primary = Lime, background = Ink, surface = Surface)) {
+        var screen by remember { mutableStateOf<Screen>(Screen.Home) }
+        // ホームへ戻るたびに一覧を読み直すための鍵。
+        var homeKey by remember { mutableStateOf(0) }
+
+        // **共有で Amazon のリンクが届いたら、作成画面の Amazon タブへ。**
+        // リンクが無い文なら、何も変えずにそう言う（設計 08 章 8.2）。
+        val incoming by Incoming.text.collectAsState()
+        LaunchedEffect(incoming) {
+            val text = incoming ?: return@LaunchedEffect
+            Incoming.text.value = null
+            val link = Amazon.parse(text)
+            if (link == null) {
+                android.widget.Toast.makeText(
+                    context, "Amazon Photos の共有リンクが見つかりませんでした",
+                    android.widget.Toast.LENGTH_LONG
+                ).show()
+            } else {
+                screen = Screen.Create(link.url)
+            }
+        }
+
+        Surface(color = Ink, modifier = Modifier.fillMaxSize()) {
+            when (val here = screen) {
+                is Screen.Home -> key(homeKey) {
+                    HomeScreen(
+                        onOpen = { screen = Screen.Detail(it) },
+                        onCreate = { screen = Screen.Create() },
+                        onSettings = { screen = Screen.Settings }
+                    )
+                }
+
+                is Screen.Settings -> SettingsScreen(
+                    onBack = { screen = Screen.Home; homeKey += 1 }
+                )
+
+                // **作成は画面。** 下から出るシートだと、フォルダ一覧を送る指で
+                // 閉じてしまう（実際に何度も起きた）。
+                is Screen.Create -> key(here.link) {
+                  CreateScreen(
+                    initialLink = here.link,
+                    onCreated = { project ->
+                        // 作ったらそのまま詳細へ。準備の様子が見える。
+                        screen = Screen.Detail(project)
+                    },
+                    onDismiss = { screen = Screen.Home; homeKey += 1 }
+                  )
+                }
+
+                is Screen.Detail -> ProjectScreen(
+                    project = here.project,
+                    onBack = { screen = Screen.Home; homeKey += 1 },
+                    onCull = { learn -> screen = if (learn) Screen.Learn(here.project) else Screen.Cull(here.project) },
+                    // 完了したプロジェクトは結果へ直行する。
+                    onResults = { screen = Screen.Results(here.project, -1) },
+                    onOpenStar = { screen = Screen.Results(here.project, it) }
+                )
+
+                is Screen.Learn -> LearnFlow(
+                    project = here.project,
+                    onStart = { screen = Screen.Cull(here.project) },
+                    onBack = { screen = Screen.Detail(here.project) }
+                )
+
+                is Screen.Cull -> CullScreen(
+                    project = here.project,
+                    againFromStar = here.againFromStar,
+                    // ラウンド完了から結果へ直行できるように。
+                    onResults = { screen = Screen.Results(here.project, -1) },
+                    // **選別から戻る先はプロジェクト詳細。** 一覧まで飛ばすと、
+                    // いま何枚残ったのかを確かめる前に見失う。
+                    onBack = { screen = Screen.Detail(here.project) }
+                )
+
+                is Screen.Results -> ResultsScreen(
+                    project = here.project,
+                    star = here.star,
+                    // **その星だけで作り直して選別へ。** 終わったら結果へ戻る。
+                    onCullAgain = { again -> screen = Screen.Cull(here.project, again) },
+                    onBack = { screen = Screen.Detail(here.project) }
+                )
+            }
+        }
+
+    }
+}

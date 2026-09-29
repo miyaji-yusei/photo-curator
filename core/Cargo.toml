@@ -1,0 +1,41 @@
+[package]
+name = "photo-curator-core"
+version = "0.1.0"
+edition = "2021"
+
+# **判断が絡むものは全部ここに置く。** 画面と入出力は各環境に任せる。
+# cdylib は Android と Web、lib は PC（Tauri から直接使う）向け。
+[lib]
+# **namespace ＝ クレート名 ＝ ライブラリ名で揃える。**
+#
+# 生成された Kotlin は lib<namespace>.so を読み込み、
+# uniffi_<クレート名>_... という記号を探す。3 つがずれると
+# 実機で「library not found」か「undefined symbol」で落ちる。
+name = "photo_curator_core"
+crate-type = ["cdylib", "lib"]
+
+# uniffi-bindgen（Kotlin バインディング生成）は uniffi があるときだけ組む。
+# `--no-default-features` のときはこの bin を丸ごと外す。
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["uniffi"]
+
+[features]
+# 既定は今までどおり uniffi あり（Android 向けの .so をそのまま作れる）。
+# `--no-default-features` で uniffi 無しでも組める（PC・Web が wasm から呼ぶとき用）。
+default = ["uniffi"]
+uniffi = ["dep:uniffi"]
+
+[dependencies]
+uniffi = { version = "0.28", features = ["cli"], optional = true }
+# 保存の形は core が持つ。**各環境が独自に組み立てない。**
+# サイドカー（NAS で共有する catalog.json）もこの形をそのまま使う。
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+uniffi = { version = "0.28", features = ["build"] }
+
+[dev-dependencies]
+uniffi = { version = "0.28", features = ["bindgen-tests"] }
