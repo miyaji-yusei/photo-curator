@@ -81,6 +81,10 @@ export interface SidecarSync {
   keepMine: (project: { id: string }, theirs: Sidecar) => Promise<void>
   /** 「NAS の記録を使う」。この端末の分を退避してから、相手の分を取り込む。 */
   keepTheirs: (project: { id: string }, theirs: Sidecar) => Promise<void>
+  /** 食い違いの答えを実行する。書けなければ、書けない共有として相手を取り込む（理由を返す）。 */
+  resolveClash: (
+    project: { id: string }, theirs: Sidecar, choice: 'mine' | 'theirs'
+  ) => Promise<{ kind: 'done' } | { kind: 'readonly', reason: string }>
   /** 判断が変わった印を付ける。同じ状態のあいだは書き込まない。 */
   markChanged: (projectId: string) => Promise<void>
   /** 端末の分から Sidecar を組む。 */
