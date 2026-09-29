@@ -265,7 +265,10 @@ watch(filterMode, async () => {
       <div :style="isNarrow ? '' : 'width: 340px; flex-shrink: 0'">
         <v-card class="mb-4">
           <v-card-item>
-            <template #prepend><v-icon icon="mdi-folder" /></template>
+            <template #prepend>
+              <!-- 出所の印（08章 8.6）。Amazon は雲、それ以外はフォルダ。 -->
+              <v-icon :icon="project.source.kind === 'amazon' ? 'mdi-cloud-outline' : 'mdi-folder'" />
+            </template>
             <template #title>{{ project.source.label }}</template>
             <template #subtitle>{{ project.photoCount }} 枚</template>
           </v-card-item>

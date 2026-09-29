@@ -148,7 +148,12 @@ const columns = computed(() => (isNarrow.value ? 1 : isWide.value ? 3 : 2))
               :src="covers[project.id]!"
               style="width: 100%; height: 100%; object-fit: cover"
             >
-            <v-icon v-else icon="mdi-folder-image" size="32" color="rgba(255,255,255,.25)" />
+            <v-icon
+              v-else
+              :icon="project.source.kind === 'amazon' ? 'mdi-cloud-outline' : 'mdi-folder-image'"
+              size="32"
+              color="rgba(255,255,255,.25)"
+            />
           </div>
           <v-card-text>
             <div class="d-flex align-center mb-1">
