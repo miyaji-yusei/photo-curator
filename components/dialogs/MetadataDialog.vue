@@ -17,7 +17,7 @@ const {
 <v-dialog v-model="metadataDialog" max-width="640">
   <v-card title="レーティングをメタデータに反映">
     <v-card-text class="pt-5">
-      <v-alert type="warning" variant="tonal" density="comfortable" class="mb-4">
+      <v-alert type="error" variant="tonal" density="comfortable" class="mb-4">
         <strong>写真の原本を書き換えます。</strong>
         星は XMP（<code>xmp:Rating</code>）として写真の中に書き込まれ、Lightroom や Bridge などが読み取れます。
         撮影情報（EXIF）と画像そのものには手を加えません。
