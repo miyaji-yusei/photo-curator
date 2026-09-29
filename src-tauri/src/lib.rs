@@ -1,3 +1,5 @@
+mod format;
+
 use exif::{In, Reader, Tag, Value};
 use image::DynamicImage;
 use rusqlite::{params, Connection};
@@ -157,9 +159,9 @@ impl AnalysisMode {
         }
     }
 
-    fn workers(self) -> usize {
+    fn workers(self, folder: &Path) -> usize {
         match self {
-            Self::Foreground => analysis_worker_count(),
+            Self::Foreground => analysis_worker_count_for(folder),
             Self::Background => 1,
         }
     }
@@ -181,6 +183,57 @@ fn analysis_worker_count() -> usize {
         .map(|value| value.get())
         .unwrap_or(2);
     (cores / 2).clamp(MIN_ANALYSIS_WORKERS, MAX_ANALYSIS_WORKERS)
+}
+
+/// フォルダに合わせた worker 数。ネットワークのフォルダは並列 2 に抑える
+/// （同時に何本も投げると NAS 側が詰まって、かえって遅くなる）。
+/// 環境変数で明示された値があればそれを優先する。
+fn analysis_worker_count_for(folder: &Path) -> usize {
+    if std::env::var(WORKER_COUNT_ENV).is_ok() {
+        return analysis_worker_count();
+    }
+    if is_network_path(folder) {
+        return NETWORK_ANALYSIS_WORKERS;
+    }
+    analysis_worker_count()
+}
+
+/// ネットワークのフォルダを解析するときの worker 数。
+const NETWORK_ANALYSIS_WORKERS: usize = 2;
+
+/// フォルダがネットワーク上か。UNC（`\\` 始まり）か、ドライブの種類が
+/// `DRIVE_REMOTE`（割り当て済みのネットワークドライブ）なら true。
+#[cfg(windows)]
+fn is_network_path(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::{Component, Prefix};
+    use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+
+    // windows-sys では別の feature（WindowsProgramming）にあるので、値（4）を直に持つ。
+    const DRIVE_REMOTE: u32 = 4;
+
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        // 接頭辞として読めなくても、`\\server` のように `\\` で始まるなら UNC とみなす。
+        let text = path.to_string_lossy();
+        return text.starts_with("\\\\") && !text.starts_with("\\\\?\\") && !text.starts_with("\\\\.\\");
+    };
+    let letter = match prefix.kind() {
+        Prefix::UNC(..) | Prefix::VerbatimUNC(..) => return true,
+        Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => letter,
+        _ => return false,
+    };
+    let root: Vec<u16> = std::ffi::OsString::from(format!("{}:\\", letter as char))
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `root` は NUL 終端の UTF-16 で、呼び出しの間だけ生きている。
+    unsafe { GetDriveTypeW(root.as_ptr()) == DRIVE_REMOTE }
+}
+
+/// Windows 以外では常にローカル扱い。
+#[cfg(not(windows))]
+fn is_network_path(_path: &Path) -> bool {
+    false
 }
 
 #[derive(Serialize)]
@@ -630,6 +683,8 @@ struct PhotoWork {
     photo_id: String,
     captured_at: Option<i64>,
     timestamp_source: Option<TimestampSource>,
+    /// 中身が画像ではなかった。行を `is_missing=1` にして数から外す。
+    not_image: bool,
     d_hash: Option<String>,
     thumbnail_path: Option<String>,
     thumbnail_source: Option<&'static str>,
@@ -649,6 +704,7 @@ impl PhotoWork {
             photo_id: photo_id.to_owned(),
             captured_at: None,
             timestamp_source: None,
+            not_image: false,
             d_hash: None,
             thumbnail_path: None,
             thumbnail_source: None,
@@ -931,10 +987,14 @@ impl PhotoSource for LocalPhoto<'_> {
 /// EXIF → ファイル名 → mtime。ファイル名を mtime より優先するのは、
 /// 書き出しや転送で EXIF が落ちても `20260630_181932` の類は残ることが多く、
 /// mtime よりはるかに撮影時刻に近いため。
+#[cfg_attr(not(test), allow(dead_code))]
 fn read_capture_time_from(source: &dyn PhotoSource) -> Option<CaptureTime> {
-    source
-        .head(EXIF_HEAD_PROBE)
-        .and_then(|head| exif_capture_time_bytes(&head))
+    capture_time_from_head(source, source.head(EXIF_HEAD_PROBE).as_deref())
+}
+
+/// 先頭 64KB を読み済みのときの撮影時刻。先頭を 2 回読まないために分けてある。
+fn capture_time_from_head(source: &dyn PhotoSource, head: Option<&[u8]>) -> Option<CaptureTime> {
+    head.and_then(exif_capture_time_bytes)
         .or_else(|| {
             let name = source.name()?;
             let stem = Path::new(&name).file_stem()?.to_str()?.to_owned();
@@ -951,6 +1011,7 @@ fn read_capture_time_from(source: &dyn PhotoSource) -> Option<CaptureTime> {
         })
 }
 
+#[cfg_attr(not(feature = "bench"), allow(dead_code))]
 fn read_capture_time(path: &Path) -> Option<CaptureTime> {
     read_capture_time_from(&LocalPhoto(path))
 }
@@ -1689,8 +1750,63 @@ fn fingerprint(path: &Path) -> Option<(i64, i64)> {
     Some((mtime, metadata.len() as i64))
 }
 
+/// 画像・RAW の名前の拡張子。拡張子は「候補に入れるか」だけに使い、
+/// 画像かどうかは中身で決める（`content_is_not_image`）。
+const IMAGE_EXTENSIONS: [&str; 13] = [
+    "jpg", "jpeg", "png", "webp", "heic", "heif", "cr2", "cr3", "nef", "arw", "dng", "raf", "orf",
+];
+/// 拡張子が動画のものは、中身に関わらず常に除く。
+const VIDEO_EXTENSIONS: [&str; 7] = ["mp4", "mov", "m4v", "avi", "mts", "m2ts", "3gp"];
+/// 中身が JPEG・PNG・WebP でなくても「画像だが今は読めない」に数える拡張子。
+const OTHER_IMAGE_EXTENSIONS: [&str; 9] = [
+    "heic", "heif", "cr2", "cr3", "nef", "arw", "dng", "raf", "orf",
+];
+
+fn extension_lower(path: &Path) -> Option<String> {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+}
+
+/// 拡張子が画像・RAW の名前か、拡張子が無いもの。動画の拡張子は常に除く。
 fn is_supported(path: &Path) -> bool {
-    matches!(path.extension().and_then(|value| value.to_str()).map(|value| value.to_ascii_lowercase()), Some(ext) if ["jpg", "jpeg", "png", "webp"].contains(&ext.as_str()))
+    match extension_lower(path) {
+        Some(ext) => {
+            !VIDEO_EXTENSIONS.contains(&ext.as_str()) && IMAGE_EXTENSIONS.contains(&ext.as_str())
+        }
+        None => true,
+    }
+}
+
+/// 中身が画像ではない（動画・テキスト・壊れたファイルなど）。先頭バイトで決める。
+/// JPEG・PNG・WebP 以外の画像（HEIC・RAW）は先頭バイトでは見分けられないので、
+/// 拡張子がその種類なら画像として通し、「読めなかった」に数える（解析で失敗する）。
+/// HEIC・CR3 は `ftyp` で始まり、`sniff` は動画と判定するため、この扱いが要る。
+fn content_is_not_image(head: &[u8], path: &Path) -> bool {
+    let kind = format::sniff(head);
+    if format::is_image(kind) {
+        return false;
+    }
+    let other_image = extension_lower(path)
+        .map(|ext| OTHER_IMAGE_EXTENSIONS.contains(&ext.as_str()))
+        .unwrap_or(false);
+    !other_image
+}
+
+/// 隠しフォルダ・隠しファイル（名前が `.` で始まる）。NAS の `.webaxs` のような
+/// サムネイルのキャッシュを原本として数えないために、走査の入口で除く。
+fn is_hidden_entry(entry: &walkdir::DirEntry) -> bool {
+    entry.depth() > 0 && entry.file_name().to_string_lossy().starts_with('.')
+}
+
+fn list_photo_files(folder: &str) -> Vec<PathBuf> {
+    WalkDir::new(folder)
+        .into_iter()
+        .filter_entry(|entry| !is_hidden_entry(entry))
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file() && is_supported(entry.path()))
+        .map(|entry| entry.into_path())
+        .collect()
 }
 
 fn photo_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Photo> {
@@ -1762,12 +1878,7 @@ fn project_folder(app: &AppHandle, project_id: &str) -> Result<String, String> {
 fn run_scan(app: AppHandle, registry: &TaskRegistry, project_id: String) -> Result<(), String> {
     let task_key = format!("scan:{project_id}");
     let folder = project_folder(&app, &project_id)?;
-    let entries: Vec<PathBuf> = WalkDir::new(&folder)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file() && is_supported(entry.path()))
-        .map(|entry| entry.into_path())
-        .collect();
+    let entries: Vec<PathBuf> = list_photo_files(&folder);
     let total = entries.len();
     progress(
         &app,
@@ -1891,6 +2002,79 @@ fn run_scan(app: AppHandle, registry: &TaskRegistry, project_id: String) -> Resu
     Ok(())
 }
 
+/// 撮影時刻の段の worker 1本ぶん。先頭 64KB を 1 回だけ読み、画像かどうかと
+/// 撮影時刻を決める。**DB には触れない。**
+fn metadata_one(index: usize, job: &MetadataJob) -> PhotoWork {
+    let mut result = PhotoWork::new(index, &job.id);
+    let path = Path::new(&job.path);
+    let source = LocalPhoto(path);
+    let head = source.head(EXIF_HEAD_PROBE);
+    if let Some(head) = head.as_deref() {
+        if content_is_not_image(head, path) {
+            result.not_image = true;
+            return result;
+        }
+    }
+    match capture_time_from_head(&source, head.as_deref()) {
+        Some(capture) => {
+            result.captured_at = Some(capture.at);
+            result.timestamp_source = Some(capture.source);
+        }
+        None => {
+            result.error = Some("撮影時刻を読み取れませんでした。".into());
+        }
+    }
+    result
+}
+
+/// 撮影時刻の段の結果を書く。画像ではなかった行は数から外す（`is_missing=1`）。
+/// 撮影時刻は空のままにするので、再走査で行が戻っても次の解析でまた判定される。
+fn apply_metadata(tx: &Connection, item: &PhotoWork) -> Result<(), String> {
+    if item.not_image {
+        tx.execute(
+            "UPDATE photos SET is_missing=1,captured_at=NULL,timestamp_source=NULL,
+               analysis_error=NULL,analysis_error_at=NULL
+             WHERE id=?1",
+            params![item.photo_id],
+        )
+        .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    tx.execute(
+        "UPDATE photos SET captured_at=?1,timestamp_source=?2,
+           analysis_error=?3,analysis_error_at=?4
+         WHERE id=?5",
+        params![
+            item.captured_at,
+            item.timestamp_source
+                .unwrap_or(TimestampSource::Unknown)
+                .as_str(),
+            item.error,
+            item.error.as_ref().map(|_| now()),
+            item.photo_id
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// プロジェクトの写真の数を、欠損を除いて数え直す。
+fn recount_photos(conn: &Connection, project_id: &str) -> Result<i64, String> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM photos WHERE project_id=?1 AND is_missing=0",
+            params![project_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    conn.execute(
+        "UPDATE projects SET photo_count=?1 WHERE id=?2",
+        params![count, project_id],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(count)
+}
+
 /// worker 1本ぶんの仕事。1枚を読み、サムネイルと dHash を作る。
 /// **DB には触れない。**書き込みは writer が `flush_results` でまとめて行う。
 fn hash_one(thumbnails: &Path, index: usize, record: &HashRecord) -> PhotoWork {
@@ -1942,6 +2126,8 @@ fn run_burst_analysis(
     };
     let timeout = Duration::from_millis(PHOTO_TIMEOUT_MS);
     let thumbnails = thumbnail_dir(&app)?;
+    // ネットワークのフォルダは worker 数を抑えるので、フォルダの場所を先に知る。
+    let folder = project_folder(&app, &project_id)?;
     let conn = connection(&app)?;
     let records: Vec<MetadataRecord> = {
         let mut statement = conn
@@ -1983,43 +2169,14 @@ fn run_burst_analysis(
         let interval = progress_interval(metadata_total);
         let mut pending: Vec<PhotoWork> = Vec::with_capacity(ANALYSIS_CHUNK_SIZE);
         let mut committed = 0usize;
-        let apply = |tx: &Connection, item: &PhotoWork| -> Result<(), String> {
-            tx.execute(
-                "UPDATE photos SET captured_at=?1,timestamp_source=?2,
-                   analysis_error=?3,analysis_error_at=?4
-                 WHERE id=?5",
-                params![
-                    item.captured_at,
-                    item.timestamp_source
-                        .unwrap_or(TimestampSource::Unknown)
-                        .as_str(),
-                    item.error,
-                    item.error.as_ref().map(|_| now()),
-                    item.photo_id
-                ],
-            )
-            .map_err(|error| error.to_string())?;
-            Ok(())
-        };
+        let apply = apply_metadata;
         let outcome = run_in_parallel(
             Arc::new(metadata_jobs),
-            mode.workers(),
+            mode.workers(Path::new(&folder)),
             timeout,
             &should_stop,
             // worker はファイルを読むだけ。DB には触れない。
-            |index, job: &MetadataJob| {
-                let mut result = PhotoWork::new(index, &job.id);
-                match read_capture_time(Path::new(&job.path)) {
-                    Some(capture) => {
-                        result.captured_at = Some(capture.at);
-                        result.timestamp_source = Some(capture.source);
-                    }
-                    None => {
-                        result.error = Some("撮影時刻を読み取れませんでした。".into());
-                    }
-                }
-                result
-            },
+            |index, job: &MetadataJob| metadata_one(index, job),
             &mut |item| {
                 if item.error.is_some() {
                     failed += 1;
@@ -2063,6 +2220,8 @@ fn run_burst_analysis(
         )?;
         // キャンセルされていても、読み終わっているぶんは書いてから抜ける。
         committed += flush_results(&conn, &mut pending, &apply)?;
+        // 中身が画像ではなかった写真は数から外れているので、件数を数え直す。
+        recount_photos(&conn, &project_id)?;
         if outcome.cancelled {
             progress_note(
                 &app,
@@ -2205,7 +2364,7 @@ fn run_burst_analysis(
     let thumbnails_for_workers = thumbnails.clone();
     let outcome = run_in_parallel(
         Arc::new(needed_records),
-        mode.workers(),
+        mode.workers(Path::new(&folder)),
         timeout,
         &should_stop,
         // worker はファイルを読んでサムネイルを書くだけ。DB には触れない。
@@ -2366,7 +2525,14 @@ fn get_analysis_backlog(app: AppHandle, project_id: String) -> Result<i64, Strin
 /// プロジェクトを削除する。**写真原本には一切触れない。**
 /// 消すのは DB の行と、このアプリが `app_data_dir` 配下に作ったサムネイルだけ。
 #[tauri::command]
-fn delete_project(app: AppHandle, project_id: String) -> Result<(), String> {
+async fn delete_project(app: AppHandle, project_id: String) -> Result<(), String> {
+    // 重い処理（ディスクと SQLite）はメインスレッドから外す。
+    tauri::async_runtime::spawn_blocking(move || delete_project_blocking(app, project_id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn delete_project_blocking(app: AppHandle, project_id: String) -> Result<(), String> {
     let conn = connection(&app)?;
 
     // 先にサムネイルの実体を消す。DB を消してからでは対象が分からなくなる。
@@ -2474,7 +2640,14 @@ fn photo_page_query(
 }
 
 #[tauri::command]
-fn get_project_photo_page(
+async fn get_project_photo_page(app: AppHandle, project_id: String, offset: i64, limit: i64, rating: Option<i64>, sort: Option<String>) -> Result<PhotoPage, String> {
+    // 重い処理（ディスクと SQLite）はメインスレッドから外す。
+    tauri::async_runtime::spawn_blocking(move || get_project_photo_page_blocking(app, project_id, offset, limit, rating, sort))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn get_project_photo_page_blocking(
     app: AppHandle,
     project_id: String,
     offset: i64,
@@ -2681,7 +2854,14 @@ fn reset_selection_results(app: AppHandle, project_id: String) -> Result<(), Str
 }
 
 #[tauri::command]
-fn get_selection_summary(app: AppHandle, project_id: String) -> Result<SelectionSummary, String> {
+async fn get_selection_summary(app: AppHandle, project_id: String) -> Result<SelectionSummary, String> {
+    // 重い処理（ディスクと SQLite）はメインスレッドから外す。
+    tauri::async_runtime::spawn_blocking(move || get_selection_summary_blocking(app, project_id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn get_selection_summary_blocking(app: AppHandle, project_id: String) -> Result<SelectionSummary, String> {
     let conn = connection(&app)?;
     let mut counts = vec![0i64; (MAX_RATING + 1) as usize];
     let mut statement = conn
@@ -2785,7 +2965,14 @@ fn unique_destination(directory: &Path, file_name: &str) -> PathBuf {
 /// 消える**。移動は「コピーしてから元を消す」順で行い、コピーに失敗したら
 /// 元は残す。同じボリュームなら rename を試し、失敗したらコピーへ落とす。
 #[tauri::command]
-fn export_by_rating(
+async fn export_by_rating(app: AppHandle, project_id: String, destination: String, ratings: Vec<i64>, move_files: bool) -> Result<ExportReport, String> {
+    // 重い処理（ディスクと SQLite）はメインスレッドから外す。
+    tauri::async_runtime::spawn_blocking(move || export_by_rating_blocking(app, project_id, destination, ratings, move_files))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn export_by_rating_blocking(
     app: AppHandle,
     project_id: String,
     destination: String,
@@ -2947,7 +3134,14 @@ fn jpeg_with_rating(original: &[u8], rating: i64) -> Result<Vec<u8>, String> {
 /// 一時ファイルへ書いてから中身を検証し、問題なければ置き換える。
 /// 途中で失敗しても原本はそのまま残る。JPEG 以外は触らない。
 #[tauri::command]
-fn write_ratings_to_files(
+async fn write_ratings_to_files(app: AppHandle, project_id: String, ratings: Vec<i64>) -> Result<ExportReport, String> {
+    // 重い処理（ディスクと SQLite）はメインスレッドから外す。
+    tauri::async_runtime::spawn_blocking(move || write_ratings_to_files_blocking(app, project_id, ratings))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn write_ratings_to_files_blocking(
     app: AppHandle,
     project_id: String,
     ratings: Vec<i64>,
@@ -3046,7 +3240,14 @@ fn get_photos_by_ids(
 /// core に渡す写真の行。**その星に関係なく全件**（欠損を除く）を 1 回で返す。
 /// 並べ替えはフロント（`utils/coreInputs.ts`）が撮影順にする。
 #[tauri::command]
-fn get_core_inputs(app: AppHandle, project_id: String) -> Result<Vec<Photo>, String> {
+async fn get_core_inputs(app: AppHandle, project_id: String) -> Result<Vec<Photo>, String> {
+    // 重い処理（ディスクと SQLite）はメインスレッドから外す。
+    tauri::async_runtime::spawn_blocking(move || get_core_inputs_blocking(app, project_id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn get_core_inputs_blocking(app: AppHandle, project_id: String) -> Result<Vec<Photo>, String> {
     let conn = connection(&app)?;
     let mut statement = conn
         .prepare(&format!(
@@ -5507,7 +5708,7 @@ mod tests {
             "既定の worker 数が範囲外: {workers}"
         );
         // 事前生成は必ず 1 本。前面の操作を邪魔しないため。
-        assert_eq!(AnalysisMode::Background.workers(), 1);
+        assert_eq!(AnalysisMode::Background.workers(Path::new("C:/photos")), 1);
     }
 
     // migration は利用者の実データに触れるため、合成データだけでなく実物の
@@ -5931,6 +6132,124 @@ mod tests {
         }
         drop(conn);
         fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    // ---- 走査の除外・形式の判定・ネットワークのフォルダ ------------------
+
+    fn relative_names(folder: &Path, files: &[PathBuf]) -> Vec<String> {
+        let mut names: Vec<String> = files
+            .iter()
+            .map(|path| {
+                path.strip_prefix(folder)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn supported_names_are_images_raws_or_have_no_extension() {
+        for name in ["a.jpg", "a.JPEG", "a.png", "a.webp", "a.heic", "a.cr2", "a.dng", "a.rw2x", "noext"] {
+            let expected = name != "a.rw2x";
+            assert_eq!(is_supported(Path::new(name)), expected, "{name}");
+        }
+        for name in ["a.mp4", "a.MOV", "a.m4v", "a.avi", "a.mts", "a.m2ts", "a.3gp", "a.mkv", "a.txt"] {
+            assert!(!is_supported(Path::new(name)), "{name}");
+        }
+    }
+
+    /// 隠しフォルダ・動画は数えず、中身が JPEG の `.cr2` は数え、中身がテキストの
+    /// `.jpg` は数から外れる。
+    #[test]
+    fn scanning_skips_hidden_and_video_and_judges_the_content() {
+        let directory = test_directory("scan-content");
+        let root = directory.to_string_lossy().to_string();
+        let jpeg = jpeg_bytes(64, 48, 1);
+        fs::create_dir_all(directory.join(".hidden")).unwrap();
+        fs::write(directory.join(".hidden/a.jpg"), &jpeg).unwrap();
+        fs::write(directory.join(".hidden_file.jpg"), &jpeg).unwrap();
+        fs::write(directory.join("ok.jpg"), &jpeg).unwrap();
+        fs::write(directory.join("fake.cr2"), &jpeg).unwrap();
+        fs::write(directory.join("broken.jpg"), b"this is not an image, just text").unwrap();
+        fs::write(directory.join("video.mp4"), b"\0\0\0\x18ftypmp42\0\0\0\0mp42isom").unwrap();
+        // HEIC は先頭が `ftyp` だが画像。数から外さず、「読めなかった」に数える。
+        fs::write(directory.join("photo.heic"), b"\0\0\0\x18ftypheic\0\0\0\0mif1heic").unwrap();
+
+        let files = list_photo_files(&root);
+        assert_eq!(
+            relative_names(&directory, &files),
+            vec!["broken.jpg", "fake.cr2", "ok.jpg", "photo.heic"]
+        );
+
+        let conn = open_database(&directory.join("scan.sqlite3")).expect("open database");
+        conn.execute(
+            "INSERT INTO projects (id,name,folder_path,photo_count,status,created_at,updated_at)
+             VALUES ('p1','p1',?1,0,'ready',1,1)",
+            params![root],
+        )
+        .expect("insert project");
+        for path in &files {
+            let (mtime, size) = fingerprint(path).map_or((None, None), |(m, s)| (Some(m), Some(s)));
+            let relative = path.strip_prefix(&directory).unwrap().to_string_lossy().to_string();
+            upsert_photo(
+                &conn,
+                "p1",
+                &path.to_string_lossy(),
+                &relative,
+                &relative,
+                mtime,
+                size,
+            )
+            .expect("upsert");
+        }
+        assert_eq!(recount_photos(&conn, "p1").unwrap(), 4);
+
+        for (index, path) in files.iter().enumerate() {
+            let id: String = conn
+                .query_row(
+                    "SELECT id FROM photos WHERE path=?1",
+                    params![path.to_string_lossy().to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let job = MetadataJob { id, path: path.to_string_lossy().to_string() };
+            let work = metadata_one(index, &job);
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            assert_eq!(work.not_image, name == "broken.jpg", "{name}");
+            apply_metadata(&conn, &work).expect("apply");
+        }
+        assert_eq!(recount_photos(&conn, "p1").unwrap(), 3, "broken.jpg は数から外れる");
+        let count: i64 = conn
+            .query_row("SELECT photo_count FROM projects WHERE id='p1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 3);
+        let missing: String = conn
+            .query_row("SELECT name FROM photos WHERE is_missing=1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(missing, "broken.jpg");
+        // fake.cr2 は撮影時刻まで読めている（画像として扱われた）。
+        let captured: Option<i64> = conn
+            .query_row("SELECT captured_at FROM photos WHERE name='fake.cr2'", [], |row| row.get(0))
+            .unwrap();
+        assert!(captured.is_some());
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn a_local_folder_keeps_the_default_worker_count() {
+        assert!(!is_network_path(Path::new("/home/user/photos")));
+        assert!(!is_network_path(Path::new("C:/photos")));
+        if std::env::var(WORKER_COUNT_ENV).is_err() {
+            assert_eq!(
+                analysis_worker_count_for(Path::new("/home/user/photos")),
+                analysis_worker_count()
+            );
+        }
+        assert_eq!(NETWORK_ANALYSIS_WORKERS, 2);
     }
 
     // ---- レートの移動 ----------------------------------------------------

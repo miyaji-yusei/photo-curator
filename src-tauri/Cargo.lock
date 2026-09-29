@@ -2415,6 +2415,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "uuid",
  "walkdir",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
