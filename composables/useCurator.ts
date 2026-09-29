@@ -182,6 +182,9 @@ function createCurator() {
   const nextRoundGroupSize = ref(10)
   const nextRoundRating = ref(0)
   const restartDialog = ref(false)
+  /** 確認のダイアログが「選別を開始」から開かれたか（確定すると、やり直しではなく開始へ進む）。 */
+  const restartForStart = ref(false)
+  watch(restartDialog, open => { if (!open) restartForStart.value = false })
   const restartBusy = ref(false)
   const resultsPhotos = ref<Photo[]>([])
   const resultsTotal = ref(0)
@@ -925,6 +928,26 @@ function createCurator() {
   // 解析の完了を待たない。scan 後の事前生成で出来ているぶんをそのまま使い、
   // 未解析が残っていても選別画面へ進む。残りはバックグラウンドで進み続ける。
   async function beginTournament() {
+    if (!activeProject.value || taskDialog.value || sidecarClash.value) return
+    // 星が 1 つでも付いている（取り込んだ星を含む）と、開始は星を全部 0 にする。
+    // 「最初からやり直す」と同じ確認を先に出す。「キャンセル」なら何もしない。
+    await loadSummary()
+    if (hasSelectionData.value) {
+      restartForStart.value = true
+      restartDialog.value = true
+      return
+    }
+    await startTournament()
+  }
+
+  /** 確認の「星を全部消してやり直す」。開始の確認から開いていたら、閉じて開始へ進む。 */
+  async function confirmRestartDialog() {
+    if (!restartForStart.value) return restartFromScratch()
+    restartDialog.value = false
+    await startTournament()
+  }
+
+  async function startTournament() {
     if (!activeProject.value || taskDialog.value || sidecarClash.value) return
     pendingTournamentSettings.value = { ...settings }
     if (settings.groupBursts) {
@@ -2556,6 +2579,8 @@ function createCurator() {
     nextRoundGroupSize,
     nextRoundRating,
     restartDialog,
+    restartForStart,
+    confirmRestartDialog,
     restartBusy,
     resultsPhotos,
     resultsTotal,

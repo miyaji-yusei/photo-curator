@@ -2,7 +2,7 @@
 const {
   restartBusy,
   restartDialog,
-  restartFromScratch
+  confirmRestartDialog
 } = useCurator()
 </script>
 
@@ -21,7 +21,7 @@ const {
     <v-card-actions class="pa-5 pt-2">
       <v-spacer />
       <v-btn variant="outlined" :disabled="restartBusy" @click="restartDialog = false">キャンセル</v-btn>
-      <v-btn color="error" :loading="restartBusy" @click="restartFromScratch">星を全部消してやり直す</v-btn>
+      <v-btn color="error" :loading="restartBusy" @click="confirmRestartDialog">星を全部消してやり直す</v-btn>
     </v-card-actions>
   </v-card>
 </v-dialog>
