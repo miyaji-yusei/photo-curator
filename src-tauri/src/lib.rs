@@ -1,5 +1,5 @@
 use exif::{In, Reader, Tag, Value};
-use image::{imageops::FilterType, DynamicImage, GenericImageView};
+use image::DynamicImage;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -51,7 +51,7 @@ const MIN_EXIF_THUMBNAIL_EDGE: u32 = 96;
 // dHash の算出方式のバージョン。fingerprint は「ファイルが変わっていない」ことしか
 // 見ておらず、**アルゴリズムの変更を検知できない**。方式を変えたらこの値を上げる。
 // 版が合わない d_hash はキャッシュとして使わず、サムネイルから引き直す。
-const D_HASH_VERSION: i64 = 2;
+const D_HASH_VERSION: i64 = photo_curator_core::D_HASH_VERSION as i64;
 // サムネイルの生成方式のバージョン。**d_hash とは別に持つ必要がある。**
 // `analyse_photo` は保存済みのサムネイルが使えると判断したら原本に戻らないため、
 // `D_HASH_VERSION` を上げても「古いサムネイルから引き直す」だけで、サムネイルの
@@ -226,13 +226,6 @@ struct PhotoPage {
     total: i64,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SelectionSeed {
-    id: String,
-    rating: i64,
-}
-
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProjectProgress {
@@ -270,7 +263,9 @@ fn db_path(app: &AppHandle) -> Result<PathBuf, String> {
         .app_data_dir()
         .map_err(|error| error.to_string())?;
     fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
-    Ok(dir.join("photo-curator.sqlite3"))
+    // 指紋の計算式を core に替えたので、古い指紋が混ざらないよう別のファイルにする。
+    // 旧 `photo-curator.sqlite3` は読まない・消さない。
+    Ok(dir.join("photo-curator-v2.sqlite3"))
 }
 
 fn connection(app: &AppHandle) -> Result<Connection, String> {
@@ -1398,17 +1393,18 @@ fn encode_thumbnail(image: &DynamicImage) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-fn d_hash_of(image: &DynamicImage) -> String {
-    let small = image.resize_exact(9, 8, FilterType::Triangle).grayscale();
-    let mut bits = 0u64;
-    for y in 0..8 {
-        for x in 0..8 {
-            if small.get_pixel(x, y).0[0] > small.get_pixel(x + 1, y).0[0] {
-                bits |= 1 << (y * 8 + x);
-            }
-        }
-    }
-    format!("{bits:016x}")
+/// 指紋。**必ず core を通す**（Android・Web と同じ計算式にするため）。
+/// 大きい画像のまま平均を取ると遅いので、先に軽く縮めてから渡す。
+/// 作れないとき（極端に小さい画像など）は None で、0 を入れない。
+fn d_hash_of(image: &DynamicImage) -> Option<String> {
+    let scaled = if image.width().max(image.height()) > 128 {
+        image.thumbnail(128, 128)
+    } else {
+        image.clone()
+    };
+    let gray = scaled.to_luma8();
+    let (width, height) = (gray.width(), gray.height());
+    photo_curator_core::d_hash_from_gray(gray.into_raw(), width, height)
 }
 
 /// dHash は**必ず保存するサムネイルのバイト列から**計算する。
@@ -1417,7 +1413,7 @@ fn d_hash_of(image: &DynamicImage) -> String {
 fn hash_thumbnail_bytes(bytes: &[u8]) -> Option<String> {
     image::load_from_memory_with_format(bytes, image::ImageFormat::Jpeg)
         .ok()
-        .map(|image| d_hash_of(&image))
+        .and_then(|image| d_hash_of(&image))
 }
 
 /// キャッシュを使わずに1枚ぶんのハッシュを出す。計測ハーネス用。
@@ -3047,51 +3043,6 @@ fn get_photos_by_ids(
         .collect())
 }
 
-/// 選別の並び順。**ここが返す順序が、そのまま選別画面の並びになる。**
-///
-/// 似た構図は撮影時刻が近いので、撮影順に並べると「その中の1枚を選ぶ」比較が
-/// 同じ場面どうしになる。以前は `ORDER BY id`（= UUID なので実質ランダム）で、
-/// さらにフロント側でシャッフルしていた。
-/// 撮影日時の無い写真は末尾へ回し、その中はファイル順で安定させる。
-const SELECTION_SEED_ORDER: &str = " ORDER BY captured_at IS NULL, captured_at, relative_path";
-
-/// 選別に出す写真。`rating` を指定するとその星の写真だけを返す。
-/// 「★3 の 120 枚を選別する」という使い方をするので、対象は星で決まる。
-#[tauri::command]
-fn get_selection_seed(
-    app: AppHandle,
-    project_id: String,
-    rating: Option<i64>,
-) -> Result<Vec<SelectionSeed>, String> {
-    let conn = connection(&app)?;
-    let where_extra = if rating.is_some() {
-        " AND rating=?2"
-    } else {
-        ""
-    };
-    let mut statement = conn
-        .prepare(&format!(
-            "SELECT id,rating FROM photos WHERE project_id=?1 AND is_missing=0{where_extra}{SELECTION_SEED_ORDER}"
-        ))
-        .map_err(|error| error.to_string())?;
-    let rows = statement
-        .query_map(
-            rusqlite::params_from_iter(
-                std::iter::once(rusqlite::types::Value::from(project_id.clone()))
-                    .chain(rating.map(rusqlite::types::Value::from)),
-            ),
-            |row| {
-                Ok(SelectionSeed {
-                    id: row.get(0)?,
-                    rating: row.get(1)?,
-                })
-            },
-        )
-        .map_err(|error| error.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())
-}
-
 /// core に渡す写真の行。**その星に関係なく全件**（欠損を除く）を 1 回で返す。
 /// 並べ替えはフロント（`utils/coreInputs.ts`）が撮影順にする。
 #[tauri::command]
@@ -3681,7 +3632,6 @@ pub fn run() {
             get_analysis_backlog,
             get_project_photo_page,
             get_photos_by_ids,
-            get_selection_seed,
             save_selection_results,
             reset_selection_results,
             move_rating,
@@ -3713,6 +3663,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::GenericImageView;
 
     #[test]
     fn migrates_the_legacy_photo_schema_before_creating_indexes() {
@@ -5933,54 +5884,51 @@ mod tests {
         fs::remove_dir_all(&directory).expect("remove test directory");
     }
 
-    /// 選別の並びは撮影順。似た構図は撮影時刻が近いので、この並びのまま
-    /// グループに切ると「同じ場面から1枚選ぶ」比較になる。
-    /// 撮影日時の無い写真は末尾へ回し、その中はファイル順で安定させる。
+    // ---- 指紋（core）・DB のファイル ------------------------------------
+
+    /// 同じ絵を JPEG で作り直しても、指紋はほとんど動かない（core と同じ基準）。
     #[test]
-    fn selection_seed_is_ordered_by_capture_time() {
-        let directory = test_directory("seed-order");
-        let conn = open_database(&directory.join("seed.sqlite3")).expect("open database");
-        conn.execute(
-            "INSERT INTO projects (id,name,folder_path,photo_count,status,created_at,updated_at)
-             VALUES ('p1','p1','C:/photos',5,'ready',1,1)",
-            [],
+    fn the_fingerprint_survives_a_jpeg_round_trip() {
+        let original = synthetic_image(640, 480, 3);
+        let recompressed = image::load_from_memory_with_format(
+            &encode_thumbnail(&original).expect("encode"),
+            image::ImageFormat::Jpeg,
         )
-        .expect("insert project");
-
-        // id 順・ファイル名順・挿入順のどれとも食い違う撮影順にする。
-        // どれか1つでも一致していると、間違った ORDER BY を素通りさせてしまう。
-        let insert = |id: &str, relative: &str, captured: Option<i64>| {
-            conn.execute(
-                "INSERT INTO photos (id,project_id,path,relative_path,name,captured_at,rating,is_missing)
-                 VALUES (?1,'p1',?2,?3,?3,?4,0,0)",
-                params![id, format!("C:/photos/{relative}"), relative, captured],
-            )
-            .expect("insert photo");
-        };
-        insert("id-a", "2-third.jpg", Some(300));
-        insert("id-y", "b-no-time.jpg", None);
-        insert("id-z", "3-first.jpg", Some(100));
-        insert("id-b", "c-no-time.jpg", None);
-        insert("id-m", "1-second.jpg", Some(200));
-
-        let mut statement = conn
-            .prepare(&format!(
-                "SELECT id FROM photos WHERE project_id=?1 AND is_missing=0{SELECTION_SEED_ORDER}"
-            ))
-            .expect("prepare");
-        let ids: Vec<String> = statement
-            .query_map(params!["p1"], |row| row.get(0))
-            .expect("query")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("collect");
-
-        assert_eq!(
-            ids,
-            vec!["id-z", "id-m", "id-a", "id-y", "id-b"],
-            "撮影順。日時の無い2枚は末尾で、その中はファイル順"
+        .expect("decode");
+        let a = d_hash_of(&original).expect("hash of original");
+        let b = d_hash_of(&recompressed).expect("hash of recompressed");
+        assert!(
+            photo_curator_core::hash_distance(a.clone(), b.clone()) <= 2,
+            "{a} vs {b}"
         );
+        assert_eq!(D_HASH_VERSION, 2);
+    }
 
-        drop(statement);
+    #[test]
+    fn a_too_small_image_has_no_fingerprint() {
+        assert!(d_hash_of(&synthetic_image(4, 4, 0)).is_none());
+    }
+
+    #[test]
+    fn a_fresh_database_file_creates_every_table() {
+        let directory = test_directory("fresh-db");
+        let conn = open_database(&directory.join("photo-curator-v2.sqlite3")).expect("open");
+        for table in [
+            "projects",
+            "photos",
+            "project_states",
+            "app_settings",
+            "pair_overrides",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .expect("query");
+            assert_eq!(count, 1, "表 {table} が作られていない");
+        }
         drop(conn);
         fs::remove_dir_all(&directory).expect("remove test directory");
     }
