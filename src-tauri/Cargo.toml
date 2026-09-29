@@ -41,3 +41,8 @@ uuid = { version = "1", features = ["v4"] }
 # scaled decode を提供しないため、EXIF サムネイルが無い JPEG の
 # フォールバック経路としてこちらを併用する。
 jpeg-decoder = "0.3"
+
+# dev（`tauri dev`）でも画像のデコード・縮小を最適化する。依存だけ最適化するので自分のコードのビルドは遅くならない。
+# 最適化なしだと表示用画像づくりが release の約 35 倍遅い（docs/rebuild/07-取り込み方針.md §1）。
+[profile.dev.package."*"]
+opt-level = 3

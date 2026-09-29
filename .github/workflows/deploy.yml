@@ -7,9 +7,7 @@
 name: Deploy to GitHub Pages
 
 on:
-  push:
-    branches: [main]
-  # 手動でも流せるようにしておく。
+  # 公開しない（05章）ため、手動で流したときだけ配信する。
   workflow_dispatch:
 
 permissions:
