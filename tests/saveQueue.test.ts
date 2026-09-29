@@ -99,4 +99,39 @@ describe('saveQueue', () => {
     await queue.flush()
     expect(queue.busy).toBe(false)
   })
+
+  it('drop: そのプロジェクトの未書き込みを捨てる。ほかのプロジェクトは書く', async () => {
+    const w = gatedWriter()
+    const queue = createSaveQueue<string>(w.write, () => {})
+    queue.enqueue('p', '1') // 書き込み中になる
+    queue.enqueue('q', 'x')
+    queue.enqueue('gone', 'y')
+    await tick()
+    await Promise.all([queue.drop('gone'), (async () => { w.release(); await tick() })()])
+    w.release(); await queue.flush()
+    expect(w.log).toEqual(['p:1', 'q:x'])
+  })
+
+  it('drop: 書いている最中の 1 件は、終わるまで待つ', async () => {
+    const w = gatedWriter()
+    const queue = createSaveQueue<string>(w.write, () => {})
+    queue.enqueue('gone', '1')
+    await tick()
+    queue.enqueue('gone', '2')
+    let dropped = false
+    const pendingDrop = queue.drop('gone').then(() => { dropped = true })
+    await tick()
+    expect(dropped).toBe(false) // まだ書いている
+    w.release()
+    await pendingDrop
+    expect(dropped).toBe(true)
+    await queue.flush()
+    expect(w.log).toEqual(['gone:1']) // 待っていた間に捨てた '2' は書かれない
+  })
+
+  it('drop: 何も無ければすぐ戻る', async () => {
+    const queue = createSaveQueue<string>(async () => {}, () => {})
+    await queue.drop('none')
+    expect(queue.busy).toBe(false)
+  })
 })

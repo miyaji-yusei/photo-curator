@@ -84,7 +84,13 @@ function createCurator() {
   /** 保存を書き終えてから、サイドカーに変更があれば書く（サイドカーは封筒も持つので順序が要る）。 */
   async function flushThenPush() {
     await saveQueue.flush()
-    await sidecar.pushAuto(activeProject.value)
+    await sidecar.pushAuto(pushableProject())
+  }
+  /** 削除中のプロジェクトの id。待ち行列にも、サイドカーの書き込み・変更の印にも、触らせない。 */
+  let deletingProjectId: string | null = null
+  const pushableProject = () => {
+    const project = activeProject.value
+    return project && project.id !== deletingProjectId ? project : null
   }
   const createDialog = ref(false)
   /** 作成ダイアログのタブ。Amazon は `capabilities.amazon` が true のときだけ選べる。 */
@@ -591,7 +597,7 @@ function createCurator() {
 
   /** 判断（星・連写の手直し・学習した距離・やり直し）が変わった印。準備（指紋・画像）では呼ばない。 */
   function noteJudgementChanged(projectId = activeProject.value?.id) {
-    if (projectId) sidecar.markChanged(projectId)
+    if (projectId && projectId !== deletingProjectId) sidecar.markChanged(projectId)
   }
 
   /** 前後の星を比べ、変わった写真の行だけ書く。`undo` も同じ。 */
@@ -1208,7 +1214,7 @@ function createCurator() {
   function saveSession() {
     const current = session.value
     const project = activeProject.value
-    if (!current || !project) return
+    if (!current || !project || project.id === deletingProjectId) return
     current.updatedAt = Date.now()
     saveQueue.enqueue(project.id, {
       ...current,
@@ -2263,7 +2269,10 @@ function createCurator() {
     const target = deleteTarget.value
     if (!target) return
     deleteBusy.value = true
+    deletingProjectId = target.id
     try {
+      // 消す前に、そのプロジェクトの未書き込みの封筒を捨てる（消したあとに書かれないように）。
+      await saveQueue.drop(target.id)
       await desktop.deleteProject(target.id)
       if (activeProject.value?.id === target.id) {
         activeProject.value = null
@@ -2279,6 +2288,7 @@ function createCurator() {
     } catch (cause) {
       error.value = cause instanceof Error ? cause.message : 'プロジェクトを削除できませんでした。'
     } finally {
+      deletingProjectId = null
       deleteBusy.value = false
     }
   }
@@ -2482,7 +2492,7 @@ function createCurator() {
       error.value = cause instanceof Error ? cause.message : '進み具合を受け取れませんでした。'
     }
     // 背面へ回る・窓を閉じるときに書く。ホームへ戻るときは `view` の監視で書く。
-    stopAutoPush = registerAutoPush(() => sidecar.pushAuto(activeProject.value), () => saveQueue.flush())
+    stopAutoPush = registerAutoPush(() => sidecar.pushAuto(pushableProject()), () => saveQueue.flush())
     // Tauri の窓を閉じるとき: 保存とサイドカーの書き込みを待ってから閉じる（待ちすぎないよう 5 秒で切る）。
     if (desktop.kind === 'tauri') {
       try {
