@@ -9,6 +9,7 @@ const {
   confirmChoices,
   confirmPhoto,
   desktop,
+  groupSelectedAsBurst,
   isConfirmed,
   isTouchOnly,
   openBurst,
@@ -116,6 +117,14 @@ const session = nullableSession as Ref<SavedSelection>
         1〜0 選ぶ ・ Ctrl+数字 拡大 ・ Shift+数字 ★{{ MAX_RATING }}で確定 ・ Alt+数字 まとめを開く ・ Enter 決定 ・ ⌫ 戻す
       </div>
       <div class="d-flex flex-wrap ga-2">
+        <!-- 複数選択で 2 枚以上選んだときだけ。「連写をまとめる」がオフだと手直しが効かないので押せない。 -->
+        <v-btn
+          v-if="session.multiSelect && session.selectedInGroup.length >= 2"
+          variant="outlined" prepend-icon="mdi-layers-triple-outline"
+          :disabled="!session.settings.groupBursts"
+          :title="session.settings.groupBursts ? undefined : '「表示枚数」の設定で「連写をまとめる」をオンにすると使えます'"
+          @click="groupSelectedAsBurst"
+        >この写真をまとめる</v-btn>
         <v-btn variant="outlined" @click="skipGroup">どれも選ばない</v-btn>
         <v-btn color="primary" @click="confirmChoices">
           {{ session.selectedInGroup.length ? `${session.selectedInGroup.length} 枚を選択` : '選択なしで次へ' }}（Enter）

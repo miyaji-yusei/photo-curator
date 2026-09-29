@@ -17,7 +17,8 @@ import {
 } from '~/utils/burstEdit'
 import { buildBurstQuestions } from '~/utils/burstQuestions'
 import { burstNeighborhood } from '~/utils/burstNeighborhood'
-import { overridesFromShape } from '~/utils/burstShape'
+import { joinSpanOverrides, overridesFromShape } from '~/utils/burstShape'
+import { createSaveQueue } from '~/utils/saveQueue'
 import {
   BURST_WINDOW_MS, D_HASH_VERSION, DEFAULT_BURST_DISTANCE,
   buildCoreInputs, maxNeighborDistance, toPhotoRef
@@ -51,6 +52,7 @@ function createCurator() {
   /** 写真の行がまだ無いまま開いたプロジェクト。走査が済んでから確かめる。 */
   let sidecarCheckPending: string | null = null
   let stopAutoPush: (() => void) | undefined
+  let stopCloseListener: (() => void) | undefined
   const projects = ref<Project[]>([])
   /** ホームの行・サイドバーの点が使う、プロジェクトごとの状態と見本。端末にある値だけで決める。 */
   const projectCards = ref<Record<string, { status: CardStatus, thumbnailUrl: string | null }>>({})
@@ -71,6 +73,19 @@ function createCurator() {
   const view = ref<View>('home')
   const loading = ref(false)
   const error = ref('')
+  /**
+   * 選別の途中（封筒）の保存。**画面は待たない。** 1 本ずつ・未書き込みは最新の 1 つだけ。
+   * 閉じる・ホームへ戻る・背面へ回る・窓を閉じるときは `flush` してからサイドカーを書く。
+   */
+  const saveQueue = createSaveQueue<SavedSelection>(
+    (projectId, envelope) => desktop.saveSession(projectId, envelope),
+    (cause) => { error.value = cause instanceof Error ? cause.message : '選別の途中を保存できませんでした。' }
+  )
+  /** 保存を書き終えてから、サイドカーに変更があれば書く（サイドカーは封筒も持つので順序が要る）。 */
+  async function flushThenPush() {
+    await saveQueue.flush()
+    await sidecar.pushAuto(activeProject.value)
+  }
   const createDialog = ref(false)
   /** 作成ダイアログのタブ。Amazon は `capabilities.amazon` が true のときだけ選べる。 */
   const createTab = ref<'folder' | 'amazon'>('folder')
@@ -394,6 +409,8 @@ function createCurator() {
   /** 各プロジェクトの状態と見本を読み直す（網へは行かない）。新しい呼び出しがあれば古い結果は捨てる。 */
   async function refreshProjectCards() {
     const token = ++cardsToken
+    // 書き途中の選別を先に書き終える（行の状態は保存したものから読む）。
+    await saveQueue.flush()
     const list = projects.value
     const entries = await Promise.all(list.map(async (project) => {
       try {
@@ -481,7 +498,55 @@ function createCurator() {
       tournamentPhotos.value = []
       return
     }
-    tournamentPhotos.value = await desktop.getPhotosByIds(activeProject.value.id, ids)
+    // 先読みで行を読んでいれば、それを使う（組が変わるたびに読み直さない）。
+    const ahead = prefetched.get(ids.join('\u0000'))
+    tournamentPhotos.value = ahead && ahead.projectId === activeProject.value.id
+      ? ahead.photos
+      : await desktop.getPhotosByIds(activeProject.value.id, ids)
+    void prefetchNextGroups()
+  }
+
+  /**
+   * 次の組の先読み。組を出したら、`queue` の先頭 `groupSize` 枚（まとまりは代表）の表示用画像を
+   * 読んで `decode()` しておく（Tauri は同期の URL、Web は blob の URL）。最大 2 組分。古いものは捨てる。
+   * `Image` を持ち続けることでデコード済みの絵を手放さない。
+   */
+  const PREFETCH_GROUPS = 2
+  const prefetched = new Map<string, { projectId: string, photos: Photo[], images: HTMLImageElement[] }>()
+  async function prefetchNextGroups() {
+    const current = session.value
+    const project = activeProject.value
+    if (!current || !project || current.core.finished || typeof Image === 'undefined') {
+      prefetched.clear()
+      return
+    }
+    const size = Math.max(1, current.core.group_size)
+    const groups = Array.from({ length: PREFETCH_GROUPS }, (_, index) =>
+      idsOf(current.core.queue.slice(index * size, (index + 1) * size))
+    ).filter(ids => ids.length > 0)
+    const wanted = new Set(groups.map(ids => ids.join('\u0000')))
+    for (const key of [...prefetched.keys()]) {
+      if (!wanted.has(key) || prefetched.get(key)!.projectId !== project.id) prefetched.delete(key)
+    }
+    for (const ids of groups) {
+      const key = ids.join('\u0000')
+      if (prefetched.has(key)) continue
+      try {
+        const photos = await desktop.getPhotosByIds(project.id, ids)
+        // 待っている間に組が進んだ・プロジェクトが変わったら、この結果は捨てる。
+        if (activeProject.value?.id !== project.id || session.value !== current) return
+        const images = photos.map((photo) => {
+          const image = new Image()
+          image.decoding = 'async'
+          image.src = desktop.photoDisplayUrl(photo)
+          image.decode().catch(() => undefined)
+          return image
+        })
+        prefetched.set(key, { projectId: project.id, photos, images })
+      } catch {
+        // 先読みは無くても困らない。
+      }
+    }
   }
 
   /**
@@ -577,6 +642,7 @@ function createCurator() {
   /** 取り込んだあとに、画面が持っている分を読み直す。 */
   async function reloadAfterSidecar(projectId: string) {
     if (activeProject.value?.id !== projectId) return
+    await saveQueue.flush()
     const value = await desktop.loadSession(projectId)
     if (value) value.core = markRaw(value.core)
     session.value = value
@@ -597,6 +663,7 @@ function createCurator() {
 
   /** 「今すぐ保存」。 */
   async function saveSidecarNow() {
+    await saveQueue.flush()
     if (activeProject.value) await sidecar.saveNow(activeProject.value)
   }
 
@@ -605,12 +672,15 @@ function createCurator() {
     previewPhotos.value = []
     previewTotal.value = 0
     analysisBacklog.value = 0
+    prefetched.clear()
     coreInputs.value = null
     pairOverrides = []
     view.value = 'project'
     loading.value = true
     sidecarCheckPending = null
     try {
+      // 前に開いていたプロジェクトの書き途中を、読む前に書き終える。
+      await saveQueue.flush()
       // 記録の取り込みは、選別の途中を読み込む前に済ませる（取り込んだ分が画面に出るように）。
       // 写真の行がまだ無いときは、走査のあとで確かめる（星を写す行が要る）。
       if (project.photoCount > 0) await runSidecarCheck(project)
@@ -1071,7 +1141,7 @@ function createCurator() {
       await loadCurrentPhotos()
     }
     await saveSession()
-    if (current.core.finished) void sidecar.pushAuto(activeProject.value)
+    if (current.core.finished) void flushThenPush()
   }
 
   /** 設定画面から学習をやり直す。 */
@@ -1087,10 +1157,23 @@ function createCurator() {
     }
   }
 
-  async function saveSession() {
-    if (!session.value || !activeProject.value) return
-    session.value.updatedAt = Date.now()
-    await desktop.saveSession(activeProject.value.id, session.value)
+  /**
+   * 選別の途中を保存する。**待たない**（待ち行列に入れて戻る）。入れる時点の写しを渡すので、
+   * 書くまでの間に画面が封筒を書き換えても、この時点の状態が書かれる（core の Session は丸ごと置き換える決め）。
+   */
+  function saveSession() {
+    const current = session.value
+    const project = activeProject.value
+    if (!current || !project) return
+    current.updatedAt = Date.now()
+    saveQueue.enqueue(project.id, {
+      ...current,
+      settings: { ...current.settings },
+      selectedInGroup: [...current.selectedInGroup],
+      learning: current.learning
+        ? { ...current.learning, answers: [...current.learning.answers] }
+        : null
+    })
   }
 
   async function toggleChoice(photoId: string) {
@@ -1134,7 +1217,7 @@ function createCurator() {
     }
     await saveSession()
     // ラウンドが終わったら書く（変更があるときだけ）。待たない。
-    if (next.finished) void sidecar.pushAuto(activeProject.value)
+    if (next.finished) void flushThenPush()
   }
 
   /** このグループからは 1 枚も通さない。 */
@@ -1408,6 +1491,61 @@ function createCurator() {
     await enterTournamentAfterRebuild()
   }
 
+  /**
+   * 選別中の設定の「連写をまとめる」。**その場で今の組に効かせる**（core の `regroup` は
+   * まだ判断していない写真だけを組み直すので、済んだ組はそのまま）。
+   */
+  async function applyGroupBursts(on: boolean) {
+    const current = session.value
+    const project = activeProject.value
+    if (!current || !project || current.settings.groupBursts === on) return
+    try {
+      current.settings = { ...current.settings, groupBursts: on }
+      if (on) {
+        // 距離が決まっていなければ、学習済み（無ければ既定）を使う。指紋は裏で作っておく。
+        current.burstDistance ??= project.burstThreshold ?? DEFAULT_BURST_DISTANCE
+        desktop.startBurstAnalysis(project.id).catch(() => undefined)
+      }
+      const inputs = await loadCoreInputs(project.id) ?? await ensureCoreInputs()
+      await loadPairOverrides()
+      setCore(core.regroup(current.core, inputs.refs, on, thresholdFor(currentDistance()), pairOverrides))
+      noteJudgementChanged(project.id)
+      current.selectedInGroup = []
+      current.multiSelect = false
+      await enterTournamentAfterRebuild()
+    } catch (cause) {
+      error.value = cause instanceof Error ? cause.message : '連写のまとめを切り替えられませんでした。'
+    }
+  }
+
+  /**
+   * 複数選択中の「この写真をまとめる」。選んだ代表（とその仲間）の撮影順で最初から最後までの
+   * 隣どうしを全部 `join` の手直しにして保存し、`core.regroup` で今のラウンドに反映する。
+   * あいだに挟まる選んでいない写真も同じまとまりに入る（仕様）。
+   */
+  async function groupSelectedAsBurst() {
+    const current = session.value
+    const project = activeProject.value
+    if (!current || !project || current.selectedInGroup.length < 2) return
+    try {
+      const inputs = await ensureCoreInputs()
+      const existing = await loadPairOverrides()
+      const merged = joinSpanOverrides(
+        inputs.refs.map(ref => ref.relative_path), current.selectedInGroup, current.core.members, existing
+      )
+      if (!merged) return
+      await desktop.savePairOverrides(project.id, merged)
+      noteJudgementChanged(project.id)
+      pairOverrides = merged
+      setCore(core.regroup(current.core, inputs.refs, current.settings.groupBursts, thresholdFor(currentDistance()), merged))
+      current.selectedInGroup = []
+      current.multiSelect = false
+      await enterTournamentAfterRebuild()
+    } catch (cause) {
+      error.value = cause instanceof Error ? cause.message : '写真をまとめられませんでした。'
+    }
+  }
+
   function openNextRoundDialog(rating: number) {
     nextRoundGroupSize.value = clampGroupSize(session.value?.settings.groupSize ?? groupLimits.default, groupLimits)
     nextRoundRating.value = rating
@@ -1462,7 +1600,7 @@ function createCurator() {
       noteJudgementChanged()
       session.value = null
       // 途中の選別も消す。残すと、リロードで星の無い写真に古い Session が戻る。
-      await desktop.saveSession(activeProject.value.id, null).catch(() => undefined)
+      saveQueue.enqueue(activeProject.value.id, null)
       await loadSummary()
       restartDialog.value = false
       view.value = 'project'
@@ -1787,6 +1925,8 @@ function createCurator() {
    */
   async function refreshDisplayState() {
     if (!activeProject.value) return
+    // 表示用画像が替わりうるので、先読みした行（表示用の場所を含む）は捨てる。
+    prefetched.clear()
     try {
       displaySettings.value = await desktop.getDisplaySettings()
       // プロジェクトの上書きを反映した実効値。null を渡すと現状のまま返る。
@@ -2217,7 +2357,7 @@ function createCurator() {
 
   // プロジェクトを閉じる（ホームへ戻る）とき、変更があれば書く。
   watch(view, (next, previous) => {
-    if (next === 'home' && previous !== 'home') void sidecar.pushAuto(activeProject.value)
+    if (next === 'home' && previous !== 'home') void flushThenPush()
     // 選別のあとに戻ったとき、行の状態・点を今の値にする。
     if ((next === 'home' || next === 'project') && previous !== next) void refreshProjectCards()
   })
@@ -2286,7 +2426,24 @@ function createCurator() {
       error.value = cause instanceof Error ? cause.message : '進み具合を受け取れませんでした。'
     }
     // 背面へ回る・窓を閉じるときに書く。ホームへ戻るときは `view` の監視で書く。
-    stopAutoPush = registerAutoPush(() => sidecar.pushAuto(activeProject.value))
+    stopAutoPush = registerAutoPush(() => sidecar.pushAuto(activeProject.value), () => saveQueue.flush())
+    // Tauri の窓を閉じるとき: 保存とサイドカーの書き込みを待ってから閉じる（待ちすぎないよう 5 秒で切る）。
+    if (desktop.kind === 'tauri') {
+      try {
+        const { getCurrentWindow } = await import('@tauri-apps/api/window')
+        const win = getCurrentWindow()
+        stopCloseListener = await win.onCloseRequested(async (event) => {
+          event.preventDefault()
+          try {
+            await Promise.race([flushThenPush(), new Promise(resolve => setTimeout(resolve, 5000))])
+          } finally {
+            await win.destroy()
+          }
+        })
+      } catch {
+        // 窓の口が無い環境（テスト・Web）では登録しない。
+      }
+    }
     window.addEventListener('keydown', onKeydown)
     compactQuery = window.matchMedia(COMPACT_QUERY)
     syncCompact(compactQuery)
@@ -2296,6 +2453,7 @@ function createCurator() {
   function unmount() {
     stopProgressListener?.()
     stopAutoPush?.()
+    stopCloseListener?.()
     window.removeEventListener('keydown', onKeydown)
     compactQuery?.removeEventListener('change', syncCompact)
   }
@@ -2506,6 +2664,8 @@ function createCurator() {
     applyBurstShape,
     undoChoice,
     applyGroupSize,
+    applyGroupBursts,
+    groupSelectedAsBurst,
     openNextRoundDialog,
     startRatingSelection,
     restartFromScratch,

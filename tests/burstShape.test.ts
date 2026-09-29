@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { PairOverride, PhotoRef } from '~/lib/core'
-import { overridesFromShape } from '~/utils/burstShape'
+import { joinSpanOverrides, overridesFromShape } from '~/utils/burstShape'
 
 const ref = (name: string): PhotoRef =>
   ({ relative_path: name, captured_at: 0, d_hash: '0000000000000000', d_hash_version: 2 })
@@ -57,5 +57,50 @@ describe('overridesFromShape', () => {
   it('どの塊にも入っていない写真は、隣と別のものとして扱う', () => {
     const result = overridesFromShape(run, [['a', 'b']], [], byThreshold(['ab', 'bc']))
     expect(sorted(result)).toEqual([{ left: 'b', right: 'c', decision: 'split' }])
+  })
+})
+
+describe('joinSpanOverrides（この写真をまとめる）', () => {
+  const order = ['a', 'b', 'c', 'd', 'e', 'f']
+  const join = (left: string, right: string): PairOverride => ({ left, right, decision: 'join' })
+
+  it('選んだ 2 枚の、最初から最後までの隣どうしを全部 join にする（あいだの写真も入る）', () => {
+    const result = joinSpanOverrides(order, ['b', 'e'], {}, [])
+    expect(result).toEqual([join('b', 'c'), join('c', 'd'), join('d', 'e')])
+  })
+
+  it('代表の仲間も含めた撮影順の端から端まで', () => {
+    // b の仲間は a と b、e の仲間は e と f。→ a から f まで
+    const result = joinSpanOverrides(order, ['b', 'e'], { b: ['a', 'b'], e: ['e', 'f'] }, [])
+    expect(result).toHaveLength(5)
+    expect(result![0]).toEqual(join('a', 'b'))
+    expect(result![4]).toEqual(join('e', 'f'))
+  })
+
+  it('選んだ順は関係ない', () => {
+    expect(joinSpanOverrides(order, ['e', 'b'], {}, [])).toEqual(joinSpanOverrides(order, ['b', 'e'], {}, []))
+  })
+
+  it('同じ 2 枚の既存の手直し（split）は置き換え、ほかは残す', () => {
+    const existing: PairOverride[] = [
+      { left: 'c', right: 'd', decision: 'split' },
+      { left: 'e', right: 'f', decision: 'split' }
+    ]
+    const result = joinSpanOverrides(order, ['b', 'd'], {}, existing)!
+    expect(result).toContainEqual({ left: 'e', right: 'f', decision: 'split' })
+    expect(result).not.toContainEqual({ left: 'c', right: 'd', decision: 'split' })
+    expect(result).toContainEqual(join('c', 'd'))
+    expect(result).toHaveLength(3)
+  })
+
+  it('もう一度押しても結果が変わらない（冪等）', () => {
+    const once = joinSpanOverrides(order, ['b', 'e'], {}, [])!
+    expect(joinSpanOverrides(order, ['b', 'e'], {}, once)).toEqual(once)
+  })
+
+  it('対象が 2 枚に満たなければ null', () => {
+    expect(joinSpanOverrides(order, ['b'], {}, [])).toBeNull()
+    expect(joinSpanOverrides(order, [], {}, [])).toBeNull()
+    expect(joinSpanOverrides(order, ['zzz'], {}, [])).toBeNull()
   })
 })

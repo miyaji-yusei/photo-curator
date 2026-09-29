@@ -45,3 +45,42 @@ export function overridesFromShape(
   }
   return [...next.values()]
 }
+
+/**
+ * 「この写真をまとめる」。選んだ代表（と、それぞれの連写の仲間）を、**撮影順で最初から最後まで**、
+ * 隣どうしを全部 `join` の手直しにする。core は隣どうしのペアしか見ないため、離れた 2 枚を
+ * まとめるにはあいだも連鎖させるしかない。**あいだに挟まる選んでいない写真も同じまとまりに入る**
+ * （仕様として受け入れる。07 章）。
+ *
+ * - `order`: 全写真の relativePath（撮影順）
+ * - `reps`: 選んだ代表の relativePath
+ * - `members`: core の Session の `members`（代表 → 仲間）
+ * - 既存の手直しのうち、今回の隣どうしと同じ 2 枚のものは置き換える
+ * - 対象が 2 枚に満たなければ null（何もしない）
+ */
+export function joinSpanOverrides(
+  order: string[],
+  reps: string[],
+  members: Record<string, string[]>,
+  existing: PairOverride[]
+): PairOverride[] | null {
+  const wanted = new Set<string>()
+  for (const rep of reps) {
+    for (const mate of members[rep] ?? [rep]) wanted.add(mate)
+  }
+  let first = -1
+  let last = -1
+  order.forEach((path, index) => {
+    if (!wanted.has(path)) return
+    if (first < 0) first = index
+    last = index
+  })
+  if (first < 0 || first === last) return null
+  const span = order.slice(first, last + 1)
+  const joins: PairOverride[] = []
+  for (let index = 0; index + 1 < span.length; index += 1) {
+    joins.push({ left: span[index]!, right: span[index + 1]!, decision: 'join' })
+  }
+  const replaced = new Set(joins.map(item => `${item.left}\u0000${item.right}`))
+  return [...existing.filter(item => !replaced.has(`${item.left}\u0000${item.right}`)), ...joins]
+}
