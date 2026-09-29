@@ -33,6 +33,17 @@ describe('projectStatus の 5 状態', () => {
     expect(status).toMatchObject({ state: 'culling', statusText: '★2 を選別中・ROUND 3', actionLabel: '続ける' })
   })
 
+  it('選別中: session があれば、未処理（backlog）が残っていても選別中（準備中に戻さない）', () => {
+    const status = projectStatus(base({
+      analysisBacklog: 10, displayBacklog: 25, session: { target_star: 2, round: 3, finished: false }
+    }))
+    expect(status).toMatchObject({ state: 'culling', statusText: '★2 を選別中・ROUND 3', actionLabel: '続ける' })
+    const done = projectStatus(base({
+      analysisBacklog: 10, session: { target_star: 0, round: 1, finished: true }, keptCount: 4
+    }))
+    expect(done.state).toBe('done')
+  })
+
   it('選別完了: ★1 以上が n 枚', () => {
     const status = projectStatus(base({ session: { target_star: 0, round: 1, finished: true }, keptCount: 7 }))
     expect(status).toMatchObject({ state: 'done', statusText: '選別完了・★1 以上が 7 枚', actionLabel: '結果を見る' })

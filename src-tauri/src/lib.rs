@@ -2954,26 +2954,66 @@ fn write_atomically(file: &Path, bytes: &[u8]) -> Result<(), String> {
 fn get_analysis_backlog(app: AppHandle, project_id: String) -> Result<i64, String> {
     let conn = connection(&app)?;
     // Amazon の撮影時刻は走査で入る（contentDate が無い写真は空のまま）ので、空でも「未解析」に数えない。
-    let time_missing = if amazon_source_of(&conn, &project_id)?.is_some() {
-        "0"
-    } else {
-        "(captured_at IS NULL OR timestamp_source IS NULL)"
-    };
-    conn.query_row(
-            &format!(
-            "SELECT COUNT(*) FROM photos
+    let is_amazon = amazon_source_of(&conn, &project_id)?.is_some();
+    analysis_backlog(&conn, &project_id, is_amazon)
+}
+
+/// 「解析の対象なのに未処理」の枚数。
+///
+/// 指紋・サムネイルを作る対象は、解析（`select_burst_candidates`）が選んだ連写の候補だけ
+/// （Amazon は全部）。対象でない写真は指紋もサムネイルも空のままなので、数えない。
+/// 数えると、候補でない写真の分だけ backlog が 0 にならず、ホームがずっと「準備中」になる。
+/// 撮影時刻が未読の写真は、対象が決まる前なので常に数える。
+fn analysis_backlog(conn: &Connection, project_id: &str, is_amazon: bool) -> Result<i64, String> {
+    struct Row {
+        id: String,
+        captured_at: Option<i64>,
+        source: Option<String>,
+        stale: bool,
+    }
+    let mut statement = conn
+        .prepare(
+            "SELECT id,captured_at,timestamp_source,
+                    (d_hash IS NULL OR d_hash_version IS NULL OR d_hash_version <> ?2
+                     OR thumbnail_path IS NULL OR thumbnail_version IS NULL OR thumbnail_version <> ?3)
+             FROM photos
              WHERE project_id=?1 AND is_missing=0
-               AND ({time_missing}
-                 OR d_hash IS NULL
-                 OR d_hash_version IS NULL
-                 OR d_hash_version <> ?2
-                 OR thumbnail_path IS NULL
-                 OR thumbnail_version IS NULL
-                 OR thumbnail_version <> ?3)"),
-            params![project_id, D_HASH_VERSION, THUMBNAIL_VERSION],
-            |row| row.get(0),
+             ORDER BY captured_at IS NULL, captured_at, path",
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params![project_id, D_HASH_VERSION, THUMBNAIL_VERSION], |row| {
+            Ok(Row {
+                id: row.get(0)?,
+                captured_at: row.get(1)?,
+                source: row.get(2)?,
+                stale: row.get::<_, i64>(3)? != 0,
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let selection = select_burst_candidates(
+        &rows
+            .iter()
+            .filter_map(|row| {
+                Some(CandidateInput {
+                    id: row.id.clone(),
+                    captured_at: row.captured_at?,
+                    source: TimestampSource::parse(row.source.as_deref()),
+                })
+            })
+            .collect::<Vec<_>>(),
+    );
+    let pending = rows
+        .iter()
+        .filter(|row| {
+            let time_missing = !is_amazon && (row.captured_at.is_none() || row.source.is_none());
+            let targeted = is_amazon || selection.ids.contains(&row.id);
+            time_missing || (targeted && row.stale)
+        })
+        .count();
+    Ok(pending as i64)
 }
 
 /// プロジェクトを削除する。**写真原本には一切触れない。**
@@ -7251,6 +7291,47 @@ mod tests {
         assert_eq!(count, 1, "何も移動しなければ増えない");
 
         drop(statement);
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn analysis_backlog_counts_only_photos_the_analysis_targets() {
+        let directory = test_directory("backlog");
+        let conn = open_database(&directory.join("b.sqlite3")).expect("open database");
+        conn.execute(
+            "INSERT INTO projects (id,name,folder_path,photo_count,status,created_at,updated_at)
+             VALUES ('p1','p1','C:/photos',4,'ready',1,1)",
+            [],
+        )
+        .expect("insert project");
+        // a1 と a2 は 1 秒差（連写の候補）。b1 と b2 は隣と 1 時間以上離れている（候補ではない）。
+        for (id, at) in [("a1", 1_000_000_i64), ("a2", 1_001_000), ("b1", 9_000_000), ("b2", 20_000_000)] {
+            conn.execute(
+                "INSERT INTO photos (id,project_id,path,relative_path,name,captured_at,timestamp_source,is_missing)
+                 VALUES (?1,'p1',?2,?1,?1,?3,'exif_original',0)",
+                params![id, format!("C:/photos/{id}.jpg"), at],
+            )
+            .expect("insert photo");
+        }
+        assert_eq!(analysis_backlog(&conn, "p1", false).expect("backlog"), 2, "候補の 2 枚だけが未処理");
+
+        conn.execute(
+            "UPDATE photos SET d_hash='0000000000000000',d_hash_version=?1,thumbnail_path='C:/t.jpg',thumbnail_version=?2
+             WHERE id IN ('a1','a2')",
+            params![D_HASH_VERSION, THUMBNAIL_VERSION],
+        )
+        .expect("analyse candidates");
+        assert_eq!(
+            analysis_backlog(&conn, "p1", false).expect("backlog"),
+            0,
+            "候補でない写真が空のままでも 0 になる"
+        );
+
+        conn.execute("UPDATE photos SET timestamp_source=NULL WHERE id='b1'", [])
+            .expect("unread time");
+        assert_eq!(analysis_backlog(&conn, "p1", false).expect("backlog"), 1, "撮影時刻が未読の写真は数える");
+
         drop(conn);
         fs::remove_dir_all(&directory).expect("remove test directory");
     }

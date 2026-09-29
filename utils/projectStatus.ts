@@ -36,19 +36,7 @@ export function projectStatus(facts: StatusFacts): CardStatus {
       : '写真のフォルダが見つかりません'
     return { state: 'error', statusText: `エラー（${reason}）`, actionLabel: '再試行', actionEnabled: true }
   }
-  const progress = prepareProgress(facts)
-  if (!progress.every(line => line.total !== null && line.done >= line.total) || project.photoCount === 0) {
-    // 走査中は走査の行、そのあとは一番遅れている行。
-    const slowest = progress[0]!.total === null
-      ? progress[0]!
-      : progress.reduce((low, line) => (line.done < low.done ? line : low), progress[0]!)
-    return {
-      state: 'preparing',
-      statusText: `準備中（${slowest.done.toLocaleString()} / ${slowest.total === null ? '?' : slowest.total.toLocaleString()}）`,
-      actionLabel: '開始',
-      actionEnabled: project.photoCount > 0 && project.status !== 'scanning'
-    }
-  }
+  // 選別が始まっているなら、準備の未処理より先にその状態を返す（準備の進みは詳細の 3 行で見せる）。
   if (session?.finished) {
     return {
       state: 'done',
@@ -63,6 +51,19 @@ export function projectStatus(facts: StatusFacts): CardStatus {
       statusText: `★${session.target_star} を選別中・ROUND ${session.round}`,
       actionLabel: '続ける',
       actionEnabled: true
+    }
+  }
+  const progress = prepareProgress(facts)
+  if (!progress.every(line => line.total !== null && line.done >= line.total) || project.photoCount === 0) {
+    // 走査中は走査の行、そのあとは一番遅れている行。
+    const slowest = progress[0]!.total === null
+      ? progress[0]!
+      : progress.reduce((low, line) => (line.done < low.done ? line : low), progress[0]!)
+    return {
+      state: 'preparing',
+      statusText: `準備中（${slowest.done.toLocaleString()} / ${slowest.total === null ? '?' : slowest.total.toLocaleString()}）`,
+      actionLabel: '開始',
+      actionEnabled: project.photoCount > 0 && project.status !== 'scanning'
     }
   }
   return { state: 'new', statusText: '準備完了', actionLabel: '開始', actionEnabled: true }
