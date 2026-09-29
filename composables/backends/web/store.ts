@@ -8,7 +8,8 @@
  * - `projects` / `photos`（索引 projectId）… 行
  * - `states` … Session（キー `<projectId>`）とフォルダの handle（キー `handle:<projectId>`）
  * - `burstShapes` … 手で直した連写の例外（キー `overrides:<projectId>`）
- * - `states` には、サイドカーの端末の記憶（キー `sidecar:<projectId>`）と端末の id（キー `device`）も置く
+ * - `states` には、サイドカーの端末の記憶（キー `sidecar:<projectId>`）と端末の id（キー `device`）、
+ *   Amazon の tempLink（キー `amazonLinks:<projectId>`）も置く
  */
 import type { PairOverride } from '~/lib/core'
 import type { SelectionResult } from '~/types/photo'
@@ -50,6 +51,10 @@ export interface WebStore {
   /** この端末の id。初回に作って残す。 */
   deviceId: () => Promise<string>
 
+  /** Amazon の tempLink（node id → URL）。無ければ null。 */
+  readAmazonLinks: (projectId: string) => Promise<Record<string, string> | null>
+  writeAmazonLinks: (projectId: string, links: Record<string, string>) => Promise<void>
+
   readHandle: (projectId: string) => Promise<FileSystemDirectoryHandle | null>
   writeHandle: (projectId: string, handle: FileSystemDirectoryHandle) => Promise<void>
 }
@@ -58,6 +63,8 @@ export interface WebStore {
 export const overridesKey = (projectId: string) => `overrides:${projectId}`
 /** フォルダの handle を置く `states` のキー。 */
 export const handleKey = (projectId: string) => `handle:${projectId}`
+/** Amazon の tempLink を置く `states` のキー。 */
+export const amazonLinksKey = (projectId: string) => `amazonLinks:${projectId}`
 /** サイドカーの端末の記憶を置く `states` のキー。 */
 export const sidecarStateKey = (projectId: string) => `sidecar:${projectId}`
 /** 端末の id を置く `states` のキー。 */
@@ -92,6 +99,7 @@ export function createIdbStore(): WebStore {
           await deleteOne(transaction, STORE_STATES, projectId)
           await deleteOne(transaction, STORE_STATES, handleKey(projectId))
           await deleteOne(transaction, STORE_STATES, sidecarStateKey(projectId))
+          await deleteOne(transaction, STORE_STATES, amazonLinksKey(projectId))
           await deleteOne(transaction, STORE_BURST_SHAPES, overridesKey(projectId))
           await deleteOne(transaction, STORE_PROJECTS, projectId)
         }
@@ -215,6 +223,19 @@ export function createIdbStore(): WebStore {
         await putOne(transaction, STORE_STATES, { projectId: DEVICE_KEY, id, updatedAt: Date.now() })
         return id
       }),
+
+    readAmazonLinks: async projectId => {
+      const row = await withStores([STORE_STATES], 'readonly', transaction =>
+        getOne<{ projectId: string, links: Record<string, string> }>(
+          transaction, STORE_STATES, amazonLinksKey(projectId)
+        ))
+      return row?.links ?? null
+    },
+
+    writeAmazonLinks: async (projectId, links) => {
+      await withStores([STORE_STATES], 'readwrite', transaction =>
+        putOne(transaction, STORE_STATES, { projectId: amazonLinksKey(projectId), links, updatedAt: Date.now() }))
+    },
 
     readHandle: async projectId => {
       const row = await withStores([STORE_STATES], 'readonly', transaction =>

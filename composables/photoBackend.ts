@@ -8,7 +8,7 @@ export interface DisplaySettings {
   largeEdge: number
 }
 import type {
-  AmazonPreview, ExportReport, Photo, PhotoPage, PhotoSort, Project,
+  AmazonExport, AmazonPreview, ExportReport, Photo, PhotoPage, PhotoSort, Project,
   ProjectProgress, ProjectTask, SelectionResult, SelectionSummary
 } from '~/types/photo'
 import type { PairOverride } from '~/lib/core'
@@ -160,6 +160,11 @@ export interface PhotoBackend {
   amazonPreview?: (shareUrl: string) => Promise<AmazonPreview>
   /** 共有リンクのプロジェクトを作る（走査はこのあと `startProjectScan`）。 */
   createAmazonProject?: (name: string, shareUrl: string) => Promise<Project>
+  /**
+   * Amazon の結果の取り出し（ブラウザ）。ZIP は原本を取って `star-N/` に分ける（取れなければ reject。
+   * 文に「CSV だけ書き出せます」を含む）。CSV は先頭 3 列が他と同じで、4 列目に `name`。
+   */
+  exportAmazon?: (projectId: string, ratings: number[], format: 'zip' | 'csv') => Promise<AmazonExport>
 
   // ---- ブラウザだけが持つ機能 ------------------------------------------
   // デスクトップはフォルダ走査と原本パスがあるので必要ない。

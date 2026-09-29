@@ -54,6 +54,9 @@ export type StoredSource
   // handle は `states` の `handle:<projectId>` に置く。
     | { kind: 'folder', folderName: string }
     | { kind: 'dev', root: string }
+  // Amazon Photos の共有リンク。`key` は `"{host}|{shareId}"`、`url` は入力されたリンク。
+  // tempLink は `states` の `amazonLinks:<projectId>` に置く。
+    | { kind: 'amazon', key: string, url: string }
 
 export interface StoredProject {
   id: string

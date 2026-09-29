@@ -1775,8 +1775,34 @@ function createCurator() {
     }
   }
 
+  /**
+   * Amazon の結果の書き出し（ZIP は原本を取る・CSV は端末の中だけ）。
+   * ZIP で原本が 1 枚も取れないときは、その理由が `shareError` に出る（CSV だけ書き出せます）。
+   */
+  async function exportAmazonResults(format: 'zip' | 'csv') {
+    const project = activeProject.value
+    if (!project || !desktop.exportAmazon) return
+    shareBusy.value = true
+    shareError.value = ''
+    shareMessage.value = ''
+    try {
+      const out = await desktop.exportAmazon(project.id, [...shareRatings.value], format)
+      downloadBlob(out.blob, out.fileName)
+      const what = format === 'zip' ? 'ZIP' : 'CSV'
+      shareMessage.value = `${out.count} 枚を ${what} にしました${out.skipped ? `（原本を取れなかった ${out.skipped} 枚は除いています）` : ''}。`
+    } catch (cause) {
+      shareError.value = cause instanceof Error ? cause.message : '書き出せませんでした。'
+    } finally {
+      shareBusy.value = false
+    }
+  }
+
+  /** Amazon の結果を CSV で書き出す。 */
+  const exportCsvByRating = () => exportAmazonResults('csv')
+
   /** 星ごとのフォルダに分けた ZIP を書き出す。 */
   async function exportZipByRating() {
+    if (isAmazon.value) return exportAmazonResults('zip')
     shareBusy.value = true
     shareError.value = ''
     shareMessage.value = ''
@@ -2286,6 +2312,7 @@ function createCurator() {
     collectShareCandidates,
     shareSelectedPhotos,
     exportZipByRating,
+    exportCsvByRating,
     openShareDialog,
     resumeSession,
     sidecarAccess,

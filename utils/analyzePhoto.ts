@@ -101,7 +101,7 @@ async function readCaptureTime(file: File): Promise<CaptureTime | null> {
  * 保存したサムネイルの画素から指紋を出す。**縮小はしない**（core がする）。
  * 作れないとき（小さすぎる画像）は null。
  */
-async function hashThumbnail(thumbnail: Blob): Promise<string | null> {
+export async function hashThumbnail(thumbnail: Blob): Promise<string | null> {
   const bitmap = await createImageBitmap(thumbnail)
   try {
     const { width, height } = bitmap

@@ -53,6 +53,8 @@ const {
   <v-alert type="warning" variant="tonal" density="comfortable" class="mt-5">
     リンクを知っている人は誰でも見られます。選別が終わったら Amazon Photos でリンクを削除してください。
   </v-alert>
+  <!-- ブラウザは写真を Amazon から直接表示する（端末には置かない）。 -->
+  <p v-if="desktop.kind === 'local'" class="text-caption text-medium-emphasis mt-3">選別中も通信が要ります（写真は Amazon から表示します）。</p>
   </template>
 </v-card-text><v-card-actions class="pa-5 pt-2"><v-spacer /><v-btn variant="outlined" @click="createDialog = false">キャンセル</v-btn><v-btn variant="outlined" color="primary" :disabled="desktop.capabilities.amazon && createTab === 'amazon' ? !amazonPreview || !amazonPreview.count : !canImportPhotos && !folderPath" :loading="loading" @click="createProject">作成</v-btn></v-card-actions></v-card></v-dialog>
 </template>

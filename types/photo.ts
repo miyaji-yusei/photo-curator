@@ -87,9 +87,17 @@ export interface Project {
    * 写真の出所（ブラウザだけ）。省略はデスクトップ（フォルダ参照）。
    * `picker` は写真ピッカー、`folder` は File System Access のフォルダ、`dev` は開発用の HTTP。
    */
-  source?: 'picker' | 'folder' | 'dev'
+  source?: 'picker' | 'folder' | 'dev' | 'amazon'
   /** `folder` のとき、次に読む許可がまだ無ければ 'needs-permission'（ボタンで許可を求める）。 */
   folderAccess?: 'granted' | 'needs-permission'
+}
+
+/** Amazon の結果を書き出したもの（ブラウザ）。`skipped` は原本を取れず ZIP に入らなかった枚数。 */
+export interface AmazonExport {
+  blob: Blob
+  fileName: string
+  count: number
+  skipped: number
 }
 
 /** Amazon Photos の共有リンクを読んだ結果（作成画面）。 */

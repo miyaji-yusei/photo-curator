@@ -28,7 +28,7 @@ export interface BackendCapabilities {
   exportFolders: boolean
   /** 原本の XMP に星を書ける。**原本を書き換えるので、触れる環境を絞る。** */
   writeMetadata: boolean
-  /** Amazon Photos の共有リンクを出所にできる（読み取りだけ。ログインしない）。PC だけ。 */
+  /** Amazon Photos の共有リンクを出所にできる（読み取りだけ。ログインしない）。PC とブラウザ。 */
   amazon: boolean
 }
 
@@ -80,8 +80,8 @@ export function capabilitiesFor(
         fullResolution: false,
         exportFolders: false,
         writeMetadata: false,
-        // 画像本体はブラウザから読めない（CORS）。PC だけ。
-        amazon: false
+        // 表示は素の <img> で出せる。バイトが要る指紋・ZIP は中継があるときだけ（呼んだ成否で決める）。
+        amazon: true
       }
   }
 }

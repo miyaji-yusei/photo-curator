@@ -6,7 +6,7 @@
  * - `store`     … プロジェクト・写真の行・Session・手直し（IndexedDB `photo-curator-mb`）
  * - `blobStore` … サムネイル・表示用画像の実体と object URL
  * - `sourceIO`  … 出所から原本のバイトを得る（ピッカー・フォルダ・開発用 HTTP）
- * - `fetcher`   … Amazon のバイト（T10。いまは口だけ）
+ * - `fetcher`   … Amazon のバイト（指紋・ZIP 用。既定は中継サーバー。表示は素の `<img>` で足りる）
  *
  * - 写真の出所は 3 通り。ピッカーは**原本を保存しない**（iOS には永続的なファイルハンドルが無く、
  *   リロードすると参照が切れる）。フォルダは handle を保存して、次に開いたとき読み直す。
@@ -15,7 +15,7 @@
  * - **写真ライブラリは書き換えない。** 反映は共有シートや ZIP 書き出しなど、利用者の操作を経由する。
  */
 import type {
-  ExportReport, Photo, PhotoPage, PhotoSort, Project,
+  AmazonExport, AmazonPreview, ExportReport, Photo, PhotoPage, PhotoSort, Project,
   ProjectProgress, ProjectTask, SelectionResult, SelectionSummary
 } from '~/types/photo'
 import { init as initCore } from '~/lib/core'
@@ -24,8 +24,14 @@ import type { SavedSelection } from '~/utils/selectionFlow'
 import { MAX_RATING } from '~/types/photo'
 import type { DeviceIdentity, PhotoBackend, SidecarAccess, SidecarState } from '~/composables/photoBackend'
 import { analyzeAll, workersFor } from '~/utils/analysisPool'
+import { fetchPool } from '~/utils/amazonPool'
+import { amazonCsv } from '~/utils/amazonCsv'
+import { keyFor, parseContentDate, parseKey, parseShareUrl, readShare, viewBoxUrl } from '~/lib/amazonShare'
+import { resolveCaptureTime } from '~/utils/captureTime'
+import { createStoredZip } from '~/utils/zip'
+import { zipEntriesByRating } from '~/utils/shareExport'
 import type { AnalysisJob } from '~/utils/analysisPool'
-import { DISPLAY_EDGE_DEFAULT } from '~/utils/analyzePhoto'
+import { DISPLAY_EDGE_DEFAULT, hashThumbnail } from '~/utils/analyzePhoto'
 import { capabilitiesFor, hasDirectoryPicker } from '~/utils/capabilities'
 import { requestPersistence, toPhoto } from '~/utils/browserStore'
 import type { StoredPhoto, StoredProject, StoredSource } from '~/utils/browserStore'
@@ -35,10 +41,10 @@ import {
 } from '~/utils/photoQuery'
 import { uniquePaths } from '~/utils/uniquePath'
 import { randomUUID } from '~/utils/uuid'
+import type { Fetcher } from '~/composables/backends/web/fetcher'
+import { relayFetcher } from '~/composables/backends/web/fetcher'
 import type { BlobStore, PhotoUrls } from '~/composables/backends/web/blobStore'
 import { createIdbBlobStore } from '~/composables/backends/web/blobStore'
-import type { Fetcher } from '~/composables/backends/web/fetcher'
-import { noFetcher } from '~/composables/backends/web/fetcher'
 import type { SourceIO, SourceIOSet } from '~/composables/backends/web/sourceIO'
 import {
   createSourceIOSet, hasHandlePermission, requestHandlePermission
@@ -72,6 +78,18 @@ function subPathOf(row: StoredPhoto): string {
   return cut > 0 && row.relativePath.endsWith(`/${row.name}`) ? row.relativePath.slice(0, cut) : ''
 }
 
+/** 共有が消えている（404）ときの理由。`lib/amazonShare.ts` の文と同じ。 */
+const LINK_GONE = 'このリンクは削除されたか、無効です。'
+/** サムネイルの長辺（08章 6「絵の 3 段」）。指紋もここから作る（PC と同じ）。 */
+const AMAZON_THUMB_EDGE = 160
+const SAMPLE_LIMIT = 12
+/** 指紋作りの並列。Amazon への通信は控えめに。 */
+const HASH_CONCURRENCY = 4
+/** 何枚ごとに行へ書くか。 */
+const HASH_SAVE_EVERY = 20
+const NO_RELAY_WARNING = '中継サーバーが無いため、連写は自動ではまとまりません（表示だけで選別できます）。'
+const ONLY_CSV = '原本を取れませんでした。CSV だけ書き出せます。'
+
 const unsupported = (what: string) =>
   Promise.reject(new Error(`${what}はこの端末では行えません。ブラウザから写真ライブラリを書き換えられないためです。`))
 
@@ -79,9 +97,8 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
   const store = parts.store ?? createIdbStore()
   const blobStore = parts.blobStore ?? createIdbBlobStore()
   const sourceIO = parts.sourceIO ?? createSourceIOSet()
-  // Amazon（T10）が使う。いまは口だけ。
-  const fetcher = parts.fetcher ?? noFetcher
-  void fetcher
+  // Amazon の指紋・ZIP が使う。既定は中継（Nitro）。無ければ null が返るだけ。
+  const fetcher = parts.fetcher ?? relayFetcher
 
   const capabilities = capabilitiesFor('browser', { directoryPicker: hasDirectoryPicker() })
   const workers = workersFor(hasDirectoryPicker())
@@ -92,6 +109,10 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
   const cancelled = new Set<string>()
   /** 準備が走っているプロジェクト。同じものを二重に走らせない。 */
   const preparing = new Set<string>()
+  /** Amazon の tempLink（node id → URL）。Amazon でなければ null。読んだ結果を覚える。 */
+  const linkCache = new Map<string, Record<string, string> | null>()
+  /** 中継が無いと分かったプロジェクト。**このページを開いている間**は、準備・続きで叩き直さない。 */
+  const noRelay = new Set<string>()
   /** 「フォルダを選ぶ」で選ばれた、まだプロジェクトにならない handle。 */
   let pendingFolder: FileSystemDirectoryHandle | null = null
 
@@ -109,6 +130,8 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
       folderAccess = handle && await hasHandlePermission(handle) ? 'granted' : 'needs-permission'
     } else if (source.kind === 'dev') {
       folderPath = source.root
+    } else if (source.kind === 'amazon') {
+      folderPath = source.url
     }
     return {
       id: row.id,
@@ -120,8 +143,7 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
       updatedAt: row.updatedAt,
       burstThreshold: row.burstThreshold,
       burstThresholdLearnedAt: row.burstThresholdLearnedAt,
-      // ブラウザに Amazon の出所は無い（画像本体が CORS で読めない）。
-      sourceKind: 'folder',
+      sourceKind: source.kind === 'amazon' ? 'amazon' : 'folder',
       source: source.kind,
       ...(folderAccess ? { folderAccess } : {})
     }
@@ -135,6 +157,8 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
     const source = sourceOf(row)
     if (source.kind === 'dev') return sourceIO.forDev(source.root)
     if (source.kind === 'picker') return sourceIO.picker
+    // Amazon は出所からファイルを読まない（URL で出し、バイトは fetcher で取る）。
+    if (source.kind === 'amazon') return null
     const handle = await store.readHandle(row.id)
     if (!handle) return null
     if (!(await hasHandlePermission(handle))) {
@@ -143,8 +167,37 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
     return sourceIO.forHandle(handle)
   }
 
+  async function linksOf(projectId: string): Promise<Record<string, string> | null> {
+    if (linkCache.has(projectId)) return linkCache.get(projectId) ?? null
+    const links = await store.readAmazonLinks(projectId).catch(() => null)
+    linkCache.set(projectId, links)
+    return links
+  }
+
+  /**
+   * Amazon の写真に URL を付ける。**画像は端末に置かず、URL をそのまま `<img>` に渡す**
+   * （crossOrigin を付けない素の `<img>` なら、CORS の無い画像 CDN からも出せる）。
+   * サムネイルは指紋を作るときに取れていればその実体、無ければ `viewBox=160`。
+   * 表示用は `viewBox=<長辺>`、原本（`path`）は tempLink そのもの。
+   */
+  async function decorateAmazon(rows: StoredPhoto[], links: Record<string, string>): Promise<Photo[]> {
+    const urls = await blobStore.load(rows.map(row => row.id))
+    return rows.map(row => {
+      const found = urls.get(row.id)
+      const link = links[row.relativePath] ?? null
+      return toPhoto(
+        row,
+        found?.thumbnailUrl ?? (link ? viewBoxUrl(link, AMAZON_THUMB_EDGE) : null),
+        link,
+        found?.displayUrl ?? (link ? viewBoxUrl(link, DISPLAY_EDGE_DEFAULT) : null)
+      )
+    })
+  }
+
   /** 行に URL を付けて画面が使える形にする。サムネイルは 1 枚ずつ読む。 */
   async function decorate(rows: StoredPhoto[], projectId?: string): Promise<Photo[]> {
+    const links = rows.length ? await linksOf(rows[0]!.projectId) : null
+    if (links) return decorateAmazon(rows, links)
     const urls = await blobStore.load(rows.map(row => row.id))
     const fallbacks = projectId ? await originalsOfUnprepared(rows, urls, projectId) : new Map<string, string>()
     return rows.map(row => {
@@ -194,6 +247,8 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
     const source = sourceOf(row)
     if (source.kind === 'dev') return sourceIO.forDev(source.root)
     if (source.kind === 'picker') return sourceIO.picker
+    // Amazon にサイドカーは無い（none）。結果は「この端末だけの結果」。
+    if (source.kind === 'amazon') return null
     const handle = await store.readHandle(projectId).catch(() => null)
     return handle ? sourceIO.forHandle(handle) : null
   }
@@ -319,6 +374,195 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
     }
   }
 
+  // ---- Amazon Photos の共有リンク --------------------------------------
+
+  const amazonSourceOf = (row: StoredProject) => {
+    const source = sourceOf(row)
+    return source.kind === 'amazon' ? source : null
+  }
+
+  /**
+   * 準備: 一覧を読んで写真の行を作る（表示用・サムネイルは「URL で出せる」ので、これで準備済み）。
+   * そのあと裏で、中継からサムネイルを取って指紋を作る。**失敗したら自動でやり直し続けない**
+   * （リンクが消えていたら理由を出して `missing` にし、開くたびには読まない。利用者の「再試行」だけ）。
+   */
+  async function prepareAmazon(projectId: string): Promise<void> {
+    if (preparing.has(projectId)) {
+      emit(progressOf(projectId, 'scan', 'complete', 0, 0, '準備は進んでいます'))
+      return
+    }
+    preparing.add(projectId)
+    cancelled.delete(projectId)
+    noRelay.delete(projectId)
+    let scanned = false
+    try {
+      const row = await store.getProject(projectId)
+      const source = row && amazonSourceOf(row)
+      if (!row || !source) return
+      const share = parseKey(source.key)
+      if (!share) throw new Error('リンクの形が正しくありません。')
+      emit(progressOf(projectId, 'scan', 'indexing', 0, 0, '共有リンクを読んでいます'))
+      await store.patchProject(projectId, { status: 'scanning' })
+      await requestPersistence()
+
+      let read
+      try {
+        read = await readShare(share)
+      } catch (cause) {
+        const message = cause instanceof Error ? cause.message : 'Amazon から読めませんでした。'
+        const status = message === LINK_GONE ? 'missing' : row.photoCount ? 'ready' : 'new'
+        await store.patchProject(projectId, { status })
+        emit(progressOf(projectId, 'scan', 'error', 0, 0, message))
+        return
+      }
+      if (cancelled.has(projectId)) {
+        await store.patchProject(projectId, { status: row.photoCount ? 'ready' : 'new' })
+        emit(progressOf(projectId, 'scan', 'cancelled', 0, 0, '読み込みを中断しました'))
+        return
+      }
+
+      // 鍵は node id。再読み込みでも同じ行を使い回し、星と指紋を失わない。
+      const links: Record<string, string> = {}
+      const existing = await store.photosOfProject(projectId)
+      const byPath = new Map(existing.map(item => [item.relativePath, item]))
+      const seen = new Set<string>()
+      const changed: StoredPhoto[] = []
+      for (const node of read.photos) {
+        if (!node.tempLink) continue
+        links[node.id] = node.tempLink
+        seen.add(node.id)
+        const at = parseContentDate(node.contentProperties?.contentDate)
+        const capture = at !== null
+          ? { at, source: 'exif_original' as const }
+          : resolveCaptureTime(null, node.name, null)
+        const found = byPath.get(node.id)
+        const fields = {
+          name: node.name, capturedAt: capture?.at ?? null, timestampSource: capture?.source ?? 'unknown' as const
+        }
+        if (!found) changed.push({ ...newRow(projectId, randomUUID(), node.id, node.name), ...fields })
+        else if (found.isMissing || found.name !== node.name || found.capturedAt !== fields.capturedAt) {
+          changed.push({ ...found, ...fields, isMissing: false })
+        }
+      }
+      for (const item of existing) {
+        if (!seen.has(item.relativePath) && !item.isMissing) changed.push({ ...item, isMissing: true })
+      }
+      await store.writeAmazonLinks(projectId, links)
+      linkCache.set(projectId, links)
+      await store.putPhotos(changed)
+      await store.patchProject(projectId, { photoCount: seen.size, status: 'ready' })
+      scanned = true
+      emit(progressOf(projectId, 'scan', 'complete', seen.size, seen.size, '読み込みが終わりました'))
+
+      await hashBacklog(projectId)
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : '共有リンクを読み込めませんでした。'
+      if (!scanned) {
+        const current = await store.getProject(projectId).catch(() => undefined)
+        await store.patchProject(projectId, { status: current?.photoCount ? 'ready' : 'new' }).catch(() => undefined)
+      }
+      emit(progressOf(projectId, scanned ? 'background' : 'scan', 'error', 0, 0, message))
+    } finally {
+      preparing.delete(projectId)
+    }
+  }
+
+  /**
+   * 指紋のまだ無い写真のサムネイル（`viewBox=160`）を中継から取り、指紋を作る。
+   * 並列 4、20 枚ごとに行へ書く。**最初の 4 枚が全部取れなければ、中継は無いとみなして打ち切る**
+   * （指紋は無いまま。選別は始められる。連写が自動でまとまらないだけ）。
+   * 星は行の別の欄なので、書くのは 1 行ずつの `patchPhoto`（星を巻き戻さない）。
+   */
+  async function hashBacklog(projectId: string): Promise<void> {
+    const links = await linksOf(projectId)
+    if (!links) return
+    const rows = (await store.photosOfProject(projectId))
+      .filter(row => !row.isMissing && row.dHash === null && row.analysisError === null && links[row.relativePath])
+    if (!rows.length) return
+    const total = rows.length
+    let processed = 0
+    let failed = 0
+    emit(progressOf(projectId, 'background', 'hashing', 0, total, '写真の指紋を作っています'))
+    let pending: { id: string, patch: Partial<StoredPhoto> }[] = []
+    const flush = async () => {
+      const batch = pending
+      pending = []
+      await Promise.all(batch.map(item => store.patchPhoto(item.id, item.patch)))
+    }
+    const report = await fetchPool({
+      items: rows,
+      concurrency: HASH_CONCURRENCY,
+      giveUpAfter: HASH_CONCURRENCY,
+      isCancelled: () => cancelled.has(projectId),
+      fetch: row => fetcher.fetchBytes(links[row.relativePath]!, AMAZON_THUMB_EDGE),
+      onResult: async (row, blob) => {
+        processed += 1
+        // 取れなかった行には何も書かない（次に準備したとき、中継があればやり直せる）。
+        if (blob) {
+          const hash = await hashThumbnail(blob).catch(() => null)
+          if (hash) await blobStore.put(row.id, { thumbnail: blob })
+          if (!hash) failed += 1
+          pending.push({
+            id: row.id,
+            patch: { dHash: hash, analysisError: hash ? null : '指紋を作れませんでした。' }
+          })
+        } else {
+          failed += 1
+        }
+        if (pending.length >= HASH_SAVE_EVERY) await flush()
+        emit(progressOf(projectId, 'background', 'hashing', processed, total, '写真の指紋を作っています', failed))
+      }
+    })
+    await flush()
+    if (report.gaveUp) {
+      noRelay.add(projectId)
+      emit({
+        // 取れなかったのは中継が無いため。写真ごとの失敗としては数えない。
+        ...progressOf(projectId, 'background', 'complete', processed, total, '指紋は作りませんでした'),
+        warning: NO_RELAY_WARNING
+      })
+    } else {
+      const phase = cancelled.has(projectId) ? 'cancelled' : 'complete'
+      emit(progressOf(projectId, 'background', phase, processed, total, '解析が終わりました', failed))
+    }
+    await store.patchProject(projectId, {})
+  }
+
+  /** Amazon の結果を書き出す。ZIP は中継で原本を取る。CSV は端末の中だけで作る。 */
+  async function exportAmazon(projectId: string, ratings: number[], format: 'zip' | 'csv'): Promise<AmazonExport> {
+    const links = await linksOf(projectId)
+    if (!links) throw new Error('Amazon のプロジェクトではありません。')
+    const wanted = new Set(ratings)
+    const rows = (await store.photosOfProject(projectId))
+      .filter(row => !row.isMissing && wanted.has(row.rating))
+      .sort((left, right) => right.rating - left.rating || (left.relativePath < right.relativePath ? -1 : 1))
+    if (!rows.length) throw new Error('対象の写真がありません。')
+    const stamp = new Date().toISOString().slice(0, 10)
+    if (format === 'csv') {
+      const text = amazonCsv(rows.map(row => ({
+        relativePath: row.relativePath, rating: row.rating, capturedAt: row.capturedAt, name: row.name
+      })))
+      return {
+        blob: new Blob([text], { type: 'text/csv' }), fileName: `photo-curator-${stamp}.csv`,
+        count: rows.length, skipped: 0
+      }
+    }
+    const got = new Map<string, Blob>()
+    await fetchPool({
+      items: rows,
+      concurrency: HASH_CONCURRENCY,
+      giveUpAfter: HASH_CONCURRENCY,
+      fetch: row => links[row.relativePath] ? fetcher.fetchBytes(links[row.relativePath]!) : Promise.resolve(null),
+      onResult: (row, blob) => { if (blob) got.set(row.id, blob) }
+    })
+    if (!got.size) throw new Error(ONLY_CSV)
+    const taken = rows.filter(row => got.has(row.id))
+    const zip = await createStoredZip(zipEntriesByRating(taken.map(row => ({
+      name: row.name, rating: row.rating, blob: got.get(row.id)!, modifiedAt: row.capturedAt ?? undefined
+    }))))
+    return { blob: zip, fileName: `photo-curator-${stamp}.zip`, count: taken.length, skipped: rows.length - taken.length }
+  }
+
   return {
     kind: 'local',
     capabilities,
@@ -386,7 +630,41 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
       return asProject(row)
     },
 
+    amazonPreview: async (shareUrl: string): Promise<AmazonPreview> => {
+      const source = parseShareUrl(shareUrl)
+      if (!source) throw new Error('Amazon Photos の共有リンクの形ではありません。')
+      const share = await readShare(source)
+      // 見本は `viewBox=160` の URL をそのまま `<img>` に渡す（バイトは読まない）。
+      const samples = share.photos
+        .slice(0, SAMPLE_LIMIT)
+        .flatMap(node => (node.tempLink ? [viewBoxUrl(node.tempLink, AMAZON_THUMB_EDGE)] : []))
+      return { key: share.key, name: share.name, count: share.photos.length, samples }
+    },
+
+    createAmazonProject: async (name: string, shareUrl: string) => {
+      const source = parseShareUrl(shareUrl)
+      if (!source) throw new Error('Amazon Photos の共有リンクの形ではありません。')
+      const now = Date.now()
+      const row: StoredProject = {
+        id: randomUUID(),
+        name: name.trim() || '新しいプロジェクト',
+        source: { kind: 'amazon', key: keyFor(source), url: shareUrl.trim() },
+        photoCount: 0,
+        status: 'new',
+        createdAt: now,
+        updatedAt: now,
+        burstThreshold: null,
+        burstThresholdLearnedAt: null
+      }
+      await store.putProject(row)
+      return asProject(row)
+    },
+
+    exportAmazon,
+
     deleteProject: async (projectId: string) => {
+      linkCache.delete(projectId)
+      noRelay.delete(projectId)
       const rows = await store.photosOfProject(projectId)
       const ids = rows.map(row => row.id)
       await store.deleteProject(projectId, ids)
@@ -461,7 +739,7 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
     startProjectScan: async (projectId: string) => {
       const row = await store.getProject(projectId)
       if (!row || sourceOf(row).kind === 'picker') return
-      void prepareFolder(projectId)
+      void (sourceOf(row).kind === 'amazon' ? prepareAmazon(projectId) : prepareFolder(projectId))
     },
     startBurstAnalysis: () => Promise.resolve(),
 
@@ -469,6 +747,21 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
     startBackgroundAnalysis: async (projectId: string) => {
       const row = await store.getProject(projectId)
       if (!row || sourceOf(row).kind === 'picker' || preparing.has(projectId)) return
+      if (sourceOf(row).kind === 'amazon') {
+        // リンクが消えているものや、中継が無いと分かったものは叩き直さない。
+        if (row.status === 'missing' || noRelay.has(projectId)) return
+        preparing.add(projectId)
+        cancelled.delete(projectId)
+        try {
+          await hashBacklog(projectId)
+        } catch (cause) {
+          emit(progressOf(projectId, 'background', 'error', 0, 0,
+            cause instanceof Error ? cause.message : '解析できませんでした。'))
+        } finally {
+          preparing.delete(projectId)
+        }
+        return
+      }
       const io = await ioFor(row, false).catch(() => null)
       if (!io) return
       preparing.add(projectId)
@@ -484,6 +777,7 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
     },
 
     getAnalysisBacklog: async (projectId: string) => {
+      if (noRelay.has(projectId)) return 0
       const rows = await store.photosOfProject(projectId)
       return rows.filter(row => !row.isMissing && row.dHash === null && row.analysisError === null).length
     },
