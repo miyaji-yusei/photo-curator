@@ -13,7 +13,10 @@
 export type Platform = 'desktop' | 'android' | 'browser'
 
 export interface BackendCapabilities {
-  /** フォルダを指定して走査できる。ブラウザだけができない（ピッカー経由になる）。 */
+  /**
+   * フォルダを指定して走査できる。ブラウザは `showDirectoryPicker`（File System Access）が
+   * あるときだけ（Safari・iPad には無く、写真ピッカー経由になる）。
+   */
   browseFolders: boolean
   /** 物理キーボードを想定してよい。ショートカットの案内を出すかの判断に使う。 */
   keyboard: boolean
@@ -27,13 +30,21 @@ export interface BackendCapabilities {
   writeMetadata: boolean
 }
 
+/** このブラウザに `showDirectoryPicker` があるか（`capabilitiesFor` の `directoryPicker` に渡す）。 */
+export function hasDirectoryPicker(scope: object | undefined = typeof window === 'undefined' ? undefined : window): boolean {
+  return !!scope && typeof (scope as { showDirectoryPicker?: unknown }).showDirectoryPicker === 'function'
+}
+
 /**
  * 環境から能力を引く。**表そのもの**なので、増えるときはここに 1 列足す。
  *
  * Android を desktop と分けているのは画面の広さとキーボードの有無だけで、
  * ファイルを扱う能力（走査・書き出し）は Rust 側が面倒を見るので同じ。
  */
-export function capabilitiesFor(platform: Platform): BackendCapabilities {
+export function capabilitiesFor(
+  platform: Platform,
+  environment: { directoryPicker?: boolean } = {}
+): BackendCapabilities {
   switch (platform) {
     case 'desktop':
       return {
@@ -57,8 +68,8 @@ export function capabilitiesFor(platform: Platform): BackendCapabilities {
       }
     case 'browser':
       return {
-        // ブラウザはフォルダを走査できない。写真ピッカーが唯一の入口。
-        browseFolders: false,
+        // フォルダを選べるのは `showDirectoryPicker` があるブラウザだけ。無ければ写真ピッカーが唯一の入口。
+        browseFolders: environment.directoryPicker === true,
         keyboard: false,
         largeGroups: false,
         // 原本はセッション中しか持てないので、リロード後は表示用までしか出せない。

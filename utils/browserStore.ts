@@ -12,13 +12,14 @@
  * 画像の実体まで引きずらないため。
  */
 import type { Photo } from '~/types/photo'
-import type { PairOverride } from '~/lib/core'
 import type { TimestampSource } from '~/utils/captureTime'
 
-const DATABASE_NAME = 'photo-curator'
-// 2 で `burstShapes`、3 で `displays` を足した。`onupgradeneeded` は「無ければ作る」だけなので、
-// 既存のストアと中身はそのまま残る。
-const DATABASE_VERSION = 3
+/**
+ * **旧版の DB（名前 `photo-curator`）は開かない・消さない。** 新しい名前で作り直す。
+ * 旧版の行は写真の鍵が uuid・Session が旧形で、そのままでは core が読めないため。
+ */
+export const DATABASE_NAME = 'photo-curator-mb'
+const DATABASE_VERSION = 1
 
 export const STORE_PROJECTS = 'projects'
 export const STORE_PHOTOS = 'photos'
@@ -47,9 +48,18 @@ export interface StoredPhoto {
   displayEdge?: number | null
 }
 
+/** 写真の出所。行に持つので、リロード後も同じ出所から読み直せる。 */
+export type StoredSource
+  = | { kind: 'picker' }
+  // handle は `states` の `handle:<projectId>` に置く。
+    | { kind: 'folder', folderName: string }
+    | { kind: 'dev', root: string }
+
 export interface StoredProject {
   id: string
   name: string
+  /** 省略はピッカー（旧版の行）。 */
+  source?: StoredSource
   photoCount: number
   status: 'new' | 'scanning' | 'ready' | 'missing'
   createdAt: number
@@ -61,13 +71,44 @@ export interface StoredProject {
 let opening: Promise<IDBDatabase> | null = null
 
 /**
+ * 開けなかった理由を、「何が起きたか」と「次にすること」が分かる文にする。
+ * IndexedDB は版を下げて開き直せないので、データを勝手に消さず、人に消してもらう。
+ */
+export function describeOpenError(error: DOMException | null): Error {
+  if (error?.name === 'VersionError') {
+    return new Error(
+      `この端末の保存領域（${DATABASE_NAME}）が、より新しい版のアプリで作られていて開けません。`
+      + 'アプリを最新の版に更新してください。直らないときは、ブラウザの設定でこのサイトのデータ（IndexedDB）を消してください。'
+    )
+  }
+  return new Error(
+    `端末の保存領域を開けませんでした（${error?.name ?? '不明'}）。`
+    + 'ブラウザを再読み込みしてください。プライベートブラウズでは使えないことがあるので、通常のウィンドウで開き直してください。'
+  )
+}
+
+export const BLOCKED_MESSAGE
+  = '別のタブが古い版の保存領域を使っていて開けません。ほかの Photo Curator のタブをすべて閉じてから、再読み込みしてください。'
+
+/**
  * DB を開く。**スキーマの追加は冪等**にしておき、既存データを壊さない
  * （デスクトップ側の migration と同じ方針）。
  */
 export function openStore(): Promise<IDBDatabase> {
   if (opening) return opening
-  opening = new Promise((resolve, reject) => {
-    const request = indexedDB.open(DATABASE_NAME, DATABASE_VERSION)
+  const attempt = new Promise<IDBDatabase>((resolve, reject) => {
+    let settled = false
+    const fail = (error: Error) => {
+      settled = true
+      reject(error)
+    }
+    let request: IDBOpenDBRequest
+    try {
+      request = indexedDB.open(DATABASE_NAME, DATABASE_VERSION)
+    } catch (cause) {
+      fail(describeOpenError(cause instanceof DOMException ? cause : null))
+      return
+    }
     request.onupgradeneeded = () => {
       const db = request.result
       if (!db.objectStoreNames.contains(STORE_PROJECTS)) {
@@ -80,11 +121,11 @@ export function openStore(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains(STORE_THUMBNAILS)) {
         db.createObjectStore(STORE_THUMBNAILS, { keyPath: 'photoId' })
       }
+      // Session・フォルダの handle（`handle:<projectId>`）を置く。
       if (!db.objectStoreNames.contains(STORE_STATES)) {
         db.createObjectStore(STORE_STATES, { keyPath: 'projectId' })
       }
-      // 手で直したまとめの例外。1 プロジェクト 1 行に畳んで持つ。
-      // 触ったペアの数だけしか増えないので、行に収めて構わない。
+      // 手で直したまとめの例外（`overrides:<projectId>`）。1 プロジェクト 1 行に畳んで持つ。
       if (!db.objectStoreNames.contains(STORE_BURST_SHAPES)) {
         db.createObjectStore(STORE_BURST_SHAPES, { keyPath: 'projectId' })
       }
@@ -92,10 +133,19 @@ export function openStore(): Promise<IDBDatabase> {
         db.createObjectStore(STORE_DISPLAYS, { keyPath: 'photoId' })
       }
     }
-    request.onsuccess = () => resolve(request.result)
-    request.onerror = () => reject(request.error ?? new Error('保存領域を開けませんでした。'))
+    request.onsuccess = () => {
+      // すでに失敗として返した後に開けたものは閉じる（別のタブの版上げを塞がないため）。
+      if (settled) request.result.close()
+      else resolve(request.result)
+    }
+    request.onerror = () => fail(describeOpenError(request.error))
+    // 別のタブが古い版で開いたままだと、いつまでも待たされる。
+    request.onblocked = () => fail(new Error(BLOCKED_MESSAGE))
   })
-  return opening
+  opening = attempt
+  // 失敗を覚えたままにしない。直したあとの次の呼び出しで開き直せるように。
+  attempt.catch(() => { if (opening === attempt) opening = null })
+  return attempt
 }
 
 const asPromise = <T>(request: IDBRequest<T>) =>
@@ -138,50 +188,6 @@ export const deleteOne = (transaction: IDBTransaction, store: string, key: IDBVa
 export function photosOfProject(transaction: IDBTransaction, projectId: string) {
   const index = transaction.objectStore(STORE_PHOTOS).index('projectId')
   return asPromise<StoredPhoto[]>(index.getAll(projectId) as IDBRequest<StoredPhoto[]>)
-}
-
-/** 保存されたセッション JSON。無ければ null。 */
-export async function readSession(projectId: string): Promise<string | null> {
-  return withStores([STORE_STATES], 'readonly', async transaction => {
-    const row = await getOne<{ projectId: string, stateJson: string }>(transaction, STORE_STATES, projectId)
-    return row?.stateJson ?? null
-  })
-}
-
-export async function writeSession(projectId: string, stateJson: string): Promise<void> {
-  await withStores([STORE_STATES], 'readwrite', transaction =>
-    putOne(transaction, STORE_STATES, { projectId, stateJson, updatedAt: Date.now() })
-  )
-}
-
-/**
- * 手で直した連写の例外（core の `PairOverride`、鍵は relativePath）。
- *
- * 新しい store を足すと DB の版上げが要るので、既存の `burstShapes` に
- * `overrides:<projectId>` のキーで 1 プロジェクト 1 行に畳んで置く。
- * 旧版の行（キーが素の projectId、photo id の組）は読まない。
- */
-export const overridesKey = (projectId: string) => `overrides:${projectId}`
-
-export async function readPairOverrides(projectId: string): Promise<PairOverride[]> {
-  const row = await withStores([STORE_BURST_SHAPES], 'readonly', transaction =>
-    getOne<{ projectId: string, overrides: PairOverride[] }>(
-      transaction, STORE_BURST_SHAPES, overridesKey(projectId)
-    )
-  )
-  return Array.isArray(row?.overrides) ? row.overrides : []
-}
-
-export async function writePairOverrides(
-  projectId: string, overrides: PairOverride[]
-): Promise<void> {
-  await withStores([STORE_BURST_SHAPES], 'readwrite', transaction =>
-    putOne(transaction, STORE_BURST_SHAPES, {
-      projectId: overridesKey(projectId),
-      overrides,
-      updatedAt: Date.now()
-    })
-  )
 }
 
 /**

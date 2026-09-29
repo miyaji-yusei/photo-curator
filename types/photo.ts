@@ -78,6 +78,13 @@ export interface Project {
   /** このプロジェクトで学習済みの連写まとめ閾値。未学習なら null。 */
   burstThreshold: number | null
   burstThresholdLearnedAt: number | null
+  /**
+   * 写真の出所（ブラウザだけ）。省略はデスクトップ（フォルダ参照）。
+   * `picker` は写真ピッカー、`folder` は File System Access のフォルダ、`dev` は開発用の HTTP。
+   */
+  source?: 'picker' | 'folder' | 'dev'
+  /** `folder` のとき、次に読む許可がまだ無ければ 'needs-permission'（ボタンで許可を求める）。 */
+  folderAccess?: 'granted' | 'needs-permission'
 }
 
 export interface TournamentSettings {

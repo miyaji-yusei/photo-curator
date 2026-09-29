@@ -5,7 +5,6 @@ import type { Project } from '~/types/photo'
 const {
   activeProject: nullableActiveProject,
   askDeleteProject,
-  canImportPhotos,
   densityOptions,
   desktop,
   displayBacklog,
@@ -16,6 +15,7 @@ const {
   gridClass,
   gridStyle,
   hasSelectionData,
+  importsByPicker,
   largeDisplay,
   openPhotoPicker,
   openResults,
@@ -35,8 +35,8 @@ const activeProject = nullableActiveProject as Ref<Project>
 </script>
 
 <template>
-    <div class="d-flex align-center justify-space-between flex-wrap ga-4 mb-7"><div><v-btn variant="text" prepend-icon="mdi-arrow-left" class="px-0" @click="view = 'home'">ホーム</v-btn><h1 class="text-h4 font-weight-bold">{{ activeProject.name }}</h1><p class="text-body-2 text-medium-emphasis mt-1">{{ activeProject.folderPath }}</p></div><div class="d-flex flex-wrap ga-2"><v-btn variant="text" prepend-icon="mdi-delete-outline" @click="askDeleteProject(activeProject)">削除</v-btn><v-btn v-if="hasSelectionData" variant="text" prepend-icon="mdi-star-outline" @click="openResults">選別結果を見る</v-btn><v-btn v-if="canImportPhotos" variant="outlined" prepend-icon="mdi-image-plus" :loading="scanRunning" @click="openPhotoPicker">写真を追加</v-btn><v-btn v-else variant="outlined" prepend-icon="mdi-refresh" :loading="scanRunning" @click="startScan">写真を再読み込み</v-btn><v-btn color="primary" prepend-icon="mdi-play" :disabled="!activeProject.photoCount" @click="session ? resumeSession() : enterMethod()">{{ session ? '選別を再開' : '選別を開始' }}</v-btn></div></div>
-    <v-card class="mb-6"><v-card-text class="d-flex align-center ga-5"><v-avatar color="primary" size="50"><v-icon color="black" icon="mdi-image-multiple" /></v-avatar><div><div class="text-h6">{{ activeProject.photoCount.toLocaleString() }} 枚の写真</div><div class="text-body-2 text-medium-emphasis">{{ canImportPhotos ? '星とサムネイルはこの端末に保存されます。写真ライブラリは変更しません。' : 'サブフォルダも含めて参照します。写真ファイルは変更しません。' }}</div></div></v-card-text></v-card>
+    <div class="d-flex align-center justify-space-between flex-wrap ga-4 mb-7"><div><v-btn variant="text" prepend-icon="mdi-arrow-left" class="px-0" @click="view = 'home'">ホーム</v-btn><h1 class="text-h4 font-weight-bold">{{ activeProject.name }}</h1><p class="text-body-2 text-medium-emphasis mt-1">{{ activeProject.folderPath }}</p></div><div class="d-flex flex-wrap ga-2"><v-btn variant="text" prepend-icon="mdi-delete-outline" @click="askDeleteProject(activeProject)">削除</v-btn><v-btn v-if="hasSelectionData" variant="text" prepend-icon="mdi-star-outline" @click="openResults">選別結果を見る</v-btn><v-btn v-if="importsByPicker" variant="outlined" prepend-icon="mdi-image-plus" :loading="scanRunning" @click="openPhotoPicker">写真を追加</v-btn><v-btn v-else-if="activeProject.folderAccess === 'needs-permission'" variant="outlined" color="warning" prepend-icon="mdi-folder-key-outline" :loading="scanRunning" @click="startScan">フォルダへのアクセスを許可</v-btn><v-btn v-else variant="outlined" prepend-icon="mdi-refresh" :loading="scanRunning" @click="startScan">写真を再読み込み</v-btn><v-btn color="primary" prepend-icon="mdi-play" :disabled="!activeProject.photoCount" @click="session ? resumeSession() : enterMethod()">{{ session ? '選別を再開' : '選別を開始' }}</v-btn></div></div>
+    <v-card class="mb-6"><v-card-text class="d-flex align-center ga-5"><v-avatar color="primary" size="50"><v-icon color="black" icon="mdi-image-multiple" /></v-avatar><div><div class="text-h6">{{ activeProject.photoCount.toLocaleString() }} 枚の写真</div><div class="text-body-2 text-medium-emphasis">{{ importsByPicker ? '星とサムネイルはこの端末に保存されます。写真ライブラリは変更しません。' : 'サブフォルダも含めて参照します。写真ファイルは変更しません。' }}</div></div></v-card-text></v-card>
     <!-- 選別画面に出す画像の大きさ。**解析を起こす場所の隣に置く**ので
          対応が分かりやすい。設定画面では全体の既定を決められる。 -->
     <v-card v-if=displaySettings class="mb-6">
@@ -74,7 +74,7 @@ const activeProject = nullableActiveProject as Ref<Project>
     <div v-if="previewPhotos.length" class="photo-grid" :class="gridClass(previewDensity)" :style="gridStyle(previewDensity)"><div v-for="photo in previewPhotos" :key="photo.id" class="photo-tile" role="button" tabindex="0" @click="openZoom(photo, previewPhotos)" @keydown.enter="openZoom(photo, previewPhotos)"><img :src="desktop.photoThumbnailUrl(photo)" :alt="photo.name" loading="lazy"><div class="photo-tile__caption">{{ photo.relativePath }}</div></div></div>
     <v-alert v-if="previewTotal > previewPhotos.length" type="info" variant="tonal" class="mt-5">表示負荷を抑えるため、最初の {{ previewPhotos.length }} 枚だけを表示しています。選別にはすべての写真が含まれます。</v-alert>
     <!-- まだ 1 枚も無いプロジェクト。次にやることを 1 つだけ置く。 -->
-    <v-card v-if="canImportPhotos && !previewPhotos.length && !scanRunning" class="pa-10 text-center">
+    <v-card v-if="importsByPicker && !previewPhotos.length && !scanRunning" class="pa-10 text-center">
       <v-icon icon="mdi-image-plus" size="44" class="text-medium-emphasis" />
       <div class="text-h6 mt-4">まだ写真がありません</div>
       <p class="text-body-2 text-medium-emphasis mt-2 mb-6">

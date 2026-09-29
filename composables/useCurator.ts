@@ -55,6 +55,11 @@ function createCurator() {
   const createDialog = ref(false)
   const projectName = ref('')
   const folderPath = ref('')
+  /** (開発用) フォルダの絶対パス。`pnpm dev` のときだけ作成ダイアログに出す。 */
+  const devFolderPath = ref('')
+  // 開発用の配信（server/api/dev-folder/）は、Nuxt の開発サーバーが動くブラウザ版でだけ使える。
+  // `tauri dev` の画面では使えない（Rust に渡しても読めない）。
+  const isDev = import.meta.dev && desktop.kind === 'local'
   const taskProgress = ref<ProjectProgress | null>(null)
   const taskWarning = ref<string | null>(null)
   const taskDialog = ref(false)
@@ -469,7 +474,9 @@ function createCurator() {
       // **フォルダを走査できる環境だけ。** ブラウザには走査するフォルダが無く、
       // `startProjectScan` は何もしないので、進捗イベントも来ない。それを待つ
       // ダイアログが閉じられなくなり、リロードしないと戻れなくなっていた。
-      if (!project.photoCount && !canImportPhotos.value && !scanRunning.value) {
+      // フォルダの許可が切れているときは、ここで求めても通らない（許可は利用者の操作の中でだけ）。
+      // プロジェクトの画面の「フォルダへのアクセスを許可」を押してもらう。
+      if (!project.photoCount && !importsByPicker.value && !scanRunning.value && project.folderAccess !== 'needs-permission') {
         await startScan()
         return
       }
@@ -503,6 +510,12 @@ function createCurator() {
    * 代わりに写真ピッカーから受け取る。
    */
   const canImportPhotos = computed(() => typeof desktop.importPhotos === 'function')
+  /**
+   * このプロジェクトは写真ピッカーで取り込むか。ブラウザでも、フォルダ（File System Access・
+   * 開発用）のプロジェクトはフォルダから読むので、デスクトップと同じく「再読み込み」になる。
+   */
+  const importsByPicker = computed(() =>
+    canImportPhotos.value && (activeProject.value?.source ?? 'picker') === 'picker')
   const photoInput = ref<HTMLInputElement | null>(null)
 
   function openPhotoPicker() {
@@ -539,15 +552,20 @@ function createCurator() {
   }
 
   async function createProject() {
-    // ブラウザではフォルダを選べない。名前だけ決めて作り、続けて写真を選ばせる。
+    // フォルダを選べないブラウザでは、名前だけ決めて作り、続けて写真を選ばせる。
+    // フォルダ（選んだもの・開発用の絶対パス）があれば、そこから読む。
+    const devPath = isDev ? devFolderPath.value.trim() : ''
     if (!canImportPhotos.value && !folderPath.value) return
     loading.value = true
     try {
-      const fallbackName = folderPath.value ? fileName(folderPath.value) : '新しいプロジェクト'
-      const project = await desktop.createProject(projectName.value.trim() || fallbackName, folderPath.value)
+      const fallbackName = devPath ? fileName(devPath) : folderPath.value ? fileName(folderPath.value) : '新しいプロジェクト'
+      const project = await desktop.createProject(
+        projectName.value.trim() || fallbackName, devPath ? `dev:${devPath}` : folderPath.value
+      )
       createDialog.value = false
       projectName.value = ''
       folderPath.value = ''
+      devFolderPath.value = ''
       await refreshProjects()
       await openProject(project)
       // ここで写真ピッカーを自動で開かない。iOS はファイル選択を
@@ -563,10 +581,10 @@ function createCurator() {
 
   async function startScan() {
     if (!activeProject.value || taskDialog.value) return
-    // 走査するフォルダを持たない環境では、待つべき進捗が一度も発生しない。
-    // ダイアログを出すと閉じる手立てが無くなるので、始めない。
-    // ブラウザでの取り込みは `openPhotoPicker` が入口。
-    if (canImportPhotos.value) return
+    // 走査するフォルダを持たないプロジェクト（ブラウザのピッカー）では、待つべき進捗が
+    // 一度も発生しない。ダイアログを出すと閉じる手立てが無くなるので、始めない。
+    // ピッカーでの取り込みは `openPhotoPicker` が入口。
+    if (importsByPicker.value) return
     taskProgress.value = { projectId: activeProject.value.id, task: 'scan', phase: 'indexing', processed: 0, total: 0, message: '写真フォルダを確認しています…', warning: null, failed: 0 }
     taskWarning.value = null
     taskDialog.value = true
@@ -1768,11 +1786,35 @@ function createCurator() {
     zoomPhoto.value = null
   }
 
+  /** 準備の途中で、格子のサムネイルを少しずつ埋める（ブラウザだけ。PC は元から原本が見える）。 */
+  let previewRefreshedAt = 0
+  async function refreshDuringPreparation(progress: ProjectProgress) {
+    if (desktop.kind !== 'local' || view.value !== 'project') return
+    const finished = progress.phase === 'complete' || progress.phase === 'cancelled'
+    const now = Date.now()
+    if (!finished && now - previewRefreshedAt < 3000) return
+    previewRefreshedAt = now
+    await loadPreview(progress.projectId).catch(() => undefined)
+    if (!finished) return
+    await refreshProjects().catch(() => undefined)
+    await loadCoreInputs(progress.projectId).catch(() => undefined)
+  }
+
   async function mount() {
     try {
       // 判断（core）は wasm。最初に 1 回だけ読み込む。
       await core.init()
+    } catch (cause) {
+      error.value = cause instanceof Error ? cause.message : '判断の部品を読み込めませんでした。'
+    }
+    try {
+      // 保存領域を開けないとき（別の版が残っている・別のタブが使っている など）は、
+      // その理由と次にすることの文がここに来る。ホームの上の赤い帯に出す。
       await refreshProjects()
+    } catch (cause) {
+      error.value = cause instanceof Error ? cause.message : 'プロジェクトを読み込めませんでした。'
+    }
+    try {
       stopProgressListener = await desktop.onProjectProgress(async (progress) => {
         if (!activeProject.value || progress.projectId !== activeProject.value.id) return
         // 連写解析（前面・事前生成とも）は待たせない。帯で状況だけ伝える。
@@ -1782,6 +1824,7 @@ function createCurator() {
           // 警告は解析中の1イベントにしか乗らないので、別に保持して出し続ける。
           if (progress.warning) taskWarning.value = progress.warning
           if (progress.phase === 'error') error.value = progress.message
+          if (progress.task === 'background') void refreshDuringPreparation(progress)
           return
         }
         taskProgress.value = progress
@@ -1799,7 +1842,7 @@ function createCurator() {
         }
       })
     } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : 'プロジェクトを読み込めませんでした。'
+      error.value = cause instanceof Error ? cause.message : '進み具合を受け取れませんでした。'
     }
     window.addEventListener('keydown', onKeydown)
     compactQuery = window.matchMedia(COMPACT_QUERY)
@@ -1959,6 +2002,9 @@ function createCurator() {
     openProject,
     chooseFolder,
     canImportPhotos,
+    importsByPicker,
+    devFolderPath,
+    isDev,
     photoInput,
     openPhotoPicker,
     onPhotoPicked,
