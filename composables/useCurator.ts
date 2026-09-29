@@ -1613,16 +1613,26 @@ function createCurator() {
     }
   }
 
-  /** 星を全部 0 に戻して最初からやり直す。解析結果は消えない。 */
+  /**
+   * 星を全部 0 に戻して最初からやり直す。解析結果（指紋・サムネイル）は消えない。
+   * 消す判断の中身（星・連写の手直し・学習した距離・選別の途中）は、ここ 1 か所に集める。
+   */
   async function restartFromScratch() {
-    if (!activeProject.value) return
+    const project = activeProject.value
+    if (!project) return
     restartBusy.value = true
     try {
-      await desktop.resetSelectionResults(activeProject.value.id)
+      await desktop.resetSelectionResults(project.id)
+      // 連写の手直しと学習した距離も消す（消さないと、やり直しても学習の質問から始まらない）。
+      await desktop.savePairOverrides(project.id, [])
+      pairOverrides = []
+      await desktop.clearBurstThreshold(project.id)
+      project.burstThreshold = null
       noteJudgementChanged()
       session.value = null
       // 途中の選別も消す。残すと、リロードで星の無い写真に古い Session が戻る。
-      saveQueue.enqueue(activeProject.value.id, null)
+      saveQueue.enqueue(project.id, null)
+      await refreshProjects()
       await loadSummary()
       restartDialog.value = false
       view.value = 'project'
