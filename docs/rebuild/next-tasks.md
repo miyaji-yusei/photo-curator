@@ -25,7 +25,7 @@
 | --- | --- | --- | --- | --- |
 | U1 | 「1 つ戻す」で、まとめの中の ★5 の仲間が ★4 になる（レビュー #2）→ **core の「1 つ戻す」を直す**（ユーザー決定） | M | `core/src/lib.rs`・`app-android/`（`.so` の作り直し） | 済（#28。Android の .so の作り直しはユーザー） |
 | U2 | メタデータに反映が失敗する | S | `src-tauri/src/lib.rs` の `write_ratings_to_photos_blocking` | 済（#22） |
-| U3 | 写真を移動すると、結果に数は出るが、当てはまる写真が無くなる | S〜M | `src-tauri/src/lib.rs`（移動と集計）・`composables/useCurator.ts` | 未 |
+| U3 | 写真を移動すると、結果に数は出るが、当てはまる写真が無くなる | S〜M | `src-tauri/src/lib.rs`（移動と集計）・`composables/useCurator.ts` | 済（#29） |
 | U4 | 「8 枚を ★5 から ★0 へ移しました」などの通知が × を押すまで消えない。通知の分だけ画面が下がる | S | `app.vue` 67〜79 行（`error`・`taskWarning`・`moveReport`）、`ResultsView.vue` の `resultsMessage` | 済（#23） |
 | U5 | プロジェクトの詳細に「選別を最初からやり直す」の入口が無い（Android にはある） | S | `ProjectView.vue`・`RestartDialog.vue`・`restartFromScratch` | 済（#24） |
 | U6 | 選別画面の下のボタン列を上に移し、写真を大きく見せる | M | `TournamentView.vue`・`composables/useCurator.ts` | 未 |
@@ -35,7 +35,7 @@
 | U10 | 拡大の読み込み中にぐるぐる（Android と同じ） | S | 拡大の部品（`zoomLoading` はもうある） | 済（#26） |
 | U11 | 複数モードで ★5 を押しても、すぐ次の組へ進まない（Android と同じ） | S〜M | `useCurator.ts` の ★5（`keepAndTop`）の呼び方 | 未 |
 | U12 | まとまり編集を、Android と同じ横並び＋境目のバーで切る／ずらす UI にする | M | `components/dialogs/BurstDialog.vue`・`utils/burstEdit.ts` | 未 |
-| U13 | 表示用画像の大きさを、PC・Web でもプロジェクトの作成時から決められるようにする | S〜M | 作成ダイアログ・アプリの設定・`save_display_edge` | 未 |
+| U13 | 表示用画像の大きさを、PC・Web でもプロジェクトの作成時から決められるようにする | S〜M | 作成ダイアログ・アプリの設定・`save_display_edge` | 済（#30。Web の Amazon の表示用は 1024 固定のまま） |
 | U14 | PC の Amazon の読み込みが遅い（Web は速い）→ 速くできるか調べて比べる | 調査 → M | `src-tauri/src/amazon.rs`・`lib.rs` の Amazon の準備 | 未 |
 
 ---
