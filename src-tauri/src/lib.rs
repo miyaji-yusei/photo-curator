@@ -3998,10 +3998,17 @@ struct DisplaySettings {
     choices: Vec<u32>,
     default_edge: u32,
     large_edge: u32,
+    /// プロジェクトを渡したとき、そのプロジェクトで実際に使う長辺（上書き → 全体の既定）。
+    /// 読むだけで、上書きは消さない。
+    project_edge: Option<u32>,
 }
 
 #[tauri::command]
-fn get_display_settings(app: AppHandle) -> Result<DisplaySettings, String> {
+fn get_display_settings(app: AppHandle, project_id: Option<String>) -> Result<DisplaySettings, String> {
+    let project_edge = match project_id {
+        Some(id) => Some(resolve_display_edge(&app, &id)?),
+        None => None,
+    };
     let conn = connection(&app)?;
     let edge = read_setting(&conn, SETTING_DISPLAY_EDGE)
         .and_then(|v| v.parse::<i64>().ok())
@@ -4011,6 +4018,7 @@ fn get_display_settings(app: AppHandle) -> Result<DisplaySettings, String> {
         choices: DISPLAY_EDGES.to_vec(),
         default_edge: DISPLAY_EDGE_DEFAULT,
         large_edge: DISPLAY_EDGE_LARGE,
+        project_edge,
     })
 }
 

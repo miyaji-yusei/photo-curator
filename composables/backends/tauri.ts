@@ -137,7 +137,8 @@ export function createTauriBackend(): PhotoBackend {
       }
       return convertFileSrc(photo.displayPath ?? photo.thumbnailPath ?? photo.path)
     },
-    getDisplaySettings: () => invokeDesktop<DisplaySettings>('get_display_settings'),
+    getDisplaySettings: (projectId?: string) =>
+      invokeDesktop<DisplaySettings>('get_display_settings', { projectId: projectId ?? null }),
     saveDisplayEdge: (edge: number) => invokeDesktop<number>('save_display_edge', { edge }),
     saveProjectDisplayEdge: (projectId: string, edge: number | null) =>
       invokeDesktop<number>('save_project_display_edge', { projectId, edge }),

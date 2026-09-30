@@ -4,6 +4,7 @@ import type {
 } from '~/types/photo'
 import { MAX_RATING } from '~/types/photo'
 import type { DisplaySettings } from '~/composables/photoBackend'
+import { builtDisplayCount, displayEdgePlan } from '~/utils/displayEdge'
 import type { MoveSelection } from '~/utils/ratingMove'
 // `selectedCount` は選別画面側の computed と名前がぶつかるので別名にする。
 import {
@@ -124,9 +125,12 @@ function createCurator() {
     get: () => displayEdge.value >= (displaySettings.value?.largeEdge ?? 1536),
     set: (on: boolean) => {
       const settings = displaySettings.value
-      if (settings) void applyDisplayEdge(on ? settings.largeEdge : settings.defaultEdge)
+      if (settings) void requestDisplayEdge(on ? settings.largeEdge : settings.defaultEdge)
     }
   })
+  /** 「表示用画像を作り直します。よろしいですか」の確認。OK までは px を変えない（選択は元のまま）。 */
+  const displayEdgeDialog = ref(false)
+  const pendingDisplayEdge = ref<number | null>(null)
   const pendingTournamentSettings = ref<TournamentSettings | null>(null)
   /**
    * 1 グループの枚数の既定と上限。デスクトップは 10 枚、iPad などブラウザは
@@ -895,17 +899,18 @@ function createCurator() {
   watch(view, next => { if (next === 'app-settings') void loadAppSettings() })
 
   /**
-   * 作成した直後、**準備（表示用画像づくり）を始める前**に、選んだ長辺をこのプロジェクトに書く
-   * （あとで作り直さないため）。選んだ値はアプリの既定にもする。
+   * 作成した直後、**準備（表示用画像づくり）を始める前**に、ダイアログで選んだ長辺を
+   * このプロジェクトに書く（生成はこの値で行う）。**アプリの既定は変えない**
+   * （既定はダイアログの初期値にだけ効く。変えるのはアプリの設定の画面）。
    */
   async function applyCreateDisplayEdge(projectId: string) {
     const edge = createDisplayEdge.value
     if (!edge || !createDisplayChoices.value.length) return
     try {
-      await desktop.saveDisplayEdge(edge)
       await desktop.saveProjectDisplayEdge(projectId, edge)
-    } catch {
-      // 保存できなくても作成は続ける（既定の大きさで作られる）。
+    } catch (cause) {
+      // 作成は続ける（既定の大きさで作られる）が、黙らずに知らせる。
+      error.value = cause instanceof Error ? cause.message : '表示用画像の大きさを保存できませんでした。既定の大きさで作ります。'
     }
   }
 
@@ -2064,9 +2069,10 @@ function createCurator() {
     // 表示用画像が替わりうるので、先読みした行（表示用の場所を含む）は捨てる。
     prefetched.clear()
     try {
-      displaySettings.value = await desktop.getDisplaySettings()
-      // プロジェクトの上書きを反映した実効値。null を渡すと現状のまま返る。
-      displayEdge.value = await desktop.saveProjectDisplayEdge(activeProject.value.id, null)
+      // プロジェクトの上書きを反映した実効値（読むだけ。上書きは消さない）。
+      const settings = await desktop.getDisplaySettings(activeProject.value.id)
+      displaySettings.value = settings
+      displayEdge.value = settings.projectEdge ?? settings.edge
       displayBacklog.value = await desktop.getDisplayBacklog(activeProject.value.id)
     } catch {
       // 設定が読めなくても選別は続けられる。表示用が無ければ原本に落ちるだけ。
@@ -2092,6 +2098,50 @@ function createCurator() {
     } finally {
       displayBusy.value = false
     }
+  }
+
+  /** 走査が終わったプロジェクトの表示用画像を、選んだ長辺で作り始める。 */
+  async function startDisplayAfterScan(projectId: string) {
+    if (activeProject.value?.id !== projectId) return
+    await refreshDisplayState()
+    if (displayBacklog.value > 0) desktop.startDisplayGeneration(projectId).catch(() => undefined)
+  }
+
+  /**
+   * プロジェクトの画面から px を変える。作り直しが要るとき（作られた画像があり、値が変わる）だけ
+   * 確認を出す。要らなければ保存だけ。変えられないとき・同じ値のときは何もしない。
+   */
+  async function requestDisplayEdge(edge: number) {
+    const project = activeProject.value
+    if (!project || displayBusy.value) return
+    const plan = displayEdgePlan({
+      current: displayEdge.value,
+      next: edge,
+      canRebuild: displaySettings.value?.canRebuild,
+      rebuildsOnChange: displaySettings.value?.rebuildsOnChange,
+      builtCount: builtDisplayCount(project.photoCount, displayBacklog.value)
+    })
+    if (plan === 'locked' || plan === 'same') return
+    if (plan === 'confirm') {
+      pendingDisplayEdge.value = edge
+      displayEdgeDialog.value = true
+      return
+    }
+    await applyDisplayEdge(edge)
+  }
+
+  /** 確認の OK。選んだ px で作り直す。 */
+  async function confirmDisplayEdge() {
+    const edge = pendingDisplayEdge.value
+    displayEdgeDialog.value = false
+    pendingDisplayEdge.value = null
+    if (edge !== null) await applyDisplayEdge(edge)
+  }
+
+  /** 確認のキャンセル。選択は元のまま、作り直さない。 */
+  function cancelDisplayEdge() {
+    displayEdgeDialog.value = false
+    pendingDisplayEdge.value = null
   }
 
   /** 明示的に作り直す。壊れたときや、途中で止まったときの逃げ道。 */
@@ -2550,6 +2600,8 @@ function createCurator() {
           await loadPreview(progress.projectId)
           void refreshPrepareCounts(progress.projectId, true)
           await loadCoreInputs(progress.projectId).catch(() => undefined)
+          // 表示用画像は走査のあとに溜める（開き直さないと始まらなかった）。
+          await startDisplayAfterScan(progress.projectId)
           await sidecar.refreshAccess(progress.projectId)
           if (sidecarCheckPending === progress.projectId && activeProject.value) {
             // 写真の行ができたので、開いたときの確認をここで行う（取り込んだ星を行へ写せる）。
@@ -2647,6 +2699,11 @@ function createCurator() {
     displayEdge,
     displayBacklog,
     displayBusy,
+    displayEdgeDialog,
+    pendingDisplayEdge,
+    requestDisplayEdge,
+    confirmDisplayEdge,
+    cancelDisplayEdge,
     largeDisplay,
     pendingTournamentSettings,
     groupLimits,
