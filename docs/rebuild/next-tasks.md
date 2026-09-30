@@ -34,7 +34,7 @@
 | U9 | 拡大で Ctrl+スクロールで拡大・縮小。Ctrl を押しても拡大を閉じない | M | `useCurator.ts` の `onZoomKeydown`・拡大の部品 | 済（#36。ユーザーの目視待ち） |
 | U10 | 拡大の読み込み中にぐるぐる（Android と同じ） | S | 拡大の部品（`zoomLoading` はもうある） | 済（#26） |
 | U11 | 複数モードで ★5 を押しても、すぐ次の組へ進まない（Android と同じ） | S〜M | `useCurator.ts` の ★5（`keepAndTop`）の呼び方 | 閉じた（変更なし。2026-09-30 ユーザー決定: 今のまま＝Android と同じ） |
-| U12 | まとまり編集を、Android と同じ横並び＋境目のバーで切る／ずらす UI にする | M | `components/dialogs/BurstDialog.vue`・`utils/burstEdit.ts` | 未 |
+| U12 | まとまり編集を、Android と同じ横並び＋境目のバーで切る／ずらす UI にする | M | `components/dialogs/BurstDialog.vue`・`utils/burstEdit.ts` | 済（#37。PC の実機は未確認。ユーザーの目視待ち） |
 | U13 | 表示用画像の大きさを、PC・Web でもプロジェクトの作成時から決められるようにする | S〜M | 作成ダイアログ・アプリの設定・`save_display_edge` | 済（#30。Web の Amazon の表示用は 1024 固定のまま） |
 | U14 | PC の Amazon の読み込みが遅い（Web は速い）→ 速くできるか調べて比べる | 調査 → M | `src-tauri/src/amazon.rs`・`lib.rs` の Amazon の準備 | 未 |
 | U15 | プロジェクト詳細の上のボタンの高さをそろえ、並びを「⋮・選別結果を見る・削除・写真を再読み込み・選別を再開」にする（2026-09-30 #27 の確認で） | S | `components/views/ProjectView.vue` 49 行付近 | 済（#31） |
