@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use rusqlite::{params, Connection};
@@ -62,11 +62,19 @@ pub fn parse_key(key: &str) -> Option<AmazonSource> {
     Some(AmazonSource { host: host.to_string(), share_id: share_id.to_string() })
 }
 
-fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
-        .build()
+/// プロセスで 1 つの共有 agent。呼ぶたびに作ると接続（TCP＋TLS。tempLink は 302 で別ホストへ
+/// 飛ぶので 2 ホスト分）を毎回やり直すことになる（U14）。ureq 2 の既定は 1 ホスト 1 本しか
+/// 使い回さないので、並列数（`WORKERS`）以上に広げる。
+fn agent() -> &'static ureq::Agent {
+    static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
+        ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .max_idle_connections(32)
+            .max_idle_connections_per_host(WORKERS.max(8))
+            .build()
+    });
+    &AGENT
 }
 
 /// 共有リンクが消えた（404 など）ときの文。これが出たら準備を自動でやり直さない。
@@ -169,23 +177,32 @@ fn is_image_node(node: &AmazonNode) -> bool {
 /// FILE 以外は 2 階層まで潜り、`image/*` の FILE だけ集める
 /// （**拡張子で判定しない**。08章「落とし穴」1・2）。
 pub fn list_photos(source: &AmazonSource, root_node_id: &str) -> Result<Vec<AmazonNode>, String> {
+    let children = fetch_all_children(source, root_node_id)?;
+    list_photos_from_children(source, children)
+}
+
+/// 直下の子を取ってあるとき用（`preview()` が直下を 1 回だけ取って使う）。
+fn list_photos_from_children(source: &AmazonSource, top_children: Vec<AmazonNode>) -> Result<Vec<AmazonNode>, String> {
     let mut photos = Vec::new();
-    collect(source, root_node_id, 0, &mut photos)?;
+    collect_children(source, top_children, 0, &mut photos)?;
     Ok(photos)
 }
 
-fn collect(source: &AmazonSource, node_id: &str, depth: u32, out: &mut Vec<AmazonNode>) -> Result<(), String> {
+fn collect_children(source: &AmazonSource, children: Vec<AmazonNode>, depth: u32, out: &mut Vec<AmazonNode>) -> Result<(), String> {
     if depth > MAX_DEPTH {
         return Ok(());
     }
-    let children = fetch_all_children(source, node_id)?;
     for child in children {
         if child.kind == "FILE" {
             if is_image_node(&child) {
                 out.push(child);
             }
         } else {
-            collect(source, &child.id, depth + 1, out)?;
+            if depth + 1 > MAX_DEPTH {
+                continue;
+            }
+            let grandchildren = fetch_all_children(source, &child.id)?;
+            collect_children(source, grandchildren, depth + 1, out)?;
         }
     }
     Ok(())
@@ -240,12 +257,12 @@ pub struct AmazonPreview {
 pub fn preview(share_url: &str, sample_limit: usize) -> Result<AmazonPreview, String> {
     let source = parse_share_url(share_url).ok_or_else(|| "Amazon Photos の共有リンクの形ではありません。".to_string())?;
     let root = fetch_share_root(&source)?;
-    let nodes = list_photos(&source, &root.node_id)?;
-
-    // 共有の直下がアルバム1つだけなら、そのアルバムの名前を使う（08章「プロジェクト名の決め方」）。
+    // 直下の子は 1 回だけ取り、走査とアルバム名の決定の両方に使う（U14）。
     let top_children = fetch_all_children(&source, &root.node_id)?;
+    // 共有の直下がアルバム1つだけなら、そのアルバムの名前を使う（08章「プロジェクト名の決め方」）。
     let albums: Vec<&AmazonNode> = top_children.iter().filter(|n| n.kind != "FILE").collect();
     let name = if albums.len() == 1 { albums[0].name.clone() } else { root.name.clone() };
+    let nodes = list_photos_from_children(&source, top_children)?;
 
     let mut samples = Vec::new();
     for node in nodes.iter().take(sample_limit) {
