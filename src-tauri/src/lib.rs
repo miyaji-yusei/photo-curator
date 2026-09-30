@@ -2335,7 +2335,7 @@ fn run_burst_analysis(
     // ネットワークのフォルダは worker 数を抑えるので、フォルダの場所を先に知る。
     let folder = project_folder(&app, &project_id)?;
     // Amazon の共有リンクは、撮影時刻を一覧の contentDate から走査で入れてあり、
-    // サムネイル・指紋は viewBox=160 の画像から作る。並列は 4。
+    // サムネイル・指紋は viewBox=160 の画像から作る。並列は WORKERS（8）。
     let amazon_book = amazon_book_of(&app, &project_id)?;
     let workers = if amazon_book.is_some() {
         amazon::WORKERS
