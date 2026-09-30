@@ -33,7 +33,7 @@
     "survivors": ["1"],
     "ratings": { "1": 1, "2": 0, "3": 0, "4": 0 },
     "members": {},
-    "history": [ { "group": ["1", "2"], "chosen": ["1"], "topped": null } ],
+    "history": [ { "group": ["1", "2"], "chosen": ["1"], "topped": null, "before": { "1": 0 } } ],
     "finished": false
   },
   "expected_after_undo": {

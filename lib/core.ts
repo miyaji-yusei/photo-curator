@@ -57,6 +57,8 @@ export interface Decision {
   group: string[]
   chosen: string[]
   topped: Topped | null
+  /** 確定の前の星の控え。空（または無い）なら古い形で、差分で戻す */
+  before: Record<string, number>
 }
 
 export interface Session {

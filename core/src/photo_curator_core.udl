@@ -173,6 +173,9 @@ dictionary Decision {
     sequence<string> chosen;
     // ★5 で確定したなら、その 1 枚と押す前の星。戻すときに使う。
     Topped? topped;
+    // 確定の前の星の控え（写真 → 確定の前の星）。戻すときはこの値を書き戻す。
+    // 空なら古い形の履歴で、差分で戻す。
+    record<DOMString, i32> before;
 };
 
 dictionary Topped {
