@@ -1,0 +1,156 @@
+# 次の作業（2026-09-30、ユーザーの確認を受けて）
+
+`feat/main-base` に T0〜T16 と修正（#20）をマージした（`55de41d`）。ここからは、ユーザーが実機で確かめて出した要望を片付ける。
+**ローカルで続けるときは、このファイルを上から順に進める。** 1 件 = 1 ブランチ（`feat/main-base` から `fix/mb-uNN-<名前>`）= 1 PR（`feat/main-base` 向け）。マージはユーザーが行う。
+
+## 共通の決まり
+- main・feat/rebuild は書き換えない
+- push・PR まではしてよい。merge・force・rebase・ブランチ削除はしない
+- 判断（星・連写）は core。人が星を直接決める手直しは `utils/ratingEdit.ts` だけ（`docs/rebuild/spec-changes.md` の 04章）
+- コミットの前に通すもの: `cargo test`（core）・`cargo check`（src-tauri）・`pnpm typecheck`・`pnpm test`
+- ポート 3000 はユーザーの `pnpm tauri:dev`。確認は 3100 で行い、終わったら止める
+- Android 版（`app-android/`）は見本として読むだけ。**U1 以外では変えない**
+- **U7 は、実装の前にプランをユーザーと合わせる（ここで止まる）**
+
+## 一覧（おすすめの順）
+
+| # | 要望 | 規模 | 主な場所 |
+| --- | --- | --- | --- |
+| U1 | 「1 つ戻す」で、まとめの中の ★5 の仲間が ★4 になる（レビュー #2）→ **core の「1 つ戻す」を直す**（ユーザー決定） | M | `core/src/lib.rs`・`app-android/`（`.so` の作り直し） |
+| U2 | メタデータに反映が失敗する | S | `src-tauri/src/lib.rs` の `write_ratings_to_photos_blocking` |
+| U3 | 写真を移動すると、結果に数は出るが、当てはまる写真が無くなる | S〜M | `src-tauri/src/lib.rs`（移動と集計）・`composables/useCurator.ts` |
+| U4 | 「8 枚を ★5 から ★0 へ移しました」などの通知が × を押すまで消えない。通知の分だけ画面が下がる | S | `app.vue` 67〜79 行（`error`・`taskWarning`・`moveReport`）、`ResultsView.vue` の `resultsMessage` |
+| U5 | プロジェクトの詳細に「選別を最初からやり直す」の入口が無い（Android にはある） | S | `ProjectView.vue`・`RestartDialog.vue`・`restartFromScratch` |
+| U6 | 選別画面の下のボタン列を上に移し、写真を大きく見せる | M | `TournamentView.vue`・`composables/useCurator.ts` |
+| U7 | 選別の並べ方（4 枚で 2×2 か 1×4 か）を窓の形に合わせて変える → **プランを合わせてから** | M | `TournamentView.vue`・新規 `utils/gridFor.ts` |
+| U8 | 「表示枚数」の画面で、クリックと矢印キーで増減できるようにする | S | `components/dialogs/GroupSizeDialog.vue` |
+| U9 | 拡大で Ctrl+スクロールで拡大・縮小。Ctrl を押しても拡大を閉じない | M | `useCurator.ts` の `onZoomKeydown`・拡大の部品 |
+| U10 | 拡大の読み込み中にぐるぐる（Android と同じ） | S | 拡大の部品（`zoomLoading` はもうある） |
+| U11 | 複数モードで ★5 を押しても、すぐ次の組へ進まない（Android と同じ） | S〜M | `useCurator.ts` の ★5（`keepAndTop`）の呼び方 |
+| U12 | まとまり編集を、Android と同じ横並び＋境目のバーで切る／ずらす UI にする | M | `components/dialogs/BurstDialog.vue`・`utils/burstEdit.ts` |
+| U13 | 表示用画像の大きさを、PC・Web でもプロジェクトの作成時から決められるようにする | S〜M | 作成ダイアログ・アプリの設定・`save_display_edge` |
+| U14 | PC の Amazon の読み込みが遅い（Web は速い）→ 速くできるか調べて比べる | 調査 → M | `src-tauri/src/amazon.rs`・`lib.rs` の Amazon の準備 |
+
+---
+
+## U1 core の「1 つ戻す」を直す（レビュー #2）
+- **症状**:
+  1. 連写まとめ on で、まとめの中の仲間を手で ★5 にする
+  2. 代表を確定すると、仲間は `shift_star(+1)` で 5 のまま（上限）
+  3. 「1 つ戻す」で `shift_star(-1)` が効き、仲間が ★4 になる。押す前の ★5 に戻らない（C-4・INV-3）
+- **直し方（core）**:
+  - `Decision` に、確定の前の星の控え `before: HashMap<String, i32>` を足す。確定で星を動かした写真（代表と仲間）の分を入れる
+  - `undo` は差分で戻さず、この控えの値をそのまま書き戻す
+  - 足すフィールドは `#[serde(default)]`。**控えが無い古い `Decision` は今までどおり差分で戻す**（保存済みの Session・Android が書いたサイドカーを読めるように）
+  - `keep_and_top` の `topped` も同じ控えで扱えるなら一つにまとめる。ただし既存のテストの期待は変えない
+- **テスト**: 上の症状の再現を core のテストにする（仲間 ★5 → 確定 → 戻す → ★5）。INV-3 のテストを全部通す。古い形の Session の JSON を読んで戻せるテスト
+- **Android**:
+  - core を変えたので `.so` と Kotlin の束ね（UniFFI）を作り直す（`app-android/` の手順。`scripts/build-core.mjs` を feat/rebuild から持ってくる必要があるかを先に確かめる）
+  - Android のビルドが通ることと、実機の 1 つ戻すを確かめるのはユーザーに頼む
+- **wasm**: `pnpm core:wasm` で作り直し、`tests/core-wasm-fixtures.test.mjs` を通す
+- 04章に 1 行（`spec-changes.md` に追記）: 「2026-09-30 変更: 1 つ戻すは差分ではなく、確定の前の星に書き戻す」
+
+## U2 メタデータに反映が失敗する（原因は分かっている）
+- **原因**: `write_ratings_to_photos_blocking`（`src-tauri/src/lib.rs` 3780 行付近）が、書いたあとの確かめで、拡張子 `.photocurator-tmp` の一時ファイルを `image::ImageReader::open(&temporary)` で開いている。拡張子から形式が分からないので、確かめが毎回失敗し、書き込みを取り消している
+- 新版で同じ不具合を直した `6e56524`（`git show 6e56524`）と同じ直し: `ImageReader::open(&temporary)?.with_guessed_format()?` で中身から形式を判定する
+- **テスト**: 一時フォルダの JPEG に星を書き、`xmp:Rating` が入ること（Rust の `cargo test --lib`）
+- ユーザーの確認: 作業用にコピーしたフォルダで「メタデータに反映」
+
+## U3 写真を移動すると、結果に数は出るが写真が無くなる
+- **分かっていること**:
+  - #20（review#1）で、移動した写真だけを `is_missing=1` にした
+  - 結果の一覧（`get_project_photo_page`）は `is_missing=0` だけを出す
+  - 一方、星ごとの数（`get_selection_summary`）が `is_missing` を見ていない見込み（**確かめる**）
+  - 移動先はプロジェクトのフォルダの外なので、写真はプロジェクトから消える
+- **決めること（実装の前に確かめる）**: 移動した写真を結果に「移動済み」として残すか、数からも外すか
+  - おすすめは「数からも外し、移動した旨を 1 回だけ通知」（原本はもうそのフォルダに無いので）
+- 数と一覧の条件をそろえる。移動したあと、Session の `ratings` に残る移動済みの写真が、次のラウンドや書き出しに入らないことも確かめる（`getCoreInputs` は `is_missing=0` だけ）
+
+## U4 通知が消えない・画面が下がる
+- `app.vue` の `v-alert`（`error`・`taskWarning`・`moveReport`）と `ResultsView.vue` の `resultsMessage` は、本文の中に置かれているので、出ると本文が下がる
+- **直し方**:
+  - 成功と情報の通知（`moveReport`・`resultsMessage`・`taskWarning` のうち情報のもの）は、画面の下に重ねて出す `v-snackbar`（`location="bottom"`、4 秒で自動で消える、× でも消せる）1 つにまとめる
+  - 出す口は `composables/useNotice.ts`（`notify(text, kind)`）
+  - **エラー（`error`）は消えないままにする**（何が起きたかを読ませるため）が、本文を下げない位置（上に重ねる）にする
+- 確認: 星の一括移動のあと通知が 4 秒で消え、格子の位置が動かない
+
+## U5 プロジェクトの詳細に「最初からやり直す」
+- Android の `Album.kt` の「…」メニューの「最初からやり直す」と同じにする
+- 旧版の `ProjectView.vue` の右上（削除の隣）に「…」メニューを置き、その中に「選別を最初からやり直す」を入れる。押すと `RestartDialog`（確認）→ `restartFromScratch`（#20 で連写の手直しと学習も消すようにした）
+- 削除も同じメニューに入れるかは、見た目の好みなので今のまま（削除ボタン）でよい
+
+## U6 選別の下のボタン列を上に移す
+- **並び（Android の `Cull.kt` の上のバーと同じ順）**: 左から ← 中断（**一時停止のアイコン `mdi-pause`**）・1 つ戻す（`mdi-undo`）・複数選択（`mdi-checkbox-multiple-outline`）・（真ん中に「★n を選別中 · ROUND n」と残り枚数）・「…」（選別中の設定）・主ボタン（確定／n 枚とも落とす）
+- アイコンは Android の `Cull.kt` で使っているものに合わせる（`app-android/app/src/main/java/app/photocurator/next/Cull.kt` の `Icons.…` を読み、同じ意味の mdi に置き換える）
+- 文字は残す（画面が広いので、アイコンだけにしない）。**「1〜0 選ぶ・Ctrl+数字 拡大・Shift+数字 ★5 で確定・Alt+数字 まとめを開く・Enter 決定・⌫ 戻す」の説明の行は消す**
+- 複数選択のときのボタン（この写真をまとめる など）は、今の並びのまま上のバーへ移す
+- 下のボタン列が無くなった分、写真の格子を下端まで広げる
+- 確認: 1440×900 と 933×704 のスクリーンショットで、写真の枠が前より大きい
+
+## U7 選別の並べ方を窓の形に合わせる（**プランを合わせてから**）
+- **背景**: 新版で一度試してうまくいかなかった（ユーザー）。新版の `cull.vue` の `gridFor()` は、`ResizeObserver` で測った縦横比から行×列を決めていた（`git show origin/feat/rebuild:pages/project/[id]/cull.vue`）
+- **プラン案（ユーザーと合わせる）**:
+  1. 並べ方の候補を作る。N 枚に対し、行 r = 1..N、列 c = ceil(N/r)。空きマスが 1 行分以上になる組み合わせは捨てる
+  2. 各候補で、1 マスの大きさ = (枠の幅 − 隙間) / c × (枠の高さ − 隙間) / r を出す
+  3. 写真の縦横比 a（その組の写真の長辺/短辺の平均。横長の写真が多ければ 3:2）を仮定し、1 マスに収まる写真の面積 = min(マスの幅, マスの高さ × a) × min(マスの高さ, マスの幅 / a) を出す
+  4. **写真の面積が最も大きい候補を選ぶ**。同じくらい（差が 5% 未満）なら、今の並びを保つ（窓を少し動かしただけで並びがちらつかないように）
+  5. 枠の大きさは `ResizeObserver` で測る（窓の大きさではなく、ボタンのバーを除いた写真の枠）。変わったら 100ms 待ってから計算し直す
+  6. 計算は純関数 `utils/gridFor.ts`（`gridFor(n, frameW, frameH, gap, aspect, current?) → {rows, cols}`）にし、テストで 4 枚の 1440×900（→ 2×2）、2560×800（→ 1×4）、800×1200（→ 4×1 か 2×2）などを確かめる
+- **ユーザーに確かめること**:
+  - 縦横比を写真ごとに見るか、固定（3:2）にするか
+  - 空きマスの許し方
+  - ちらつき防止の 5%
+  - 前に失敗したときの症状（何がうまくいかなかったか）
+
+## U8 表示枚数を、クリックと矢印キーで増減する
+- `GroupSizeDialog.vue` のスライダーの左右に − と ＋ のボタンを置く。←→（↑↓）キーでも ±1（最小・最大で止める）。今のスライダーは残す
+- 変えたらその場で今の組に効く（今の `core.resize` のまま）
+
+## U9 拡大で Ctrl+スクロールで拡大・縮小する
+- 拡大の画面で `wheel` を受け、`ctrlKey` のときだけ倍率を変える（1〜8 倍、マウスの位置を中心に）。ドラッグで動かせる。ダブルクリックで元の倍率（Android の `Zoom.kt` の `scale` と「N.N 倍」の表示と同じ）
+- `onZoomKeydown` は、Ctrl・Shift・Alt・Meta の単独の押下では閉じない（今は何かのキーで閉じる）。Esc・← → など決まったキーだけで動くようにする
+- ブラウザの Ctrl+ホイールの拡大（ページ全体）は `preventDefault` で止める（`{ passive: false }`）
+
+## U10 拡大の読み込み中のぐるぐる
+- `zoomLoading`（`useCurator.ts` 1082 行付近）が true の間、写真の真ん中に `v-progress-circular indeterminate` を重ねる。原本に替わる前は表示用画像を出したまま、その上に重ねる（Android の `Zoom.kt` と同じ）
+
+## U11 複数モードで ★5 を押しても、すぐ次の組へ進まない
+- Android の `Cull.kt` を読む（複数モードで ★5 を押すと、その写真に ★5 の印が付き、選択の一つとして残る。主ボタンで組を確定したときに ★5 が決まる）
+- 今（T4）は、複数モードの ★5 で `keepAndTop` を呼んで、すぐ確定している
+- **直し方**:
+  - 複数モードの ★5 は「★5 の印」を選択に足すだけにする（封筒に `toppedInGroup: string[]` を足す。保存の形が変わるので、古い封筒は空として読む）
+  - 主ボタンで `keepAndTop(session, 選んだ写真, ★5 の印の写真)` を呼ぶ。★5 の印が 2 枚以上なら、core に合わせて 1 枚ずつ呼ぶか、core の口を確かめてから決める（**core に口が無ければ止まってユーザーに聞く**）
+  - 単数モードの ★5 は今のまま（押したら確定）
+
+## U12 まとまり編集を横並び＋境目のバーにする
+- Android の `Burst.kt` の `BurstEditSheet` と同じにする: 写真を撮影順に横 1 列に並べ、写真のあいだに縦のバー（境目）を置く。バーをタップで「切る／つなぐ」、左右にドラッグで隣の境目へずらす
+- 新版の `components/BurstEditSheet.vue`（`git show origin/feat/rebuild:components/BurstEditSheet.vue`）がこの作り（`pointerdown`/`pointermove`/`pointerup`＋`setPointerCapture`）なので、それを旧版の見た目（ダイアログの枠）に合わせて移す
+- 形の保存は今の `utils/burstShape.ts`（`isSameBurst` との食い違いだけを保存）のまま
+
+## U13 表示用画像の大きさを作成時から決める
+- 旧版には、プロジェクトの画面に「大きな画像で選別する」（1024／1536）がある。PC の Rust には `save_display_edge`（アプリ全体）・`save_project_display_edge`（プロジェクトごと）がある
+- **直し方**:
+  - アプリの設定の置き場（旧版のサイドバーの下か、ホームの右上）に「表示用画像の既定の大きさ」（768・1024・1280・1536・1920、容量の見込みを添える。FR-7.2）を足す
+  - 作成ダイアログにも同じ選択を足し、既定はアプリの設定の値にする
+  - 作成時に選んだ大きさで、最初から表示用画像を作る（あとで作り直さない）
+  - Web も同じ（`web/store.ts` の設定）
+
+## U14 PC の Amazon の読み込みを速くする（調べてから）
+- **まず測る**（実リンク「嵐山」454 枚。PC・Web・Android）: 一覧（走査）・名前・撮影時刻・サムネ・表示用のそれぞれの時間
+- **比べる**:
+  - PC は `ureq` の同期の 1 本の agent を、並列 4 のスレッドで使っている（`src-tauri/src/amazon.rs`）
+  - Web はブラウザ（HTTP/2 で同じ接続に多重化、キャッシュあり）
+  - Android（`Amazon.kt`・`AmazonImages.kt`）は OkHttp（HTTP/2・接続の使い回し）で、並列の数も確かめる
+- **候補**:
+  - (a) `ureq` の agent を 1 つにして使い回す（接続の使い回し。今は呼ぶたびに作っていないか確かめる）
+  - (b) HTTP/2 に対応したクライアント（`reqwest` の blocking か、`tokio`＋`reqwest`）で並列 8〜16
+  - (c) 一覧のページ（200 件ずつ）を並べて取る
+  - (d) サムネは `viewBox=160` を先に全部、表示用はあとで（今の順を確かめる）
+- 走査と名前（一覧）は (a)(c) で速くなる見込み。撮影時刻は一覧に入っているので、別に取っていたらやめる。サムネと表示用は帯域しだいで、Android も遅い
+- 測った結果と選んだ方法を 10章 §7 に書いてから実装する
+
+---
+
+## 済んだこと（2026-09-30）
+- ユーザーの実機確認は、おおむね OK（T5 の空から始まる・窓を閉じるとき・NAS・Amazon の向きなど）
+- #20 を `feat/main-base` にマージした
