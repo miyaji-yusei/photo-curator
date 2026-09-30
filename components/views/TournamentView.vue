@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { Ref } from 'vue'
 import type { SavedSelection } from '~/utils/selectionFlow'
-import { gridFor, PHOTO_ASPECT, type GridShape } from '~/utils/gridFor'
+import { gridFor, type GridShape } from '~/utils/gridFor'
 
 const {
   MAX_RATING,
@@ -39,37 +39,8 @@ const MEASURE_DELAY_MS = 100
 const stage = ref<HTMLElement | null>(null)
 const frame = ref({ width: 0, height: 0 })
 const shape = ref<GridShape>({ rows: 1, cols: 1 })
-// 写真の縦横比（横 / 縦）。組の写真が全部読み込めたら、その中央値に替える。読み込むまでは
-// 直前の組の値（最初は 1.5）を使う。アルバムは向きがそろいやすく、組が替わっても並びが跳ねない。
-const groupAspect = ref(PHOTO_ASPECT)
-const measured = new Map<string, number>()
-const failedIds = new Set<string>()
-let aspectSettled = false
 function recompute() {
-  shape.value = gridFor(tournamentPhotos.value.length, frame.value.width, frame.value.height, GRID_GAP, shape.value, groupAspect.value)
-}
-function median(values: number[]) {
-  const sorted = [...values].sort((a, b) => a - b)
-  const mid = sorted.length >> 1
-  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2
-}
-// 全部（読み込みに失敗したものは除く）が測れたら、1 回だけ縦横比を確定して並べ直す。
-function settleAspect() {
-  if (aspectSettled) return
-  const expected = tournamentPhotos.value.length - failedIds.size
-  if (expected <= 0 || measured.size < expected) return
-  aspectSettled = true
-  groupAspect.value = median([...measured.values()])
-  recompute()
-}
-function onPhotoLoad(id: string, img: HTMLImageElement | null) {
-  if (!img || !img.naturalWidth || !img.naturalHeight) return
-  measured.set(id, img.naturalWidth / img.naturalHeight)
-  settleAspect()
-}
-function onPhotoError(id: string) {
-  failedIds.add(id)
-  settleAspect()
+  shape.value = gridFor(tournamentPhotos.value.length, frame.value.width, frame.value.height, GRID_GAP, shape.value)
 }
 let measureTimer: ReturnType<typeof setTimeout> | null = null
 let observer: ResizeObserver | null = null
@@ -94,21 +65,6 @@ onBeforeUnmount(() => {
 })
 // 枚数が変わったら（表示枚数の変更・組の切り替わり）すぐに計算し直す。
 watch(() => tournamentPhotos.value.length, recompute, { immediate: true })
-// 組が替わったら測り直す（測るのは組につき 1 回）。描画済みの <img> が使い回されて @load が
-// 来ない写真は、描画後に読み込み済みのものから拾う。
-watch(
-  () => tournamentPhotos.value.map(photo => photo.id).join('\n'),
-  async () => {
-    measured.clear()
-    failedIds.clear()
-    aspectSettled = false
-    await nextTick()
-    stage.value?.querySelectorAll<HTMLImageElement>('img[data-photo-id]').forEach(img => {
-      if (img.complete && img.naturalWidth) onPhotoLoad(img.dataset.photoId ?? '', img)
-    })
-  },
-  { immediate: true }
-)
 
 function toggleMultiSelect() {
   session.value.multiSelect = !session.value.multiSelect
@@ -221,10 +177,7 @@ function clearSelection() {
         </span>
         <span v-if="isConfirmed(photo.id)" class="tournament-card__confirmed">確定</span>
 
-        <img
-          :src="desktop.photoDisplayUrl(photo)" :alt="photo.name" :data-photo-id="photo.id"
-          @load="onPhotoLoad(photo.id, $event.target as HTMLImageElement)" @error="onPhotoError(photo.id)"
-        >
+        <img :src="desktop.photoDisplayUrl(photo)" :alt="photo.name">
       </v-card>
     </div>
     </div>
