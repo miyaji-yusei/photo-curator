@@ -1744,7 +1744,15 @@ function createCurator() {
         activeProject.value.id, exportDestination.value,
         photos.map(photo => photo.id), exportMode.value === 'move'
       )
-      if (exportMode.value === 'move') await refreshProjects()
+      if (exportMode.value === 'move') {
+        // 移動した写真は、原本がそのフォルダに無いのでプロジェクトから外れる。数・一覧・対応表を読み直す。
+        coreInputs.value = null
+        await refreshProjects()
+        await loadSummary()
+        if (view.value === 'results') await loadResultsPage(true)
+        const moved = exportResult.value?.processed ?? 0
+        if (moved > 0) notify(`${moved.toLocaleString()} 枚を移動しました（このプロジェクトからは外れます）`)
+      }
     } catch (cause) {
       // ダイアログの外に出すと、モーダルに隠れて気づけない。中に出す。
       exportError.value = cause instanceof Error ? cause.message : '書き出しに失敗しました。'

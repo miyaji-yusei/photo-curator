@@ -75,5 +75,6 @@ export function exportTargetsForStars(
       .map(tile => ({ relativePath: tile.photo.relativePath, rating: star, mates: tile.mates }))
     out.push(...expandExportTargets(rows, ratings, path => capturedAt.get(path) ?? null))
   }
-  return out
+  // Session の members には、移動で外れた写真の経路が残ることがある。読み込んだ行に無いものは出さない。
+  return out.filter(target => capturedAt.has(target.relativePath))
 }

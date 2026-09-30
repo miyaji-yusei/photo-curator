@@ -71,4 +71,11 @@ describe('exportTargetsForStars', () => {
     expect(exportTargetsForStars(photos, {}, [])).toEqual([])
     expect(exportTargetsForStars(photos, {}, [2, 2])).toHaveLength(1)
   })
+
+  it('移動で外れた写真が members に残っていても、対象に入らない', () => {
+    // b は移動済み（行に無い）。members にはまだ残っている。★0 の連写でも入らない。
+    const photos = [{ relativePath: 'a', rating: 0, capturedAt: null }]
+    const members = { a: ['a', 'b'] }
+    expect(exportTargetsForStars(photos, members, [0]).map(t => t.relativePath)).toEqual(['a'])
+  })
 })

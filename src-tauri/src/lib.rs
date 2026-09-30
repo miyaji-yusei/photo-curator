@@ -3371,6 +3371,11 @@ async fn get_selection_summary(app: AppHandle, project_id: String) -> Result<Sel
 
 fn get_selection_summary_blocking(app: AppHandle, project_id: String) -> Result<SelectionSummary, String> {
     let conn = connection(&app)?;
+    selection_summary(&conn, &project_id)
+}
+
+/// 星ごとの数。一覧（`get_project_photo_page`）と同じく、欠損（移動済みなど）は数えない。
+fn selection_summary(conn: &Connection, project_id: &str) -> Result<SelectionSummary, String> {
     let mut counts = vec![0i64; (MAX_RATING + 1) as usize];
     let mut statement = conn
         .prepare(
@@ -7273,6 +7278,19 @@ mod tests {
         );
         assert!(photos_for_export(&conn, "p1", &[]).expect("empty").is_empty(), "id が空なら何も書き出さない");
 
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn moved_photo_leaves_the_star_counts() {
+        let directory = test_directory("move-count");
+        let conn = rated_fixture(&directory.join("m.sqlite3"));
+        let before = selection_summary(&conn, "p1").expect("before");
+        mark_photos_missing(&conn, "p1", &["three-b".to_string()]).expect("mark");
+        let after = selection_summary(&conn, "p1").expect("after");
+        assert_eq!(after.total, before.total - 1, "移動した 1 枚だけ減る");
+        assert_eq!(after.counts.iter().sum::<i64>(), after.total);
         drop(conn);
         fs::remove_dir_all(&directory).expect("remove test directory");
     }
