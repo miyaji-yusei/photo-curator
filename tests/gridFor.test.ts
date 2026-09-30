@@ -63,6 +63,13 @@ describe('gridFor', () => {
     expect(checkedSwitch).toBe(true)
   })
 
+  it('3 枚は窓の形によらず 1×3 に固定', () => {
+    for (const [w, h] of [[1440, 900], [600, 1000], [2560, 800], [800, 1200]]) {
+      expect(gridFor(3, w, h, GAP)).toEqual({ rows: 1, cols: 3 })
+      expect(gridFor(3, w, h, GAP, { rows: 2, cols: 2 })).toEqual({ rows: 1, cols: 3 })
+    }
+  })
+
   it('枚数 1・2・10', () => {
     expect(gridFor(1, 1440, 900, GAP)).toEqual({ rows: 1, cols: 1 })
     expect(gridFor(2, 1440, 900, GAP)).toEqual({ rows: 1, cols: 2 })

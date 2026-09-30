@@ -1,7 +1,7 @@
 // 選別画面の並べ方（行×列）を、写真を置く枠の形から決める純関数。
 //
 // 写真は固定で 3:2 の横長とみなす（写真ごとには測らない）。各候補（行 r・列 c）で
-// 1 マスに収まる写真の面積を出し、最も大きい並びを選ぶ。
+// 1 マスに収まる写真の面積を出し、最も大きい並びを選ぶ。3 枚だけは 1×3 固定。
 
 /** 写真の縦横比（横 / 縦）。固定。 */
 export const PHOTO_ASPECT = 1.5
@@ -32,6 +32,8 @@ export function gridFor(
   current?: GridShape | null
 ): GridShape {
   if (!(count > 0)) return { rows: 1, cols: 1 }
+  // 3 枚だけは 1×3 に固定（縦長の写真が 2×2 で小さくなるのを避ける。窓の形では変えない）。
+  if (count === 3) return { rows: 1, cols: 3 }
   if (!(frameWidth > 0) || !(frameHeight > 0)) return { rows: 1, cols: count }
 
   const areaOf = (rows: number, cols: number) =>
