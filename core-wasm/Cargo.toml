@@ -1,0 +1,16 @@
+[package]
+name = "photo-curator-core-wasm"
+version = "0.1.0"
+edition = "2021"
+
+# PC・Web の画面（Nuxt）から core の判断を直接呼ぶための薄い橋。
+# **判断そのものはここに書かない。** core をそのまま JsValue で包むだけ。
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# uniffi は要らない（wasm-bindgen が別の橋を作る）。
+photo-curator-core = { path = "../core", default-features = false }
+wasm-bindgen = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde-wasm-bindgen = "0.6"

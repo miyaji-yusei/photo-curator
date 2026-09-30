@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  重なった写真から 1 枚を選ぶ。**このアプリがしていることをそのまま形にする。**
+  後ろの 2 枚は灰色で伏せ、前の 1 枚だけが primary（Lime）で立つ。
+  小さく見えるものなので、線は太く・要素は 3 つまでにする。
+
+  108dp のうち安全なのは中央 66dp。中身はその内側に収める。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 後ろの 1 枚（左へ倒す） -->
+    <group
+        android:pivotX="54"
+        android:pivotY="78"
+        android:rotation="-19">
+        <path
+            android:fillColor="#3A3E47"
+            android:pathData="M41,32h26a4,4 0 0 1 4,4v40a4,4 0 0 1 -4,4h-26a4,4 0 0 1 -4,-4v-40a4,4 0 0 1 4,-4z" />
+    </group>
+
+    <!-- 後ろの 1 枚（右へ倒す） -->
+    <group
+        android:pivotX="54"
+        android:pivotY="78"
+        android:rotation="19">
+        <path
+            android:fillColor="#5F6572"
+            android:pathData="M41,32h26a4,4 0 0 1 4,4v40a4,4 0 0 1 -4,4h-26a4,4 0 0 1 -4,-4v-40a4,4 0 0 1 4,-4z" />
+    </group>
+
+    <!-- 選ばれた 1 枚。**前に立つのはこれだけ。** -->
+    <path
+        android:fillColor="#D6FF73"
+        android:pathData="M40,30h28a5,5 0 0 1 5,5v42a5,5 0 0 1 -5,5h-28a5,5 0 0 1 -5,-5v-42a5,5 0 0 1 5,-5z" />
+
+    <!-- 決めた印 -->
+    <path
+        android:strokeColor="#101114"
+        android:strokeWidth="7"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M45,57l7,8l14,-17" />
+</vector>

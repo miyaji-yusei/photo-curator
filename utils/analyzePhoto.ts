@@ -7,12 +7,15 @@
  * できるので、`createImageBitmap` に任せれば JPEG/HEIC/PNG/WebP が無償で入る。
  *
  * 手順はデスクトップと同じ順序にしてある:
- * 長辺 256px へ縮小 → JPEG に符号化 → **その JPEG から dHash**。
+ * 長辺 256px へ縮小 → JPEG に符号化 → **その JPEG から指紋**。
  * 生成直後とキャッシュ読み出しで必ず同じ値になるようにするため。
+ * 指紋は、保存したサムネイルをそのまま輝度にして core の `dHashFromGray` に渡す
+ * （9×8 への縮小も core がする。設計 04 章「縮小も core で」）。
  */
 import type { CaptureTime, TimestampSource } from '~/utils/captureTime'
 import { resolveCaptureTime } from '~/utils/captureTime'
-import { D_HASH_HEIGHT, D_HASH_WIDTH, dHashFromRgba } from '~/utils/dhash'
+import { dHashFromGray, init as initCore } from '~/lib/core'
+import { lumaFromRgba } from '~/utils/dhash'
 import { readExifCapture } from '~/utils/exifReader'
 
 /** デスクトップの `THUMBNAIL_MAX_EDGE` / `THUMBNAIL_QUALITY` と同じ値。 */
@@ -94,23 +97,27 @@ async function readCaptureTime(file: File): Promise<CaptureTime | null> {
   return resolveCaptureTime(exif, file.name, Number.isFinite(file.lastModified) ? file.lastModified : null)
 }
 
-/** 保存したサムネイルの画素から dHash を出す。 */
-async function hashThumbnail(thumbnail: Blob): Promise<string> {
+/**
+ * 保存したサムネイルの画素から指紋を出す。**縮小はしない**（core がする）。
+ * 作れないとき（小さすぎる画像）は null。
+ */
+export async function hashThumbnail(thumbnail: Blob): Promise<string | null> {
   const bitmap = await createImageBitmap(thumbnail)
   try {
-    const surface = createSurface(D_HASH_WIDTH, D_HASH_HEIGHT)
-    surface.context.imageSmoothingEnabled = true
-    surface.context.imageSmoothingQuality = 'high'
-    surface.context.drawImage(bitmap, 0, 0, D_HASH_WIDTH, D_HASH_HEIGHT)
-    const pixels = surface.context.getImageData(0, 0, D_HASH_WIDTH, D_HASH_HEIGHT)
-    return dHashFromRgba(pixels.data)
+    const { width, height } = bitmap
+    const surface = createSurface(width, height)
+    surface.context.drawImage(bitmap, 0, 0)
+    const pixels = surface.context.getImageData(0, 0, width, height)
+    // ワーカーの中でも wasm を読む（2 回目以降は同じ Promise）。
+    await initCore()
+    return dHashFromGray(lumaFromRgba(pixels.data, width * height), width, height)
   } finally {
     bitmap.close()
   }
 }
 
 /**
- * 撮影日時・サムネイル・dHash を求める。
+ * 撮影日時・サムネイル・指紋を求める。
  * **例外は投げない**。1 枚失敗しても取り込み全体を止めないため、
  * 理由を `error` に入れて返す。
  */
@@ -151,7 +158,10 @@ export async function analyzePhotoFile(
     displaySurface.context.imageSmoothingQuality = 'high'
     displaySurface.context.drawImage(bitmap, 0, 0, displaySize.width, displaySize.height)
     const display = await displaySurface.toBlob('image/jpeg', THUMBNAIL_QUALITY)
-    return { ...base, thumbnail, display, dHash: await hashThumbnail(thumbnail) }
+    const dHash = await hashThumbnail(thumbnail)
+    // 指紋だけ作れなかった写真も、サムネイルと表示用はあるので選別には使える。
+    // 理由を残しておかないと「解析待ち」に数え続けてしまう。
+    return { ...base, thumbnail, display, dHash, error: dHash ? null : '指紋を作れませんでした（画像が小さすぎます）。' }
   } catch (cause) {
     // 非対応の形式・壊れたファイル・メモリ不足がここに来る。
     const message = cause instanceof Error ? cause.message : '画像を読み込めませんでした。'

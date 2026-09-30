@@ -1,12 +1,15 @@
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { capabilitiesFor, detectPlatform } from '~/utils/capabilities'
-import { open } from '@tauri-apps/plugin-dialog'
+import { open, save } from '@tauri-apps/plugin-dialog'
 import type {
-  BurstGroup, BurstPair, ExportReport, Photo, PhotoPage, PhotoSort, Project,
-  ProjectProgress, ProjectTask, SelectionResult, SelectionSeed, SelectionSession, SelectionSummary
+  AmazonPreview, ExportReport, Photo, PhotoPage, PhotoSort, Project,
+  ProjectProgress, ProjectTask, SelectionResult, SelectionSummary
 } from '~/types/photo'
-import { normalizeSession } from '~/utils/tournament'
-import type { DisplaySettings, PhotoBackend } from '~/composables/photoBackend'
+import type { PairOverride } from '~/lib/core'
+import { init as initCore } from '~/lib/core'
+import type { SavedSelection } from '~/utils/selectionFlow'
+import { parseSavedSelection, serializeSavedSelection } from '~/utils/selectionFlow'
+import type { DeviceIdentity, DisplaySettings, PhotoBackend, SidecarAccess, SidecarState } from '~/composables/photoBackend'
 import { isTauriRuntime } from '~/composables/photoBackend'
 
 async function invokeDesktop<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -26,6 +29,12 @@ async function invokeDesktop<T>(command: string, args?: Record<string, unknown>)
  * `#[tauri::command]` と 1:1 で対応する。
  */
 export function createTauriBackend(): PhotoBackend {
+  /** 出所の種類。原本の URL を取るとき、Amazon かどうかを引く（`listProjects`・作成で更新する）。 */
+  const sourceKinds = new Map<string, Project['sourceKind']>()
+  const remember = (projects: Project[]) => {
+    for (const project of projects) sourceKinds.set(project.id, project.sourceKind)
+    return projects
+  }
   return {
     kind: 'tauri',
     // Android も Tauri なので、UA まで見て初めて desktop と分かれる。
@@ -42,8 +51,12 @@ export function createTauriBackend(): PhotoBackend {
       const { listen } = await import('@tauri-apps/api/event')
       return listen<ProjectProgress>('project-progress', event => callback(event.payload))
     },
-    listProjects: () => invokeDesktop<Project[]>('list_projects'),
-    createProject: (name: string, folderPath: string) => invokeDesktop<Project>('create_project', { name, folderPath }),
+    listProjects: async () => remember(await invokeDesktop<Project[]>('list_projects')),
+    createProject: async (name: string, folderPath: string) =>
+      remember([await invokeDesktop<Project>('create_project', { name, folderPath })])[0]!,
+    amazonPreview: (shareUrl: string) => invokeDesktop<AmazonPreview>('amazon_preview', { shareUrl }),
+    createAmazonProject: async (name: string, shareUrl: string) =>
+      remember([await invokeDesktop<Project>('create_amazon_project', { name, shareUrl })])[0]!,
     deleteProject: (projectId: string) => invokeDesktop<void>('delete_project', { projectId }),
     getProjectPhotoPage: (projectId: string, offset = 0, limit = 80, rating: number | null = null, sort: PhotoSort = 'name') =>
       invokeDesktop<PhotoPage>('get_project_photo_page', { projectId, offset, limit, rating, sort }),
@@ -56,43 +69,72 @@ export function createTauriBackend(): PhotoBackend {
     ) => invokeDesktop<number>('move_rating', { projectId, fromRating, toRating, includeIds, excludeIds }),
     getSelectionSummary: (projectId: string) => invokeDesktop<SelectionSummary>('get_selection_summary', { projectId }),
     getPhotosByIds: (projectId: string, photoIds: string[]) => invokeDesktop<Photo[]>('get_photos_by_ids', { projectId, photoIds }),
-    getSelectionSeed: (projectId: string, rating?: number) =>
-      invokeDesktop<SelectionSeed[]>('get_selection_seed', { projectId, rating: rating ?? null }),
-    exportByRating: (projectId: string, destination: string, ratings: number[], moveFiles: boolean) =>
-      invokeDesktop<ExportReport>('export_by_rating', { projectId, destination, ratings, moveFiles }),
-    writeRatingsToFiles: (projectId: string, ratings: number[]) =>
-      invokeDesktop<ExportReport>('write_ratings_to_files', { projectId, ratings }),
-    getBurstGroups: (projectId: string, threshold?: number) =>
-      invokeDesktop<BurstGroup[]>('get_burst_groups', { projectId, threshold: threshold ?? null }),
-    getBurstPairs: (projectId: string) => invokeDesktop<BurstPair[]>('get_burst_pairs', { projectId }),
+    getCoreInputs: (projectId: string) => invokeDesktop<Photo[]>('get_core_inputs', { projectId }),
+    exportPhotos: (projectId: string, destination: string, photoIds: string[], moveFiles: boolean) =>
+      invokeDesktop<ExportReport>('export_photos', { projectId, destination, photoIds, moveFiles }),
+    writeRatingsToPhotos: (projectId: string, photoIds: string[]) =>
+      invokeDesktop<ExportReport>('write_ratings_to_photos', { projectId, photoIds }),
+    saveCsv: async (fileName: string, text: string) => {
+      if (!isTauriRuntime()) throw new Error('CSV の保存はデスクトップアプリで使えます。')
+      const chosen = await save({
+        title: 'CSV を保存', defaultPath: fileName, filters: [{ name: 'CSV', extensions: ['csv'] }]
+      })
+      if (!chosen) return false
+      await invokeDesktop<void>('write_text_file', { path: chosen, text })
+      return true
+    },
     saveBurstThreshold: (projectId: string, threshold: number) =>
       invokeDesktop<void>('save_burst_threshold', { projectId, threshold }),
     clearBurstThreshold: (projectId: string) => invokeDesktop<void>('clear_burst_threshold', { projectId }),
-    getBurstNeighborhood: (projectId: string, photoIds: string[], windowMs?: number) =>
-      invokeDesktop<Photo[]>('get_burst_neighborhood', { projectId, photoIds, windowMs: windowMs ?? null }),
-    saveBurstShape: (projectId: string, orderedPhotoIds: string[], blocks: string[][]) =>
-      invokeDesktop<void>('save_burst_shape', { projectId, orderedPhotoIds, blocks }),
+    getPairOverrides: (projectId: string) => invokeDesktop<PairOverride[]>('get_pair_overrides', { projectId }),
+    savePairOverrides: (projectId: string, overrides: PairOverride[]) =>
+      invokeDesktop<void>('save_pair_overrides', { projectId, overrides }),
     startProjectScan: (projectId: string) => invokeDesktop<void>('start_project_scan', { projectId }),
     startBurstAnalysis: (projectId: string) => invokeDesktop<void>('start_burst_analysis', { projectId }),
     getAnalysisBacklog: (projectId: string) => invokeDesktop<number>('get_analysis_backlog', { projectId }),
     startBackgroundAnalysis: (projectId: string) => invokeDesktop<void>('start_background_analysis', { projectId }),
     cancelProjectTask: (projectId: string, task: ProjectTask) => invokeDesktop<void>('cancel_project_task', { projectId, task }),
-    saveSession: (session: SelectionSession) =>
-      invokeDesktop<void>('save_project_state', { projectId: session.projectId, stateJson: JSON.stringify(session) }),
+    saveSession: (projectId: string, selection: SavedSelection | null) =>
+      invokeDesktop<void>('save_project_state', {
+        projectId, stateJson: selection ? serializeSavedSelection(selection) : 'null'
+      }),
     loadSession: async (projectId: string) => {
       const raw = await invokeDesktop<string | null>('load_project_state', { projectId })
       if (!raw) return null
-      // 閾値学習を入れる前に保存された JSON が残っていることがある。
-      return normalizeSession(JSON.parse(raw) as SelectionSession)
+      // Session の読み戻しは core（wasm）が行う。旧版の形は null（最初から）。
+      await initCore()
+      return parseSavedSelection(raw)
     },
+    sidecarSupported: (projectId: string) => invokeDesktop<SidecarAccess>('sidecar_supported', { projectId }),
+    readSidecar: (projectId: string) => invokeDesktop<string | null>('read_sidecar', { projectId }),
+    writeSidecar: (projectId: string, json: string, fileName = 'catalog.json') =>
+      invokeDesktop<void>('write_sidecar', { projectId, json, fileName }),
+    loadSidecarState: (projectId: string) => invokeDesktop<SidecarState>('load_sidecar_state', { projectId }),
+    saveSidecarState: (projectId: string, state: SidecarState) =>
+      invokeDesktop<void>('save_sidecar_state', { projectId, state }),
+    deviceIdentity: () => invokeDesktop<DeviceIdentity>('device_identity'),
     photoUrl: (path: string) => isTauriRuntime() ? convertFileSrc(path) : '',
+    photoOriginalUrl: async (photo: Photo) => {
+      if (!isTauriRuntime()) return ''
+      if (sourceKinds.get(photo.projectId) !== 'amazon') return convertFileSrc(photo.path)
+      const path = await invokeDesktop<string>('amazon_original', { projectId: photo.projectId, photoId: photo.id })
+      return convertFileSrc(path)
+    },
+    // Amazon の写真の `path` は node id で、ファイルではない。絵がまだ無いときは空にする。
     photoThumbnailUrl: (photo: Photo) => {
       if (!isTauriRuntime()) return ''
+      if (sourceKinds.get(photo.projectId) === 'amazon') {
+        return photo.thumbnailPath ? convertFileSrc(photo.thumbnailPath) : ''
+      }
       return convertFileSrc(photo.thumbnailPath ?? photo.path)
     },
     // 表示用 → サムネイル → 原本。原本まで落ちるのは生成が追いつく前だけ。
     photoDisplayUrl: (photo: Photo) => {
       if (!isTauriRuntime()) return ''
+      if (sourceKinds.get(photo.projectId) === 'amazon') {
+        const path = photo.displayPath ?? photo.thumbnailPath
+        return path ? convertFileSrc(path) : ''
+      }
       return convertFileSrc(photo.displayPath ?? photo.thumbnailPath ?? photo.path)
     },
     getDisplaySettings: () => invokeDesktop<DisplaySettings>('get_display_settings'),

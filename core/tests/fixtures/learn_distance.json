@@ -1,0 +1,11 @@
+{
+  "_note": "6までは同じ、14からは別→あいだの10。cargo test の既存テスト「同じと別のあいだに境目を置く」と同じ入力。",
+  "answers": [
+    { "distance": 4, "same": true },
+    { "distance": 6, "same": true },
+    { "distance": 14, "same": false },
+    { "distance": 18, "same": false }
+  ],
+  "fallback": 9,
+  "expected": 10
+}

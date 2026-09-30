@@ -1,0 +1,176 @@
+package app.photocurator.next
+
+import android.content.Context
+import android.util.Log
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.io.File
+
+/**
+ * プロジェクト。**選別の単位。**
+ *
+ * 端末のアルバムを直接開くのではなく、「どのフォルダを選別するか」を
+ * 人が決めて名前を付けたものを単位にする。同じアルバムから 2 つ作れるし、
+ * NAS のフォルダも同じ形で扱える。出所が変わっても選別の続きは残る。
+ */
+
+/**
+ * 出所の種類。**文字列ではなく型で持つ**（設計 09 章 §5 #2）。
+ * 種類を足したときに `when` の漏れをコンパイルで検出できるようにする。
+ * 保存する JSON には [id] をそのまま書く。**過去に書いた値は変えない。**
+ */
+enum class SourceKind(val id: String) {
+    Album("album"),
+    Nas("nas"),
+    Amazon("amazon");
+
+    companion object {
+        fun fromId(id: String): SourceKind = entries.first { it.id == id }
+    }
+}
+
+/**
+ * 出所。**人の言葉（label）と、機械の指し先を分けて持つ。**
+ * 生のパスや ID は「技術情報」にだけ出す。
+ */
+data class Source(
+    val kind: SourceKind,
+    /** 人に見せる言い方。「この端末・アルバム「Camera」」など。 */
+    val label: String,
+    /** kind ごとの指し先。album なら bucket id。 */
+    val key: String
+) {
+    /**
+     * 「このフォルダ以下ぜんぶ」か。
+     *
+     * 鍵の末尾に印を足すだけにしてある。出所の形（kind）を増やすと、
+     * 保存してあるプロジェクトの読み方まで変わるので、そこは触らない。
+     */
+    val deep: Boolean get() = key.endsWith("|**")
+
+    /** 印を外した、実際のフォルダの道筋。 */
+    val folder: String get() = key.removeSuffix("|**").substringAfter("|")
+
+    /** 技術情報に出す生の値。**普段は見せない。** */
+    val technical: String get() = "${kind.id}:$key"
+
+    /**
+     * 網越しか。**NAS も Amazon も「表示用画像を作って置く」側。**
+     * 「NAS か端末か」の 2 択で書かれていた分岐のうち、この意味のものはこれを見る。
+     */
+    val remote: Boolean get() = kind != SourceKind.Album
+
+    /**
+     * 端末に置いた絵（サムネイル・表示用画像）の名前の頭。
+     * 端末のアルバムは絵を置かないので null。
+     */
+    val cacheId: String?
+        get() = when (kind) {
+            SourceKind.Nas -> key.substringBefore("|")
+            SourceKind.Amazon -> Amazon.linkOf(key).cacheId
+            SourceKind.Album -> null
+        }
+}
+
+data class Project(
+    val id: String,
+    val name: String,
+    val source: Source,
+    val createdAt: Long,
+    val updatedAt: Long
+)
+
+object Projects {
+    private const val TAG = "Projects"
+    private const val FILE = "projects.json"
+
+    private fun file(context: Context) = File(context.filesDir, FILE)
+
+    suspend fun all(context: Context): List<Project> = withContext(Dispatchers.IO) {
+        val target = file(context)
+        if (!target.exists()) return@withContext emptyList()
+        try {
+            val array = org.json.JSONArray(target.readText())
+            val read = (0 until array.length()).map { at ->
+                val entry = array.getJSONObject(at)
+                val source = entry.getJSONObject("source")
+                Project(
+                    id = entry.getString("id"),
+                    name = entry.getString("name"),
+                    source = Source(
+                        kind = SourceKind.fromId(source.getString("kind")),
+                        label = source.getString("label"),
+                        key = source.getString("key")
+                    ),
+                    createdAt = entry.getLong("created"),
+                    updatedAt = entry.getLong("updated")
+                )
+            // **更新順。** 2 回目以降は続きから始めることの方が多い。
+            }.sortedByDescending { it.updatedAt }
+            lastSeen = read
+            read
+        } catch (error: Exception) {
+            Log.w(TAG, "プロジェクトを読めなかった", error)
+            emptyList()
+        }
+    }
+
+    suspend fun save(context: Context, projects: List<Project>) = withContext(Dispatchers.IO) {
+        try {
+            val array = org.json.JSONArray()
+            for (project in projects) {
+                array.put(
+                    org.json.JSONObject()
+                        .put("id", project.id)
+                        .put("name", project.name)
+                        .put("created", project.createdAt)
+                        .put("updated", project.updatedAt)
+                        .put(
+                            "source",
+                            org.json.JSONObject()
+                                .put("kind", project.source.kind.id)
+                                .put("label", project.source.label)
+                                .put("key", project.source.key)
+                        )
+                )
+            }
+            file(context).writeAtomically { it.writeText(array.toString()) }
+        } catch (error: Exception) {
+            Log.w(TAG, "プロジェクトを保存できなかった", error)
+        }
+    }
+
+    /**
+     * 最後に読んだ一覧。**背面へ回るときに、どれを書けばよいかを知るため。**
+     * そのときにファイルを読みに行くと、止められる前に間に合わないことがある。
+     */
+    @Volatile
+    private var lastSeen: List<Project> = emptyList()
+
+    fun cached(): List<Project> = lastSeen
+
+    suspend fun add(context: Context, name: String, source: Source): Project {
+        val now = System.currentTimeMillis()
+        val project = Project("p$now", name, source, now, now)
+        save(context, listOf(project) + all(context))
+        return project
+    }
+
+    /** 触ったことを記録する。一覧の並び（更新順）に効く。 */
+    suspend fun touch(context: Context, id: String) {
+        val now = System.currentTimeMillis()
+        save(context, all(context).map { if (it.id == id) it.copy(updatedAt = now) else it })
+    }
+
+    suspend fun rename(context: Context, id: String, name: String) {
+        save(context, all(context).map { if (it.id == id) it.copy(name = name) else it })
+    }
+
+    /**
+     * 一覧から外す。**プロジェクトごとの持ち物の片付けは [ProjectData.remove] が行う。**
+     * ここを直接呼ぶのは [ProjectData.remove] からだけにする（09 章 §5 #1）。
+     */
+    suspend fun remove(context: Context, id: String) {
+        save(context, all(context).filterNot { it.id == id })
+    }
+}

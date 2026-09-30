@@ -16,9 +16,9 @@
 
 use image::{imageops::FilterType, DynamicImage, GenericImageView, GrayImage};
 use photo_curator_lib::bench_api::{
-    analyse_photo, build_burst_groups, capture_time, d_hash, fingerprint, open_database,
+    analyse_photo, capture_time, d_hash, fingerprint, open_database,
     select_burst_candidates, upsert_photo, CachedAnalysis, CandidateInput, DecodeSource,
-    ThumbnailState, TimestampSource, D_HASH_VERSION, HASH_DISTANCE_LIMIT,
+    ThumbnailState, TimestampSource, D_HASH_VERSION,
 };
 use rusqlite::{params, Connection};
 use std::collections::BTreeMap;
@@ -541,12 +541,8 @@ fn run_pipeline(
             .expect("collect groups")
     });
     times.groups_query = elapsed;
-    // 計測は既定値で行う。閾値は本来プロジェクトごとの学習値だが、
-    // ここで測りたいのはグルーピング処理そのものの速度。
-    let (groups, elapsed) = timed(|| build_burst_groups(entries, HASH_DISTANCE_LIMIT));
-    times.groups_build = elapsed;
-    stats.groups = groups.len();
-    stats.grouped_photos = groups.iter().map(Vec::len).sum();
+    // 連写のまとめは core（Rust の core クレート）へ移った。ここでは行の取得だけを測る。
+    let _ = entries;
     stats.thumbnail_bytes = directory_bytes(thumbnails);
 
     (times, stats)

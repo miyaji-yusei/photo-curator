@@ -15,6 +15,7 @@
     "tauri:dev:release": "tauri dev --release",
     "dev:app": "node scripts/tauri-dev.mjs",
     "tauri:build": "tauri build",
+    "core:wasm": "wasm-pack build core-wasm --target web",
     "test": "vitest run",
     "typecheck": "nuxt typecheck"
   },

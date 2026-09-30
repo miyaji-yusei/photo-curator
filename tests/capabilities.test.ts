@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { capabilitiesFor, detectPlatform } from '~/utils/capabilities'
+import { capabilitiesFor, detectPlatform, hasDirectoryPicker } from '~/utils/capabilities'
 
 /** 実機・実環境の User-Agent を模したもの。 */
 const UA = {
@@ -44,8 +44,23 @@ describe('capabilitiesFor', () => {
     expect(capabilitiesFor('browser').writeMetadata).toBe(false)
   })
 
-  it('ブラウザだけがフォルダを走査できない', () => {
+  it('ブラウザは showDirectoryPicker があるときだけフォルダを選べる', () => {
     expect(capabilitiesFor('browser').browseFolders).toBe(false)
+    expect(capabilitiesFor('browser', { directoryPicker: false }).browseFolders).toBe(false)
+    expect(capabilitiesFor('browser', { directoryPicker: true }).browseFolders).toBe(true)
+    // ほかの能力は変わらない（フォルダを選べても、ブラウザの原本はリロードで失われうる）。
+    expect(capabilitiesFor('browser', { directoryPicker: true }).fullResolution).toBe(false)
+    expect(capabilitiesFor('browser', { directoryPicker: true }).writeMetadata).toBe(false)
+  })
+
+  it('hasDirectoryPicker は関数として在るかだけを見る', () => {
+    expect(hasDirectoryPicker(undefined)).toBe(false)
+    expect(hasDirectoryPicker({})).toBe(false)
+    expect(hasDirectoryPicker({ showDirectoryPicker: undefined })).toBe(false)
+    expect(hasDirectoryPicker({ showDirectoryPicker: () => undefined })).toBe(true)
+  })
+
+  it('デスクトップ・Android は常にフォルダを走査できる', () => {
     expect(capabilitiesFor('desktop').browseFolders).toBe(true)
     expect(capabilitiesFor('android').browseFolders).toBe(true)
   })
@@ -53,6 +68,13 @@ describe('capabilitiesFor', () => {
   it('ブラウザはリロードで原本を失うので、フル解像度を出せない', () => {
     expect(capabilitiesFor('browser').fullResolution).toBe(false)
     expect(capabilitiesFor('android').fullResolution).toBe(true)
+  })
+
+  it('Amazon の共有リンクを出所にできるのは PC とブラウザ（Android はまだ）', () => {
+    expect(capabilitiesFor('desktop').amazon).toBe(true)
+    expect(capabilitiesFor('android').amazon).toBe(false)
+    expect(capabilitiesFor('browser').amazon).toBe(true)
+    expect(capabilitiesFor('browser', { directoryPicker: true }).amazon).toBe(true)
   })
 
   it('デスクトップだけが大きなグループを持つ', () => {

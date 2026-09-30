@@ -8,9 +8,11 @@ export interface DisplaySettings {
   largeEdge: number
 }
 import type {
-  BurstGroup, BurstPair, ExportReport, Photo, PhotoPage, PhotoSort, Project,
-  ProjectProgress, ProjectTask, SelectionResult, SelectionSeed, SelectionSession, SelectionSummary
+  AmazonExport, AmazonPreview, ExportReport, Photo, PhotoPage, PhotoSort, Project,
+  ProjectProgress, ProjectTask, SelectionResult, SelectionSummary
 } from '~/types/photo'
+import type { PairOverride } from '~/lib/core'
+import type { SavedSelection } from '~/utils/selectionFlow'
 
 /**
  * 画面が使うデータ操作の全体。**フロントとバックエンドの唯一の接点**で、
@@ -49,8 +51,12 @@ export interface PhotoBackend {
     rating?: number | null, sort?: PhotoSort
   ) => Promise<PhotoPage>
   getPhotosByIds: (projectId: string, photoIds: string[]) => Promise<Photo[]>
-  /** rating を渡すとその星の写真だけ。選別対象は星で決まる。 */
-  getSelectionSeed: (projectId: string, rating?: number) => Promise<SelectionSeed[]>
+  /**
+   * core に渡す写真の行。**その星に関係なく全件**（欠損を除く）を 1 回で返す。
+   * 並べ替えは呼び出し側（`utils/coreInputs.ts`）が撮影順にする。
+   * サムネイルなどの URL は持たない（写真そのものの表示は `getPhotosByIds`）。
+   */
+  getCoreInputs: (projectId: string) => Promise<Photo[]>
 
   /** 判定したグループぶんだけを書く。全件を毎回送らない。 */
   saveSelectionResults: (projectId: string, entries: SelectionResult[]) => Promise<void>
@@ -67,28 +73,17 @@ export interface PhotoBackend {
   ) => Promise<number>
   getSelectionSummary: (projectId: string) => Promise<SelectionSummary>
 
-  /** threshold を省くとプロジェクトの学習値、それも無ければ既定値が使われる。 */
-  getBurstGroups: (projectId: string, threshold?: number) => Promise<BurstGroup[]>
-  /** 閾値学習の出題元。距離での足切りはされていない。 */
-  getBurstPairs: (projectId: string) => Promise<BurstPair[]>
+  /** 学習した連写の距離をプロジェクトに覚えさせる（次の選別で質問を省く）。 */
   saveBurstThreshold: (projectId: string, threshold: number) => Promise<void>
   clearBurstThreshold: (projectId: string) => Promise<void>
   /**
-   * まとまりを見直すための「1続きの写真」。指定した写真の前後 `windowMs` に
-   * 入るものを撮影順で返す。まとめの中身も、まとめに入れられる近くの写真も、
-   * どちらもこの1本の並びの上にある。
+   * 手で直した連写の例外（core の `PairOverride`、鍵は relativePath）。
+   * **例外そのもの**を保存する。「こう分かれていてほしい」という形からの
+   * 導き方は `utils/burstShape.ts`。
    */
-  getBurstNeighborhood: (
-    projectId: string, photoIds: string[], windowMs?: number
-  ) => Promise<Photo[]>
-  /**
-   * 見直した結果の形を保存する。渡すのは**例外そのものではなく「こう分かれて
-   * いてほしい」という形**で、閾値との食い違いだけが例外として残る。
-   * 何度保存しても結果が変わらない。
-   */
-  saveBurstShape: (
-    projectId: string, orderedPhotoIds: string[], blocks: string[][]
-  ) => Promise<void>
+  getPairOverrides: (projectId: string) => Promise<PairOverride[]>
+  /** そのプロジェクトの手直しを、渡したものに丸ごと入れ替える。 */
+  savePairOverrides: (projectId: string, overrides: PairOverride[]) => Promise<void>
 
   /** 表示用画像の設定と生成。 */
   getDisplaySettings: () => Promise<DisplaySettings>
@@ -109,14 +104,37 @@ export interface PhotoBackend {
   startBackgroundAnalysis: (projectId: string) => Promise<void>
   cancelProjectTask: (projectId: string, task: ProjectTask) => Promise<void>
 
-  saveSession: (session: SelectionSession) => Promise<void>
-  loadSession: (projectId: string) => Promise<SelectionSession | null>
+  /** 封筒（`v: 2`）ごと保存する。`core` は core の Session そのまま。null は途中の選別を消す。 */
+  saveSession: (projectId: string, selection: SavedSelection | null) => Promise<void>
+  /** 旧版の形（`v` が無い）は null。旧データは引き継がない。 */
+  loadSession: (projectId: string) => Promise<SavedSelection | null>
+
+  // ---- サイドカー（写真のフォルダ直下の `.photo-curator/catalog.json`）----
+  // 口だけ。**4 通りの判断は持たない**（`useSidecarSync` が core の `sidecarDecide` を呼ぶ）。
+
+  /** この出所にサイドカーを書けるか。`readonly` は読むだけ、`none` は読み書きとも無い。 */
+  sidecarSupported: (projectId: string) => Promise<SidecarAccess>
+  /** サイドカーの JSON の文字列。無ければ null。 */
+  readSidecar: (projectId: string) => Promise<string | null>
+  /** 原子的に書く（一時ファイル → rename）。`fileName` は退避（`catalog.<id>.json`）のときだけ変える。 */
+  writeSidecar: (projectId: string, json: string, fileName?: string) => Promise<void>
+  /** 端末が覚える、最後に読んだ／書いたサイドカーの印と、判断が変わったか。 */
+  loadSidecarState: (projectId: string) => Promise<SidecarState>
+  saveSidecarState: (projectId: string, state: SidecarState) => Promise<void>
+  /** この端末の id と名前。id は初回に作って残す。 */
+  deviceIdentity: () => Promise<DeviceIdentity>
 
   /**
    * 原本を表示するための URL。
    * デスクトップは絶対パスを asset プロトコルへ、ブラウザは既に URL なのでそのまま。
    */
   photoUrl: (path: string) => string
+  /**
+   * 拡大のときだけ使う、原本の URL。フォルダの写真は `photoUrl(photo.path)` と同じ。
+   * Amazon の写真は、ここで原本を取ってきて端末に置き（あれば使い回す）、そのパスの URL を返す。
+   * 取れなければ reject する（リンクが消えていたら「このリンクは削除されたか、無効です。」）。
+   */
+  photoOriginalUrl: (photo: Photo) => Promise<string>
   /**
    * 一覧に並べるための URL。解析時に作った 256px のサムネイルを使い回すので
    * 追加のデコードは無い。まだ解析していない写真は原本へ落ちる。
@@ -128,12 +146,34 @@ export interface PhotoBackend {
    */
   photoDisplayUrl: (photo: Photo) => string
 
-  /** 星ごとのフォルダへ書き出す。moveFiles が true なら原本を移動する。 */
-  exportByRating: (
-    projectId: string, destination: string, ratings: number[], moveFiles: boolean
+  /**
+   * 選んだ写真を星ごとのフォルダへ書き出す。moveFiles が true なら原本を移動する。
+   * **対象は `photoIds`**（画面が連写の仲間まで広げて決める。星では選ばない）。
+   * Amazon は原本を取ってきて置く（移動はできない）。
+   */
+  exportPhotos: (
+    projectId: string, destination: string, photoIds: string[], moveFiles: boolean
   ) => Promise<ExportReport>
-  /** 星を写真本体の XMP に書き込む。原本を書き換える。 */
-  writeRatingsToFiles: (projectId: string, ratings: number[]) => Promise<ExportReport>
+  /** 選んだ写真（`photoIds`）の星を、写真本体の XMP に書き込む。原本を書き換える。 */
+  writeRatingsToPhotos: (projectId: string, photoIds: string[]) => Promise<ExportReport>
+  /**
+   * CSV を保存する。PC は保存ダイアログで選んだ場所に書き、ブラウザはダウンロードにする。
+   * 保存ダイアログを閉じたら `false`。
+   */
+  saveCsv: (fileName: string, text: string) => Promise<boolean>
+
+  // ---- Amazon Photos の共有リンク（PC だけ。`capabilities.amazon` が true のとき）----
+  // 走査・準備・表示用・書き出しの分岐は Rust の入口が `source_kind` で行う。画面は分岐しない。
+
+  /** 共有リンクを読み、名前・枚数・見本（最大 12 枚）を返す。 */
+  amazonPreview?: (shareUrl: string) => Promise<AmazonPreview>
+  /** 共有リンクのプロジェクトを作る（走査はこのあと `startProjectScan`）。 */
+  createAmazonProject?: (name: string, shareUrl: string) => Promise<Project>
+  /**
+   * Amazon の結果の ZIP（ブラウザ）。対象の写真（`photoIds`）の原本を取って `star-N/` に分ける
+   * （取れなければ reject。文に「CSV だけ書き出せます」を含む）。CSV は `saveCsv` で、全部の出所が同じ。
+   */
+  exportAmazon?: (projectId: string, photoIds: string[]) => Promise<AmazonExport>
 
   // ---- ブラウザだけが持つ機能 ------------------------------------------
   // デスクトップはフォルダ走査と原本パスがあるので必要ない。
@@ -146,6 +186,22 @@ export interface PhotoBackend {
    * iOS には永続的なファイルハンドルが無いため、**リロードすると失われる**。
    */
   originalFile?: (photoId: string) => File | null
+}
+
+export type SidecarAccess = 'readwrite' | 'readonly' | 'none'
+
+export interface SidecarState {
+  /** 最後に読んだ／書いたサイドカーの `updatedAt`。未確認は 0。 */
+  seenAt: number
+  /** 同じく `updatedBy`。未確認は空文字。 */
+  seenBy: string
+  /** 判断（星・連写の手直し・学習した距離・やり直し）が変わったか。 */
+  localChanged: boolean
+}
+
+export interface DeviceIdentity {
+  id: string
+  name: string
 }
 
 export type BackendKind = 'tauri' | 'local'

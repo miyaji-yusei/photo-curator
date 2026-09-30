@@ -1,5 +1,9 @@
+mod amazon;
+mod format;
+mod sidecar;
+
 use exif::{In, Reader, Tag, Value};
-use image::{imageops::FilterType, DynamicImage, GenericImageView};
+use image::DynamicImage;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -21,6 +25,7 @@ use walkdir::WalkDir;
 const PROGRESS_EVENT: &str = "project-progress";
 const PAGE_SIZE_LIMIT: i64 = 200;
 const BURST_WINDOW_MS: i64 = 4_000;
+#[cfg_attr(not(feature = "bench"), allow(dead_code))]
 const HASH_DISTANCE_LIMIT: u32 = 14;
 // 候補率がこれを超えたら時間窓を自動的に狭める。撮影間隔がほぼ全て窓の内側に
 // 収まるフォルダでは「時間が近いものだけハッシュする」最適化が原理的に効かず、
@@ -36,6 +41,10 @@ const THUMBNAIL_DIR: &str = "thumbnails";
 // 写真の良し悪しを判断できず、かといって原本(6.7MB)を毎回読むと
 // Android では 1 ラウンドで 13.4GB 流れる。その中間をここに作る。
 const DISPLAY_DIR: &str = "display";
+/// Amazon の共有リンクの原本の置き場（プロジェクトごとの下に node id で置く）。
+const AMAZON_CACHE_DIR: &str = "amazon-cache";
+/// 作成画面の見本の置き場。
+const SAMPLES_DIR: &str = "samples";
 /// 既定の長辺。Galaxy Z Fold 8 の実機計測で 1 グループ 3〜4 枚なら 733px、
 /// 9 枚なら 489px あれば足りる。普段使いはこれで過不足ない。
 const DISPLAY_EDGE_DEFAULT: u32 = 1024;
@@ -50,7 +59,7 @@ const MIN_EXIF_THUMBNAIL_EDGE: u32 = 96;
 // dHash の算出方式のバージョン。fingerprint は「ファイルが変わっていない」ことしか
 // 見ておらず、**アルゴリズムの変更を検知できない**。方式を変えたらこの値を上げる。
 // 版が合わない d_hash はキャッシュとして使わず、サムネイルから引き直す。
-const D_HASH_VERSION: i64 = 2;
+const D_HASH_VERSION: i64 = photo_curator_core::D_HASH_VERSION as i64;
 // サムネイルの生成方式のバージョン。**d_hash とは別に持つ必要がある。**
 // `analyse_photo` は保存済みのサムネイルが使えると判断したら原本に戻らないため、
 // `D_HASH_VERSION` を上げても「古いサムネイルから引き直す」だけで、サムネイルの
@@ -156,9 +165,9 @@ impl AnalysisMode {
         }
     }
 
-    fn workers(self) -> usize {
+    fn workers(self, folder: &Path) -> usize {
         match self {
-            Self::Foreground => analysis_worker_count(),
+            Self::Foreground => analysis_worker_count_for(folder),
             Self::Background => 1,
         }
     }
@@ -182,6 +191,57 @@ fn analysis_worker_count() -> usize {
     (cores / 2).clamp(MIN_ANALYSIS_WORKERS, MAX_ANALYSIS_WORKERS)
 }
 
+/// フォルダに合わせた worker 数。ネットワークのフォルダは並列 2 に抑える
+/// （同時に何本も投げると NAS 側が詰まって、かえって遅くなる）。
+/// 環境変数で明示された値があればそれを優先する。
+fn analysis_worker_count_for(folder: &Path) -> usize {
+    if std::env::var(WORKER_COUNT_ENV).is_ok() {
+        return analysis_worker_count();
+    }
+    if is_network_path(folder) {
+        return NETWORK_ANALYSIS_WORKERS;
+    }
+    analysis_worker_count()
+}
+
+/// ネットワークのフォルダを解析するときの worker 数。
+const NETWORK_ANALYSIS_WORKERS: usize = 2;
+
+/// フォルダがネットワーク上か。UNC（`\\` 始まり）か、ドライブの種類が
+/// `DRIVE_REMOTE`（割り当て済みのネットワークドライブ）なら true。
+#[cfg(windows)]
+fn is_network_path(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::{Component, Prefix};
+    use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+
+    // windows-sys では別の feature（WindowsProgramming）にあるので、値（4）を直に持つ。
+    const DRIVE_REMOTE: u32 = 4;
+
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        // 接頭辞として読めなくても、`\\server` のように `\\` で始まるなら UNC とみなす。
+        let text = path.to_string_lossy();
+        return text.starts_with("\\\\") && !text.starts_with("\\\\?\\") && !text.starts_with("\\\\.\\");
+    };
+    let letter = match prefix.kind() {
+        Prefix::UNC(..) | Prefix::VerbatimUNC(..) => return true,
+        Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => letter,
+        _ => return false,
+    };
+    let root: Vec<u16> = std::ffi::OsString::from(format!("{}:\\", letter as char))
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `root` は NUL 終端の UTF-16 で、呼び出しの間だけ生きている。
+    unsafe { GetDriveTypeW(root.as_ptr()) == DRIVE_REMOTE }
+}
+
+/// Windows 以外では常にローカル扱い。
+#[cfg(not(windows))]
+fn is_network_path(_path: &Path) -> bool {
+    false
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Project {
@@ -195,6 +255,8 @@ struct Project {
     /// 連写まとめの学習済み閾値。未学習なら None。
     burst_threshold: Option<i64>,
     burst_threshold_learned_at: Option<i64>,
+    /// 写真の出所。`folder`（PC のフォルダ）か `amazon`（Amazon Photos の共有リンク）。
+    source_kind: String,
 }
 
 #[derive(Serialize)]
@@ -223,23 +285,6 @@ struct Photo {
 struct PhotoPage {
     photos: Vec<Photo>,
     total: i64,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SelectionSeed {
-    id: String,
-    rating: i64,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BurstGroup {
-    id: String,
-    photo_ids: Vec<String>,
-    captured_span_ms: i64,
-    similarity: i64,
-    accepted: Option<bool>,
 }
 
 #[derive(Clone, Serialize)]
@@ -279,7 +324,9 @@ fn db_path(app: &AppHandle) -> Result<PathBuf, String> {
         .app_data_dir()
         .map_err(|error| error.to_string())?;
     fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
-    Ok(dir.join("photo-curator.sqlite3"))
+    // 指紋の計算式を core に替えたので、古い指紋が混ざらないよう別のファイルにする。
+    // 旧 `photo-curator.sqlite3` は読まない・消さない。
+    Ok(dir.join("photo-curator-v2.sqlite3"))
 }
 
 fn connection(app: &AppHandle) -> Result<Connection, String> {
@@ -305,6 +352,17 @@ fn display_dir(app: &AppHandle) -> Result<PathBuf, String> {
         .app_data_dir()
         .map_err(|error| error.to_string())?
         .join(DISPLAY_DIR);
+    fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    Ok(dir)
+}
+
+/// アプリのデータフォルダの下の置き場（なければ作る）。
+fn data_subdir(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?
+        .join(name);
     fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     Ok(dir)
 }
@@ -456,6 +514,10 @@ fn open_database(path: &Path) -> Result<Connection, String> {
     add_column_if_missing(&conn, "photos", "display_edge", "INTEGER")?;
     // プロジェクトごとの上書き。NULL なら全体の設定に従う。
     add_column_if_missing(&conn, "projects", "display_edge", "INTEGER")?;
+    // 写真の出所（T9）。既存のプロジェクトはすべてフォルダ。Amazon は `source_key` に
+    // `"{host}|{shareId}"` を持ち、`folder_path` にはリンクの URL を置く。
+    add_column_if_missing(&conn, "projects", "source_kind", "TEXT NOT NULL DEFAULT 'folder'")?;
+    add_column_if_missing(&conn, "projects", "source_key", "TEXT")?;
     // d_hash の算出方式。旧ビルドの行は NULL になり、キャッシュとして使われない。
     // 古い方式のハッシュと新しい方式のハッシュが混ざると連写判定が壊れるため、
     // 値を消さずに「使わない」ことで移行する。
@@ -484,16 +546,22 @@ fn open_database(path: &Path) -> Result<Connection, String> {
     .map_err(|error| error.to_string())?;
 
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS burst_pair_overrides (
+        // 手で直した連写の例外。core の `PairOverride`（鍵は relativePath）をそのまま持つ。
+        // 旧版の `burst_pair_overrides`（photo id の組）は使わない。既存の DB には残るが読まない。
+        "CREATE TABLE IF NOT EXISTS pair_overrides (
            project_id TEXT NOT NULL,
-           left_photo_id TEXT NOT NULL,
-           right_photo_id TEXT NOT NULL,
+           left_path TEXT NOT NULL,
+           right_path TEXT NOT NULL,
            decision TEXT NOT NULL,
-           updated_at INTEGER NOT NULL,
-           PRIMARY KEY (project_id, left_photo_id, right_photo_id)
+           PRIMARY KEY (project_id, left_path, right_path)
          );",
     )
     .map_err(|error| error.to_string())?;
+
+    // サイドカー（T8）。端末が覚える 3 つの値。
+    sidecar::ensure_tables(&conn)?;
+    // Amazon の共有リンクの tempLink の控え（T9）。
+    amazon::ensure_tables(&conn)?;
 
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS photos_project_visible
@@ -643,6 +711,8 @@ struct PhotoWork {
     photo_id: String,
     captured_at: Option<i64>,
     timestamp_source: Option<TimestampSource>,
+    /// 中身が画像ではなかった。行を `is_missing=1` にして数から外す。
+    not_image: bool,
     d_hash: Option<String>,
     thumbnail_path: Option<String>,
     thumbnail_source: Option<&'static str>,
@@ -662,6 +732,7 @@ impl PhotoWork {
             photo_id: photo_id.to_owned(),
             captured_at: None,
             timestamp_source: None,
+            not_image: false,
             d_hash: None,
             thumbnail_path: None,
             thumbnail_source: None,
@@ -944,10 +1015,14 @@ impl PhotoSource for LocalPhoto<'_> {
 /// EXIF → ファイル名 → mtime。ファイル名を mtime より優先するのは、
 /// 書き出しや転送で EXIF が落ちても `20260630_181932` の類は残ることが多く、
 /// mtime よりはるかに撮影時刻に近いため。
+#[cfg_attr(not(test), allow(dead_code))]
 fn read_capture_time_from(source: &dyn PhotoSource) -> Option<CaptureTime> {
-    source
-        .head(EXIF_HEAD_PROBE)
-        .and_then(|head| exif_capture_time_bytes(&head))
+    capture_time_from_head(source, source.head(EXIF_HEAD_PROBE).as_deref())
+}
+
+/// 先頭 64KB を読み済みのときの撮影時刻。先頭を 2 回読まないために分けてある。
+fn capture_time_from_head(source: &dyn PhotoSource, head: Option<&[u8]>) -> Option<CaptureTime> {
+    head.and_then(exif_capture_time_bytes)
         .or_else(|| {
             let name = source.name()?;
             let stem = Path::new(&name).file_stem()?.to_str()?.to_owned();
@@ -964,6 +1039,7 @@ fn read_capture_time_from(source: &dyn PhotoSource) -> Option<CaptureTime> {
         })
 }
 
+#[cfg_attr(not(feature = "bench"), allow(dead_code))]
 fn read_capture_time(path: &Path) -> Option<CaptureTime> {
     read_capture_time_from(&LocalPhoto(path))
 }
@@ -1406,17 +1482,18 @@ fn encode_thumbnail(image: &DynamicImage) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-fn d_hash_of(image: &DynamicImage) -> String {
-    let small = image.resize_exact(9, 8, FilterType::Triangle).grayscale();
-    let mut bits = 0u64;
-    for y in 0..8 {
-        for x in 0..8 {
-            if small.get_pixel(x, y).0[0] > small.get_pixel(x + 1, y).0[0] {
-                bits |= 1 << (y * 8 + x);
-            }
-        }
-    }
-    format!("{bits:016x}")
+/// 指紋。**必ず core を通す**（Android・Web と同じ計算式にするため）。
+/// 大きい画像のまま平均を取ると遅いので、先に軽く縮めてから渡す。
+/// 作れないとき（極端に小さい画像など）は None で、0 を入れない。
+fn d_hash_of(image: &DynamicImage) -> Option<String> {
+    let scaled = if image.width().max(image.height()) > 128 {
+        image.thumbnail(128, 128)
+    } else {
+        image.clone()
+    };
+    let gray = scaled.to_luma8();
+    let (width, height) = (gray.width(), gray.height());
+    photo_curator_core::d_hash_from_gray(gray.into_raw(), width, height)
 }
 
 /// dHash は**必ず保存するサムネイルのバイト列から**計算する。
@@ -1425,7 +1502,7 @@ fn d_hash_of(image: &DynamicImage) -> String {
 fn hash_thumbnail_bytes(bytes: &[u8]) -> Option<String> {
     image::load_from_memory_with_format(bytes, image::ImageFormat::Jpeg)
         .ok()
-        .map(|image| d_hash_of(&image))
+        .and_then(|image| d_hash_of(&image))
 }
 
 /// キャッシュを使わずに1枚ぶんのハッシュを出す。計測ハーネス用。
@@ -1566,6 +1643,7 @@ fn analyse_photo(
     }
 }
 
+#[cfg_attr(not(feature = "bench"), allow(dead_code))]
 fn hash_distance(left: &str, right: &str) -> u32 {
     u64::from_str_radix(left, 16)
         .ok()
@@ -1607,7 +1685,7 @@ pub enum PairEligibility {
 }
 
 /// 候補判定の一次審査。`candidates_within`（解析対象の絞り込み）と
-/// `build_burst_pairs`（閾値学習の出題元）が同じ規則を使うために切り出してある。
+/// 以前は閾値学習の出題元も同じ規則を使っていた（いまは core が判断する）。
 /// 二重実装すると、片方だけ直したときに学習と本番でズレる。
 fn pair_eligibility(
     left: &CandidateInput,
@@ -1700,8 +1778,63 @@ fn fingerprint(path: &Path) -> Option<(i64, i64)> {
     Some((mtime, metadata.len() as i64))
 }
 
+/// 画像・RAW の名前の拡張子。拡張子は「候補に入れるか」だけに使い、
+/// 画像かどうかは中身で決める（`content_is_not_image`）。
+const IMAGE_EXTENSIONS: [&str; 13] = [
+    "jpg", "jpeg", "png", "webp", "heic", "heif", "cr2", "cr3", "nef", "arw", "dng", "raf", "orf",
+];
+/// 拡張子が動画のものは、中身に関わらず常に除く。
+const VIDEO_EXTENSIONS: [&str; 7] = ["mp4", "mov", "m4v", "avi", "mts", "m2ts", "3gp"];
+/// 中身が JPEG・PNG・WebP でなくても「画像だが今は読めない」に数える拡張子。
+const OTHER_IMAGE_EXTENSIONS: [&str; 9] = [
+    "heic", "heif", "cr2", "cr3", "nef", "arw", "dng", "raf", "orf",
+];
+
+fn extension_lower(path: &Path) -> Option<String> {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+}
+
+/// 拡張子が画像・RAW の名前か、拡張子が無いもの。動画の拡張子は常に除く。
 fn is_supported(path: &Path) -> bool {
-    matches!(path.extension().and_then(|value| value.to_str()).map(|value| value.to_ascii_lowercase()), Some(ext) if ["jpg", "jpeg", "png", "webp"].contains(&ext.as_str()))
+    match extension_lower(path) {
+        Some(ext) => {
+            !VIDEO_EXTENSIONS.contains(&ext.as_str()) && IMAGE_EXTENSIONS.contains(&ext.as_str())
+        }
+        None => true,
+    }
+}
+
+/// 中身が画像ではない（動画・テキスト・壊れたファイルなど）。先頭バイトで決める。
+/// JPEG・PNG・WebP 以外の画像（HEIC・RAW）は先頭バイトでは見分けられないので、
+/// 拡張子がその種類なら画像として通し、「読めなかった」に数える（解析で失敗する）。
+/// HEIC・CR3 は `ftyp` で始まり、`sniff` は動画と判定するため、この扱いが要る。
+fn content_is_not_image(head: &[u8], path: &Path) -> bool {
+    let kind = format::sniff(head);
+    if format::is_image(kind) {
+        return false;
+    }
+    let other_image = extension_lower(path)
+        .map(|ext| OTHER_IMAGE_EXTENSIONS.contains(&ext.as_str()))
+        .unwrap_or(false);
+    !other_image
+}
+
+/// 隠しフォルダ・隠しファイル（名前が `.` で始まる）。NAS の `.webaxs` のような
+/// サムネイルのキャッシュを原本として数えないために、走査の入口で除く。
+fn is_hidden_entry(entry: &walkdir::DirEntry) -> bool {
+    entry.depth() > 0 && entry.file_name().to_string_lossy().starts_with('.')
+}
+
+fn list_photo_files(folder: &str) -> Vec<PathBuf> {
+    WalkDir::new(folder)
+        .into_iter()
+        .filter_entry(|entry| !is_hidden_entry(entry))
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file() && is_supported(entry.path()))
+        .map(|entry| entry.into_path())
+        .collect()
 }
 
 fn photo_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Photo> {
@@ -1771,14 +1904,13 @@ fn project_folder(app: &AppHandle, project_id: &str) -> Result<String, String> {
 }
 
 fn run_scan(app: AppHandle, registry: &TaskRegistry, project_id: String) -> Result<(), String> {
+    // 出所で分ける。Amazon の共有リンクは、一覧を読むことが走査になる。
+    if let Some(source) = amazon_source_of(&connection(&app)?, &project_id)? {
+        return run_amazon_scan(app, registry, project_id, source);
+    }
     let task_key = format!("scan:{project_id}");
     let folder = project_folder(&app, &project_id)?;
-    let entries: Vec<PathBuf> = WalkDir::new(&folder)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file() && is_supported(entry.path()))
-        .map(|entry| entry.into_path())
-        .collect();
+    let entries: Vec<PathBuf> = list_photo_files(&folder);
     let total = entries.len();
     progress(
         &app,
@@ -1902,6 +2034,196 @@ fn run_scan(app: AppHandle, registry: &TaskRegistry, project_id: String) -> Resu
     Ok(())
 }
 
+/// Amazon の写真の行を登録・更新する。`path` と `relative_path` は node id。
+/// 撮影時刻は一覧の `contentDate`（その土地の時計）をそのまま入れる。
+/// 大きさ（`fingerprint_size`）が変わった行だけ、解析の結果を捨てる。
+fn upsert_amazon_photo(
+    conn: &Connection,
+    project_id: &str,
+    node: &amazon::AmazonNode,
+) -> Result<(), String> {
+    let size = node
+        .content_properties
+        .as_ref()
+        .and_then(|properties| properties.size)
+        .map(|size| size as i64);
+    let stem = Path::new(&node.name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    let (captured_at, source) = match amazon::captured_at_of(node) {
+        Some(at) => (Some(at), TimestampSource::ExifOriginal),
+        None => match filename_capture_time_of(stem) {
+            Some(at) => (Some(at), TimestampSource::FilenameInferred),
+            None => (None, TimestampSource::Unknown),
+        },
+    };
+    conn.execute(
+        "INSERT INTO photos (id,project_id,path,relative_path,name,captured_at,timestamp_source,d_hash,rating,fingerprint_mtime,fingerprint_size,is_missing)
+         VALUES (?1,?2,?3,?3,?4,?5,?6,NULL,0,NULL,?7,0)
+         ON CONFLICT(project_id,path) DO UPDATE SET
+           relative_path=excluded.relative_path, name=excluded.name, is_missing=0,
+           captured_at=excluded.captured_at, timestamp_source=excluded.timestamp_source,
+           d_hash=CASE WHEN photos.fingerprint_size IS excluded.fingerprint_size THEN photos.d_hash ELSE NULL END,
+           d_hash_version=CASE WHEN photos.fingerprint_size IS excluded.fingerprint_size THEN photos.d_hash_version ELSE NULL END,
+           thumbnail_path=CASE WHEN photos.fingerprint_size IS excluded.fingerprint_size THEN photos.thumbnail_path ELSE NULL END,
+           thumbnail_version=CASE WHEN photos.fingerprint_size IS excluded.fingerprint_size THEN photos.thumbnail_version ELSE NULL END,
+           display_path=CASE WHEN photos.fingerprint_size IS excluded.fingerprint_size THEN photos.display_path ELSE NULL END,
+           display_edge=CASE WHEN photos.fingerprint_size IS excluded.fingerprint_size THEN photos.display_edge ELSE NULL END,
+           analysis_error=CASE WHEN photos.fingerprint_size IS excluded.fingerprint_size THEN photos.analysis_error ELSE NULL END,
+           analysis_error_at=CASE WHEN photos.fingerprint_size IS excluded.fingerprint_size THEN photos.analysis_error_at ELSE NULL END,
+           fingerprint_size=excluded.fingerprint_size",
+        params![
+            Uuid::new_v4().to_string(),
+            project_id,
+            node.id,
+            node.name,
+            captured_at,
+            source.as_str(),
+            size
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// `run_scan` の Amazon 版。共有 → アルバム → FILE の一覧を読み、写真の行と tempLink を作る。
+/// 共有リンクが消えていたら、状態を `missing` にして理由を返す（自動ではやり直さない）。
+fn run_amazon_scan(
+    app: AppHandle,
+    registry: &TaskRegistry,
+    project_id: String,
+    source: amazon::AmazonSource,
+) -> Result<(), String> {
+    let task_key = format!("scan:{project_id}");
+    progress(&app, &project_id, "scan", "indexing", 0, 0, "Amazon Photos の一覧を読んでいます…");
+    let conn = connection(&app)?;
+    conn.execute(
+        "UPDATE projects SET status='scanning', updated_at=?1 WHERE id=?2",
+        params![now(), project_id],
+    )
+    .map_err(|error| error.to_string())?;
+
+    let listed = amazon::fetch_share_root(&source)
+        .and_then(|root| amazon::list_photos(&source, &root.node_id));
+    let nodes = match listed {
+        Ok(nodes) => nodes,
+        Err(message) => {
+            if message == amazon::GONE_MESSAGE {
+                mark_amazon_gone(&conn, &project_id);
+            } else {
+                settle_project_status(&conn, &project_id);
+            }
+            return Err(message);
+        }
+    };
+    let total = nodes.len();
+    if registry.is_cancelled(&task_key) {
+        settle_project_status(&conn, &project_id);
+        progress(&app, &project_id, "scan", "cancelled", 0, total, "Scanning was cancelled.");
+        return Ok(());
+    }
+
+    conn.execute("UPDATE photos SET is_missing=1 WHERE project_id=?1", params![project_id])
+        .map_err(|error| error.to_string())?;
+    let transaction = conn.unchecked_transaction().map_err(|error| error.to_string())?;
+    for (index, node) in nodes.iter().enumerate() {
+        upsert_amazon_photo(&transaction, &project_id, node)?;
+        if (index + 1) % 250 == 0 || index + 1 == total {
+            progress(&app, &project_id, "scan", "indexing", index + 1, total, "Recording photo locations…");
+        }
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    // tempLink は node id で控える。拡大のたびに一覧をたどり直さないため。
+    amazon::save_links(&conn, &project_id, &amazon::links_of(&nodes))?;
+    let count = recount_photos(&conn, &project_id)?;
+    conn.execute(
+        "UPDATE projects SET status='ready',updated_at=?1 WHERE id=?2",
+        params![now(), project_id],
+    )
+    .map_err(|error| error.to_string())?;
+    progress(&app, &project_id, "scan", "complete", count as usize, count as usize, "写真の読み込みが完了しました。");
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let registry = handle.state::<TaskRegistry>();
+        let _ = spawn_analysis(handle.clone(), &registry, project_id, AnalysisMode::Background);
+    });
+    Ok(())
+}
+
+/// 撮影時刻の段の worker 1本ぶん。先頭 64KB を 1 回だけ読み、画像かどうかと
+/// 撮影時刻を決める。**DB には触れない。**
+fn metadata_one(index: usize, job: &MetadataJob) -> PhotoWork {
+    let mut result = PhotoWork::new(index, &job.id);
+    let path = Path::new(&job.path);
+    let source = LocalPhoto(path);
+    let head = source.head(EXIF_HEAD_PROBE);
+    if let Some(head) = head.as_deref() {
+        if content_is_not_image(head, path) {
+            result.not_image = true;
+            return result;
+        }
+    }
+    match capture_time_from_head(&source, head.as_deref()) {
+        Some(capture) => {
+            result.captured_at = Some(capture.at);
+            result.timestamp_source = Some(capture.source);
+        }
+        None => {
+            result.error = Some("撮影時刻を読み取れませんでした。".into());
+        }
+    }
+    result
+}
+
+/// 撮影時刻の段の結果を書く。画像ではなかった行は数から外す（`is_missing=1`）。
+/// 撮影時刻は空のままにするので、再走査で行が戻っても次の解析でまた判定される。
+fn apply_metadata(tx: &Connection, item: &PhotoWork) -> Result<(), String> {
+    if item.not_image {
+        tx.execute(
+            "UPDATE photos SET is_missing=1,captured_at=NULL,timestamp_source=NULL,
+               analysis_error=NULL,analysis_error_at=NULL
+             WHERE id=?1",
+            params![item.photo_id],
+        )
+        .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    tx.execute(
+        "UPDATE photos SET captured_at=?1,timestamp_source=?2,
+           analysis_error=?3,analysis_error_at=?4
+         WHERE id=?5",
+        params![
+            item.captured_at,
+            item.timestamp_source
+                .unwrap_or(TimestampSource::Unknown)
+                .as_str(),
+            item.error,
+            item.error.as_ref().map(|_| now()),
+            item.photo_id
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// プロジェクトの写真の数を、欠損を除いて数え直す。
+fn recount_photos(conn: &Connection, project_id: &str) -> Result<i64, String> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM photos WHERE project_id=?1 AND is_missing=0",
+            params![project_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    conn.execute(
+        "UPDATE projects SET photo_count=?1 WHERE id=?2",
+        params![count, project_id],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(count)
+}
+
 /// worker 1本ぶんの仕事。1枚を読み、サムネイルと dHash を作る。
 /// **DB には触れない。**書き込みは writer が `flush_results` でまとめて行う。
 fn hash_one(thumbnails: &Path, index: usize, record: &HashRecord) -> PhotoWork {
@@ -1923,6 +2245,63 @@ fn hash_one(thumbnails: &Path, index: usize, record: &HashRecord) -> PhotoWork {
     }
     result
 }
+
+/// `hash_one` の Amazon 版。`viewBox=160` の画像を取り、旧版と同じサムネイルと指紋にする。
+/// サムネイルが残っていて版も合えば、網を使わない。**DB には触れない。**
+fn hash_one_amazon(
+    book: &amazon::LinkBook,
+    thumbnails: &Path,
+    index: usize,
+    record: &HashRecord,
+) -> PhotoWork {
+    let mut result = PhotoWork::new(index, &record.id);
+    let file = thumbnail_file(thumbnails, &record.id);
+    let stored = file.to_string_lossy().to_string();
+    let cached = &record.cached;
+    if cached.thumbnail_path.as_deref() == Some(stored.as_str())
+        && cached.thumbnail_version == Some(THUMBNAIL_VERSION)
+        && file.is_file()
+    {
+        if cached.d_hash.is_some() && cached.d_hash_version == Some(D_HASH_VERSION) {
+            result.d_hash = cached.d_hash.clone();
+            result.thumbnail_path = Some(stored);
+            result.hash_reused = true;
+            return result;
+        }
+        if let Some(hash) = fs::read(&file).ok().as_deref().and_then(hash_thumbnail_bytes) {
+            result.d_hash = Some(hash);
+            result.thumbnail_path = Some(stored);
+            return result;
+        }
+    }
+    let bytes = match book.fetch(&record.path, Some(AMAZON_THUMBNAIL_EDGE)) {
+        Ok(bytes) => bytes,
+        Err(message) => {
+            result.error = Some(message);
+            return result;
+        }
+    };
+    let Some(image) = image::load_from_memory(&bytes).ok() else {
+        result.error = Some("画像を読み取れませんでした（破損または非対応の形式）。".into());
+        return result;
+    };
+    let Some(thumbnail) = encode_thumbnail(&scale_for_thumbnail(&image)) else {
+        result.error = Some("画像を読み取れませんでした（破損または非対応の形式）。".into());
+        return result;
+    };
+    result.d_hash = hash_thumbnail_bytes(&thumbnail);
+    if write_atomically(&file, &thumbnail).is_ok() {
+        result.thumbnail_path = Some(stored);
+        result.thumbnail_source = Some("amazon");
+    }
+    if result.d_hash.is_none() {
+        result.error = Some("画像を読み取れませんでした（破損または非対応の形式）。".into());
+    }
+    result
+}
+
+/// Amazon に縮小させるときの長辺（サムネイルと指紋のもと）。
+const AMAZON_THUMBNAIL_EDGE: u32 = 160;
 
 /// 解析できなかった写真の件数。UI へそのまま渡す。
 fn failed_photo_count(conn: &Connection, project_id: &str) -> Result<usize, String> {
@@ -1953,6 +2332,16 @@ fn run_burst_analysis(
     };
     let timeout = Duration::from_millis(PHOTO_TIMEOUT_MS);
     let thumbnails = thumbnail_dir(&app)?;
+    // ネットワークのフォルダは worker 数を抑えるので、フォルダの場所を先に知る。
+    let folder = project_folder(&app, &project_id)?;
+    // Amazon の共有リンクは、撮影時刻を一覧の contentDate から走査で入れてあり、
+    // サムネイル・指紋は viewBox=160 の画像から作る。並列は 4。
+    let amazon_book = amazon_book_of(&app, &project_id)?;
+    let workers = if amazon_book.is_some() {
+        amazon::WORKERS
+    } else {
+        mode.workers(Path::new(&folder))
+    };
     let conn = connection(&app)?;
     let records: Vec<MetadataRecord> = {
         let mut statement = conn
@@ -1971,7 +2360,9 @@ fn run_burst_analysis(
     // （EXIF 読取は 0.14 ms/枚）。既に両方ある行は仕事そのものを作らない。
     let metadata_jobs: Vec<MetadataJob> = records
         .iter()
-        .filter(|(_, _, captured_at, source)| captured_at.is_none() || source.is_none())
+        .filter(|(_, _, captured_at, source)| {
+            amazon_book.is_none() && (captured_at.is_none() || source.is_none())
+        })
         .map(|(id, path, _, _)| MetadataJob {
             id: id.clone(),
             path: path.clone(),
@@ -1994,43 +2385,14 @@ fn run_burst_analysis(
         let interval = progress_interval(metadata_total);
         let mut pending: Vec<PhotoWork> = Vec::with_capacity(ANALYSIS_CHUNK_SIZE);
         let mut committed = 0usize;
-        let apply = |tx: &Connection, item: &PhotoWork| -> Result<(), String> {
-            tx.execute(
-                "UPDATE photos SET captured_at=?1,timestamp_source=?2,
-                   analysis_error=?3,analysis_error_at=?4
-                 WHERE id=?5",
-                params![
-                    item.captured_at,
-                    item.timestamp_source
-                        .unwrap_or(TimestampSource::Unknown)
-                        .as_str(),
-                    item.error,
-                    item.error.as_ref().map(|_| now()),
-                    item.photo_id
-                ],
-            )
-            .map_err(|error| error.to_string())?;
-            Ok(())
-        };
+        let apply = apply_metadata;
         let outcome = run_in_parallel(
             Arc::new(metadata_jobs),
-            mode.workers(),
+            workers,
             timeout,
             &should_stop,
             // worker はファイルを読むだけ。DB には触れない。
-            |index, job: &MetadataJob| {
-                let mut result = PhotoWork::new(index, &job.id);
-                match read_capture_time(Path::new(&job.path)) {
-                    Some(capture) => {
-                        result.captured_at = Some(capture.at);
-                        result.timestamp_source = Some(capture.source);
-                    }
-                    None => {
-                        result.error = Some("撮影時刻を読み取れませんでした。".into());
-                    }
-                }
-                result
-            },
+            |index, job: &MetadataJob| metadata_one(index, job),
             &mut |item| {
                 if item.error.is_some() {
                     failed += 1;
@@ -2074,6 +2436,8 @@ fn run_burst_analysis(
         )?;
         // キャンセルされていても、読み終わっているぶんは書いてから抜ける。
         committed += flush_results(&conn, &mut pending, &apply)?;
+        // 中身が画像ではなかった写真は数から外れているので、件数を数え直す。
+        recount_photos(&conn, &project_id)?;
         if outcome.cancelled {
             progress_note(
                 &app,
@@ -2094,14 +2458,20 @@ fn run_burst_analysis(
 
     let candidates: Vec<HashRecord> = {
         let conn = connection(&app)?;
+        // Amazon は撮影時刻の無い写真にもサムネイルが要る（一覧の絵になる）ので絞らない。
+        let dated_only = if amazon_book.is_some() {
+            ""
+        } else {
+            "AND captured_at IS NOT NULL"
+        };
         let mut statement = conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT id,path,captured_at,timestamp_source,d_hash,d_hash_version,
                         thumbnail_path,thumbnail_mtime,thumbnail_size,thumbnail_version
                  FROM photos
-                 WHERE project_id=?1 AND is_missing=0 AND captured_at IS NOT NULL
-                 ORDER BY captured_at",
-            )
+                 WHERE project_id=?1 AND is_missing=0 {dated_only}
+                 ORDER BY captured_at IS NULL, captured_at, path"
+            ))
             .map_err(|error| error.to_string())?;
         let rows = statement
             .query_map(params![project_id], |row| {
@@ -2109,7 +2479,7 @@ fn run_burst_analysis(
                 Ok(HashRecord {
                     id: row.get(0)?,
                     path: row.get(1)?,
-                    captured_at: row.get(2)?,
+                    captured_at: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
                     source: TimestampSource::parse(source.as_deref()),
                     cached: CachedAnalysis {
                         d_hash: row.get(4)?,
@@ -2138,13 +2508,18 @@ fn run_burst_analysis(
             })
             .collect::<Vec<_>>(),
     );
-    let needed_records: Vec<_> = candidates
-        .iter()
-        .filter(|record| selection.ids.contains(&record.id))
-        .cloned()
-        .collect();
+    let needed_records: Vec<_> = if amazon_book.is_some() {
+        // Amazon は小さい画像を取るだけなので、近い写真に絞らず全部を作る。
+        candidates.clone()
+    } else {
+        candidates
+            .iter()
+            .filter(|record| selection.ids.contains(&record.id))
+            .cloned()
+            .collect()
+    };
     let needed_total = needed_records.len();
-    let warning = selection.narrowed.then(|| {
+    let warning = (selection.narrowed && amazon_book.is_none()).then(|| {
         format!(
             "撮影間隔が近い写真が多すぎたため、連写とみなす時間の幅を {:.1} 秒に狭めました（候補 {} / {} 枚）。",
             selection.window_ms as f64 / 1000.0,
@@ -2167,9 +2542,32 @@ fn run_burst_analysis(
     let interval = progress_interval(needed_total.max(1));
     let mut pending: Vec<PhotoWork> = Vec::with_capacity(ANALYSIS_CHUNK_SIZE);
     let mut committed = 0usize;
+    let is_amazon = amazon_book.is_some();
     let apply = |tx: &Connection, item: &PhotoWork| -> Result<(), String> {
         // 据え置きで済んだ1枚は、書き込む理由が無い。
         if item.hash_reused {
+            return Ok(());
+        }
+        if is_amazon {
+            // 原本の mtime は無い。走査が入れた大きさ（fingerprint_size）は触らない。
+            tx.execute(
+                "UPDATE photos SET d_hash=?1,d_hash_version=?2,thumbnail_path=?3,
+                   thumbnail_source=COALESCE(?4,thumbnail_source),
+                   thumbnail_version=?5,
+                   analysis_error=?6,analysis_error_at=?7
+                 WHERE id=?8",
+                params![
+                    item.d_hash,
+                    item.d_hash.as_ref().map(|_| D_HASH_VERSION),
+                    item.thumbnail_path,
+                    item.thumbnail_source,
+                    item.thumbnail_path.as_ref().map(|_| THUMBNAIL_VERSION),
+                    item.error,
+                    item.error.as_ref().map(|_| now()),
+                    item.photo_id
+                ],
+            )
+            .map_err(|error| error.to_string())?;
             return Ok(());
         }
         // metadata が読めない場合は fingerprint を NULL のままにする。(0,0) を
@@ -2214,13 +2612,17 @@ fn run_burst_analysis(
         Ok(())
     };
     let thumbnails_for_workers = thumbnails.clone();
+    let book_for_workers = amazon_book.clone();
     let outcome = run_in_parallel(
         Arc::new(needed_records),
-        mode.workers(),
+        workers,
         timeout,
         &should_stop,
         // worker はファイルを読んでサムネイルを書くだけ。DB には触れない。
-        move |index, record: &HashRecord| hash_one(&thumbnails_for_workers, index, record),
+        move |index, record: &HashRecord| match &book_for_workers {
+            Some(book) => hash_one_amazon(book, &thumbnails_for_workers, index, record),
+            None => hash_one(&thumbnails_for_workers, index, record),
+        },
         &mut |item| {
             if item.error.is_some() {
                 failed += 1;
@@ -2263,6 +2665,11 @@ fn run_burst_analysis(
         },
     )?;
     committed += flush_results(&conn, &mut pending, &apply)?;
+    // リンクが消えていたら、ここで止めて理由を伝える。開いたときに自動では続けない。
+    if amazon_book.as_ref().is_some_and(|book| book.is_gone()) {
+        mark_amazon_gone(&conn, &project_id);
+        return Err(amazon::GONE_MESSAGE.to_string());
+    }
     if outcome.cancelled {
         progress_note(
             &app,
@@ -2301,7 +2708,7 @@ fn run_burst_analysis(
 fn list_projects(app: AppHandle) -> Result<Vec<Project>, String> {
     let conn = connection(&app)?;
     let mut statement = conn
-        .prepare("SELECT id,name,folder_path,photo_count,status,created_at,updated_at,burst_threshold,burst_threshold_learned_at FROM projects ORDER BY updated_at DESC")
+        .prepare("SELECT id,name,folder_path,photo_count,status,created_at,updated_at,burst_threshold,burst_threshold_learned_at,source_kind FROM projects ORDER BY updated_at DESC")
         .map_err(|error| error.to_string())?;
     let rows = statement
         .query_map([], |row| {
@@ -2315,6 +2722,7 @@ fn list_projects(app: AppHandle) -> Result<Vec<Project>, String> {
                 updated_at: row.get(6)?,
                 burst_threshold: row.get(7)?,
                 burst_threshold_learned_at: row.get(8)?,
+                source_kind: row.get(9)?,
             })
         })
         .map_err(|error| error.to_string())?;
@@ -2339,14 +2747,202 @@ fn create_project(app: AppHandle, name: String, folder_path: String) -> Result<P
         updated_at: now(),
         burst_threshold: None,
         burst_threshold_learned_at: None,
+        source_kind: SOURCE_FOLDER.into(),
     };
     connection(&app)?
         .execute(
-            "INSERT INTO projects (id,name,folder_path,photo_count,status,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-            params![project.id, project.name, project.folder_path, project.photo_count, project.status, project.created_at, project.updated_at],
+            "INSERT INTO projects (id,name,folder_path,photo_count,status,created_at,updated_at,source_kind) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![project.id, project.name, project.folder_path, project.photo_count, project.status, project.created_at, project.updated_at, project.source_kind],
         )
         .map_err(|error| error.to_string())?;
     Ok(project)
+}
+
+// ---------------------------------------------------------------------------
+// Amazon Photos の共有リンク（T9）。ログインしない。公開の JSON を読むだけ。
+// 分岐は Rust の入口（走査・解析・表示用・書き出し・サイドカー）で `source_kind` を見て行い、
+// 画面側には持たせない。
+// ---------------------------------------------------------------------------
+
+const SOURCE_FOLDER: &str = "folder";
+const SOURCE_AMAZON: &str = "amazon";
+const AMAZON_UNSUPPORTED: &str = "Amazon の写真には使えません。";
+
+/// 写真の出所の種類と鍵。
+fn project_source(conn: &Connection, project_id: &str) -> Result<(String, Option<String>), String> {
+    conn.query_row(
+        "SELECT source_kind,source_key FROM projects WHERE id=?1",
+        params![project_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .map_err(|_| "Project was not found.".to_string())
+}
+
+/// Amazon のプロジェクトなら共有リンクの出所を返す。フォルダなら None。
+fn amazon_source_of(conn: &Connection, project_id: &str) -> Result<Option<amazon::AmazonSource>, String> {
+    let (kind, key) = project_source(conn, project_id)?;
+    if kind != SOURCE_AMAZON {
+        return Ok(None);
+    }
+    key.as_deref()
+        .and_then(amazon::parse_key)
+        .map(Some)
+        .ok_or_else(|| "Amazon Photos のリンクの情報を読めません。".to_string())
+}
+
+/// Amazon のプロジェクトの tempLink の控えと取り直し。フォルダなら None。
+fn amazon_book_of(app: &AppHandle, project_id: &str) -> Result<Option<Arc<amazon::LinkBook>>, String> {
+    let conn = connection(app)?;
+    let Some(source) = amazon_source_of(&conn, project_id)? else {
+        return Ok(None);
+    };
+    let book = amazon::LinkBook::load(db_path(app)?, &conn, project_id, source)?;
+    Ok(Some(Arc::new(book)))
+}
+
+/// リンクが消えていたと分かったとき。以後、開いたときに自動では読みにいかない。
+fn mark_amazon_gone(conn: &Connection, project_id: &str) {
+    let _ = conn.execute(
+        "UPDATE projects SET status='missing',updated_at=?1 WHERE id=?2",
+        params![now(), project_id],
+    );
+}
+
+/// 走査を途中でやめたとき・失敗したときの状態。写真があれば ready、なければ new。
+fn settle_project_status(conn: &Connection, project_id: &str) {
+    let _ = conn.execute(
+        "UPDATE projects SET status=CASE WHEN photo_count>0 THEN 'ready' ELSE 'new' END,updated_at=?1 WHERE id=?2",
+        params![now(), project_id],
+    );
+}
+
+/// 作成画面の見本。バイト列は JSON に載せず、ファイルに書いてパスを返す。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AmazonPreviewInfo {
+    key: String,
+    name: String,
+    count: usize,
+    /// 見本の JPEG のパス（アプリのデータフォルダの `samples/`）。
+    samples: Vec<String>,
+}
+
+const AMAZON_SAMPLE_LIMIT: usize = 12;
+
+fn clear_dir(path: &Path) {
+    let _ = fs::remove_dir_all(path);
+}
+
+fn amazon_preview_blocking(app: AppHandle, share_url: String) -> Result<AmazonPreviewInfo, String> {
+    let preview = amazon::preview(&share_url, AMAZON_SAMPLE_LIMIT)?;
+    let dir = data_subdir(&app, SAMPLES_DIR)?;
+    // 前の見本は要らない。名前を毎回変えるので、画面が古い画像を覚えていても取り違えない。
+    clear_dir(&dir);
+    fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    let batch = Uuid::new_v4();
+    let mut samples = Vec::new();
+    for (index, bytes) in preview.samples.iter().enumerate() {
+        let file = dir.join(format!("{batch}-{index}.jpg"));
+        if fs::write(&file, bytes).is_ok() {
+            samples.push(file.to_string_lossy().to_string());
+        }
+    }
+    Ok(AmazonPreviewInfo { key: preview.key, name: preview.name, count: preview.count, samples })
+}
+
+#[tauri::command]
+async fn amazon_preview(app: AppHandle, share_url: String) -> Result<AmazonPreviewInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || amazon_preview_blocking(app, share_url))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn create_amazon_project_blocking(app: AppHandle, name: String, share_url: String) -> Result<Project, String> {
+    let source = amazon::parse_share_url(&share_url)
+        .ok_or_else(|| "Amazon Photos の共有リンクの形ではありません。".to_string())?;
+    let name = name.trim();
+    let project = Project {
+        id: Uuid::new_v4().to_string(),
+        name: if name.is_empty() { "Amazon Photos".to_string() } else { name.to_string() },
+        folder_path: share_url.trim().to_string(),
+        photo_count: 0,
+        status: "new".into(),
+        created_at: now(),
+        updated_at: now(),
+        burst_threshold: None,
+        burst_threshold_learned_at: None,
+        source_kind: SOURCE_AMAZON.into(),
+    };
+    connection(&app)?
+        .execute(
+            "INSERT INTO projects (id,name,folder_path,photo_count,status,created_at,updated_at,source_kind,source_key) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![project.id, project.name, project.folder_path, project.photo_count, project.status, project.created_at, project.updated_at, project.source_kind, amazon::key_for(&source)],
+        )
+        .map_err(|error| error.to_string())?;
+    // 見本はもう要らない。
+    if let Ok(dir) = data_subdir(&app, SAMPLES_DIR) {
+        clear_dir(&dir);
+    }
+    Ok(project)
+}
+
+#[tauri::command]
+async fn create_amazon_project(app: AppHandle, name: String, share_url: String) -> Result<Project, String> {
+    tauri::async_runtime::spawn_blocking(move || create_amazon_project_blocking(app, name, share_url))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+/// 原本を `amazon-cache/<project_id>/<node_id>.jpg` に置いてパスを返す。あれば使い回す。
+/// 取れなかったら一覧を読み直して tempLink を取り直し、1 回だけやり直す（`LinkBook::fetch`）。
+fn amazon_original_blocking(app: AppHandle, project_id: String, photo_id: String) -> Result<String, String> {
+    let conn = connection(&app)?;
+    let node_id: String = conn
+        .query_row(
+            "SELECT path FROM photos WHERE id=?1 AND project_id=?2",
+            params![photo_id, project_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| "この写真は見つかりませんでした。".to_string())?;
+    let Some(book) = amazon_book_of(&app, &project_id)? else {
+        return Err("Amazon の写真ではありません。".into());
+    };
+    let dir = data_subdir(&app, AMAZON_CACHE_DIR)?.join(&project_id);
+    let file = dir.join(format!("{}.jpg", amazon::safe_file_stem(&node_id)));
+    if file.is_file() {
+        return Ok(file.to_string_lossy().to_string());
+    }
+    let bytes = match book.fetch(&node_id, None) {
+        Ok(bytes) => bytes,
+        Err(message) => {
+            if book.is_gone() {
+                mark_amazon_gone(&conn, &project_id);
+            }
+            return Err(message);
+        }
+    };
+    write_atomically(&file, &bytes)?;
+    Ok(file.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+async fn amazon_original(app: AppHandle, project_id: String, photo_id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || amazon_original_blocking(app, project_id, photo_id))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+/// 一時ファイルに書いてから置き換える。途中で切れた半端なファイルを残さない。
+fn write_atomically(file: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = file.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let temporary = file.with_extension("part");
+    fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
+    fs::rename(&temporary, file).map_err(|error| {
+        let _ = fs::remove_file(&temporary);
+        error.to_string()
+    })
 }
 
 /// まだ解析が必要な写真の枚数。0 なら事前生成を起動する意味がない。
@@ -2356,28 +2952,81 @@ fn create_project(app: AppHandle, name: String, folder_path: String) -> Result<P
 /// 一瞬出ていた。
 #[tauri::command]
 fn get_analysis_backlog(app: AppHandle, project_id: String) -> Result<i64, String> {
-    connection(&app)?
-        .query_row(
-            "SELECT COUNT(*) FROM photos
+    let conn = connection(&app)?;
+    // Amazon の撮影時刻は走査で入る（contentDate が無い写真は空のまま）ので、空でも「未解析」に数えない。
+    let is_amazon = amazon_source_of(&conn, &project_id)?.is_some();
+    analysis_backlog(&conn, &project_id, is_amazon)
+}
+
+/// 「解析の対象なのに未処理」の枚数。
+///
+/// 指紋・サムネイルを作る対象は、解析（`select_burst_candidates`）が選んだ連写の候補だけ
+/// （Amazon は全部）。対象でない写真は指紋もサムネイルも空のままなので、数えない。
+/// 数えると、候補でない写真の分だけ backlog が 0 にならず、ホームがずっと「準備中」になる。
+/// 撮影時刻が未読の写真は、対象が決まる前なので常に数える。
+fn analysis_backlog(conn: &Connection, project_id: &str, is_amazon: bool) -> Result<i64, String> {
+    struct Row {
+        id: String,
+        captured_at: Option<i64>,
+        source: Option<String>,
+        stale: bool,
+    }
+    let mut statement = conn
+        .prepare(
+            "SELECT id,captured_at,timestamp_source,
+                    (d_hash IS NULL OR d_hash_version IS NULL OR d_hash_version <> ?2
+                     OR thumbnail_path IS NULL OR thumbnail_version IS NULL OR thumbnail_version <> ?3)
+             FROM photos
              WHERE project_id=?1 AND is_missing=0
-               AND (captured_at IS NULL
-                 OR timestamp_source IS NULL
-                 OR d_hash IS NULL
-                 OR d_hash_version IS NULL
-                 OR d_hash_version <> ?2
-                 OR thumbnail_path IS NULL
-                 OR thumbnail_version IS NULL
-                 OR thumbnail_version <> ?3)",
-            params![project_id, D_HASH_VERSION, THUMBNAIL_VERSION],
-            |row| row.get(0),
+             ORDER BY captured_at IS NULL, captured_at, path",
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params![project_id, D_HASH_VERSION, THUMBNAIL_VERSION], |row| {
+            Ok(Row {
+                id: row.get(0)?,
+                captured_at: row.get(1)?,
+                source: row.get(2)?,
+                stale: row.get::<_, i64>(3)? != 0,
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let selection = select_burst_candidates(
+        &rows
+            .iter()
+            .filter_map(|row| {
+                Some(CandidateInput {
+                    id: row.id.clone(),
+                    captured_at: row.captured_at?,
+                    source: TimestampSource::parse(row.source.as_deref()),
+                })
+            })
+            .collect::<Vec<_>>(),
+    );
+    let pending = rows
+        .iter()
+        .filter(|row| {
+            let time_missing = !is_amazon && (row.captured_at.is_none() || row.source.is_none());
+            let targeted = is_amazon || selection.ids.contains(&row.id);
+            time_missing || (targeted && row.stale)
+        })
+        .count();
+    Ok(pending as i64)
 }
 
 /// プロジェクトを削除する。**写真原本には一切触れない。**
 /// 消すのは DB の行と、このアプリが `app_data_dir` 配下に作ったサムネイルだけ。
 #[tauri::command]
-fn delete_project(app: AppHandle, project_id: String) -> Result<(), String> {
+async fn delete_project(app: AppHandle, project_id: String) -> Result<(), String> {
+    // 重い処理（ディスクと SQLite）はメインスレッドから外す。
+    tauri::async_runtime::spawn_blocking(move || delete_project_blocking(app, project_id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn delete_project_blocking(app: AppHandle, project_id: String) -> Result<(), String> {
     let conn = connection(&app)?;
 
     // 先にサムネイルの実体を消す。DB を消してからでは対象が分からなくなる。
@@ -2410,6 +3059,19 @@ fn delete_project(app: AppHandle, project_id: String) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     transaction
         .execute(
+            "DELETE FROM pair_overrides WHERE project_id=?1",
+            params![project_id],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "DELETE FROM sidecar_state WHERE project_id=?1",
+            params![project_id],
+        )
+        .map_err(|error| error.to_string())?;
+    amazon::delete_links(&transaction, &project_id)?;
+    transaction
+        .execute(
             "DELETE FROM photos WHERE project_id=?1",
             params![project_id],
         )
@@ -2421,6 +3083,13 @@ fn delete_project(app: AppHandle, project_id: String) -> Result<(), String> {
 
     if deleted == 0 {
         return Err("プロジェクトが見つかりませんでした。".into());
+    }
+    // Amazon の原本の置き場と、作成画面の見本。フォルダのプロジェクトでは無いので何も起きない。
+    if let Ok(dir) = data_subdir(&app, AMAZON_CACHE_DIR) {
+        clear_dir(&dir.join(&project_id));
+    }
+    if let Ok(dir) = data_subdir(&app, SAMPLES_DIR) {
+        clear_dir(&dir);
     }
     eprintln!("削除: プロジェクト {project_id} / サムネイル {removed} 件");
     Ok(())
@@ -2479,7 +3148,14 @@ fn photo_page_query(
 }
 
 #[tauri::command]
-fn get_project_photo_page(
+async fn get_project_photo_page(app: AppHandle, project_id: String, offset: i64, limit: i64, rating: Option<i64>, sort: Option<String>) -> Result<PhotoPage, String> {
+    // 重い処理（ディスクと SQLite）はメインスレッドから外す。
+    tauri::async_runtime::spawn_blocking(move || get_project_photo_page_blocking(app, project_id, offset, limit, rating, sort))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn get_project_photo_page_blocking(
     app: AppHandle,
     project_id: String,
     offset: i64,
@@ -2686,7 +3362,14 @@ fn reset_selection_results(app: AppHandle, project_id: String) -> Result<(), Str
 }
 
 #[tauri::command]
-fn get_selection_summary(app: AppHandle, project_id: String) -> Result<SelectionSummary, String> {
+async fn get_selection_summary(app: AppHandle, project_id: String) -> Result<SelectionSummary, String> {
+    // 重い処理（ディスクと SQLite）はメインスレッドから外す。
+    tauri::async_runtime::spawn_blocking(move || get_selection_summary_blocking(app, project_id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn get_selection_summary_blocking(app: AppHandle, project_id: String) -> Result<SelectionSummary, String> {
     let conn = connection(&app)?;
     let mut counts = vec![0i64; (MAX_RATING + 1) as usize];
     let mut statement = conn
@@ -2734,30 +3417,46 @@ impl ExportReport {
     }
 }
 
-/// 対象の写真を星ごとに取り出す。`ratings` が空なら全部。
+/// 対象の写真を取り出す。**対象は TS が決めた写真の id**（連写の仲間まで広げたあと）で、
+/// 星では選ばない。id が空なら何も返さない。並びは相対パス順。
 fn photos_for_export(
     conn: &Connection,
     project_id: &str,
-    ratings: &[i64],
-) -> Result<Vec<(String, i64)>, String> {
+    photo_ids: &[String],
+) -> Result<Vec<(String, String, i64)>, String> {
+    if photo_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let wanted: std::collections::HashSet<&str> = photo_ids.iter().map(String::as_str).collect();
     let mut statement = conn
-        .prepare("SELECT path,rating FROM photos WHERE project_id=?1 AND is_missing=0 ORDER BY relative_path")
+        .prepare("SELECT id,path,rating FROM photos WHERE project_id=?1 AND is_missing=0 ORDER BY relative_path")
         .map_err(|error| error.to_string())?;
     let rows = statement
         .query_map(params![project_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
         })
         .map_err(|error| error.to_string())?;
-    let all = rows
-        .collect::<Result<Vec<_>, _>>()
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, path, rating) = row.map_err(|error| error.to_string())?;
+        if wanted.contains(id.as_str()) {
+            out.push((id, path, rating));
+        }
+    }
+    Ok(out)
+}
+
+/// 移動できた写真の行だけを欠損にする（場所が古くなったので、次の scan で拾い直させる）。
+/// 移動しなかった写真や、失敗した写真は、そのまま。
+fn mark_photos_missing(conn: &Connection, project_id: &str, ids: &[String]) -> Result<(), String> {
+    for id in ids {
+        conn.execute(
+            "UPDATE photos SET is_missing=1 WHERE project_id=?1 AND id=?2",
+            params![project_id, id],
+        )
         .map_err(|error| error.to_string())?;
-    Ok(if ratings.is_empty() {
-        all
-    } else {
-        all.into_iter()
-            .filter(|(_, rating)| ratings.contains(rating))
-            .collect()
-    })
+    }
+    Ok(())
 }
 
 /// 出力先に同名があるとき、`name (2).jpg` のように連番を付ける。
@@ -2784,22 +3483,37 @@ fn unique_destination(directory: &Path, file_name: &str) -> PathBuf {
     candidate
 }
 
-/// 星ごとのフォルダへ書き出す。`star-5` `star-4` … を出力先に作る。
+/// 選んだ写真を星ごとのフォルダへ書き出す。`star-5` `star-4` … を出力先に作る。
+/// 対象は `photo_ids`（TS が連写の仲間まで広げて決める）。
 ///
 /// `move_files` が false ならコピー。true なら移動で、**原本フォルダから写真が
 /// 消える**。移動は「コピーしてから元を消す」順で行い、コピーに失敗したら
 /// 元は残す。同じボリュームなら rename を試し、失敗したらコピーへ落とす。
 #[tauri::command]
-fn export_by_rating(
+async fn export_photos(app: AppHandle, project_id: String, destination: String, photo_ids: Vec<String>, move_files: bool) -> Result<ExportReport, String> {
+    // 重い処理（ディスクと SQLite）はメインスレッドから外す。
+    tauri::async_runtime::spawn_blocking(move || export_photos_blocking(app, project_id, destination, photo_ids, move_files))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn export_photos_blocking(
     app: AppHandle,
     project_id: String,
     destination: String,
-    ratings: Vec<i64>,
+    photo_ids: Vec<String>,
     move_files: bool,
 ) -> Result<ExportReport, String> {
     let root = PathBuf::from(&destination);
     if !root.is_dir() {
         return Err("出力先フォルダが見つかりません。".into());
+    }
+    // Amazon の写真は、原本を取ってきて書き出し先に置く（移動はできない）。
+    if let Some(book) = amazon_book_of(&app, &project_id)? {
+        if move_files {
+            return Err(AMAZON_UNSUPPORTED.into());
+        }
+        return export_amazon_copy(&app, &project_id, book, &root, &photo_ids);
     }
     // 出力先が写真フォルダの中だと、書き出した先をまた読んでしまう。
     let folder = project_folder(&app, &project_id)?;
@@ -2808,10 +3522,11 @@ fn export_by_rating(
     }
 
     let conn = connection(&app)?;
-    let targets = photos_for_export(&conn, &project_id, &ratings)?;
+    let targets = photos_for_export(&conn, &project_id, &photo_ids)?;
     let mut report = ExportReport::default();
 
-    for (path, rating) in &targets {
+    let mut moved_ids: Vec<String> = Vec::new();
+    for (id, path, rating) in &targets {
         let source = Path::new(path);
         if !source.is_file() {
             report.skipped += 1;
@@ -2832,11 +3547,15 @@ fn export_by_rating(
             // 同じボリュームなら rename が速くて安全。失敗したらコピー＋削除。
             if fs::rename(source, &target).is_ok() {
                 report.processed += 1;
+                moved_ids.push(id.clone());
                 continue;
             }
             match fs::copy(source, &target) {
                 Ok(_) => match fs::remove_file(source) {
-                    Ok(()) => report.processed += 1,
+                    Ok(()) => {
+                        report.processed += 1;
+                        moved_ids.push(id.clone());
+                    }
                     // コピーは済んでいるので写真は失われない。元が残るだけ。
                     Err(error) => report.fail(path, format!("複製後に元を削除できません: {error}")),
                 },
@@ -2851,12 +3570,67 @@ fn export_by_rating(
     }
 
     // 移動したなら DB の場所が古くなる。次の scan で拾い直させる。
-    if move_files && report.processed > 0 {
-        conn.execute(
-            "UPDATE photos SET is_missing=1 WHERE project_id=?1",
-            params![project_id],
-        )
-        .map_err(|error| error.to_string())?;
+    if move_files {
+        mark_photos_missing(&conn, &project_id, &moved_ids)?;
+    }
+    Ok(report)
+}
+
+/// Amazon の写真を星ごとのフォルダへコピーする。原本を Amazon から取り、書き出し先に直接置く
+/// （端末の `amazon-cache` は使わない）。失敗した 1 枚で止めない。
+fn export_amazon_copy(
+    app: &AppHandle,
+    project_id: &str,
+    book: Arc<amazon::LinkBook>,
+    root: &Path,
+    photo_ids: &[String],
+) -> Result<ExportReport, String> {
+    let conn = connection(app)?;
+    let targets: Vec<(String, String, String, i64)> = {
+        let mut statement = conn
+            .prepare("SELECT id,path,name,rating FROM photos WHERE project_id=?1 AND is_missing=0 ORDER BY relative_path")
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![project_id], |row| Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?
+    };
+    let wanted: std::collections::HashSet<&str> = photo_ids.iter().map(String::as_str).collect();
+    let mut report = ExportReport::default();
+    for (id, node_id, name, rating) in targets {
+        if !wanted.contains(id.as_str()) {
+            continue;
+        }
+        let directory = root.join(format!("star-{rating}"));
+        if let Err(error) = fs::create_dir_all(&directory) {
+            report.fail(&name, error);
+            continue;
+        }
+        // 名前に区切りが入っていても、書き出し先の外には出さない。
+        let file_name = Path::new(&name)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("photo.jpg");
+        match book.fetch(&node_id, None) {
+            Ok(bytes) => {
+                let target = unique_destination(&directory, file_name);
+                match fs::write(&target, &bytes) {
+                    Ok(()) => report.processed += 1,
+                    Err(error) => {
+                        let _ = fs::remove_file(&target);
+                        report.fail(&name, error);
+                    }
+                }
+            }
+            Err(message) => {
+                report.fail(&name, message);
+                // リンクが消えていたら、残りを 1 枚ずつ試さない。
+                if book.is_gone() {
+                    mark_amazon_gone(&conn, project_id);
+                    break;
+                }
+            }
+        }
     }
     Ok(report)
 }
@@ -2951,17 +3725,29 @@ fn jpeg_with_rating(original: &[u8], rating: i64) -> Result<Vec<u8>, String> {
 ///
 /// 一時ファイルへ書いてから中身を検証し、問題なければ置き換える。
 /// 途中で失敗しても原本はそのまま残る。JPEG 以外は触らない。
+/// 対象は `photo_ids`（TS が連写の仲間まで広げて決める）。
 #[tauri::command]
-fn write_ratings_to_files(
+async fn write_ratings_to_photos(app: AppHandle, project_id: String, photo_ids: Vec<String>) -> Result<ExportReport, String> {
+    // 重い処理（ディスクと SQLite）はメインスレッドから外す。
+    tauri::async_runtime::spawn_blocking(move || write_ratings_to_photos_blocking(app, project_id, photo_ids))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn write_ratings_to_photos_blocking(
     app: AppHandle,
     project_id: String,
-    ratings: Vec<i64>,
+    photo_ids: Vec<String>,
 ) -> Result<ExportReport, String> {
     let conn = connection(&app)?;
-    let targets = photos_for_export(&conn, &project_id, &ratings)?;
+    // Amazon の写真の原本は書き換えられない。
+    if amazon_source_of(&conn, &project_id)?.is_some() {
+        return Err(AMAZON_UNSUPPORTED.into());
+    }
+    let targets = photos_for_export(&conn, &project_id, &photo_ids)?;
     let mut report = ExportReport::default();
 
-    for (path, rating) in &targets {
+    for (_id, path, rating) in &targets {
         let source = Path::new(path);
         let is_jpeg = matches!(
             source
@@ -3021,6 +3807,25 @@ fn write_ratings_to_files(
     Ok(report)
 }
 
+/// 結果の CSV を、保存ダイアログで選ばれた場所へ書く。**書けるのは `.csv` だけ**
+/// （画面が渡すのは保存ダイアログの結果と、TS が作った CSV の文）。
+#[tauri::command]
+async fn write_text_file(path: String, text: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let target = PathBuf::from(&path);
+        let is_csv = target
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("csv"));
+        if !is_csv {
+            return Err("CSV のファイルにだけ書けます。".to_string());
+        }
+        fs::write(&target, text.as_bytes()).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 #[tauri::command]
 fn get_photos_by_ids(
     app: AppHandle,
@@ -3048,284 +3853,93 @@ fn get_photos_by_ids(
         .collect())
 }
 
-/// 選別の並び順。**ここが返す順序が、そのまま選別画面の並びになる。**
-///
-/// 似た構図は撮影時刻が近いので、撮影順に並べると「その中の1枚を選ぶ」比較が
-/// 同じ場面どうしになる。以前は `ORDER BY id`（= UUID なので実質ランダム）で、
-/// さらにフロント側でシャッフルしていた。
-/// 撮影日時の無い写真は末尾へ回し、その中はファイル順で安定させる。
-const SELECTION_SEED_ORDER: &str = " ORDER BY captured_at IS NULL, captured_at, relative_path";
-
-/// 選別に出す写真。`rating` を指定するとその星の写真だけを返す。
-/// 「★3 の 120 枚を選別する」という使い方をするので、対象は星で決まる。
+/// core に渡す写真の行。**その星に関係なく全件**（欠損を除く）を 1 回で返す。
+/// 並べ替えはフロント（`utils/coreInputs.ts`）が撮影順にする。
 #[tauri::command]
-fn get_selection_seed(
-    app: AppHandle,
-    project_id: String,
-    rating: Option<i64>,
-) -> Result<Vec<SelectionSeed>, String> {
+async fn get_core_inputs(app: AppHandle, project_id: String) -> Result<Vec<Photo>, String> {
+    // 重い処理（ディスクと SQLite）はメインスレッドから外す。
+    tauri::async_runtime::spawn_blocking(move || get_core_inputs_blocking(app, project_id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn get_core_inputs_blocking(app: AppHandle, project_id: String) -> Result<Vec<Photo>, String> {
     let conn = connection(&app)?;
-    let where_extra = if rating.is_some() {
-        " AND rating=?2"
-    } else {
-        ""
-    };
     let mut statement = conn
         .prepare(&format!(
-            "SELECT id,rating FROM photos WHERE project_id=?1 AND is_missing=0{where_extra}{SELECTION_SEED_ORDER}"
+            "SELECT {PHOTO_COLUMNS} FROM photos WHERE project_id=?1 AND is_missing=0"
         ))
         .map_err(|error| error.to_string())?;
     let rows = statement
-        .query_map(
-            rusqlite::params_from_iter(
-                std::iter::once(rusqlite::types::Value::from(project_id.clone()))
-                    .chain(rating.map(rusqlite::types::Value::from)),
-            ),
-            |row| {
-                Ok(SelectionSeed {
-                    id: row.get(0)?,
-                    rating: row.get(1)?,
-                })
-            },
-        )
+        .query_map(params![project_id], photo_from_row)
         .map_err(|error| error.to_string())?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())
 }
 
-/// 閾値の学習に使う、隣り合う2枚。
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BurstPair {
-    id: String,
-    left_photo_id: String,
-    right_photo_id: String,
-    /// dHash のハミング距離。小さいほど構図が近い。
-    distance: u32,
-    gap_ms: i64,
+/// 手で直した連写の例外（core の `PairOverride`）。鍵は relativePath。
+#[derive(Clone, Serialize, serde::Deserialize)]
+struct PairOverrideRow {
+    left: String,
+    right: String,
+    decision: String,
 }
 
-/// 撮影時刻順に並んだ写真。`captured_at` と `d_hash` が揃っているものだけ。
-type BurstEntry = (String, i64, String, TimestampSource);
-
-fn load_burst_entries(app: &AppHandle, project_id: &str) -> Result<Vec<BurstEntry>, String> {
-    let conn = connection(app)?;
-    let mut statement = conn
-        .prepare("SELECT id,captured_at,d_hash,timestamp_source FROM photos WHERE project_id=?1 AND is_missing=0 AND captured_at IS NOT NULL AND d_hash IS NOT NULL ORDER BY captured_at")
-        .map_err(|error| error.to_string())?;
-    let entries = statement
-        .query_map(params![project_id], |row| {
-            let source: Option<String> = row.get(3)?;
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                TimestampSource::parse(source.as_deref()),
-            ))
-        })
-        .map_err(|error| error.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    Ok(entries)
-}
-
-/// 閾値の学習に出題する候補ペア。構図の距離は付けるが、閾値による足切りは
-/// しない。どこで切るかを決めるのがこの後の学習なので、ここで絞ってはいけない。
 #[tauri::command]
-fn get_burst_pairs(app: AppHandle, project_id: String) -> Result<Vec<BurstPair>, String> {
-    Ok(build_burst_pairs(&load_burst_entries(&app, &project_id)?))
-}
-
-fn build_burst_pairs(entries: &[BurstEntry]) -> Vec<BurstPair> {
-    let mut pairs = Vec::new();
-    for window in entries.windows(2) {
-        let [left, right] = window else { continue };
-        let left_input = CandidateInput {
-            id: left.0.clone(),
-            captured_at: left.1,
-            source: left.3,
-        };
-        let right_input = CandidateInput {
-            id: right.0.clone(),
-            captured_at: right.1,
-            source: right.3,
-        };
-        if pair_eligibility(&left_input, &right_input, BURST_WINDOW_MS) != PairEligibility::Eligible
-        {
-            continue;
-        }
-        pairs.push(BurstPair {
-            id: format!("{}:{}", left.0, right.0),
-            left_photo_id: left.0.clone(),
-            right_photo_id: right.0.clone(),
-            distance: hash_distance(&left.2, &right.2),
-            gap_ms: right.1 - left.1,
-        });
-    }
-    pairs
-}
-
-/// `threshold` が `None` のときは、プロジェクトに保存された学習値、
-/// それも無ければ既定の `HASH_DISTANCE_LIMIT` を使う。
-#[tauri::command]
-fn get_burst_groups(
-    app: AppHandle,
-    project_id: String,
-    threshold: Option<u32>,
-) -> Result<Vec<BurstGroup>, String> {
-    let entries = load_burst_entries(&app, &project_id)?;
-    let threshold = match threshold {
-        Some(value) => value,
-        None => load_burst_threshold(&app, &project_id)?.unwrap_or(HASH_DISTANCE_LIMIT),
-    };
-    let overrides = load_pair_overrides(&app, &project_id)?;
-    Ok(build_burst_groups(
-        entries
-            .into_iter()
-            .map(|(id, captured_at, hash, _)| (id, captured_at, hash))
-            .collect(),
-        threshold,
-        &overrides,
-    ))
-}
-
-fn load_pair_overrides(app: &AppHandle, project_id: &str) -> Result<PairOverrides, String> {
-    let conn = connection(app)?;
+fn get_pair_overrides(app: AppHandle, project_id: String) -> Result<Vec<PairOverrideRow>, String> {
+    let conn = connection(&app)?;
     let mut statement = conn
         .prepare(
-            "SELECT left_photo_id,right_photo_id,decision FROM burst_pair_overrides WHERE project_id=?1",
+            "SELECT left_path,right_path,decision FROM pair_overrides WHERE project_id=?1
+             ORDER BY left_path,right_path",
         )
         .map_err(|error| error.to_string())?;
     let rows = statement
         .query_map(params![project_id], |row| {
-            let left: String = row.get(0)?;
-            let right: String = row.get(1)?;
-            let decision: String = row.get(2)?;
-            Ok(((left, right), decision == "join"))
+            Ok(PairOverrideRow {
+                left: row.get(0)?,
+                right: row.get(1)?,
+                decision: row.get(2)?,
+            })
         })
-        .map_err(|error| error.to_string())?;
-    rows.collect::<Result<PairOverrides, _>>()
-        .map_err(|error| error.to_string())
-}
-
-/// まとまりを見直すための「1続きの写真」。指定した写真の前後 `window_ms` に入る
-/// ものを撮影順で返す。まとめの判定に使う写真だけを対象にするので、
-/// `load_burst_entries` と同じ絞り込み（撮影時刻とハッシュがある・欠損でない）にする。
-#[tauri::command]
-fn get_burst_neighborhood(
-    app: AppHandle,
-    project_id: String,
-    photo_ids: Vec<String>,
-    window_ms: Option<i64>,
-) -> Result<Vec<Photo>, String> {
-    if photo_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let conn = connection(&app)?;
-    let window = window_ms.unwrap_or(BURST_WINDOW_MS).max(0);
-
-    // 与えられた写真が占める時間の幅を求め、そこから前後へ広げる。
-    let mut span: Option<(i64, i64)> = None;
-    {
-        let mut statement = conn
-            .prepare("SELECT captured_at FROM photos WHERE project_id=?1 AND id=?2")
-            .map_err(|error| error.to_string())?;
-        for id in &photo_ids {
-            let at: Option<i64> = statement
-                .query_row(params![project_id, id], |row| row.get(0))
-                .unwrap_or(None);
-            let Some(at) = at else { continue };
-            span = Some(match span {
-                Some((low, high)) => (low.min(at), high.max(at)),
-                None => (at, at),
-            });
-        }
-    }
-    let Some((low, high)) = span else {
-        return Ok(Vec::new());
-    };
-
-    let mut statement = conn
-        .prepare(&format!(
-            "SELECT {PHOTO_COLUMNS} FROM photos
-             WHERE project_id=?1 AND is_missing=0
-               AND captured_at IS NOT NULL AND d_hash IS NOT NULL
-               AND captured_at BETWEEN ?2 AND ?3
-             ORDER BY captured_at"
-        ))
-        .map_err(|error| error.to_string())?;
-    let rows = statement
-        .query_map(params![project_id, low - window, high + window], photo_from_row)
         .map_err(|error| error.to_string())?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())
 }
 
-/// 見直した結果のまとまりを保存する。
-///
-/// **受け取るのは「こう分かれていてほしい」という形だけ**で、例外そのものではない。
-/// 閾値だけで出る素の判定と突き合わせ、**食い違うペアだけ**を例外として残し、
-/// 一致するペアの例外は消す。こうすると、
-/// - 切ってから元に戻したときに、無意味な例外が溜まらない
-/// - 同じ形を何度保存しても結果が変わらない（冪等）
-/// - 閾値を学習し直しても、利用者が触っていないペアは新しい閾値に従う
+/// そのプロジェクトの例外を、渡したものに丸ごと入れ替える。
 #[tauri::command]
-fn save_burst_shape(
+fn save_pair_overrides(
     app: AppHandle,
     project_id: String,
-    ordered_photo_ids: Vec<String>,
-    blocks: Vec<Vec<String>>,
+    overrides: Vec<PairOverrideRow>,
 ) -> Result<(), String> {
-    if ordered_photo_ids.len() < 2 {
-        return Ok(());
-    }
-    let threshold = load_burst_threshold(&app, &project_id)?.unwrap_or(HASH_DISTANCE_LIMIT);
-    let entries = load_burst_entries(&app, &project_id)?;
-    let by_id: std::collections::HashMap<&str, (i64, &str)> = entries
-        .iter()
-        .map(|(id, at, hash, _)| (id.as_str(), (*at, hash.as_str())))
-        .collect();
-    let block_of: std::collections::HashMap<&str, usize> = blocks
-        .iter()
-        .enumerate()
-        .flat_map(|(index, block)| block.iter().map(move |id| (id.as_str(), index)))
-        .collect();
-
     let mut conn = connection(&app)?;
+    replace_pair_overrides(&mut conn, &project_id, &overrides)
+}
+
+fn replace_pair_overrides(
+    conn: &mut Connection,
+    project_id: &str,
+    overrides: &[PairOverrideRow],
+) -> Result<(), String> {
     let tx = conn.transaction().map_err(|error| error.to_string())?;
-    let now = now();
-    for window in ordered_photo_ids.windows(2) {
-        let [left, right] = window else { continue };
-        let (Some(left_entry), Some(right_entry)) =
-            (by_id.get(left.as_str()), by_id.get(right.as_str()))
-        else {
-            continue;
-        };
-        let raw = pair_joins_by_threshold(*left_entry, *right_entry, threshold);
-        // 同じ塊に居るなら繋がっていてほしい、という意味。
-        let wanted = match (block_of.get(left.as_str()), block_of.get(right.as_str())) {
-            (Some(a), Some(b)) => a == b,
-            _ => false,
-        };
-        if wanted == raw {
-            tx.execute(
-                "DELETE FROM burst_pair_overrides WHERE project_id=?1 AND left_photo_id=?2 AND right_photo_id=?3",
-                params![project_id, left, right],
-            )
-            .map_err(|error| error.to_string())?;
-        } else {
-            tx.execute(
-                "INSERT INTO burst_pair_overrides (project_id,left_photo_id,right_photo_id,decision,updated_at)
-                 VALUES (?1,?2,?3,?4,?5)
-                 ON CONFLICT(project_id,left_photo_id,right_photo_id)
-                 DO UPDATE SET decision=excluded.decision, updated_at=excluded.updated_at",
-                params![project_id, left, right, if wanted { "join" } else { "split" }, now],
-            )
-            .map_err(|error| error.to_string())?;
-        }
+    tx.execute(
+        "DELETE FROM pair_overrides WHERE project_id=?1",
+        params![project_id],
+    )
+    .map_err(|error| error.to_string())?;
+    for item in overrides {
+        // 同じ組が重ねて来ても、後のものが勝つ。
+        tx.execute(
+            "INSERT INTO pair_overrides (project_id,left_path,right_path,decision)
+             VALUES (?1,?2,?3,?4)
+             ON CONFLICT(project_id,left_path,right_path) DO UPDATE SET decision=excluded.decision",
+            params![project_id, item.left, item.right, item.decision],
+        )
+        .map_err(|error| error.to_string())?;
     }
-    tx.commit().map_err(|error| error.to_string())?;
-    Ok(())
+    tx.commit().map_err(|error| error.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -3465,6 +4079,15 @@ fn run_display_generation(
             .map_err(|error| error.to_string())?
     };
 
+    // Amazon は縮小を Amazon にさせる（`viewBox=<長辺>`）。原本は読まない。
+    if let Some(book) = amazon_book_of(&app, &project_id)? {
+        let targets = pending
+            .into_iter()
+            .map(|(photo_id, node_id, _, _)| (photo_id, node_id))
+            .collect();
+        return run_amazon_display(&app, registry, &project_id, book, edge, &dir, targets);
+    }
+
     let total = pending.len();
     progress(
         &app,
@@ -3544,6 +4167,108 @@ fn run_display_generation(
     Ok(())
 }
 
+/// `run_display_generation` の Amazon 版。`viewBox=<表示用の長辺>` のバイトを、そのまま表示用のファイルに書く。
+/// 並列 4。まとまり（16 枚）ごとに DB へ書き、中断とリンク切れを見る。
+fn run_amazon_display(
+    app: &AppHandle,
+    registry: &TaskRegistry,
+    project_id: &str,
+    book: Arc<amazon::LinkBook>,
+    edge: u32,
+    dir: &Path,
+    pending: Vec<(String, String)>,
+) -> Result<(), String> {
+    let task_key = format!("display:{project_id}");
+    let total = pending.len();
+    let message = "選別用の画像を作っています…";
+    progress(app, project_id, "display", "hashing", 0, total, message);
+    let mut done = 0usize;
+    let mut failed = 0usize;
+    for batch in pending.chunks(amazon::WORKERS * 4) {
+        if registry.is_cancelled(&task_key) {
+            progress_note(
+                app,
+                project_id,
+                "display",
+                "cancelled",
+                done,
+                total,
+                format!("中断しました。{done} 件まで作成済みです。"),
+                ProgressNote { warning: None, failed },
+            );
+            return Ok(());
+        }
+        if book.is_gone() {
+            break;
+        }
+        let next = AtomicUsize::new(0);
+        let saved: Mutex<Vec<(usize, bool)>> = Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for _ in 0..amazon::WORKERS.min(batch.len()) {
+                scope.spawn(|| loop {
+                    let index = next.fetch_add(1, Ordering::SeqCst);
+                    let Some((photo_id, node_id)) = batch.get(index) else { break };
+                    let ok = book
+                        .fetch(node_id, Some(edge))
+                        .ok()
+                        // 画像として読める形のときだけ置く（エラーの文書を表示用にしない）。
+                        .filter(|bytes| image::guess_format(bytes).is_ok())
+                        .is_some_and(|bytes| write_atomically(&display_file(dir, photo_id), &bytes).is_ok());
+                    if let Ok(mut list) = saved.lock() {
+                        list.push((index, ok));
+                    }
+                });
+            }
+        });
+        let results = saved.into_inner().map_err(|_| "表示用画像の結果を読めません。".to_string())?;
+        let conn = connection(app)?;
+        for (index, ok) in results {
+            let photo_id = &batch[index].0;
+            if ok {
+                conn.execute(
+                    "UPDATE photos SET display_path=?1, display_edge=?2 WHERE id=?3",
+                    params![display_file(dir, photo_id).to_string_lossy().to_string(), edge as i64, photo_id],
+                )
+                .map_err(|error| error.to_string())?;
+            } else {
+                // 作れなかった写真は次回また拾えるよう、印を残さない。
+                failed += 1;
+                conn.execute(
+                    "UPDATE photos SET display_path=NULL, display_edge=NULL WHERE id=?1",
+                    params![photo_id],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+        }
+        done += batch.len();
+        progress_note(
+            app,
+            project_id,
+            "display",
+            "hashing",
+            done,
+            total,
+            message,
+            ProgressNote { warning: None, failed },
+        );
+    }
+    if book.is_gone() {
+        mark_amazon_gone(&connection(app)?, project_id);
+        return Err(amazon::GONE_MESSAGE.to_string());
+    }
+    progress_note(
+        app,
+        project_id,
+        "display",
+        "complete",
+        total,
+        total,
+        "選別用の画像がそろいました。",
+        ProgressNote { warning: None, failed },
+    );
+    Ok(())
+}
+
 #[tauri::command]
 fn start_display_generation(
     app: AppHandle,
@@ -3579,18 +4304,6 @@ fn reset_display_images(app: AppHandle, project_id: String) -> Result<(), String
     Ok(())
 }
 
-fn load_burst_threshold(app: &AppHandle, project_id: &str) -> Result<Option<u32>, String> {
-    let conn = connection(app)?;
-    let stored: Option<i64> = conn
-        .query_row(
-            "SELECT burst_threshold FROM projects WHERE id=?1",
-            params![project_id],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
-    Ok(stored.map(|value| value.clamp(0, 64) as u32))
-}
-
 #[tauri::command]
 fn save_burst_threshold(app: AppHandle, project_id: String, threshold: u32) -> Result<(), String> {
     connection(&app)?
@@ -3611,76 +4324,6 @@ fn clear_burst_threshold(app: AppHandle, project_id: String) -> Result<(), Strin
         )
         .map_err(|error| error.to_string())?;
     Ok(())
-}
-
-// グルーピング本体。DB アクセスと分けてあるのは計測ハーネス（feature = "bench"）
-// から実コードそのものを呼べるようにするため。挙動は分離前と同一。
-/// 手で直したまとめ。隣り合うペアに対する例外だけを持つ。
-/// キーは (左の写真, 右の写真) で、**撮影順の左→右**。
-pub type PairOverrides = std::collections::HashMap<(String, String), bool>;
-
-/// 隣り合う 2 枚を、閾値だけで見たときに繋ぐか。**例外を当てる前の素の判定。**
-/// `build_burst_groups` と `save_burst_shape` が同じ規則を使うよう、1 か所に出す。
-fn pair_joins_by_threshold(
-    left: (i64, &str),
-    right: (i64, &str),
-    threshold: u32,
-) -> bool {
-    right.0 - left.0 <= BURST_WINDOW_MS && hash_distance(right.1, left.1) <= threshold
-}
-
-fn build_burst_groups(
-    entries: Vec<(String, i64, String)>,
-    threshold: u32,
-    overrides: &PairOverrides,
-) -> Vec<BurstGroup> {
-    let mut groups = Vec::new();
-    let mut current: Vec<(String, i64, String)> = Vec::new();
-    let mut push = |photos: &mut Vec<(String, i64, String)>| {
-        if photos.len() < 2 {
-            return;
-        }
-        let first = &photos[0];
-        let last = photos.last().expect("group has a first item");
-        let average = photos
-            .iter()
-            .skip(1)
-            .map(|photo| hash_distance(&first.2, &photo.2) as f64)
-            .sum::<f64>()
-            / (photos.len() - 1) as f64;
-        groups.push(BurstGroup {
-            id: Uuid::new_v4().to_string(),
-            photo_ids: photos.iter().map(|photo| photo.0.clone()).collect(),
-            captured_span_ms: last.1 - first.1,
-            similarity: ((1.0 - average / 64.0).max(0.0) * 100.0).round() as i64,
-            accepted: None,
-        });
-    };
-    for entry in entries {
-        let is_near = current
-            .last()
-            .map(|previous| {
-                // 利用者が手で決めた境目があれば、閾値より優先する。
-                overrides
-                    .get(&(previous.0.clone(), entry.0.clone()))
-                    .copied()
-                    .unwrap_or_else(|| {
-                        pair_joins_by_threshold(
-                            (previous.1, &previous.2),
-                            (entry.1, &entry.2),
-                            threshold,
-                        )
-                    })
-            })
-            .unwrap_or(false);
-        if !current.is_empty() && !is_near {
-            push(&mut current);
-            current.clear();
-        }
-        current.push(entry);
-    }
-    push(&mut current);
-    groups
 }
 
 #[tauri::command]
@@ -3903,18 +4546,77 @@ pub mod bench_api {
         super::upsert_photo(conn, project_id, absolute, relative, name, mtime, size)
     }
 
-    /// 本物のグルーピングを走らせ、グループごとの photo_ids だけを返す。
-    /// `BurstGroup` の各フィールドを公開せずに件数と規模を測れる。
-    pub fn build_burst_groups(
-        entries: Vec<(String, i64, String)>,
-        threshold: u32,
-    ) -> Vec<Vec<String>> {
-        // 計測では手の入った例外を当てない。素の閾値だけを測る。
-        super::build_burst_groups(entries, threshold, &super::PairOverrides::new())
-            .into_iter()
-            .map(|group| group.photo_ids)
-            .collect()
-    }
+}
+
+
+// ---------------------------------------------------------------------------
+// サイドカー（`.photo-curator/catalog.json`）。判断は画面側の core が行う。
+// ---------------------------------------------------------------------------
+
+fn sidecar_folder(app: &AppHandle, project_id: &str) -> Result<PathBuf, String> {
+    Ok(PathBuf::from(project_folder(app, project_id)?))
+}
+
+#[tauri::command]
+async fn sidecar_supported(app: AppHandle, project_id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        // Amazon の共有リンクには、書く場所が無い。
+        if amazon_source_of(&connection(&app)?, &project_id)?.is_some() {
+            return Ok("none".to_string());
+        }
+        Ok(sidecar::support(&sidecar_folder(&app, &project_id)?).to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn read_sidecar(app: AppHandle, project_id: String) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if amazon_source_of(&connection(&app)?, &project_id)?.is_some() {
+            return Ok(None);
+        }
+        sidecar::read(&sidecar_folder(&app, &project_id)?)
+    })
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn write_sidecar(
+    app: AppHandle,
+    project_id: String,
+    json: String,
+    file_name: Option<String>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if amazon_source_of(&connection(&app)?, &project_id)?.is_some() {
+            return Err("Amazon の共有リンクにはサイドカーを書けません。".to_string());
+        }
+        let name = file_name.unwrap_or_else(|| sidecar::SIDECAR_FILE.to_string());
+        sidecar::write(&sidecar_folder(&app, &project_id)?, &name, &json)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+fn load_sidecar_state(app: AppHandle, project_id: String) -> Result<sidecar::SidecarState, String> {
+    sidecar::load_state(&connection(&app)?, &project_id)
+}
+
+#[tauri::command]
+fn save_sidecar_state(
+    app: AppHandle,
+    project_id: String,
+    state: sidecar::SidecarState,
+) -> Result<(), String> {
+    sidecar::save_state(&connection(&app)?, &project_id, &state)
+}
+
+#[tauri::command]
+fn device_identity(app: AppHandle) -> Result<sidecar::DeviceIdentity, String> {
+    sidecar::device_identity(&connection(&app)?)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -3926,26 +4628,28 @@ pub fn run() {
             list_projects,
             create_project,
             delete_project,
+            amazon_preview,
+            create_amazon_project,
+            amazon_original,
             get_analysis_backlog,
             get_project_photo_page,
             get_photos_by_ids,
-            get_selection_seed,
             save_selection_results,
             reset_selection_results,
             move_rating,
             get_selection_summary,
-            export_by_rating,
-            write_ratings_to_files,
+            export_photos,
+            write_ratings_to_photos,
+            write_text_file,
             get_display_settings,
             save_display_edge,
             save_project_display_edge,
             get_display_backlog,
             start_display_generation,
             reset_display_images,
-            get_burst_groups,
-            get_burst_neighborhood,
-            save_burst_shape,
-            get_burst_pairs,
+            get_core_inputs,
+            get_pair_overrides,
+            save_pair_overrides,
             save_burst_threshold,
             clear_burst_threshold,
             start_project_scan,
@@ -3953,7 +4657,13 @@ pub fn run() {
             start_background_analysis,
             cancel_project_task,
             save_project_state,
-            load_project_state
+            load_project_state,
+            sidecar_supported,
+            read_sidecar,
+            write_sidecar,
+            load_sidecar_state,
+            save_sidecar_state,
+            device_identity
         ])
         .run(tauri::generate_context!())
         .expect("error while running Photo Curator");
@@ -3962,6 +4672,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::GenericImageView;
 
     #[test]
     fn migrates_the_legacy_photo_schema_before_creating_indexes() {
@@ -5805,7 +6516,7 @@ mod tests {
             "既定の worker 数が範囲外: {workers}"
         );
         // 事前生成は必ず 1 本。前面の操作を邪魔しないため。
-        assert_eq!(AnalysisMode::Background.workers(), 1);
+        assert_eq!(AnalysisMode::Background.workers(Path::new("C:/photos")), 1);
     }
 
     // migration は利用者の実データに触れるため、合成データだけでなく実物の
@@ -5880,144 +6591,47 @@ mod tests {
         fs::remove_dir_all(&directory).expect("remove test directory");
     }
 
-    // -----------------------------------------------------------------------
-    // 連写まとめの閾値学習
-    // -----------------------------------------------------------------------
-
-    fn burst_entry(id: &str, captured_at: i64, hash: &str, source: TimestampSource) -> BurstEntry {
-        (id.to_string(), captured_at, hash.to_string(), source)
-    }
-
     #[test]
-    fn burst_pairs_only_include_adjacent_photos_with_strong_evidence() {
-        let entries = vec![
-            // 通常の連写。EXIF 由来で時間も近い。
-            burst_entry("a", 0, "0000000000000000", TimestampSource::ExifOriginal),
-            burst_entry(
-                "b",
-                1_000,
-                "0000000000000003",
-                TimestampSource::ExifOriginal,
-            ),
-            // 時間窓の外。
-            burst_entry(
-                "c",
-                60_000,
-                "0000000000000003",
-                TimestampSource::ExifOriginal,
-            ),
-            // mtime 同士。時間が近くても連写の根拠にしない。
-            burst_entry(
-                "d",
-                61_000,
-                "0000000000000003",
-                TimestampSource::FilesystemMtime,
-            ),
-            burst_entry(
-                "e",
-                61_500,
-                "0000000000000003",
-                TimestampSource::FilesystemMtime,
-            ),
-        ];
-        let pairs = build_burst_pairs(&entries);
-
-        let ids: Vec<&str> = pairs.iter().map(|pair| pair.id.as_str()).collect();
-        assert_eq!(ids, vec!["a:b", "c:d"], "窓外と弱い根拠のペアを除外する");
-        assert_eq!(pairs[0].distance, 2, "ハミング距離が入る");
-        assert_eq!(pairs[0].gap_ms, 1_000);
-    }
-
-    #[test]
-    fn burst_pairs_are_not_filtered_by_any_distance_threshold() {
-        // どこで切るかを決めるのが学習なので、出題元を閾値で絞ってはいけない。
-        // 既定の閾値 14 を大きく超える距離のペアも候補に残る必要がある。
-        let entries = vec![
-            burst_entry("a", 0, "0000000000000000", TimestampSource::ExifOriginal),
-            burst_entry("b", 500, "ffffffffffffffff", TimestampSource::ExifOriginal),
-        ];
-        let pairs = build_burst_pairs(&entries);
-        assert_eq!(pairs.len(), 1);
-        assert_eq!(pairs[0].distance, 64);
-        assert!(pairs[0].distance > HASH_DISTANCE_LIMIT);
-    }
-
-    #[test]
-    fn grouping_follows_the_given_threshold() {
-        let entries = vec![
-            ("a".to_string(), 0, "0000000000000000".to_string()),
-            ("b".to_string(), 1_000, "0000000000000003".to_string()), // a から 2
-            ("c".to_string(), 2_000, "000000000000003f".to_string()), // b から 4
-        ];
-        let sizes = |threshold: u32| -> Vec<usize> {
-            build_burst_groups(entries.clone(), threshold, &PairOverrides::new())
-                .iter()
-                .map(|group| group.photo_ids.len())
-                .collect()
+    fn pair_overrides_are_replaced_per_project() {
+        let directory = test_directory("pair-overrides");
+        let mut conn = open_database(&directory.join("overrides.sqlite3")).expect("open database");
+        let row = |left: &str, right: &str, decision: &str| PairOverrideRow {
+            left: left.to_string(),
+            right: right.to_string(),
+            decision: decision.to_string(),
+        };
+        let read = |conn: &Connection, project: &str| -> Vec<(String, String, String)> {
+            let mut statement = conn
+                .prepare(
+                    "SELECT left_path,right_path,decision FROM pair_overrides
+                     WHERE project_id=?1 ORDER BY left_path,right_path",
+                )
+                .expect("prepare");
+            statement
+                .query_map(params![project], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .expect("query")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect")
         };
 
-        assert!(sizes(0).is_empty(), "閾値 0 では何もまとまらない");
-        assert_eq!(sizes(2), vec![2], "a-b だけがまとまる");
-        assert_eq!(sizes(64), vec![3], "閾値を上げ切れば1グループ");
-    }
+        replace_pair_overrides(&mut conn, "p1", &[row("a.jpg", "b.jpg", "join"), row("b.jpg", "c.jpg", "split")])
+            .expect("save p1");
+        replace_pair_overrides(&mut conn, "p2", &[row("a.jpg", "b.jpg", "split")]).expect("save p2");
+        assert_eq!(read(&conn, "p1").len(), 2);
 
-    /// 手で直したまとめは閾値より優先される。ここが効かないと、
-    /// 解除したはずのまとまりが次のラウンドで復活する。
-    #[test]
-    fn hand_edited_pairs_win_over_the_threshold() {
-        let entries = vec![
-            ("a".to_string(), 0, "0000000000000000".to_string()),
-            ("b".to_string(), 1_000, "0000000000000003".to_string()), // a から 2
-            ("c".to_string(), 2_000, "000000000000003f".to_string()), // b から 4
-        ];
-        let shapes = |threshold: u32, overrides: &PairOverrides| -> Vec<Vec<String>> {
-            build_burst_groups(entries.clone(), threshold, overrides)
-                .into_iter()
-                .map(|group| group.photo_ids)
-                .collect()
-        };
-        let pair = |left: &str, right: &str, join: bool| {
-            PairOverrides::from([((left.to_string(), right.to_string()), join)])
-        };
-
-        // 閾値 64 なら素では 1 グループ。a-b を切ると 2 枚だけが残る。
+        // 入れ替えは丸ごと。前にあって今回無いものは消え、他のプロジェクトは触らない。
+        replace_pair_overrides(&mut conn, "p1", &[row("b.jpg", "c.jpg", "join")]).expect("replace p1");
         assert_eq!(
-            shapes(64, &pair("a", "b", false)),
-            vec![vec!["b".to_string(), "c".to_string()]],
-            "切った境目で分かれていない"
+            read(&conn, "p1"),
+            vec![("b.jpg".to_string(), "c.jpg".to_string(), "join".to_string())]
         );
-        // 真ん中を両側から切ると b が独立し、1 枚のまとまりは消える。
-        let split_both = PairOverrides::from([
-            (("a".to_string(), "b".to_string()), false),
-            (("b".to_string(), "c".to_string()), false),
-        ]);
-        assert!(shapes(64, &split_both).is_empty(), "b を外しきれていない");
+        assert_eq!(read(&conn, "p2").len(), 1, "他のプロジェクトは変わらない");
 
-        // 逆に、閾値では切れるペアも繋げる。
-        assert_eq!(
-            shapes(0, &pair("a", "b", true)),
-            vec![vec!["a".to_string(), "b".to_string()]],
-            "繋いだ境目が閾値に潰されている"
-        );
+        replace_pair_overrides(&mut conn, "p1", &[]).expect("clear p1");
+        assert!(read(&conn, "p1").is_empty());
 
-        // 例外が無ければ従来どおり。
-        assert_eq!(shapes(64, &PairOverrides::new()).len(), 1);
-    }
-
-    /// 例外の向きは撮影順の左→右。逆順のキーを拾ってしまうと、
-    /// 切ったつもりが別の境目に効いてしまう。
-    #[test]
-    fn pair_overrides_are_keyed_left_to_right() {
-        let entries = vec![
-            ("a".to_string(), 0, "0000000000000000".to_string()),
-            ("b".to_string(), 1_000, "0000000000000003".to_string()),
-        ];
-        let reversed = PairOverrides::from([(("b".to_string(), "a".to_string()), false)]);
-        assert_eq!(
-            build_burst_groups(entries, 64, &reversed).len(),
-            1,
-            "逆向きのキーが効いてしまっている"
-        );
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
     }
 
     #[test]
@@ -6279,56 +6893,171 @@ mod tests {
         fs::remove_dir_all(&directory).expect("remove test directory");
     }
 
-    /// 選別の並びは撮影順。似た構図は撮影時刻が近いので、この並びのまま
-    /// グループに切ると「同じ場面から1枚選ぶ」比較になる。
-    /// 撮影日時の無い写真は末尾へ回し、その中はファイル順で安定させる。
+    // ---- 指紋（core）・DB のファイル ------------------------------------
+
+    /// 同じ絵を JPEG で作り直しても、指紋はほとんど動かない（core と同じ基準）。
     #[test]
-    fn selection_seed_is_ordered_by_capture_time() {
-        let directory = test_directory("seed-order");
-        let conn = open_database(&directory.join("seed.sqlite3")).expect("open database");
-        conn.execute(
-            "INSERT INTO projects (id,name,folder_path,photo_count,status,created_at,updated_at)
-             VALUES ('p1','p1','C:/photos',5,'ready',1,1)",
-            [],
+    fn the_fingerprint_survives_a_jpeg_round_trip() {
+        let original = synthetic_image(640, 480, 3);
+        let recompressed = image::load_from_memory_with_format(
+            &encode_thumbnail(&original).expect("encode"),
+            image::ImageFormat::Jpeg,
         )
-        .expect("insert project");
-
-        // id 順・ファイル名順・挿入順のどれとも食い違う撮影順にする。
-        // どれか1つでも一致していると、間違った ORDER BY を素通りさせてしまう。
-        let insert = |id: &str, relative: &str, captured: Option<i64>| {
-            conn.execute(
-                "INSERT INTO photos (id,project_id,path,relative_path,name,captured_at,rating,is_missing)
-                 VALUES (?1,'p1',?2,?3,?3,?4,0,0)",
-                params![id, format!("C:/photos/{relative}"), relative, captured],
-            )
-            .expect("insert photo");
-        };
-        insert("id-a", "2-third.jpg", Some(300));
-        insert("id-y", "b-no-time.jpg", None);
-        insert("id-z", "3-first.jpg", Some(100));
-        insert("id-b", "c-no-time.jpg", None);
-        insert("id-m", "1-second.jpg", Some(200));
-
-        let mut statement = conn
-            .prepare(&format!(
-                "SELECT id FROM photos WHERE project_id=?1 AND is_missing=0{SELECTION_SEED_ORDER}"
-            ))
-            .expect("prepare");
-        let ids: Vec<String> = statement
-            .query_map(params!["p1"], |row| row.get(0))
-            .expect("query")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("collect");
-
-        assert_eq!(
-            ids,
-            vec!["id-z", "id-m", "id-a", "id-y", "id-b"],
-            "撮影順。日時の無い2枚は末尾で、その中はファイル順"
+        .expect("decode");
+        let a = d_hash_of(&original).expect("hash of original");
+        let b = d_hash_of(&recompressed).expect("hash of recompressed");
+        assert!(
+            photo_curator_core::hash_distance(a.clone(), b.clone()) <= 2,
+            "{a} vs {b}"
         );
+        assert_eq!(D_HASH_VERSION, 2);
+    }
 
-        drop(statement);
+    #[test]
+    fn a_too_small_image_has_no_fingerprint() {
+        assert!(d_hash_of(&synthetic_image(4, 4, 0)).is_none());
+    }
+
+    #[test]
+    fn a_fresh_database_file_creates_every_table() {
+        let directory = test_directory("fresh-db");
+        let conn = open_database(&directory.join("photo-curator-v2.sqlite3")).expect("open");
+        for table in [
+            "projects",
+            "photos",
+            "project_states",
+            "app_settings",
+            "pair_overrides",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .expect("query");
+            assert_eq!(count, 1, "表 {table} が作られていない");
+        }
         drop(conn);
         fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    // ---- 走査の除外・形式の判定・ネットワークのフォルダ ------------------
+
+    fn relative_names(folder: &Path, files: &[PathBuf]) -> Vec<String> {
+        let mut names: Vec<String> = files
+            .iter()
+            .map(|path| {
+                path.strip_prefix(folder)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn supported_names_are_images_raws_or_have_no_extension() {
+        for name in ["a.jpg", "a.JPEG", "a.png", "a.webp", "a.heic", "a.cr2", "a.dng", "a.rw2x", "noext"] {
+            let expected = name != "a.rw2x";
+            assert_eq!(is_supported(Path::new(name)), expected, "{name}");
+        }
+        for name in ["a.mp4", "a.MOV", "a.m4v", "a.avi", "a.mts", "a.m2ts", "a.3gp", "a.mkv", "a.txt"] {
+            assert!(!is_supported(Path::new(name)), "{name}");
+        }
+    }
+
+    /// 隠しフォルダ・動画は数えず、中身が JPEG の `.cr2` は数え、中身がテキストの
+    /// `.jpg` は数から外れる。
+    #[test]
+    fn scanning_skips_hidden_and_video_and_judges_the_content() {
+        let directory = test_directory("scan-content");
+        let root = directory.to_string_lossy().to_string();
+        let jpeg = jpeg_bytes(64, 48, 1);
+        fs::create_dir_all(directory.join(".hidden")).unwrap();
+        fs::write(directory.join(".hidden/a.jpg"), &jpeg).unwrap();
+        fs::write(directory.join(".hidden_file.jpg"), &jpeg).unwrap();
+        fs::write(directory.join("ok.jpg"), &jpeg).unwrap();
+        fs::write(directory.join("fake.cr2"), &jpeg).unwrap();
+        fs::write(directory.join("broken.jpg"), b"this is not an image, just text").unwrap();
+        fs::write(directory.join("video.mp4"), b"\0\0\0\x18ftypmp42\0\0\0\0mp42isom").unwrap();
+        // HEIC は先頭が `ftyp` だが画像。数から外さず、「読めなかった」に数える。
+        fs::write(directory.join("photo.heic"), b"\0\0\0\x18ftypheic\0\0\0\0mif1heic").unwrap();
+
+        let files = list_photo_files(&root);
+        assert_eq!(
+            relative_names(&directory, &files),
+            vec!["broken.jpg", "fake.cr2", "ok.jpg", "photo.heic"]
+        );
+
+        let conn = open_database(&directory.join("scan.sqlite3")).expect("open database");
+        conn.execute(
+            "INSERT INTO projects (id,name,folder_path,photo_count,status,created_at,updated_at)
+             VALUES ('p1','p1',?1,0,'ready',1,1)",
+            params![root],
+        )
+        .expect("insert project");
+        for path in &files {
+            let (mtime, size) = fingerprint(path).map_or((None, None), |(m, s)| (Some(m), Some(s)));
+            let relative = path.strip_prefix(&directory).unwrap().to_string_lossy().to_string();
+            upsert_photo(
+                &conn,
+                "p1",
+                &path.to_string_lossy(),
+                &relative,
+                &relative,
+                mtime,
+                size,
+            )
+            .expect("upsert");
+        }
+        assert_eq!(recount_photos(&conn, "p1").unwrap(), 4);
+
+        for (index, path) in files.iter().enumerate() {
+            let id: String = conn
+                .query_row(
+                    "SELECT id FROM photos WHERE path=?1",
+                    params![path.to_string_lossy().to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let job = MetadataJob { id, path: path.to_string_lossy().to_string() };
+            let work = metadata_one(index, &job);
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            assert_eq!(work.not_image, name == "broken.jpg", "{name}");
+            apply_metadata(&conn, &work).expect("apply");
+        }
+        assert_eq!(recount_photos(&conn, "p1").unwrap(), 3, "broken.jpg は数から外れる");
+        let count: i64 = conn
+            .query_row("SELECT photo_count FROM projects WHERE id='p1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 3);
+        let missing: String = conn
+            .query_row("SELECT name FROM photos WHERE is_missing=1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(missing, "broken.jpg");
+        // fake.cr2 は撮影時刻まで読めている（画像として扱われた）。
+        let captured: Option<i64> = conn
+            .query_row("SELECT captured_at FROM photos WHERE name='fake.cr2'", [], |row| row.get(0))
+            .unwrap();
+        assert!(captured.is_some());
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn a_local_folder_keeps_the_default_worker_count() {
+        assert!(!is_network_path(Path::new("/home/user/photos")));
+        assert!(!is_network_path(Path::new("C:/photos")));
+        if std::env::var(WORKER_COUNT_ENV).is_err() {
+            assert_eq!(
+                analysis_worker_count_for(Path::new("/home/user/photos")),
+                analysis_worker_count()
+            );
+        }
+        assert_eq!(NETWORK_ANALYSIS_WORKERS, 2);
     }
 
     // ---- レートの移動 ----------------------------------------------------
@@ -6521,6 +7250,93 @@ mod tests {
     }
 
     #[test]
+    fn export_targets_are_the_given_photo_ids() {
+        let directory = test_directory("export-ids");
+        let conn = rated_fixture(&directory.join("e.sqlite3"));
+
+        let ids = vec!["three-b".to_string(), "five".to_string(), "missing".to_string()];
+        let targets = photos_for_export(&conn, "p1", &ids).expect("targets");
+        // 相対パス順（c-three, e-five）。星は写真自身の星。
+        assert_eq!(
+            targets.iter().map(|(_id, path, rating)| (path.as_str(), *rating)).collect::<Vec<_>>(),
+            vec![("C:/photos/c-three.jpg", 3), ("C:/photos/e-five.jpg", 5)]
+        );
+        assert!(photos_for_export(&conn, "p1", &[]).expect("empty").is_empty(), "id が空なら何も書き出さない");
+
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn moving_one_photo_marks_only_that_photo_missing() {
+        let directory = test_directory("move-missing");
+        let conn = rated_fixture(&directory.join("m.sqlite3"));
+
+        mark_photos_missing(&conn, "p1", &["three-b".to_string()]).expect("mark");
+
+        let mut statement = conn
+            .prepare("SELECT id FROM photos WHERE project_id='p1' AND is_missing=1")
+            .expect("prepare");
+        let missing: Vec<String> = statement
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("collect");
+        assert_eq!(missing, vec!["three-b".to_string()], "移動した 1 枚だけが欠損");
+
+        mark_photos_missing(&conn, "p1", &[]).expect("mark none");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM photos WHERE is_missing=1", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(count, 1, "何も移動しなければ増えない");
+
+        drop(statement);
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn analysis_backlog_counts_only_photos_the_analysis_targets() {
+        let directory = test_directory("backlog");
+        let conn = open_database(&directory.join("b.sqlite3")).expect("open database");
+        conn.execute(
+            "INSERT INTO projects (id,name,folder_path,photo_count,status,created_at,updated_at)
+             VALUES ('p1','p1','C:/photos',4,'ready',1,1)",
+            [],
+        )
+        .expect("insert project");
+        // a1 と a2 は 1 秒差（連写の候補）。b1 と b2 は隣と 1 時間以上離れている（候補ではない）。
+        for (id, at) in [("a1", 1_000_000_i64), ("a2", 1_001_000), ("b1", 9_000_000), ("b2", 20_000_000)] {
+            conn.execute(
+                "INSERT INTO photos (id,project_id,path,relative_path,name,captured_at,timestamp_source,is_missing)
+                 VALUES (?1,'p1',?2,?1,?1,?3,'exif_original',0)",
+                params![id, format!("C:/photos/{id}.jpg"), at],
+            )
+            .expect("insert photo");
+        }
+        assert_eq!(analysis_backlog(&conn, "p1", false).expect("backlog"), 2, "候補の 2 枚だけが未処理");
+
+        conn.execute(
+            "UPDATE photos SET d_hash='0000000000000000',d_hash_version=?1,thumbnail_path='C:/t.jpg',thumbnail_version=?2
+             WHERE id IN ('a1','a2')",
+            params![D_HASH_VERSION, THUMBNAIL_VERSION],
+        )
+        .expect("analyse candidates");
+        assert_eq!(
+            analysis_backlog(&conn, "p1", false).expect("backlog"),
+            0,
+            "候補でない写真が空のままでも 0 になる"
+        );
+
+        conn.execute("UPDATE photos SET timestamp_source=NULL WHERE id='b1'", [])
+            .expect("unread time");
+        assert_eq!(analysis_backlog(&conn, "p1", false).expect("backlog"), 1, "撮影時刻が未読の写真は数える");
+
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
     fn unique_destination_never_overwrites() {
         let directory = test_directory("unique-dest");
         fs::write(directory.join("a.jpg"), b"first").expect("write");
@@ -6655,5 +7471,164 @@ mod tests {
         // SOI はあるが長さが壊れている。
         let broken = vec![0xFF, 0xD8, 0xFF, 0xE1, 0xFF, 0xFE, 0x00];
         assert!(jpeg_with_rating(&broken, 3).is_err());
+    }
+
+    // ---- Amazon（T9）----
+
+    fn amazon_node(id: &str, name: &str, date: Option<&str>, size: u64) -> amazon::AmazonNode {
+        amazon::AmazonNode {
+            id: id.into(),
+            name: name.into(),
+            kind: "FILE".into(),
+            content_properties: Some(amazon::ContentProperties {
+                content_type: Some("image/jpeg".into()),
+                content_date: date.map(str::to_owned),
+                size: Some(size),
+            }),
+            temp_link: Some(format!("https://content.example/{id}")),
+        }
+    }
+
+    fn amazon_test_db(label: &str) -> (PathBuf, Connection) {
+        let directory = test_directory(label);
+        fs::create_dir_all(&directory).expect("create test directory");
+        let database = directory.join("db.sqlite3");
+        let conn = open_database(&database).expect("open database");
+        conn.execute(
+            "INSERT INTO projects (id,name,folder_path,photo_count,status,created_at,updated_at,source_kind,source_key)
+             VALUES ('p1','x','https://www.amazon.co.jp/photos/share/abc',0,'new',0,0,'amazon','www.amazon.co.jp|abc')",
+            [],
+        )
+        .expect("insert project");
+        (directory, conn)
+    }
+
+    #[test]
+    fn a_legacy_project_becomes_a_folder_project_and_amazon_tables_exist() {
+        let directory = test_directory("amazon-migrate");
+        fs::create_dir_all(&directory).expect("create test directory");
+        let path = directory.join("legacy.sqlite3");
+        let legacy = Connection::open(&path).expect("open legacy database");
+        legacy
+            .execute_batch(
+                "CREATE TABLE projects (
+                   id TEXT PRIMARY KEY, name TEXT NOT NULL, folder_path TEXT NOT NULL,
+                   photo_count INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'new',
+                   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+                 );
+                 INSERT INTO projects (id,name,folder_path,created_at,updated_at) VALUES ('old','旧','/photos',0,0);",
+            )
+            .expect("create legacy schema");
+        drop(legacy);
+        let conn = open_database(&path).expect("migrate");
+        let (kind, key) = project_source(&conn, "old").expect("source");
+        assert_eq!(kind, "folder");
+        assert_eq!(key, None);
+        assert!(amazon_source_of(&conn, "old").unwrap().is_none());
+        amazon::save_links(&conn, "old", &[("n".into(), "l".into())]).expect("amazon_links exists");
+        fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn an_amazon_scan_row_uses_the_node_id_and_the_local_clock() {
+        let (directory, conn) = amazon_test_db("amazon-scan");
+        upsert_amazon_photo(&conn, "p1", &amazon_node("n1", "IMG_1.jpg", Some("2021-07-23T13:13:29.000Z"), 100))
+            .expect("upsert");
+        let (path, relative, name, captured, source): (String, String, String, Option<i64>, String) = conn
+            .query_row(
+                "SELECT path,relative_path,name,captured_at,timestamp_source FROM photos WHERE project_id='p1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .expect("row");
+        assert_eq!((path.as_str(), relative.as_str(), name.as_str()), ("n1", "n1", "IMG_1.jpg"));
+        // Z を信じず、その土地の時計のまま。
+        assert_eq!(captured, civil_timestamp_ms(2021, 7, 23, 13, 13, 29));
+        assert_eq!(source, "exif_original");
+
+        // 日付が無ければ、ファイル名から。それも無ければ空。
+        upsert_amazon_photo(&conn, "p1", &amazon_node("n2", "IMG_20260630_181932.jpg", None, 1)).unwrap();
+        upsert_amazon_photo(&conn, "p1", &amazon_node("n3", "photo.jpg", None, 1)).unwrap();
+        let read = |id: &str| -> (Option<i64>, String) {
+            conn.query_row(
+                "SELECT captured_at,timestamp_source FROM photos WHERE path=?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(read("n2"), (civil_timestamp_ms(2026, 6, 30, 18, 19, 32), "filename_inferred".to_string()));
+        assert_eq!(read("n3"), (None, "unknown".to_string()));
+        fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn a_rescan_keeps_the_analysis_only_while_the_size_is_unchanged() {
+        let (directory, conn) = amazon_test_db("amazon-rescan");
+        let node = amazon_node("n1", "a.jpg", Some("2021-07-23T13:13:29.000Z"), 100);
+        upsert_amazon_photo(&conn, "p1", &node).unwrap();
+        conn.execute(
+            "UPDATE photos SET rating=3,d_hash='00ff',d_hash_version=?1,thumbnail_path='/t.jpg',thumbnail_version=?2,display_path='/d.jpg',display_edge=1024",
+            params![D_HASH_VERSION, THUMBNAIL_VERSION],
+        )
+        .unwrap();
+        upsert_amazon_photo(&conn, "p1", &node).unwrap();
+        let (rating, hash, thumb, display): (i64, Option<String>, Option<String>, Option<String>) = conn
+            .query_row("SELECT rating,d_hash,thumbnail_path,display_path FROM photos", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap();
+        assert_eq!((rating, hash.as_deref(), thumb.as_deref(), display.as_deref()), (3, Some("00ff"), Some("/t.jpg"), Some("/d.jpg")));
+
+        upsert_amazon_photo(&conn, "p1", &amazon_node("n1", "a.jpg", Some("2021-07-23T13:13:29.000Z"), 999)).unwrap();
+        let (rating, hash, thumb, display): (i64, Option<String>, Option<String>, Option<String>) = conn
+            .query_row("SELECT rating,d_hash,thumbnail_path,display_path FROM photos", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap();
+        // 星は残り、絵と指紋は作り直しになる。
+        assert_eq!((rating, hash, thumb, display), (3, None, None, None));
+        fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn an_amazon_thumbnail_that_is_already_there_needs_no_network() {
+        let (directory, conn) = amazon_test_db("amazon-hash");
+        let source = amazon::parse_key("www.amazon.co.jp|abc").unwrap();
+        let book = amazon::LinkBook::load(directory.join("db.sqlite3"), &conn, "p1", source).unwrap();
+        let thumbnails = directory.join("thumbnails");
+        fs::create_dir_all(&thumbnails).unwrap();
+        let image = DynamicImage::ImageRgb8(image::RgbImage::from_fn(64, 48, |x, y| image::Rgb([(x * 4) as u8, (y * 5) as u8, 90])));
+        let bytes = encode_thumbnail(&image).unwrap();
+        let file = thumbnail_file(&thumbnails, "photo-1");
+        fs::write(&file, &bytes).unwrap();
+        let expected = hash_thumbnail_bytes(&bytes);
+        assert!(expected.is_some());
+        let record = HashRecord {
+            id: "photo-1".into(),
+            path: "n1".into(),
+            captured_at: 0,
+            source: TimestampSource::ExifOriginal,
+            cached: CachedAnalysis {
+                d_hash: expected.clone(),
+                d_hash_version: Some(D_HASH_VERSION),
+                thumbnail_path: Some(file.to_string_lossy().to_string()),
+                thumbnail_mtime: None,
+                thumbnail_size: None,
+                thumbnail_version: Some(THUMBNAIL_VERSION),
+            },
+        };
+        // 網が無い（tempLink も無い）ので、取りにいけば失敗する。それでも成功する = 使い回した。
+        let reused = hash_one_amazon(&book, &thumbnails, 0, &record);
+        assert!(reused.error.is_none() && reused.hash_reused);
+        assert_eq!(reused.d_hash, expected);
+
+        // 版が古い指紋は、サムネイルから作り直す（網は使わない）。
+        let mut old = record.clone();
+        old.cached.d_hash_version = Some(D_HASH_VERSION - 1);
+        let rebuilt = hash_one_amazon(&book, &thumbnails, 0, &old);
+        assert!(rebuilt.error.is_none() && !rebuilt.hash_reused);
+        assert_eq!(rebuilt.d_hash, expected);
+        fs::remove_dir_all(&directory).ok();
     }
 }

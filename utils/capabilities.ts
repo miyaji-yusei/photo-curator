@@ -13,7 +13,10 @@
 export type Platform = 'desktop' | 'android' | 'browser'
 
 export interface BackendCapabilities {
-  /** フォルダを指定して走査できる。ブラウザだけができない（ピッカー経由になる）。 */
+  /**
+   * フォルダを指定して走査できる。ブラウザは `showDirectoryPicker`（File System Access）が
+   * あるときだけ（Safari・iPad には無く、写真ピッカー経由になる）。
+   */
   browseFolders: boolean
   /** 物理キーボードを想定してよい。ショートカットの案内を出すかの判断に使う。 */
   keyboard: boolean
@@ -25,6 +28,13 @@ export interface BackendCapabilities {
   exportFolders: boolean
   /** 原本の XMP に星を書ける。**原本を書き換えるので、触れる環境を絞る。** */
   writeMetadata: boolean
+  /** Amazon Photos の共有リンクを出所にできる（読み取りだけ。ログインしない）。PC とブラウザ。 */
+  amazon: boolean
+}
+
+/** このブラウザに `showDirectoryPicker` があるか（`capabilitiesFor` の `directoryPicker` に渡す）。 */
+export function hasDirectoryPicker(scope: object | undefined = typeof window === 'undefined' ? undefined : window): boolean {
+  return !!scope && typeof (scope as { showDirectoryPicker?: unknown }).showDirectoryPicker === 'function'
 }
 
 /**
@@ -33,7 +43,10 @@ export interface BackendCapabilities {
  * Android を desktop と分けているのは画面の広さとキーボードの有無だけで、
  * ファイルを扱う能力（走査・書き出し）は Rust 側が面倒を見るので同じ。
  */
-export function capabilitiesFor(platform: Platform): BackendCapabilities {
+export function capabilitiesFor(
+  platform: Platform,
+  environment: { directoryPicker?: boolean } = {}
+): BackendCapabilities {
   switch (platform) {
     case 'desktop':
       return {
@@ -42,7 +55,8 @@ export function capabilitiesFor(platform: Platform): BackendCapabilities {
         largeGroups: true,
         fullResolution: true,
         exportFolders: true,
-        writeMetadata: true
+        writeMetadata: true,
+        amazon: true
       }
     case 'android':
       return {
@@ -53,18 +67,21 @@ export function capabilitiesFor(platform: Platform): BackendCapabilities {
         fullResolution: true,
         exportFolders: true,
         // 原本の書き換えは、まず PC だけに留める。
-        writeMetadata: false
+        writeMetadata: false,
+        amazon: false
       }
     case 'browser':
       return {
-        // ブラウザはフォルダを走査できない。写真ピッカーが唯一の入口。
-        browseFolders: false,
+        // フォルダを選べるのは `showDirectoryPicker` があるブラウザだけ。無ければ写真ピッカーが唯一の入口。
+        browseFolders: environment.directoryPicker === true,
         keyboard: false,
         largeGroups: false,
         // 原本はセッション中しか持てないので、リロード後は表示用までしか出せない。
         fullResolution: false,
         exportFolders: false,
-        writeMetadata: false
+        writeMetadata: false,
+        // 表示は素の <img> で出せる。バイトが要る指紋・ZIP は中継があるときだけ（呼んだ成否で決める）。
+        amazon: true
       }
   }
 }
