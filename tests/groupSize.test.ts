@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
-import { DESKTOP_GROUP_SIZE, TOUCH_GROUP_SIZE, clampGroupSize, groupSizeLimits } from '~/utils/groupSize'
+import {
+  DESKTOP_GROUP_SIZE, SLIDESHOW_GROUP_SIZE, TOUCH_GROUP_SIZE, clampGroupSize, groupSizeLimits, isSlideshowSize, tournamentGroupSize
+} from '~/utils/groupSize'
 
 describe('groupSizeLimits', () => {
   it('iPad などブラウザでは既定 4 枚・上限 9 枚', () => {
@@ -52,5 +54,14 @@ describe('clampGroupSize', () => {
   it('小数は丸める', () => {
     expect(clampGroupSize(4.4, TOUCH_GROUP_SIZE)).toBe(4)
     expect(clampGroupSize(4.6, TOUCH_GROUP_SIZE)).toBe(5)
+  })
+})
+
+describe('tournamentGroupSize', () => {
+  it('スライドショー（1 枚）は既定の枚数に、ほかは範囲に収める', () => {
+    expect(tournamentGroupSize(1, DESKTOP_GROUP_SIZE)).toBe(10)
+    expect(tournamentGroupSize(1, TOUCH_GROUP_SIZE)).toBe(4)
+    expect(tournamentGroupSize(6, TOUCH_GROUP_SIZE)).toBe(6)
+    expect(tournamentGroupSize(20, TOUCH_GROUP_SIZE)).toBe(9)
   })
 })

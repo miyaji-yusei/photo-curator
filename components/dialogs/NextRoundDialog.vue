@@ -2,6 +2,7 @@
 const {
   MAX_RATING,
   groupLimits,
+  isSlideshow,
   nextRoundDialog,
   nextRoundGroupSize,
   nextRoundRating,
@@ -19,7 +20,8 @@ const {
         ★{{ nextRoundRating }} の <strong>{{ ratingCount(nextRoundRating).toLocaleString() }} 枚</strong>が対象です。
         選ばれた写真は ★{{ Math.min(MAX_RATING, nextRoundRating + 1) }} に上がり、選ばれなかった写真は ★{{ nextRoundRating }} のまま残ります。
       </p>
-      <v-slider v-model="nextRoundGroupSize" class="selection-slider" :min="groupLimits.min" :max="groupLimits.max" :step="1" thumb-label aria-label="1グループの表示枚数">
+      <p v-if="isSlideshow" class="text-body-2 mb-0">スライドショー（1 枚ずつ）のまま選別します。</p>
+      <v-slider v-else v-model="nextRoundGroupSize" class="selection-slider" :min="groupLimits.min" :max="groupLimits.max" :step="1" thumb-label aria-label="1グループの表示枚数">
         <template #append><v-text-field v-model.number="nextRoundGroupSize" density="compact" variant="outlined" style="width: 86px" hide-details suffix="枚" /></template>
       </v-slider>
     </v-card-text>

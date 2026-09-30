@@ -7,6 +7,7 @@ import AppSettingsView from '~/components/views/AppSettingsView.vue'
 import BurstThresholdView from '~/components/views/BurstThresholdView.vue'
 import BurstPreviewView from '~/components/views/BurstPreviewView.vue'
 import TournamentView from '~/components/views/TournamentView.vue'
+import SlideshowView from '~/components/views/SlideshowView.vue'
 import ResultsView from '~/components/views/ResultsView.vue'
 import BurstReviewView from '~/components/views/BurstReviewView.vue'
 import RoundResultView from '~/components/views/RoundResultView.vue'
@@ -47,6 +48,7 @@ const {
   desktop,
   error,
   isSelecting,
+  isSlideshow,
   loading,
   onPhotoPicked,
   session,
@@ -188,7 +190,8 @@ function onZoomReset() {
         </template>
 
         <template v-else-if="view === 'tournament' && session">
-          <TournamentView />
+          <SlideshowView v-if="isSlideshow" />
+          <TournamentView v-else />
         </template>
 
         <template v-else-if="view === 'results'">

@@ -33,7 +33,7 @@ import type { CardState, CardStatus, PrepareLine } from '~/utils/projectStatus'
 import { exportTargetsForStars } from '~/utils/exportTargets'
 import { resultsCsv } from '~/utils/amazonCsv'
 import type { RatingChange, SavedSelection } from '~/utils/selectionFlow'
-import { clampGroupSize, groupSizeLimits } from '~/utils/groupSize'
+import { clampGroupSize, groupSizeLimits, isSlideshowSize, tournamentGroupSize } from '~/utils/groupSize'
 import {
   SHARE_FILE_LIMIT, downloadBlob, shareFiles, zipEntriesByRating
 } from '~/utils/shareExport'
@@ -170,6 +170,8 @@ function createCurator() {
   // 選別中の枚数変更とプロジェクト削除
   const groupSizeDialog = ref(false)
   const pendingGroupSize = ref(10)
+  /** 「選別中の設定」で選んでいる方式。true＝スライドショー（1 枚ずつ）、false＝トーナメント。 */
+  const pendingSlideshow = ref(false)
   const deleteDialog = ref(false)
   const deleteTarget = ref<Project | null>(null)
   const deleteBusy = ref(false)
@@ -344,6 +346,8 @@ function createCurator() {
   const currentGroup = computed(() => idsOf(coreSession.value?.current ?? []))
   const targetStar = computed(() => coreSession.value?.target_star ?? 0)
   const roundNumber = computed(() => coreSession.value?.round ?? 1)
+  /** スライドショー選別か。**方式は 1 グループの枚数（1 枚）で表す**（core の Session は同じ）。 */
+  const isSlideshow = computed(() => isSlideshowSize(coreSession.value?.group_size ?? 0))
   const canUndo = computed(() => (coreSession.value?.history.length ?? 0) > 0)
   const survivorCount = computed(() => coreSession.value?.survivors.length ?? 0)
   const remainingGroups = computed(() => {
@@ -990,7 +994,7 @@ function createCurator() {
 
   function openSettings() {
     const prior = session.value?.settings
-    settings.groupSize = clampGroupSize(prior?.groupSize ?? groupLimits.default, groupLimits)
+    settings.groupSize = tournamentGroupSize(prior?.groupSize ?? groupLimits.default, groupLimits)
     settings.groupBursts = prior?.groupBursts ?? false
     view.value = 'settings'
   }
@@ -1335,6 +1339,20 @@ function createCurator() {
     if (next.finished) void flushThenPush()
   }
 
+  /**
+   * スライドショーで 1 枚ぶんを決める。**判断は既存の処理をそのまま通す**
+   * （残す＝`advance`、落とす＝選ばずに `advance`、★5＝`keepAndTop`）。
+   * 複数選択が残っていると単なる選択のトグルになるので、先に切る。
+   */
+  async function decideSlide(kind: 'keep' | 'drop' | 'top', photoId: string) {
+    const current = session.value
+    if (!current) return
+    current.multiSelect = false
+    if (kind === 'keep') await toggleChoice(photoId)
+    else if (kind === 'top') await confirmPhoto(photoId)
+    else await skipGroup()
+  }
+
   /** このグループからは 1 枚も通さない。 */
   async function skipGroup() {
     if (!session.value) return
@@ -1672,7 +1690,7 @@ function createCurator() {
   }
 
   function openNextRoundDialog(rating: number) {
-    nextRoundGroupSize.value = clampGroupSize(session.value?.settings.groupSize ?? groupLimits.default, groupLimits)
+    nextRoundGroupSize.value = tournamentGroupSize(session.value?.settings.groupSize ?? groupLimits.default, groupLimits)
     nextRoundRating.value = rating
     nextRoundDialog.value = true
   }
@@ -1691,7 +1709,8 @@ function createCurator() {
     loading.value = true
     try {
       const chosen: TournamentSettings = { ...(session.value?.settings ?? settings) }
-      if (nextRoundGroupSize.value >= 2) chosen.groupSize = nextRoundGroupSize.value
+      // スライドショーのセッションは方式を保つ（次のラウンドも 1 枚ずつ）。
+      if (!isSlideshowSize(chosen.groupSize) && nextRoundGroupSize.value >= 2) chosen.groupSize = nextRoundGroupSize.value
 
       // 星は行が持ち主。行の星を入れた土台から、その星ちょうどの写真で始める。
       const { base, inputs } = await sessionWithRowRatings()
@@ -2418,7 +2437,9 @@ function createCurator() {
   }
 
   function openGroupSizeDialog() {
-    pendingGroupSize.value = clampGroupSize(session.value?.settings.groupSize ?? groupLimits.default, groupLimits)
+    const size = clampGroupSize(session.value?.settings.groupSize ?? groupLimits.default, groupLimits)
+    pendingSlideshow.value = isSlideshowSize(size)
+    pendingGroupSize.value = tournamentGroupSize(size, groupLimits)
     groupSizeDialog.value = true
   }
 
@@ -2488,6 +2509,15 @@ function createCurator() {
       event.preventDefault()
       void undoChoice()
       return
+    }
+    // スライドショーは 1 枚ずつ。Enter・M・Space は使わず（Enter で「落とす」が走らないように）、
+    // 数字の 1・2 は画面（SlideshowView）が受ける。修飾キー付き（Ctrl＝拡大など）は下の共通処理へ。
+    if (isSlideshow.value) {
+      if (event.key === 'Enter' || event.key === ' ' || event.key.toLowerCase() === 'm') {
+        event.preventDefault()
+        return
+      }
+      if (!event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey && /^(Digit|Numpad)\d$/.test(event.code)) return
     }
     // Enter は「今の選択で確定」。1枚も選んでいなければ「どれも選ばない」になる。
     if (event.key === 'Enter') {
@@ -2720,6 +2750,9 @@ function createCurator() {
     previewBusy,
     groupSizeDialog,
     pendingGroupSize,
+    pendingSlideshow,
+    isSlideshow,
+    decideSlide,
     deleteDialog,
     deleteTarget,
     deleteBusy,
