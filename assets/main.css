@@ -244,3 +244,6 @@ body { margin: 0; }
 @media (max-height: 620px) {
   .compare-pair img { max-height: 46vh; min-height: 180px; }
 }
+
+/* エラー通知は本文を下げず、上に重ねる（消えない）。 */
+.error-overlay { position: fixed; top: 72px; left: 50%; transform: translateX(-50%); z-index: 2000; width: min(720px, calc(100vw - 32px)); }
