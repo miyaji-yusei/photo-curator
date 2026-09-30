@@ -23,7 +23,7 @@
 
 | # | 要望 | 規模 | 主な場所 | 状態 |
 | --- | --- | --- | --- | --- |
-| U1 | 「1 つ戻す」で、まとめの中の ★5 の仲間が ★4 になる（レビュー #2）→ **core の「1 つ戻す」を直す**（ユーザー決定） | M | `core/src/lib.rs`・`app-android/`（`.so` の作り直し） | 未 |
+| U1 | 「1 つ戻す」で、まとめの中の ★5 の仲間が ★4 になる（レビュー #2）→ **core の「1 つ戻す」を直す**（ユーザー決定） | M | `core/src/lib.rs`・`app-android/`（`.so` の作り直し） | 済（#28。Android の .so の作り直しはユーザー） |
 | U2 | メタデータに反映が失敗する | S | `src-tauri/src/lib.rs` の `write_ratings_to_photos_blocking` | 済（#22） |
 | U3 | 写真を移動すると、結果に数は出るが、当てはまる写真が無くなる | S〜M | `src-tauri/src/lib.rs`（移動と集計）・`composables/useCurator.ts` | 未 |
 | U4 | 「8 枚を ★5 から ★0 へ移しました」などの通知が × を押すまで消えない。通知の分だけ画面が下がる | S | `app.vue` 67〜79 行（`error`・`taskWarning`・`moveReport`）、`ResultsView.vue` の `resultsMessage` | 済（#23） |
