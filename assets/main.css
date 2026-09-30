@@ -247,3 +247,6 @@ body { margin: 0; }
 
 /* エラー通知は本文を下げず、上に重ねる（消えない）。 */
 .error-overlay { position: fixed; top: 72px; left: 50%; transform: translateX(-50%); z-index: 2000; width: min(720px, calc(100vw - 32px)); }
+
+.zoom-overlay__photo { position: relative; display: flex; justify-content: center; min-width: 0; }
+.zoom-overlay__spinner { position: absolute; top: 50%; left: 50%; margin: -24px 0 0 -24px; filter: drop-shadow(0 0 4px rgba(0,0,0,.6)); pointer-events: none; }
