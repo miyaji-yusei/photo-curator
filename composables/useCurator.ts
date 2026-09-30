@@ -39,7 +39,7 @@ import {
 import { createStoredZip } from '~/utils/zip'
 import { registerAutoPush, useSidecarSync } from '~/composables/useSidecarSync'
 
-type View = 'home' | 'project' | 'method' | 'settings' | 'burst-threshold' | 'burst-preview' | 'tournament' | 'result' | 'results' | 'burst-review'
+type View = 'home' | 'project' | 'method' | 'settings' | 'app-settings' | 'burst-threshold' | 'burst-preview' | 'tournament' | 'result' | 'results' | 'burst-review'
 
 function createCurator() {
   const desktop = useDesktop()
@@ -868,6 +868,31 @@ function createCurator() {
       createDisplayChoices.value = []
     }
   }
+
+  // アプリの設定の画面。表示用画像の既定（これから作るプロジェクトの分）。
+  const appDisplayChoices = ref<number[]>([])
+  const appDisplayEdge = ref(0)
+  async function loadAppSettings() {
+    try {
+      const settings = await desktop.getDisplaySettings()
+      appDisplayChoices.value = settings.choices
+      appDisplayEdge.value = settings.edge
+    } catch {
+      appDisplayChoices.value = []
+    }
+  }
+  /** 選んだらその場で既定に保存する。既存のプロジェクトの表示用画像は作り直さない。 */
+  async function saveAppDisplayEdge(edge: number) {
+    const previous = appDisplayEdge.value
+    appDisplayEdge.value = edge
+    try {
+      appDisplayEdge.value = await desktop.saveDisplayEdge(edge)
+    } catch (caught) {
+      appDisplayEdge.value = previous
+      notify(caught instanceof Error ? caught.message : '設定を保存できませんでした')
+    }
+  }
+  watch(view, next => { if (next === 'app-settings') void loadAppSettings() })
 
   /**
    * 作成した直後、**準備（表示用画像づくり）を始める前**に、選んだ長辺をこのプロジェクトに書く
@@ -2582,6 +2607,9 @@ function createCurator() {
     createDialog,
     createDisplayChoices,
     createDisplayEdge,
+    appDisplayChoices,
+    appDisplayEdge,
+    saveAppDisplayEdge,
     createTab,
     amazonUrl,
     amazonPreview,

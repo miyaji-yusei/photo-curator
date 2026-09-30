@@ -54,6 +54,7 @@ const {
   </v-list>
   <template #append>
     <v-list nav class="pb-2">
+      <v-list-item prepend-icon="mdi-cog-outline" title="設定" :active="view === 'app-settings'" @click="view = 'app-settings'" />
       <v-list-item
         v-if="!isCompact"
         :prepend-icon="drawerRail ? 'mdi-chevron-right' : 'mdi-chevron-left'"

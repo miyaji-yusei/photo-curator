@@ -3,6 +3,7 @@ import HomeView from '~/components/views/HomeView.vue'
 import ProjectView from '~/components/views/ProjectView.vue'
 import MethodView from '~/components/views/MethodView.vue'
 import SettingsView from '~/components/views/SettingsView.vue'
+import AppSettingsView from '~/components/views/AppSettingsView.vue'
 import BurstThresholdView from '~/components/views/BurstThresholdView.vue'
 import BurstPreviewView from '~/components/views/BurstPreviewView.vue'
 import TournamentView from '~/components/views/TournamentView.vue'
@@ -108,6 +109,10 @@ const {
 
         <template v-else-if="view === 'settings'">
           <SettingsView />
+        </template>
+
+        <template v-else-if="view === 'app-settings'">
+          <AppSettingsView />
         </template>
 
         <template v-else-if="view === 'burst-threshold' && session">
