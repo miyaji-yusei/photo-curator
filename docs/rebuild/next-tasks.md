@@ -40,7 +40,7 @@
 | U15 | プロジェクト詳細の上のボタンの高さをそろえ、並びを「⋮・選別結果を見る・削除・写真を再読み込み・選別を再開」にする（2026-09-30 #27 の確認で） | S | `components/views/ProjectView.vue` 49 行付近 | 済（#31） |
 | U16 | 拡大のぐるぐるを、右上でなく写真の真ん中に重ねる（Android と同じ）。U10 の見直し | S | `app.vue`（`zoom-overlay__photo`）・`assets/main.css` 254〜255 行 | 済（#33） |
 | U17 | アプリの設定の画面を足し、表示用画像の既定の大きさを変えられるようにする（Android の設定と同じ） | S〜M | 新規 `components/views/AppSettingsView.vue`・`AppNav.vue`・`useCurator.ts`（`view`）・`displayEdge` まわり | 済（#34。PC の実機は未確認） |
-| U18 | 選別の並べ方で、3 枚のときだけ 1×3 に固定する（4〜10 枚は U7 のまま）。縦長の 3 枚が 2×2 になっていた（2026-09-30 #32 の目視で。縦横比を測る案は見送り） | S | `utils/gridFor.ts`・`tests/gridFor.test.ts` | 未（実装中） |
+| U18 | 選別の並べ方で、3 枚のときだけ 1×3 に固定する（4〜10 枚は U7 のまま）。縦長の 3 枚が 2×2 になっていた（2026-09-30 #32 の目視で。縦横比を測る案は見送り） | S | `utils/gridFor.ts`・`tests/gridFor.test.ts` | 済（#39。3 枚だけ 1×3 固定） |
 
 ---
 
