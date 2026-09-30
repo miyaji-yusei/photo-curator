@@ -43,6 +43,7 @@ type View = 'home' | 'project' | 'method' | 'settings' | 'burst-threshold' | 'bu
 
 function createCurator() {
   const desktop = useDesktop()
+  const { notify } = useNotice()
   // サイドカー（写真のフォルダの `.photo-curator/catalog.json`）。4 通りの判断は core が行う。
   const sidecar = useSidecarSync(desktop)
   const {
@@ -218,7 +219,6 @@ function createCurator() {
   /** ダイアログ内に出すエラー。画面上部に出すとモーダルに隠れて気づけない。 */
   const moveError = ref('')
   /** 移動が終わったことを画面上部で知らせる。 */
-  const moveReport = ref('')
   /**
    * 既定は「全選択」。個別のチェックは**ここからの差分**だけを持つ。
    * 5,000 枚の id を並べて持たないための形。詳細は `utils/ratingMove.ts`。
@@ -1787,11 +1787,9 @@ function createCurator() {
   }
 
   /** 結果の画面の「CSV を書き出す」。いまの絞り込み（すべてなら全部の星）が対象。 */
-  const resultsMessage = ref('')
   async function exportResultsCsv() {
-    resultsMessage.value = ''
     try {
-      resultsMessage.value = await saveResultsCsv(resultsRating.value === null ? [5, 4, 3, 2, 1, 0] : [resultsRating.value])
+      notify(await saveResultsCsv(resultsRating.value === null ? [5, 4, 3, 2, 1, 0] : [resultsRating.value]))
     } catch (cause) {
       error.value = cause instanceof Error ? cause.message : 'CSV を書き出せませんでした。'
     }
@@ -1803,7 +1801,6 @@ function createCurator() {
     view.value = 'results'
     resultsOffset.value = 0
     resultsPhotos.value = []
-    resultsMessage.value = ''
     await loadSummary()
     // 星の指定が無ければ、その結果で実際に付いている一番高い星に絞る（全部 ★0 なら「すべて」）。
     // プロジェクトの画面の星の行から来たときは、その星のまま。
@@ -2113,7 +2110,7 @@ function createCurator() {
       await loadSummary()
       if (view.value === 'results') await loadResultsPage(true)
       error.value = ''
-      moveReport.value = `${moved.toLocaleString()} 枚を ★${moveFrom.value} から ★${moveTo.value} へ移しました。`
+      notify(`${moved.toLocaleString()} 枚を ★${moveFrom.value} から ★${moveTo.value} へ移しました。`)
     } catch (cause) {
       moveError.value = cause instanceof Error ? cause.message : 'レートを移動できませんでした。'
     } finally {
@@ -2609,7 +2606,6 @@ function createCurator() {
     moveTotal,
     moveOffset,
     moveError,
-    moveReport,
     moveSelection,
     moveSelectedCount,
     isMoveSelected,
@@ -2764,7 +2760,6 @@ function createCurator() {
     exportZipByRating,
     exportCsvByRating,
     exportResultsCsv,
-    resultsMessage,
     resultsTiles,
     loadMoreResults,
     returnToResults,

@@ -19,7 +19,6 @@ const {
   restartDialog,
   resultsBusy,
   resultsDensity,
-  resultsMessage,
   resultsPhotos,
   resultsRating,
   resultsSort,
@@ -101,8 +100,6 @@ const {
       </template>
       <v-btn variant="text" prepend-icon="mdi-restart" @click="restartDialog = true">最初からやり直す</v-btn>
     </div>
-
-    <v-alert v-if="resultsMessage" type="success" variant="tonal" density="compact" class="mb-4" closable @click:close="resultsMessage = ''">{{ resultsMessage }}</v-alert>
 
     <!-- 見えている行の前後 2 行だけ描く。連写は 1 タイルに畳み、`⧉N` で中身選別へ。 -->
     <VirtualPhotoGrid

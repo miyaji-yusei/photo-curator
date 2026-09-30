@@ -27,6 +27,13 @@ const c = useCurator()
 onMounted(c.mount)
 onBeforeUnmount(c.unmount)
 const photoInput = c.photoInput
+const { notice, notify, dismiss } = useNotice()
+// 成功・情報の通知は下に重ねる（4 秒で消える）。警告はここで通知に流す。
+const noticeOpen = computed({
+  get: () => notice.value !== null,
+  set: (open: boolean) => { if (!open) dismiss() }
+})
+watch(c.taskWarning, (text) => { if (text) notify(text, 'info') })
 const {
   activeProject,
   analysisFailures,
@@ -38,7 +45,6 @@ const {
   error,
   isSelecting,
   loading,
-  moveReport,
   onPhotoPicked,
   session,
   stepZoom,
@@ -58,13 +64,21 @@ const {
     <AppNav />
 
     <v-main class="app-shell">
+      <!-- エラーは消えないまま、本文を下げないよう上に重ねる。 -->
+      <v-alert
+        v-if="error"
+        type="error"
+        closable
+        elevation="6"
+        class="error-overlay"
+        @click:close="error = ''"
+      >{{ error }}</v-alert>
       <!-- 選別中は写真の面積を優先し、余白と横幅の上限をゆるめる。 -->
       <v-container
         fluid
         :class="isSelecting ? 'pa-3 pa-md-5' : 'pa-7 pa-md-10'"
         :style="{ maxWidth: isSelecting ? '100%' : '1680px' }"
       >
-        <v-alert v-if="error" type="error" closable class="mb-5" @click:close="error = ''">{{ error }}</v-alert>
         <v-progress-linear v-if="loading" indeterminate color="primary" class="mb-6" />
 
         <!-- 連写解析はバックグラウンドで進む。操作を止めずに状況だけ見せる。 -->
@@ -75,8 +89,6 @@ const {
           </div>
           <v-progress-linear :model-value="analysisValue" :indeterminate="!analysisProgress?.total" color="primary" height="6" rounded class="mt-2" />
         </v-alert>
-        <v-alert v-if="taskWarning" type="info" variant="tonal" density="compact" closable class="mb-5" @click:close="taskWarning = null">{{ taskWarning }}</v-alert>
-        <v-alert v-if="moveReport" type="success" variant="tonal" density="compact" closable class="mb-5" @click:close="moveReport = ''">{{ moveReport }}</v-alert>
         <!-- 1枚も解析できなくても選別は続けられる。件数だけ伝えて先へ進ませる。 -->
         <v-alert v-if="analysisFailures" type="warning" variant="tonal" density="compact" closable class="mb-5" @click:close="analysisFailures = 0">
           {{ analysisFailures.toLocaleString() }} 件を解析できませんでした。該当の写真は連写のまとめ対象から外れますが、選別はこのまま続けられます。
@@ -183,5 +195,19 @@ const {
     <MetadataDialog />
     <DeleteDialog />
     <SidecarConflictDialog />
+
+    <!-- 成功・情報の通知。画面の下に重ねて 4 秒で消える（× でも消せる）。 -->
+    <v-snackbar
+      :key="notice?.id ?? 0"
+      v-model="noticeOpen"
+      location="bottom"
+      :timeout="4000"
+      :color="notice?.kind === 'warning' ? 'warning' : notice?.kind === 'info' ? 'info' : 'success'"
+    >
+      {{ notice?.text }}
+      <template #actions>
+        <v-btn icon="mdi-close" size="small" variant="text" aria-label="閉じる" @click="dismiss" />
+      </template>
+    </v-snackbar>
   </v-app>
 </template>
