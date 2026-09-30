@@ -36,7 +36,7 @@
 | U11 | 複数モードで ★5 を押しても、すぐ次の組へ進まない（Android と同じ） | S〜M | `useCurator.ts` の ★5（`keepAndTop`）の呼び方 | 閉じた（変更なし。2026-09-30 ユーザー決定: 今のまま＝Android と同じ） |
 | U12 | まとまり編集を、Android と同じ横並び＋境目のバーで切る／ずらす UI にする | M | `components/dialogs/BurstDialog.vue`・`utils/burstEdit.ts` | 済（#37。PC の実機は未確認。ユーザーの目視待ち） |
 | U13 | 表示用画像の大きさを、PC・Web でもプロジェクトの作成時から決められるようにする | S〜M | 作成ダイアログ・アプリの設定・`save_display_edge` | 済（#30。Web の Amazon の表示用は 1024 固定のまま） |
-| U14 | PC の Amazon の読み込みが遅い（Web は速い）→ 速くできるか調べて比べる | 調査 → M | `src-tauri/src/amazon.rs`・`lib.rs` の Amazon の準備 | 調査済み（10章 §7 の U14。おすすめ (a)＝`agent` の使い回し＋`preview()` の二重取得をやめる、並列 4 のまま）→ (a) を実装中。**並列を 8 に上げるか（(b')）は、08章の約束を変えるのでユーザーの判断待ち** |
+| U14 | PC の Amazon の読み込みが遅い（Web は速い）→ 速くできるか調べて比べる | 調査 → M | `src-tauri/src/amazon.rs`・`lib.rs` の Amazon の準備 | 調査済み（10章 §7 の U14。おすすめ (a)＝`agent` の使い回し＋`preview()` の二重取得をやめる、並列 4 のまま）→ (a) は済（#38。サムネ 16.1→6.9 秒・表示用 21.5→6.6 秒）。**並列を 8 に上げるか（(b')）は、08章の約束を変えるのでユーザーの判断待ち** |
 | U15 | プロジェクト詳細の上のボタンの高さをそろえ、並びを「⋮・選別結果を見る・削除・写真を再読み込み・選別を再開」にする（2026-09-30 #27 の確認で） | S | `components/views/ProjectView.vue` 49 行付近 | 済（#31） |
 | U16 | 拡大のぐるぐるを、右上でなく写真の真ん中に重ねる（Android と同じ）。U10 の見直し | S | `app.vue`（`zoom-overlay__photo`）・`assets/main.css` 254〜255 行 | 済（#33） |
 | U17 | アプリの設定の画面を足し、表示用画像の既定の大きさを変えられるようにする（Android の設定と同じ） | S〜M | 新規 `components/views/AppSettingsView.vue`・`AppNav.vue`・`useCurator.ts`（`view`）・`displayEdge` まわり | 済（#34。PC の実機は未確認） |
