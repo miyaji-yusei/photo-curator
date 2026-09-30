@@ -2384,7 +2384,7 @@ function createCurator() {
   }
 
   function onKeydown(event: KeyboardEvent) {
-    // 拡大中はどのキーでも閉じるだけ。選択には流さない。
+    // 拡大中は拡大のキーだけ。選択には流さない。
     if (zoomPhoto.value) {
       onZoomKeydown(event)
       return
@@ -2461,14 +2461,20 @@ function createCurator() {
     else void toggleChoice(photo.id)
   }
 
-  /** 拡大表示は、左右キーだけ前後送りに使い、それ以外のキーでは閉じる。 */
+  /**
+   * 拡大表示のキー。← → は前後送り、Esc・Enter・Space は閉じる。
+   * Ctrl・Shift・Alt・Meta の単独の押下や、ほかのキーでは閉じない（Ctrl+ホイールの前に Ctrl を押すだけで閉じない）。
+   * どのキーでも、選別画面の操作には流さない。
+   */
   function onZoomKeydown(event: KeyboardEvent) {
     if (!zoomPhoto.value) return
-    event.preventDefault()
     event.stopPropagation()
-    if (event.key === 'ArrowLeft') { stepZoom(-1); return }
-    if (event.key === 'ArrowRight') { stepZoom(1); return }
-    zoomPhoto.value = null
+    if (event.key === 'ArrowLeft') { event.preventDefault(); stepZoom(-1); return }
+    if (event.key === 'ArrowRight') { event.preventDefault(); stepZoom(1); return }
+    if (event.key === 'Escape' || event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault()
+      zoomPhoto.value = null
+    }
   }
 
   /** 準備の途中で、格子のサムネイルを少しずつ埋める（ブラウザだけ。PC は元から原本が見える）。 */
