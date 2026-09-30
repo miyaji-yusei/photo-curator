@@ -278,8 +278,8 @@ pub fn preview(share_url: &str, sample_limit: usize) -> Result<AmazonPreview, St
 // tempLink の控え（表 `amazon_links`）と、それを使って画像を取る道具
 // ---------------------------------------------------------------------------
 
-/// 表示用・サムネイルを取るときの並列数。
-pub const WORKERS: usize = 4;
+/// 表示用・サムネイルを取るときの並列数（U14: 4 → 8。08章の約束を、ユーザー決定で 8 に変えた）。
+pub const WORKERS: usize = 8;
 
 pub fn ensure_tables(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
