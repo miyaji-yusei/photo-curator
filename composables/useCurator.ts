@@ -13,7 +13,7 @@ import {
 import * as core from '~/lib/core'
 import type { BurstThreshold, PairOverride, PhotoRef, Session } from '~/lib/core'
 import {
-  blocksFromCuts, cutAll, cutAroundSelection, cutsFromGroups, joinAt
+  blocksFromCuts, cutAll, cutAroundSelection, cutsFromGroups, joinAt, moveCut, toggleAt
 } from '~/utils/burstEdit'
 import { buildBurstQuestions } from '~/utils/burstQuestions'
 import { burstNeighborhood } from '~/utils/burstNeighborhood'
@@ -1479,6 +1479,16 @@ function createCurator() {
     burstCuts.value = joinAt(burstCuts.value, boundaryIndex)
   }
 
+  /** 境目をひとつ、切る／つなぐ（バーのタップ）。 */
+  function toggleBurstCut(boundaryIndex: number) {
+    burstCuts.value = toggleAt(burstCuts.value, boundaryIndex)
+  }
+
+  /** 切れている境目を別の境目へずらす（バーのドラッグ）。 */
+  function moveBurstCut(from: number, to: number) {
+    burstCuts.value = moveCut(burstCuts.value, from, to)
+  }
+
   function scatterBurst() {
     burstCuts.value = cutAll(burstCuts.value)
     burstPicked.value = []
@@ -2797,6 +2807,8 @@ function createCurator() {
     toggleBurstPick,
     splitBurstSelection,
     joinBurstAt,
+    toggleBurstCut,
+    moveBurstCut,
     scatterBurst,
     boundaryBefore,
     settleBurstPhoto,

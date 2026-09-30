@@ -106,3 +106,28 @@ export function cutAll(cuts: boolean[]): boolean[] {
 export function blockSizeOf(blocks: Blocks, photoId: string): number {
   return blocks.find(block => block.includes(photoId))?.length ?? 0
 }
+
+/** 境目をひとつ切る／つなぐ。範囲外は黙って無視する。 */
+export function toggleAt(cuts: boolean[], boundaryIndex: number): boolean[] {
+  if (boundaryIndex < 0 || boundaryIndex >= cuts.length) return [...cuts]
+  const next = [...cuts]
+  next[boundaryIndex] = !next[boundaryIndex]
+  return next
+}
+
+/**
+ * 切れている境目を、別の境目の位置へずらす（ドラッグ）。
+ *
+ * - `from` が切れていなければ何も起きない（つながっている境目は動かさない）。
+ * - 行き先が範囲外なら端に収める。
+ * - 行き先がすでに切れていれば、そこへ重なって 1 つになる（Android と同じ）。
+ */
+export function moveCut(cuts: boolean[], from: number, to: number): boolean[] {
+  if (from < 0 || from >= cuts.length || !cuts[from]) return [...cuts]
+  const target = Math.min(Math.max(to, 0), cuts.length - 1)
+  if (target === from) return [...cuts]
+  const next = [...cuts]
+  next[from] = false
+  next[target] = true
+  return next
+}

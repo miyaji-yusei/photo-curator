@@ -104,19 +104,26 @@ body { margin: 0; }
 .zoom-overlay__caption { color: #cfd3da; }
 .zoom-overlay__position { background: rgba(255,255,255,.14); border-radius: 999px; padding: 2px 9px; margin-right: 6px; font-weight: 700; }
 
-/* まとめの中身は選別画面と同じ .tournament-grid を使う。
-   まとまりが縦に積まれるので、1行ぶんの高さに抑える。 */
-.burst-review-grid .tournament-card img { height: min(30vh, 220px); }
-.burst-review-grid .tournament-card { max-width: calc(1.6 * min(30vh, 220px)); }
+/* まとまりの編集。写真を撮影順に横 1 列に並べ、あいだに縦のバー（境目）を置く。
+   Android の BurstEditSheet と同じ形（写真 180×120、バー幅 28・高さ 140）。 */
+.burst-strip { display: flex; align-items: center; height: 168px; overflow-x: auto; padding-bottom: 8px; }
+.burst-tile { position: relative; flex: 0 0 180px; width: 180px; height: 120px; overflow: hidden; border-radius: 8px; background: #1b1e24; cursor: pointer; }
+.burst-tile img { width: 100%; height: 100%; object-fit: cover; display: block; user-select: none; }
+.burst-tile:not(.is-single) { background: color-mix(in srgb, var(--burst-tint) 10%, #1b1e24); }
+.burst-tile.is-single img { opacity: .45; }
+.burst-tile.is-selected { outline: 3px solid rgb(var(--v-theme-primary)); outline-offset: -3px; }
+.burst-tile .tournament-card__tools { top: 4px; right: 4px; gap: 4px; }
+.burst-tile .tournament-card__number { top: 4px; left: 4px; }
+.burst-tile .tournament-card__confirmed { top: auto; bottom: 6px; left: 6px; right: auto; }
 
-/* まとまりの単位。枠で囲って「どこまでが1つか」を見せる。 */
-.burst-block { border: 1px solid rgba(255,255,255,.10); border-radius: 12px; padding: 12px; background: #14161a; }
-/* まだまとめに入っていない近くの写真。破線で「外」だと分かるようにする。 */
-.burst-block.is-outside { border-style: dashed; border-color: rgba(255,255,255,.18); background: transparent; }
-.burst-block.is-outside .tournament-card img { opacity: 1; }
-/* まとまりどうしの境目。ここ自体が「つなぐ」の操作対象。 */
-.burst-seam { display: flex; align-items: center; gap: 12px; margin: 10px 0; }
-.burst-seam__line { flex: 1; border-top: 1px dashed rgba(255,255,255,.22); }
+/* 写真のあいだのバー。つながっている＝細い灰色の線。切れている＝太い色の線と丸いつまみ。 */
+.burst-bar { position: relative; flex: 0 0 28px; width: 28px; height: 140px; display: flex; align-items: center; justify-content: center; cursor: pointer; touch-action: none; user-select: none; outline: none; }
+.burst-bar__line { display: block; width: 1px; height: 100%; }
+.burst-bar.is-cut .burst-bar__line { width: 4px; }
+.burst-bar__knob { position: absolute; z-index: 3; width: 44px; height: 44px; border-radius: 22px; display: flex; align-items: center; justify-content: center; cursor: grab; }
+.burst-bar.is-dragging .burst-bar__knob { cursor: grabbing; }
+.burst-bar.is-dragging { z-index: 4; }
+.burst-bar:focus-visible { outline: 2px solid rgb(var(--v-theme-primary)); outline-offset: 2px; border-radius: 6px; }
 
 /* 写真の良し悪しを見るのに切り取ってはいけない。cover ではなく contain。
    高さは行数で割って、グループ全体がスクロールなしで収まるようにする。 */
