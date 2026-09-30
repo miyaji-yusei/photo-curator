@@ -850,7 +850,39 @@ function createCurator() {
     amazonPreview.value = null
     amazonError.value = ''
   })
-  watch(createDialog, open => { if (!open) resetAmazonDraft() })
+  watch(createDialog, open => {
+    if (!open) resetAmazonDraft()
+    else void loadCreateDisplay()
+  })
+
+  // 作成ダイアログの「表示用画像の大きさ」。既定はアプリの設定の値。
+  const createDisplayChoices = ref<number[]>([])
+  const createDisplayEdge = ref(0)
+  async function loadCreateDisplay() {
+    try {
+      const settings = await desktop.getDisplaySettings()
+      createDisplayChoices.value = settings.choices
+      createDisplayEdge.value = settings.edge
+    } catch {
+      // 読めなければ選択欄を出さず、あとから設定で変えられる。
+      createDisplayChoices.value = []
+    }
+  }
+
+  /**
+   * 作成した直後、**準備（表示用画像づくり）を始める前**に、選んだ長辺をこのプロジェクトに書く
+   * （あとで作り直さないため）。選んだ値はアプリの既定にもする。
+   */
+  async function applyCreateDisplayEdge(projectId: string) {
+    const edge = createDisplayEdge.value
+    if (!edge || !createDisplayChoices.value.length) return
+    try {
+      await desktop.saveDisplayEdge(edge)
+      await desktop.saveProjectDisplayEdge(projectId, edge)
+    } catch {
+      // 保存できなくても作成は続ける（既定の大きさで作られる）。
+    }
+  }
 
   /** Amazon のプロジェクトを作る。作ると走査が始まる（`openProject` が読み込みを始める）。 */
   async function createAmazonProject() {
@@ -859,6 +891,7 @@ function createCurator() {
     loading.value = true
     try {
       const project = await desktop.createAmazonProject(projectName.value.trim() || preview.name, amazonUrl.value.trim())
+      await applyCreateDisplayEdge(project.id)
       createDialog.value = false
       projectName.value = ''
       await refreshProjects()
@@ -885,6 +918,7 @@ function createCurator() {
       const project = await desktop.createProject(
         projectName.value.trim() || fallbackName, devPath ? `dev:${devPath}` : folderPath.value
       )
+      await applyCreateDisplayEdge(project.id)
       createDialog.value = false
       projectName.value = ''
       folderPath.value = ''
@@ -2546,6 +2580,8 @@ function createCurator() {
     loading,
     error,
     createDialog,
+    createDisplayChoices,
+    createDisplayEdge,
     createTab,
     amazonUrl,
     amazonPreview,

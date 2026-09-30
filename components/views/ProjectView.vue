@@ -101,7 +101,7 @@ const activeProject = nullableActiveProject as Ref<Project>
         <div class="d-flex align-center flex-wrap ga-4">
           <v-switch
             v-model="largeDisplay" color="primary" hide-details density="comfortable"
-            :disabled="displayBusy || displaySettings.choices.length < 2"
+            :disabled="displayBusy || displaySettings.choices.length < 2 || displaySettings.canRebuild === false"
             label="大きな画像で選別する"
           />
           <span class="text-caption text-medium-emphasis">
@@ -111,7 +111,7 @@ const activeProject = nullableActiveProject as Ref<Project>
           <v-spacer />
           <v-btn
             size="small" variant="text" prepend-icon="mdi-refresh"
-            :loading="displayBusy" :disabled="displaySettings.choices.length < 2"
+            :loading="displayBusy" :disabled="displaySettings.choices.length < 2 || displaySettings.canRebuild === false"
             @click="regenerateDisplayImages"
           >作り直す</v-btn>
         </div>

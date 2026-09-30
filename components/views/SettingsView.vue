@@ -22,7 +22,7 @@ const {
           <v-btn size="small" variant="outlined" @click="relearnThreshold">学習し直す</v-btn>
         </div>
       </v-alert>
-      <template v-if="displaySettings && displaySettings.choices.length > 1">
+      <template v-if="displaySettings && displaySettings.choices.length > 1 && displaySettings.canRebuild !== false">
         <v-divider class="my-7" />
         <div class="text-subtitle-1 font-weight-medium mb-2">選別に出す画像の大きさ</div>
         <p class="text-caption text-medium-emphasis mb-4">

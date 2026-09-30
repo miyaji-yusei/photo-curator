@@ -33,6 +33,8 @@ export interface AnalysisPoolOptions {
   isCancelled?: () => boolean
   /** 同時に走らせる本数の上限。 */
   workers?: number
+  /** 表示用画像の長辺。無ければ既定（`DISPLAY_EDGE_DEFAULT`）。 */
+  displayEdge?: number
 }
 
 function createWorker(): Worker | null {
@@ -47,7 +49,7 @@ function createWorker(): Worker | null {
 }
 
 /** 1 枚をワーカーに投げて結果を待つ。 */
-function runOnWorker(worker: Worker, job: AnalysisJob, file: File): Promise<AnalyzedPhoto> {
+function runOnWorker(worker: Worker, job: AnalysisJob, file: File, displayEdge?: number): Promise<AnalyzedPhoto> {
   return new Promise(resolve => {
     const finish = (analyzed: AnalyzedPhoto) => {
       worker.onmessage = null
@@ -59,7 +61,7 @@ function runOnWorker(worker: Worker, job: AnalysisJob, file: File): Promise<Anal
       finish(analyzed)
     }
     worker.onerror = () => finish(failed('解析中にエラーが発生しました。'))
-    const request: AnalyzeWorkerRequest = { id: job.id, file }
+    const request: AnalyzeWorkerRequest = { id: job.id, file, displayEdge }
     worker.postMessage(request)
   })
 }
@@ -79,9 +81,11 @@ async function loadFile(job: AnalysisJob): Promise<File | string> {
 }
 
 /** 読んだ 1 枚を解析する。 */
-async function analyzeOne(worker: Worker | null, job: AnalysisJob, file: File | string): Promise<AnalyzedPhoto> {
+async function analyzeOne(
+  worker: Worker | null, job: AnalysisJob, file: File | string, displayEdge?: number
+): Promise<AnalyzedPhoto> {
   if (typeof file === 'string') return failed(file)
-  return worker ? runOnWorker(worker, job, file) : analyzePhotoFile(file)
+  return worker ? runOnWorker(worker, job, file, displayEdge) : analyzePhotoFile(file, displayEdge)
 }
 
 /**
@@ -107,7 +111,7 @@ export async function analyzeAll(jobs: AnalysisJob[], options: AnalysisPoolOptio
     let current = take()
     while (current) {
       const upcoming = take()
-      const analyzed = await analyzeOne(worker, current.job, await current.file)
+      const analyzed = await analyzeOne(worker, current.job, await current.file, options.displayEdge)
       await options.onResult(current.job.id, analyzed)
       current = options.isCancelled?.() ? null : upcoming
     }

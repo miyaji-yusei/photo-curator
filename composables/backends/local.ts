@@ -31,6 +31,7 @@ import { createStoredZip } from '~/utils/zip'
 import { downloadBlob, zipEntriesByRating } from '~/utils/shareExport'
 import type { AnalysisJob } from '~/utils/analysisPool'
 import { DISPLAY_EDGE_DEFAULT, hashThumbnail } from '~/utils/analyzePhoto'
+import { DISPLAY_EDGE_CHOICES, nearestDisplayEdge } from '~/utils/displayEdge'
 import { capabilitiesFor, hasDirectoryPicker } from '~/utils/capabilities'
 import { requestPersistence, toPhoto } from '~/utils/browserStore'
 import type { StoredPhoto, StoredProject, StoredSource } from '~/utils/browserStore'
@@ -270,14 +271,23 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
    * 解析を並列に回す。**1 枚終わるごとに、その写真の行だけ**を書く（配列を書き直さない）。
    * 途中で閉じてもそこまでは残り、次は指紋の無い写真だけが対象になる。
    */
+  /** このプロジェクトで表示用画像を作る長辺。プロジェクトの指定 → アプリの既定 → 既定値。 */
+  async function displayEdgeOf(projectId: string): Promise<number> {
+    const own = (await store.getProject(projectId))?.displayEdge
+    const edge = own ?? await store.readDisplayEdge().catch(() => null)
+    return edge ? nearestDisplayEdge(edge) : DISPLAY_EDGE_DEFAULT
+  }
+
   async function analyze(projectId: string, jobs: AnalysisJob[]): Promise<void> {
     const total = jobs.length
+    const displayEdge = await displayEdgeOf(projectId)
     let processed = 0
     let failed = 0
     emit(progressOf(projectId, 'background', 'hashing', 0, total, '写真を解析しています'))
     await analyzeAll(jobs, {
       workers,
       isCancelled: () => cancelled.has(projectId),
+      displayEdge,
       onResult: async (id, analyzed) => {
         processed += 1
         if (analyzed.error) failed += 1
@@ -288,7 +298,7 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
           timestampSource: analyzed.timestampSource,
           dHash: analyzed.dHash,
           analysisError: analyzed.error,
-          displayEdge: analyzed.display ? DISPLAY_EDGE_DEFAULT : null
+          displayEdge: analyzed.display ? displayEdge : null
         })
         emit(progressOf(projectId, 'background', 'hashing', processed, total, '写真を解析しています', failed))
       }
@@ -807,17 +817,28 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
     photoThumbnailUrl: (photo: Photo) => photo.thumbnailPath ?? photo.path,
     photoDisplayUrl: (photo: Photo) => photo.displayPath ?? photo.thumbnailPath ?? photo.path,
 
-    // ブラウザでは表示用サイズを準備のときに決め打ちで作る。**原本を保存しない**
-    // ので、あとから別の大きさで作り直すことができない（原本がもう無い）。
-    // 変えたいときは取り込み直してもらう。
-    getDisplaySettings: () => Promise.resolve({
-      edge: DISPLAY_EDGE_DEFAULT,
-      choices: [DISPLAY_EDGE_DEFAULT],
-      defaultEdge: DISPLAY_EDGE_DEFAULT,
-      largeEdge: DISPLAY_EDGE_DEFAULT
-    }),
-    saveDisplayEdge: () => Promise.resolve(DISPLAY_EDGE_DEFAULT),
-    saveProjectDisplayEdge: () => Promise.resolve(DISPLAY_EDGE_DEFAULT),
+    // ブラウザでは表示用画像を準備のときに、作成時に選んだ長辺で作る。**原本を保存しない**
+    // ので、あとから別の大きさで作り直すことはできない（`canRebuild: false`）。
+    // 変えられるのはこれから作る分だけ。
+    getDisplaySettings: async () => {
+      const saved = await store.readDisplayEdge().catch(() => null)
+      return {
+        edge: saved ? nearestDisplayEdge(saved) : DISPLAY_EDGE_DEFAULT,
+        choices: [...DISPLAY_EDGE_CHOICES],
+        defaultEdge: DISPLAY_EDGE_DEFAULT,
+        largeEdge: 1536,
+        canRebuild: false
+      }
+    },
+    saveDisplayEdge: async (edge: number) => {
+      const normalized = nearestDisplayEdge(edge)
+      await store.writeDisplayEdge(normalized)
+      return normalized
+    },
+    saveProjectDisplayEdge: async (projectId: string, edge: number | null) => {
+      if (edge !== null) await store.patchProject(projectId, { displayEdge: nearestDisplayEdge(edge) })
+      return displayEdgeOf(projectId)
+    },
     // 準備と同時に作っているので、あとから溜まる分は無い。
     getDisplayBacklog: () => Promise.resolve(0),
     startDisplayGeneration: () => Promise.resolve(),
