@@ -253,3 +253,4 @@ body { margin: 0; }
 
 .zoom-overlay__photo { position: relative; display: flex; justify-content: center; min-width: 0; }
 .zoom-overlay__spinner { position: absolute; top: 50%; left: 50%; margin: -24px 0 0 -24px; filter: drop-shadow(0 0 4px rgba(0,0,0,.6)); pointer-events: none; }
+.project-actions .v-btn.v-btn.v-btn { height: 40px; min-height: 40px; min-width: 40px; }
