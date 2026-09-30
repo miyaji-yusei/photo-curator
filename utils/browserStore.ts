@@ -69,6 +69,8 @@ export interface StoredProject {
   updatedAt: number
   burstThreshold: number | null
   burstThresholdLearnedAt: number | null
+  /** このプロジェクトの表示用画像の長辺。無ければアプリの既定。 */
+  displayEdge?: number | null
 }
 
 let opening: Promise<IDBDatabase> | null = null

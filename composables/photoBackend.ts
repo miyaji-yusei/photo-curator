@@ -6,6 +6,8 @@ export interface DisplaySettings {
   choices: number[]
   defaultEdge: number
   largeEdge: number
+  /** 長辺を変えたあとで、作った画像を作り直せるか。ブラウザは原本を持たないので false。 */
+  canRebuild?: boolean
 }
 import type {
   AmazonExport, AmazonPreview, ExportReport, Photo, PhotoPage, PhotoSort, Project,

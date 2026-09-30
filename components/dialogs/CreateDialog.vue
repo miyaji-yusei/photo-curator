@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { displayEdgeLabel } from '~/utils/displayEdge'
+
 const {
   amazonError,
   amazonLoading,
@@ -7,6 +9,8 @@ const {
   canImportPhotos,
   chooseFolder,
   createDialog,
+  createDisplayChoices,
+  createDisplayEdge,
   createProject,
   createTab,
   desktop,
@@ -18,6 +22,8 @@ const {
   loading,
   projectName
 } = useCurator()
+
+const edgeItems = computed(() => createDisplayChoices.value.map(edge => ({ title: displayEdgeLabel(edge), value: edge })))
 </script>
 
 <template>
@@ -56,6 +62,8 @@ const {
   <!-- ブラウザは写真を Amazon から直接表示する（端末には置かない）。 -->
   <p v-if="desktop.kind === 'local'" class="text-caption text-medium-emphasis mt-3">選別中も通信が要ります（写真は Amazon から表示します）。</p>
   </template>
+  <!-- 表示用画像の大きさ。作成のあと、この大きさで最初から作る。選んだ値はアプリの既定にもなる。 -->
+  <v-select v-if="edgeItems.length" v-model="createDisplayEdge" :items="edgeItems" label="表示用画像の大きさ" hint="大きいほど細部まで見えますが、容量と準備の時間が増えます。あとからプロジェクトの画面でも変えられます。" persistent-hint class="mt-5" />
 </v-card-text><v-card-actions class="pa-5 pt-2"><v-spacer /><v-btn variant="outlined" @click="createDialog = false">キャンセル</v-btn><v-btn variant="outlined" color="primary" :disabled="desktop.capabilities.amazon && createTab === 'amazon' ? !amazonPreview || !amazonPreview.count : !canImportPhotos && !folderPath" :loading="loading" @click="createProject">作成</v-btn></v-card-actions></v-card></v-dialog>
 </template>
 

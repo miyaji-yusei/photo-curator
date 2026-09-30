@@ -48,6 +48,9 @@ export interface WebStore {
   /** サイドカーで端末が覚える 3 つの値。まだ無ければ「未確認・変更なし」。 */
   readSidecarState: (projectId: string) => Promise<SidecarState>
   writeSidecarState: (projectId: string, state: SidecarState) => Promise<void>
+  /** 表示用画像の長辺の既定（アプリ全体）。まだ保存が無ければ null。 */
+  readDisplayEdge: () => Promise<number | null>
+  writeDisplayEdge: (edge: number) => Promise<void>
   /** この端末の id。初回に作って残す。 */
   deviceId: () => Promise<string>
 
@@ -69,6 +72,8 @@ export const amazonLinksKey = (projectId: string) => `amazonLinks:${projectId}`
 export const sidecarStateKey = (projectId: string) => `sidecar:${projectId}`
 /** 端末の id を置く `states` のキー。 */
 export const DEVICE_KEY = 'device'
+/** 表示用画像の長辺の既定を置く `states` のキー。 */
+export const DISPLAY_EDGE_KEY = 'displayEdge'
 
 export function createIdbStore(): WebStore {
   return {
@@ -223,6 +228,17 @@ export function createIdbStore(): WebStore {
         await putOne(transaction, STORE_STATES, { projectId: DEVICE_KEY, id, updatedAt: Date.now() })
         return id
       }),
+
+    readDisplayEdge: async () => {
+      const row = await withStores([STORE_STATES], 'readonly', transaction =>
+        getOne<{ projectId: string, edge?: number }>(transaction, STORE_STATES, DISPLAY_EDGE_KEY))
+      return typeof row?.edge === 'number' ? row.edge : null
+    },
+
+    writeDisplayEdge: async edge => {
+      await withStores([STORE_STATES], 'readwrite', transaction =>
+        putOne(transaction, STORE_STATES, { projectId: DISPLAY_EDGE_KEY, edge, updatedAt: Date.now() }))
+    },
 
     readAmazonLinks: async projectId => {
       const row = await withStores([STORE_STATES], 'readonly', transaction =>
