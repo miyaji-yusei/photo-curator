@@ -8,6 +8,10 @@ export interface DisplaySettings {
   largeEdge: number
   /** 長辺を変えたあとで、作った画像を作り直せるか。ブラウザは原本を持たないので false。 */
   canRebuild?: boolean
+  /** 長辺を変えると、作った画像を作り直すか。Web の Amazon は URL で出すので作り直さない（既定は true）。 */
+  rebuildsOnChange?: boolean
+  /** プロジェクトを渡して読んだときの、そのプロジェクトの実効の長辺。 */
+  projectEdge?: number
 }
 import type {
   AmazonExport, AmazonPreview, ExportReport, Photo, PhotoPage, PhotoSort, Project,
@@ -88,7 +92,8 @@ export interface PhotoBackend {
   savePairOverrides: (projectId: string, overrides: PairOverride[]) => Promise<void>
 
   /** 表示用画像の設定と生成。 */
-  getDisplaySettings: () => Promise<DisplaySettings>
+  /** `projectId` を渡すと、そのプロジェクトの実効の長辺（`projectEdge`）と作り直せるか（`canRebuild`）も返す。 */
+  getDisplaySettings: (projectId?: string) => Promise<DisplaySettings>
   saveDisplayEdge: (edge: number) => Promise<number>
   /** null を渡すと全体の設定に戻す。戻り値は解決後の長辺。 */
   saveProjectDisplayEdge: (projectId: string, edge: number | null) => Promise<number>

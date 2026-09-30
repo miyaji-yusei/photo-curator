@@ -18,6 +18,7 @@ import MoveDialog from '~/components/dialogs/MoveDialog.vue'
 import BurstDialog from '~/components/dialogs/BurstDialog.vue'
 import NextRoundDialog from '~/components/dialogs/NextRoundDialog.vue'
 import RestartDialog from '~/components/dialogs/RestartDialog.vue'
+import DisplayEdgeDialog from '~/components/dialogs/DisplayEdgeDialog.vue'
 import ExportDialog from '~/components/dialogs/ExportDialog.vue'
 import MetadataDialog from '~/components/dialogs/MetadataDialog.vue'
 import DeleteDialog from '~/components/dialogs/DeleteDialog.vue'
@@ -269,6 +270,7 @@ function onZoomReset() {
     <BurstDialog />
     <NextRoundDialog />
     <RestartDialog />
+    <DisplayEdgeDialog />
     <ExportDialog />
     <MetadataDialog />
     <DeleteDialog />
