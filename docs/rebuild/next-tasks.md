@@ -41,7 +41,7 @@
 | U16 | 拡大のぐるぐるを、右上でなく写真の真ん中に重ねる（Android と同じ）。U10 の見直し | S | `app.vue`（`zoom-overlay__photo`）・`assets/main.css` 254〜255 行 | 済（#33） |
 | U17 | アプリの設定の画面を足し、表示用画像の既定の大きさを変えられるようにする（Android の設定と同じ） | S〜M | 新規 `components/views/AppSettingsView.vue`・`AppNav.vue`・`useCurator.ts`（`view`）・`displayEdge` まわり | 済（#34。PC の実機は未確認） |
 | U18 | 選別の並べ方で、3 枚のときだけ 1×3 に固定する（4〜10 枚は U7 のまま）。縦長の 3 枚が 2×2 になっていた（2026-09-30 #32 の目視で。縦横比を測る案は見送り） | S | `utils/gridFor.ts`・`tests/gridFor.test.ts` | 済（#39。3 枚だけ 1×3 固定） |
-| U20 | 表示用画像の px の不具合（1536 で作られない・作成ダイアログの値がアプリの既定に負ける）と、詳細の ⋮ から px を変える機能 | M | `useCurator.ts`・`ProjectView.vue`・新規 `DisplayEdgeDialog.vue`・`utils/displayEdge.ts`・`lib.rs`（`get_display_settings`）・`backends/local.ts` | 実装済み・確認待ち（原因は走査後に生成を起こさない・開くたびに上書きを消す・作成が既定を上書き。PC の実機は未確認） |
+| U20 | 表示用画像の px の不具合（1536 で作られない・作成ダイアログの値がアプリの既定に負ける）と、詳細の ⋮ から px を変える機能 | M | `useCurator.ts`・`ProjectView.vue`・新規 `DisplayEdgeDialog.vue`・`utils/displayEdge.ts`・`lib.rs`（`get_display_settings`）・`backends/local.ts` | 済（#42。PC 実機は確認待ち） |
 
 ---
 
