@@ -31,7 +31,7 @@
 | U6 | 選別画面の下のボタン列を上に移し、写真を大きく見せる | M | `TournamentView.vue`・`composables/useCurator.ts` | 済（U6 の PR） |
 | U7 | 選別の並べ方（4 枚で 2×2 か 1×4 か）を窓の形に合わせて変える（2026-09-30 プランをユーザーと合わせた。下の「決定」） | M | `TournamentView.vue`・新規 `utils/gridFor.ts` | 済（#35。ユーザーの目視待ち） |
 | U8 | 「表示枚数」の画面で、クリックと矢印キーで増減できるようにする | S | `components/dialogs/GroupSizeDialog.vue` | 済（#25） |
-| U9 | 拡大で Ctrl+スクロールで拡大・縮小。Ctrl を押しても拡大を閉じない | M | `useCurator.ts` の `onZoomKeydown`・拡大の部品 | 未 |
+| U9 | 拡大で Ctrl+スクロールで拡大・縮小。Ctrl を押しても拡大を閉じない | M | `useCurator.ts` の `onZoomKeydown`・拡大の部品 | 済（#36。ユーザーの目視待ち） |
 | U10 | 拡大の読み込み中にぐるぐる（Android と同じ） | S | 拡大の部品（`zoomLoading` はもうある） | 済（#26） |
 | U11 | 複数モードで ★5 を押しても、すぐ次の組へ進まない（Android と同じ） | S〜M | `useCurator.ts` の ★5（`keepAndTop`）の呼び方 | 閉じた（変更なし。2026-09-30 ユーザー決定: 今のまま＝Android と同じ） |
 | U12 | まとまり編集を、Android と同じ横並び＋境目のバーで切る／ずらす UI にする | M | `components/dialogs/BurstDialog.vue`・`utils/burstEdit.ts` | 未 |
