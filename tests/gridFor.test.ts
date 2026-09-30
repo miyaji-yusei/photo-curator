@@ -85,4 +85,43 @@ describe('gridFor', () => {
     const r = gridFor(7, 1440, 900, GAP, { rows: 2, cols: 2 })
     expect(r.rows * r.cols).toBeGreaterThanOrEqual(7)
   })
+
+  describe("実際の縦横比（aspect）", () => {
+    const g = (n: number, w: number, h: number, a?: number) => gridFor(n, w, h, 10, null, a)
+
+    it("縦長（0.75）の 3 枚・1805×840 は 1×3", () => {
+      expect(g(3, 1805, 840, 0.75)).toEqual({ rows: 1, cols: 3 })
+    })
+    it("横長（1.5）の 3 枚・1805×840 は 2×2", () => {
+      expect(g(3, 1805, 840, 1.5)).toEqual({ rows: 2, cols: 2 })
+    })
+    it("aspect を省略すると 3:2（1.5）と同じ", () => {
+      for (const n of [3, 4, 5, 6, 7]) {
+        for (const [w, h] of [[1805, 840], [1440, 900], [933, 704], [600, 1000]]) {
+          expect(g(n, w, h)).toEqual(g(n, w, h, 1.5))
+        }
+      }
+    })
+    it("不正な aspect（0・NaN）は 3:2 として扱う", () => {
+      expect(g(3, 1805, 840, 0)).toEqual(g(3, 1805, 840, 1.5))
+      expect(g(3, 1805, 840, Number.NaN)).toEqual(g(3, 1805, 840, 1.5))
+    })
+    it("縦長 4 枚: 幅広の枠は 1×4、狭い枠は 2×2", () => {
+      expect(g(4, 1440, 900, 0.75)).toEqual({ rows: 1, cols: 4 })
+      expect(g(4, 933, 704, 0.75)).toEqual({ rows: 2, cols: 2 })
+      expect(g(4, 600, 1000, 0.75)).toEqual({ rows: 2, cols: 2 })
+    })
+    it("縦長 6 枚: 幅広の枠は 2×3、縦長の枠は 3×2", () => {
+      expect(g(6, 1440, 900, 0.75)).toEqual({ rows: 2, cols: 3 })
+      expect(g(6, 600, 1000, 0.75)).toEqual({ rows: 3, cols: 2 })
+    })
+    it("縦長 7 枚: 幅広の枠は 2×4、縦長の枠は 3×3", () => {
+      expect(g(7, 1440, 900, 0.75)).toEqual({ rows: 2, cols: 4 })
+      expect(g(7, 600, 1000, 0.75)).toEqual({ rows: 3, cols: 3 })
+    })
+    it("5% の保持は aspect を使った面積で効く（縦長 3 枚で 2×2 → 1×3 へは移る）", () => {
+      expect(gridFor(3, 1805, 840, 10, { rows: 2, cols: 2 }, 0.75)).toEqual({ rows: 1, cols: 3 })
+      expect(gridFor(3, 1805, 840, 10, { rows: 1, cols: 3 }, 0.75)).toEqual({ rows: 1, cols: 3 })
+    })
+  })
 })
