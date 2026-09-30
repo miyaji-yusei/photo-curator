@@ -29,7 +29,7 @@
 | U4 | 「8 枚を ★5 から ★0 へ移しました」などの通知が × を押すまで消えない。通知の分だけ画面が下がる | S | `app.vue` 67〜79 行（`error`・`taskWarning`・`moveReport`）、`ResultsView.vue` の `resultsMessage` | 済（#23） |
 | U5 | プロジェクトの詳細に「選別を最初からやり直す」の入口が無い（Android にはある） | S | `ProjectView.vue`・`RestartDialog.vue`・`restartFromScratch` | 済（#24） |
 | U6 | 選別画面の下のボタン列を上に移し、写真を大きく見せる | M | `TournamentView.vue`・`composables/useCurator.ts` | 済（U6 の PR） |
-| U7 | 選別の並べ方（4 枚で 2×2 か 1×4 か）を窓の形に合わせて変える（2026-09-30 プランをユーザーと合わせた。下の「決定」） | M | `TournamentView.vue`・新規 `utils/gridFor.ts` | 未（実装してよい） |
+| U7 | 選別の並べ方（4 枚で 2×2 か 1×4 か）を窓の形に合わせて変える（2026-09-30 プランをユーザーと合わせた。下の「決定」） | M | `TournamentView.vue`・新規 `utils/gridFor.ts` | 済（#35。ユーザーの目視待ち） |
 | U8 | 「表示枚数」の画面で、クリックと矢印キーで増減できるようにする | S | `components/dialogs/GroupSizeDialog.vue` | 済（#25） |
 | U9 | 拡大で Ctrl+スクロールで拡大・縮小。Ctrl を押しても拡大を閉じない | M | `useCurator.ts` の `onZoomKeydown`・拡大の部品 | 未 |
 | U10 | 拡大の読み込み中にぐるぐる（Android と同じ） | S | 拡大の部品（`zoomLoading` はもうある） | 済（#26） |
