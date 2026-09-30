@@ -78,4 +78,7 @@ dependencies {
     implementation("net.java.dev.jna:jna:5.14.0@aar")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
+
+    // 単体テスト（判定など、端末なしで確かめられるもの）。
+    testImplementation("junit:junit:4.13.2")
 }
