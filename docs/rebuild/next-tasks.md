@@ -1,7 +1,14 @@
 # 次の作業（2026-09-30、ユーザーの確認を受けて）
 
 `feat/main-base` に T0〜T16 と修正（#20）をマージした（`55de41d`）。ここからは、ユーザーが実機で確かめて出した要望を片付ける。
-**ローカルで続けるときは、このファイルを上から順に進める。** 1 件 = 1 ブランチ（`feat/main-base` から `fix/mb-uNN-<名前>`）= 1 PR（`feat/main-base` 向け）。マージはユーザーが行う。
+**ローカルで続けるときは、このファイルを上から順に進める。**
+
+## ブランチの運用（2026-09-30 変更: 積み上げ式）
+- **まとめのブランチは `feat/mb-next`**。`feat/main-base` に U の直しを積み上げていく。まとめの PR（`feat/mb-next` → `feat/main-base`）でユーザーが全部を見て、マージする
+- 1 件ごとに、`origin/feat/mb-next` の先端から `fix/mb-uNN-<名前>` を切り、`feat/mb-next` 向けの PR を出す
+- 自分で差分とテストを確かめたら、`feat/mb-next` にマージコミット（`git merge --no-ff`）で取り込み、push する（**`feat/mb-next` だけは取り込んでよい。`feat/main-base`・main へは取り込まない**）
+- 取り込んだら、この表の「状態」を「済」にし、まとめの PR の概要の一覧を更新する
+- どこで止まっても、`feat/mb-next` の先端と、この表の「状態」を見れば続きが分かるようにする
 
 ## 共通の決まり
 - main・feat/rebuild は書き換えない
@@ -14,22 +21,22 @@
 
 ## 一覧（おすすめの順）
 
-| # | 要望 | 規模 | 主な場所 |
-| --- | --- | --- | --- |
-| U1 | 「1 つ戻す」で、まとめの中の ★5 の仲間が ★4 になる（レビュー #2）→ **core の「1 つ戻す」を直す**（ユーザー決定） | M | `core/src/lib.rs`・`app-android/`（`.so` の作り直し） |
-| U2 | メタデータに反映が失敗する | S | `src-tauri/src/lib.rs` の `write_ratings_to_photos_blocking` |
-| U3 | 写真を移動すると、結果に数は出るが、当てはまる写真が無くなる | S〜M | `src-tauri/src/lib.rs`（移動と集計）・`composables/useCurator.ts` |
-| U4 | 「8 枚を ★5 から ★0 へ移しました」などの通知が × を押すまで消えない。通知の分だけ画面が下がる | S | `app.vue` 67〜79 行（`error`・`taskWarning`・`moveReport`）、`ResultsView.vue` の `resultsMessage` |
-| U5 | プロジェクトの詳細に「選別を最初からやり直す」の入口が無い（Android にはある） | S | `ProjectView.vue`・`RestartDialog.vue`・`restartFromScratch` |
-| U6 | 選別画面の下のボタン列を上に移し、写真を大きく見せる | M | `TournamentView.vue`・`composables/useCurator.ts` |
-| U7 | 選別の並べ方（4 枚で 2×2 か 1×4 か）を窓の形に合わせて変える → **プランを合わせてから** | M | `TournamentView.vue`・新規 `utils/gridFor.ts` |
-| U8 | 「表示枚数」の画面で、クリックと矢印キーで増減できるようにする | S | `components/dialogs/GroupSizeDialog.vue` |
-| U9 | 拡大で Ctrl+スクロールで拡大・縮小。Ctrl を押しても拡大を閉じない | M | `useCurator.ts` の `onZoomKeydown`・拡大の部品 |
-| U10 | 拡大の読み込み中にぐるぐる（Android と同じ） | S | 拡大の部品（`zoomLoading` はもうある） |
-| U11 | 複数モードで ★5 を押しても、すぐ次の組へ進まない（Android と同じ） | S〜M | `useCurator.ts` の ★5（`keepAndTop`）の呼び方 |
-| U12 | まとまり編集を、Android と同じ横並び＋境目のバーで切る／ずらす UI にする | M | `components/dialogs/BurstDialog.vue`・`utils/burstEdit.ts` |
-| U13 | 表示用画像の大きさを、PC・Web でもプロジェクトの作成時から決められるようにする | S〜M | 作成ダイアログ・アプリの設定・`save_display_edge` |
-| U14 | PC の Amazon の読み込みが遅い（Web は速い）→ 速くできるか調べて比べる | 調査 → M | `src-tauri/src/amazon.rs`・`lib.rs` の Amazon の準備 |
+| # | 要望 | 規模 | 主な場所 | 状態 |
+| --- | --- | --- | --- | --- |
+| U1 | 「1 つ戻す」で、まとめの中の ★5 の仲間が ★4 になる（レビュー #2）→ **core の「1 つ戻す」を直す**（ユーザー決定） | M | `core/src/lib.rs`・`app-android/`（`.so` の作り直し） | 未 |
+| U2 | メタデータに反映が失敗する | S | `src-tauri/src/lib.rs` の `write_ratings_to_photos_blocking` | 済（#22） |
+| U3 | 写真を移動すると、結果に数は出るが、当てはまる写真が無くなる | S〜M | `src-tauri/src/lib.rs`（移動と集計）・`composables/useCurator.ts` | 未 |
+| U4 | 「8 枚を ★5 から ★0 へ移しました」などの通知が × を押すまで消えない。通知の分だけ画面が下がる | S | `app.vue` 67〜79 行（`error`・`taskWarning`・`moveReport`）、`ResultsView.vue` の `resultsMessage` | 済（#23） |
+| U5 | プロジェクトの詳細に「選別を最初からやり直す」の入口が無い（Android にはある） | S | `ProjectView.vue`・`RestartDialog.vue`・`restartFromScratch` | 済（#24） |
+| U6 | 選別画面の下のボタン列を上に移し、写真を大きく見せる | M | `TournamentView.vue`・`composables/useCurator.ts` | 未 |
+| U7 | 選別の並べ方（4 枚で 2×2 か 1×4 か）を窓の形に合わせて変える → **プランを合わせてから** | M | `TournamentView.vue`・新規 `utils/gridFor.ts` | 未 |
+| U8 | 「表示枚数」の画面で、クリックと矢印キーで増減できるようにする | S | `components/dialogs/GroupSizeDialog.vue` | 済（#25） |
+| U9 | 拡大で Ctrl+スクロールで拡大・縮小。Ctrl を押しても拡大を閉じない | M | `useCurator.ts` の `onZoomKeydown`・拡大の部品 | 未 |
+| U10 | 拡大の読み込み中にぐるぐる（Android と同じ） | S | 拡大の部品（`zoomLoading` はもうある） | 済（#26） |
+| U11 | 複数モードで ★5 を押しても、すぐ次の組へ進まない（Android と同じ） | S〜M | `useCurator.ts` の ★5（`keepAndTop`）の呼び方 | 未 |
+| U12 | まとまり編集を、Android と同じ横並び＋境目のバーで切る／ずらす UI にする | M | `components/dialogs/BurstDialog.vue`・`utils/burstEdit.ts` | 未 |
+| U13 | 表示用画像の大きさを、PC・Web でもプロジェクトの作成時から決められるようにする | S〜M | 作成ダイアログ・アプリの設定・`save_display_edge` | 未 |
+| U14 | PC の Amazon の読み込みが遅い（Web は速い）→ 速くできるか調べて比べる | 調査 → M | `src-tauri/src/amazon.rs`・`lib.rs` の Amazon の準備 | 未 |
 
 ---
 
