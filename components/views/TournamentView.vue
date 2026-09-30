@@ -20,9 +20,7 @@ const {
   roundNumber,
   roundProgress,
   saveSession,
-  selectedCount,
   session: nullableSession,
-  skipGroup,
   targetStar,
   toggleChoice,
   tournamentColumns,
@@ -33,22 +31,60 @@ const {
 } = useCurator()
 // 親の `v-if` で null を除いているので、ここでは non-null として扱う。
 const session = nullableSession as Ref<SavedSelection>
+
+function toggleMultiSelect() {
+  session.value.multiSelect = !session.value.multiSelect
+  session.value.selectedInGroup = []
+  saveSession()
+}
+function clearSelection() {
+  session.value.selectedInGroup = []
+  saveSession()
+}
 </script>
 
 <template>
-    <div class="d-flex align-center justify-space-between flex-wrap ga-3 mb-3">
-      <div>
-        <div class="text-overline text-primary">★{{ targetStar }} を選別中 &middot; Round {{ roundNumber }}</div>
-        <h1 class="text-h6 text-md-h5">残り {{ remainingPhotos.toLocaleString() }} 枚 / {{ remainingGroups.toLocaleString() }} グループ</h1>
+    <!-- 上のバー。Android の Cull.kt の並び（左: 中断・1 つ戻す・複数選択 / 真ん中: 状況 /
+         右: 設定・主ボタン）に合わせる。以前は下にあったボタンもここへ集め、写真を下端まで使う。 -->
+    <div class="tournament-bar d-flex align-center ga-2">
+      <div class="d-flex align-center ga-1 tournament-bar__side">
+        <v-btn variant="text" prepend-icon="mdi-pause" @click="view = 'project'">中断して戻る</v-btn>
+        <v-btn variant="text" prepend-icon="mdi-undo" :disabled="!canUndo" @click="undoChoice">1つ戻す</v-btn>
+        <v-btn
+          :variant="session.multiSelect ? 'tonal' : 'text'"
+          :color="session.multiSelect ? 'primary' : undefined"
+          :prepend-icon="session.multiSelect ? 'mdi-check' : 'mdi-checkbox-multiple-outline'"
+          :aria-pressed="session.multiSelect"
+          aria-label="複数枚選択（M）"
+          @click="toggleMultiSelect"
+        >複数選択</v-btn>
+        <v-btn
+          v-if="session.multiSelect && session.selectedInGroup.length"
+          variant="text" size="small" @click="clearSelection"
+        >解除</v-btn>
       </div>
-      <div class="d-flex flex-wrap ga-2">
-        <v-btn variant="text" prepend-icon="mdi-undo" :disabled="!canUndo" @click="undoChoice">1つ戻す<span class="ms-1 text-caption">⌫</span></v-btn>
-        <v-btn variant="text" prepend-icon="mdi-view-grid-outline" @click="openGroupSizeDialog">表示枚数</v-btn>
-        <v-btn variant="text" prepend-icon="mdi-pause-circle-outline" @click="view = 'project'">中断して戻る</v-btn>
+
+      <div class="tournament-bar__center text-center">
+        <div class="text-overline text-primary">★{{ targetStar }} を選別中 &middot; ROUND {{ roundNumber }}</div>
+        <div class="text-body-2">残り {{ remainingPhotos.toLocaleString() }} 枚 / {{ remainingGroups.toLocaleString() }} グループ</div>
+      </div>
+
+      <div class="d-flex align-center justify-end ga-2 tournament-bar__side">
+        <!-- 複数選択で 2 枚以上選んだときだけ。「連写をまとめる」がオフだと手直しが効かないので押せない。 -->
+        <v-btn
+          v-if="session.multiSelect && session.selectedInGroup.length >= 2"
+          variant="outlined" prepend-icon="mdi-layers-triple-outline"
+          :disabled="!session.settings.groupBursts"
+          :title="session.settings.groupBursts ? undefined : '「表示枚数」の設定で「連写をまとめる」をオンにすると使えます'"
+          @click="groupSelectedAsBurst"
+        >この写真をまとめる</v-btn>
+        <v-btn icon="mdi-dots-horizontal" variant="text" aria-label="選別中の設定（表示枚数）" title="選別中の設定（表示枚数）" @click="openGroupSizeDialog" />
+        <v-btn color="primary" @click="confirmChoices">
+          {{ session.selectedInGroup.length ? `${session.selectedInGroup.length} 枚を選択` : '選択なしで次へ' }}<span v-if="!isTouchOnly" class="ms-1 text-caption">（Enter）</span>
+        </v-btn>
       </div>
     </div>
-    <v-progress-linear :model-value="roundProgress" color="primary" height="6" rounded class="mb-2" />
-    <div class="d-flex justify-space-between text-caption text-medium-emphasis mb-4"><span>選択済み {{ selectedCount }} 枚</span><span>このグループ {{ tournamentPhotos.length }} 枚</span></div>
+    <v-progress-linear :model-value="roundProgress" color="primary" height="4" rounded class="mb-3" />
 
     <div
       class="tournament-grid"
@@ -109,26 +145,4 @@ const session = nullableSession as Ref<SavedSelection>
         <img :src="desktop.photoDisplayUrl(photo)" :alt="photo.name">
       </v-card>
     </div>
-
-    <v-sheet class="d-flex align-center justify-space-between flex-wrap ga-3 mt-4 pa-3" color="surface-variant" rounded>
-      <v-checkbox v-model="session.multiSelect" density="compact" hide-details label="複数枚選択（M）" @update:model-value="session.selectedInGroup = []; saveSession()" />
-      <!-- キーボードが無い環境では案内しない。操作はカード上のボタンで完結する。 -->
-      <div v-if="!isTouchOnly" class="text-caption text-medium-emphasis">
-        1〜0 選ぶ ・ Ctrl+数字 拡大 ・ Shift+数字 ★{{ MAX_RATING }}で確定 ・ Alt+数字 まとめを開く ・ Enter 決定 ・ ⌫ 戻す
-      </div>
-      <div class="d-flex flex-wrap ga-2">
-        <!-- 複数選択で 2 枚以上選んだときだけ。「連写をまとめる」がオフだと手直しが効かないので押せない。 -->
-        <v-btn
-          v-if="session.multiSelect && session.selectedInGroup.length >= 2"
-          variant="outlined" prepend-icon="mdi-layers-triple-outline"
-          :disabled="!session.settings.groupBursts"
-          :title="session.settings.groupBursts ? undefined : '「表示枚数」の設定で「連写をまとめる」をオンにすると使えます'"
-          @click="groupSelectedAsBurst"
-        >この写真をまとめる</v-btn>
-        <v-btn variant="outlined" @click="skipGroup">どれも選ばない</v-btn>
-        <v-btn color="primary" @click="confirmChoices">
-          {{ session.selectedInGroup.length ? `${session.selectedInGroup.length} 枚を選択` : '選択なしで次へ' }}（Enter）
-        </v-btn>
-      </div>
-    </v-sheet>
 </template>
