@@ -28,12 +28,12 @@
 | U3 | 写真を移動すると、結果に数は出るが、当てはまる写真が無くなる | S〜M | `src-tauri/src/lib.rs`（移動と集計）・`composables/useCurator.ts` | 済（#29） |
 | U4 | 「8 枚を ★5 から ★0 へ移しました」などの通知が × を押すまで消えない。通知の分だけ画面が下がる | S | `app.vue` 67〜79 行（`error`・`taskWarning`・`moveReport`）、`ResultsView.vue` の `resultsMessage` | 済（#23） |
 | U5 | プロジェクトの詳細に「選別を最初からやり直す」の入口が無い（Android にはある） | S | `ProjectView.vue`・`RestartDialog.vue`・`restartFromScratch` | 済（#24） |
-| U6 | 選別画面の下のボタン列を上に移し、写真を大きく見せる | M | `TournamentView.vue`・`composables/useCurator.ts` | 未 |
+| U6 | 選別画面の下のボタン列を上に移し、写真を大きく見せる | M | `TournamentView.vue`・`composables/useCurator.ts` | 済（U6 の PR） |
 | U7 | 選別の並べ方（4 枚で 2×2 か 1×4 か）を窓の形に合わせて変える → **プランを合わせてから** | M | `TournamentView.vue`・新規 `utils/gridFor.ts` | 未 |
 | U8 | 「表示枚数」の画面で、クリックと矢印キーで増減できるようにする | S | `components/dialogs/GroupSizeDialog.vue` | 済（#25） |
 | U9 | 拡大で Ctrl+スクロールで拡大・縮小。Ctrl を押しても拡大を閉じない | M | `useCurator.ts` の `onZoomKeydown`・拡大の部品 | 未 |
 | U10 | 拡大の読み込み中にぐるぐる（Android と同じ） | S | 拡大の部品（`zoomLoading` はもうある） | 済（#26） |
-| U11 | 複数モードで ★5 を押しても、すぐ次の組へ進まない（Android と同じ） | S〜M | `useCurator.ts` の ★5（`keepAndTop`）の呼び方 | 未 |
+| U11 | 複数モードで ★5 を押しても、すぐ次の組へ進まない（Android と同じ） | S〜M | `useCurator.ts` の ★5（`keepAndTop`）の呼び方 | **ユーザーの判断待ち**（下の U11 の節） |
 | U12 | まとまり編集を、Android と同じ横並び＋境目のバーで切る／ずらす UI にする | M | `components/dialogs/BurstDialog.vue`・`utils/burstEdit.ts` | 未 |
 | U13 | 表示用画像の大きさを、PC・Web でもプロジェクトの作成時から決められるようにする | S〜M | 作成ダイアログ・アプリの設定・`save_display_edge` | 済（#30。Web の Amazon の表示用は 1024 固定のまま） |
 | U14 | PC の Amazon の読み込みが遅い（Web は速い）→ 速くできるか調べて比べる | 調査 → M | `src-tauri/src/amazon.rs`・`lib.rs` の Amazon の準備 | 未 |
@@ -122,6 +122,14 @@
 - `zoomLoading`（`useCurator.ts` 1082 行付近）が true の間、写真の真ん中に `v-progress-circular indeterminate` を重ねる。原本に替わる前は表示用画像を出したまま、その上に重ねる（Android の `Zoom.kt` と同じ）
 
 ## U11 複数モードで ★5 を押しても、すぐ次の組へ進まない
+> [!warning] 2026-09-30 判断待ち
+> Android の `Cull.kt` を読むと、複数モードの ★5（`onTop`）も `keepTop` → `keepAndTop(live, selected, path)` ですぐ確定して次の組へ進む（今の Web と同じ）。ご要望（進まない）は Android の実装と食い違う。
+> core の `keep_and_top` は 1 回目で組が進むので、★5 の印を何枚も付けて主ボタンでまとめて確定する形は、core を変えないと作れない。
+> **ユーザーに次のどちらかを決めてもらう**:
+> 1. 今のまま（Android と同じ）。U11 は変更なしで閉じる
+> 2. Web だけ「印＋主ボタンで確定」にする。印は 1 枚まで（2 枚目で 1 枚目を外す）。core は変えない。封筒に `toppedInGroup` を足し、確定の関数の選び方は純関数に切り出す
+> 決まったら `fix/mb-u11-multi-top` を `origin/feat/mb-next` から切って続ける
+
 - Android の `Cull.kt` を読む（複数モードで ★5 を押すと、その写真に ★5 の印が付き、選択の一つとして残る。主ボタンで組を確定したときに ★5 が決まる）
 - 今（T4）は、複数モードの ★5 で `keepAndTop` を呼んで、すぐ確定している
 - **直し方**:
