@@ -3734,6 +3734,19 @@ async fn write_ratings_to_photos(app: AppHandle, project_id: String, photo_ids: 
         .map_err(|e| e.to_string())?
 }
 
+/// 書いたファイルが画像として開けるか確かめる。
+/// **形式は拡張子ではなく中身から判定する。** 一時ファイルの拡張子（`.photocurator-tmp`）からは
+/// 形式が分からず、確かめが毎回失敗して書き込みを取り消していた（新版の 6e56524 と同じ不具合）。
+fn verify_image_file(path: &Path) -> Result<(), String> {
+    image::ImageReader::open(path)
+        .map_err(|e| e.to_string())?
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?
+        .into_dimensions()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 fn write_ratings_to_photos_blocking(
     app: AppHandle,
     project_id: String,
@@ -3785,10 +3798,7 @@ fn write_ratings_to_photos_blocking(
             continue;
         }
         // 置き換える前に、書いたものが画像として開けるか確かめる。
-        if let Err(error) = image::ImageReader::open(&temporary)
-            .map_err(|e| e.to_string())
-            .and_then(|reader| reader.into_dimensions().map_err(|e| e.to_string()))
-        {
+        if let Err(error) = verify_image_file(&temporary) {
             let _ = fs::remove_file(&temporary);
             report.fail(
                 path,
@@ -7471,6 +7481,22 @@ mod tests {
         // SOI はあるが長さが壊れている。
         let broken = vec![0xFF, 0xD8, 0xFF, 0xE1, 0xFF, 0xFE, 0x00];
         assert!(jpeg_with_rating(&broken, 3).is_err());
+    }
+
+    /// U2: 星を書いた一時ファイル（拡張子 `.photocurator-tmp`）を、画像として確かめられること。
+    /// 拡張子で形式を決めていた頃は、ここが毎回失敗して「メタデータに反映」が全部取り消されていた。
+    #[test]
+    fn written_temporary_file_is_verified_by_its_content() {
+        let directory = test_directory("verify-tmp");
+        let updated = jpeg_with_rating(&jpeg_bytes(32, 24, 7), 3).expect("write rating");
+        let temporary = directory.join("IMG_0001.photocurator-tmp");
+        fs::write(&temporary, &updated).expect("write temporary");
+        assert!(verify_image_file(&temporary).is_ok(), "拡張子に関係なく中身で確かめる");
+
+        let broken = directory.join("broken.photocurator-tmp");
+        fs::write(&broken, b"not an image").expect("write broken");
+        assert!(verify_image_file(&broken).is_err(), "壊れた中身は確かめで落ちる");
+        let _ = fs::remove_dir_all(&directory);
     }
 
     // ---- Amazon（T9）----
