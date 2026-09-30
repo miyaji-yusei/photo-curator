@@ -38,6 +38,20 @@ body { margin: 0; }
   align-content: start;
   justify-items: center;
 }
+/* 選別画面（TournamentView）だけ、枠の大きさから JS が行×列を決める（utils/gridFor.ts）。
+   .tournament-stage は高さを固定し、格子は中で絶対配置にする。格子の中身が枠を押し広げて
+   測った大きさが変わり続ける、という循環を作らない。まとめの中身（.burst-review-grid）や
+   連写の見直しは、この修飾子を付けないので従来の並びのまま。 */
+.tournament-stage { position: relative; height: calc(100vh - 175px); min-height: 240px; }
+.tournament-grid.tournament-grid--fit {
+  position: absolute; inset: 0;
+  grid-template-columns: repeat(var(--tournament-columns, 1), minmax(0, 1fr));
+  grid-template-rows: repeat(var(--tournament-rows, 1), minmax(0, 1fr));
+  gap: var(--tournament-gap, 10px);
+  align-content: stretch;
+}
+.tournament-grid--fit .tournament-card { max-width: none; height: 100%; }
+.tournament-grid--fit .tournament-card img { height: 100%; min-height: 0; aspect-ratio: auto; }
 .tournament-card {
   /* overflow は Vuetify の .v-card が hidden にする。box-shadow は自分の
      overflow では切られないので、下の「重なった紙」の表現には影響しない。 */
@@ -226,6 +240,8 @@ body { margin: 0; }
   /* 列を最大3つに抑える。狭い幅で5列にすると1枚が小さくなりすぎる。 */
   .tournament-grid { grid-template-columns: repeat(min(var(--tournament-columns, 3), 3), 1fr); gap: 10px; }
   .tournament-card img { height: calc((100vh - 215px) / var(--tournament-rows, 2)); min-height: 120px; }
+  /* 上のバーが折り返すので、枠の高さはその分だけ小さく取る。 */
+  .tournament-stage { height: calc(100vh - 215px); }
   .photo-grid:not(.is-fixed) { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 12px; }
 }
 

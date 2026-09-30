@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import type { Ref } from 'vue'
 import type { SavedSelection } from '~/utils/selectionFlow'
+import { gridFor, type GridShape } from '~/utils/gridFor'
 
 const {
   MAX_RATING,
@@ -23,14 +24,47 @@ const {
   session: nullableSession,
   targetStar,
   toggleChoice,
-  tournamentColumns,
   tournamentPhotos,
-  tournamentRows,
   undoChoice,
   view
 } = useCurator()
 // 親の `v-if` で null を除いているので、ここでは non-null として扱う。
 const session = nullableSession as Ref<SavedSelection>
+
+// 並べ方（行×列）は、写真を置く枠の大きさから決める。枠（.tournament-stage）は高さを
+// CSS で固定し、格子は中で絶対配置にしてある。中身が枠を押し広げないので、測った値が
+// 並べ替えで変わり続けることはない。
+const GRID_GAP = 10
+const MEASURE_DELAY_MS = 100
+const stage = ref<HTMLElement | null>(null)
+const frame = ref({ width: 0, height: 0 })
+const shape = ref<GridShape>({ rows: 1, cols: 1 })
+function recompute() {
+  shape.value = gridFor(tournamentPhotos.value.length, frame.value.width, frame.value.height, GRID_GAP, shape.value)
+}
+let measureTimer: ReturnType<typeof setTimeout> | null = null
+let observer: ResizeObserver | null = null
+function measure() {
+  const el = stage.value
+  if (!el) return
+  frame.value = { width: el.clientWidth, height: el.clientHeight }
+  recompute()
+}
+onMounted(() => {
+  measure()
+  if (typeof ResizeObserver === 'undefined' || !stage.value) return
+  observer = new ResizeObserver(() => {
+    if (measureTimer) clearTimeout(measureTimer)
+    measureTimer = setTimeout(measure, MEASURE_DELAY_MS)
+  })
+  observer.observe(stage.value)
+})
+onBeforeUnmount(() => {
+  observer?.disconnect()
+  if (measureTimer) clearTimeout(measureTimer)
+})
+// 枚数が変わったら（表示枚数の変更・組の切り替わり）すぐに計算し直す。
+watch(() => tournamentPhotos.value.length, recompute, { immediate: true })
 
 function toggleMultiSelect() {
   session.value.multiSelect = !session.value.multiSelect
@@ -86,9 +120,10 @@ function clearSelection() {
     </div>
     <v-progress-linear :model-value="roundProgress" color="primary" height="4" rounded class="mb-3" />
 
+    <div ref="stage" class="tournament-stage">
     <div
-      class="tournament-grid"
-      :style="{ '--tournament-columns': tournamentColumns, '--tournament-rows': tournamentRows }"
+      class="tournament-grid tournament-grid--fit"
+      :style="{ '--tournament-columns': shape.cols, '--tournament-rows': shape.rows, '--tournament-gap': `${GRID_GAP}px` }"
     >
       <v-card
         v-for="(photo, index) in tournamentPhotos"
@@ -144,5 +179,6 @@ function clearSelection() {
 
         <img :src="desktop.photoDisplayUrl(photo)" :alt="photo.name">
       </v-card>
+    </div>
     </div>
 </template>
