@@ -36,8 +36,16 @@ describe('clampGroupSize', () => {
   })
 
   it('下限を下回る枚数は下限に収める', () => {
-    expect(clampGroupSize(1, TOUCH_GROUP_SIZE)).toBe(2)
     expect(clampGroupSize(0, DESKTOP_GROUP_SIZE)).toBe(2)
+    expect(clampGroupSize(-3, TOUCH_GROUP_SIZE)).toBe(2)
+  })
+
+  it('1 枚はスライドショーなので下限に引き上げない', () => {
+    expect(SLIDESHOW_GROUP_SIZE).toBe(1)
+    expect(clampGroupSize(1, TOUCH_GROUP_SIZE)).toBe(1)
+    expect(clampGroupSize(1, DESKTOP_GROUP_SIZE)).toBe(1)
+    expect(isSlideshowSize(1)).toBe(true)
+    expect(isSlideshowSize(2)).toBe(false)
   })
 
   it('範囲内はそのまま', () => {

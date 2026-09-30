@@ -40,6 +40,8 @@ export function groupSizeLimits(largeGroups: boolean): GroupSizeLimits {
  */
 export function clampGroupSize(size: number, limits: GroupSizeLimits): number {
   if (!Number.isFinite(size)) return limits.default
+  // 1 枚は「スライドショー」（方式）。下限（2 枚）に引き上げず、そのまま保つ。
+  if (Math.round(size) === SLIDESHOW_GROUP_SIZE) return SLIDESHOW_GROUP_SIZE
   return Math.min(limits.max, Math.max(limits.min, Math.round(size)))
 }
 
