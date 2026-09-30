@@ -33,7 +33,7 @@ import type { CardState, CardStatus, PrepareLine } from '~/utils/projectStatus'
 import { exportTargetsForStars } from '~/utils/exportTargets'
 import { resultsCsv } from '~/utils/amazonCsv'
 import type { RatingChange, SavedSelection } from '~/utils/selectionFlow'
-import { clampGroupSize, groupSizeLimits, isSlideshowSize, tournamentGroupSize } from '~/utils/groupSize'
+import { SLIDESHOW_GROUP_SIZE, clampGroupSize, groupSizeLimits, isSlideshowSize, tournamentGroupSize } from '~/utils/groupSize'
 import {
   SHARE_FILE_LIMIT, downloadBlob, shareFiles, zipEntriesByRating
 } from '~/utils/shareExport'
@@ -990,6 +990,12 @@ function createCurator() {
   function enterMethod() {
     if (!activeProject.value?.photoCount || sidecarClash.value) return
     view.value = 'method'
+  }
+
+  /** 方法の選択の「スライドショー」。設定の画面は同じで、枚数の設定は出さず 1 枚ずつにする。 */
+  function openSlideshowSettings() {
+    openSettings()
+    settings.groupSize = SLIDESHOW_GROUP_SIZE
   }
 
   function openSettings() {
@@ -2870,6 +2876,7 @@ function createCurator() {
     startScan,
     enterMethod,
     openSettings,
+    openSlideshowSettings,
     beginTournament,
     finishTournamentStart,
     enterStage,
