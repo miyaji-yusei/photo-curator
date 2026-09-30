@@ -153,7 +153,11 @@ const {
             aria-label="前の写真" :disabled="zoomIndex <= 0"
             @click.stop="stepZoom(-1)"
           />
-          <img :src="zoomSrc" :alt="zoomPhoto.name">
+          <div class="zoom-overlay__photo">
+            <img :src="zoomSrc" :alt="zoomPhoto.name">
+            <!-- 原本に替わるまで、表示用画像の上にぐるぐるを重ねる。 -->
+            <v-progress-circular v-if="zoomLoading" class="zoom-overlay__spinner" indeterminate color="white" size="48" width="4" aria-label="原本を読み込み中" />
+          </div>
           <v-btn
             class="zoom-overlay__step" icon="mdi-chevron-right" variant="text" size="large"
             aria-label="次の写真" :disabled="zoomIndex < 0 || zoomIndex >= zoomList.length - 1"
