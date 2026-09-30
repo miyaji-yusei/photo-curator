@@ -166,12 +166,24 @@ object Prefs {
     private const val FILE = "prefs"
     private const val GROUP_SIZE = "group_size"
 
-    /** 一度に並べる枚数。2〜10。 */
+    /** スライドショー選別は「1 グループ 1 枚」で表す（トーナメントは 2 以上）。 */
+    const val SLIDESHOW_SIZE = 1
+    private const val TOURNAMENT_SIZE = "tournament_size"
+
+    /**
+     * 一度に並べる枚数。1〜10。**1 はスライドショー**（方式）。
+     * 既定は 4。設計は Android 2〜4 だが、開いた状態は 933px あり
+     * 実際に 10 枚を使うので広げる（設計自身も「幅と能力で決める」）。
+     */
     fun groupSize(context: Context): Int =
         context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
             .getInt(GROUP_SIZE, 4)
-            // 2〜10。既定は 4。設計は Android 2〜4 だが、開いた状態は 933px あり
-            // 実際に 10 枚を使うので広げる（設計自身も「幅と能力で決める」）。
+            .coerceIn(SLIDESHOW_SIZE, 10)
+
+    /** スライドショーから戻すときのトーナメントの枚数。**直前に選んでいた枚数。** */
+    fun tournamentSize(context: Context): Int =
+        context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+            .getInt(TOURNAMENT_SIZE, 4)
             .coerceIn(2, 10)
 
     /**
@@ -279,10 +291,12 @@ object Prefs {
     }
 
     fun setGroupSize(context: Context, size: Int) {
-        context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
-            .edit()
-            .putInt(GROUP_SIZE, size.coerceIn(2, 10))
-            .apply()
+        val kept = size.coerceIn(SLIDESHOW_SIZE, 10)
+        val edit = context.getSharedPreferences(FILE, Context.MODE_PRIVATE).edit()
+            .putInt(GROUP_SIZE, kept)
+        // 1（スライドショー）に切り替えても、トーナメントの枚数は覚えておく。
+        if (kept >= 2) edit.putInt(TOURNAMENT_SIZE, kept)
+        edit.apply()
     }
 
     /** プロジェクトを消すときに、そのプロジェクトだけの設定を片付ける。 */

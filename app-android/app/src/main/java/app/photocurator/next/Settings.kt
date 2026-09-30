@@ -201,6 +201,20 @@ fun SettingsScreen(onBack: () -> Unit) {
                             }
                         }
                     }
+                    // 1 枚ずつ決める方式。**枚数ではなく方式**なので、丸とは別に置く。
+                    FilterChip(
+                        selected = groupSize == Prefs.SLIDESHOW_SIZE,
+                        onClick = {
+                            val next = if (groupSize == Prefs.SLIDESHOW_SIZE) Prefs.tournamentSize(context)
+                            else Prefs.SLIDESHOW_SIZE
+                            groupSize = next; Prefs.setGroupSize(context, next)
+                        },
+                        label = { Text("スライドショー（1 枚ずつ）", fontSize = 13.sp) },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = Lime, selectedLabelColor = Color.Black
+                        ),
+                        modifier = Modifier.padding(top = 8.dp)
+                    )
                     Text(
                         "4 枚がおすすめ。多いほど 1 回で絞れますが、1 枚が小さくなります",
                         fontSize = 11.sp, color = Faint,

@@ -13,6 +13,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -52,7 +53,40 @@ fun OptionsSheet(
         Column(Modifier.padding(horizontal = 20.dp).padding(bottom = 24.dp)) {
             Text("選別の設定", fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
 
+            // ---- 方式。**スライドショーは 1 グループ 1 枚**（枚数の設定と同じ仕組み）。
+            // 中断して再開したあとでも、ここから選び直せる。 ----
+            val context = LocalContext.current
+            val slideshow = groupSize == Prefs.SLIDESHOW_SIZE
             Spacer(Modifier.height(16.dp))
+            Text("選別の方式", fontSize = 13.sp)
+            Spacer(Modifier.height(8.dp))
+            SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                SegmentedButton(
+                    selected = slideshow,
+                    onClick = { if (!slideshow) onGroupSize(Prefs.SLIDESHOW_SIZE) },
+                    shape = SegmentedButtonDefaults.itemShape(0, 2),
+                    colors = SegmentedButtonDefaults.colors(
+                        activeContainerColor = Lime, activeContentColor = Color.Black
+                    )
+                ) { Text("スライドショー", fontSize = 13.sp) }
+                SegmentedButton(
+                    selected = !slideshow,
+                    onClick = { if (slideshow) onGroupSize(Prefs.tournamentSize(context)) },
+                    shape = SegmentedButtonDefaults.itemShape(1, 2),
+                    colors = SegmentedButtonDefaults.colors(
+                        activeContainerColor = Lime, activeContentColor = Color.Black
+                    )
+                ) { Text("トーナメント", fontSize = 13.sp) }
+            }
+
+            Spacer(Modifier.height(16.dp))
+            if (slideshow) {
+                Text(
+                    "1 枚ずつ出して、残す（右）か落とす（左）かを決めます。" +
+                        "上へのスワイプで ★5 にして確定します",
+                    fontSize = 11.sp, color = Faint
+                )
+            } else {
             Text("一度に見比べる枚数", fontSize = 13.sp)
             Text(
                 "いまのグループにすぐ効きます。選んだ印は残ります",
@@ -80,6 +114,7 @@ fun OptionsSheet(
                         )
                     }
                 }
+            }
             }
 
             Spacer(Modifier.height(18.dp))

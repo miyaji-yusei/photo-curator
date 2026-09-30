@@ -81,7 +81,8 @@ fun StartSheet(
                 Column(if (narrow) Modifier.fillMaxWidth() else Modifier.weight(1f)) {
                     Text("一度に見比べる枚数", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                     Spacer(Modifier.height(8.dp))
-                    // 2〜10。**4 をおすすめとして真ん中に据える。**
+                    // 1〜10。**1 はスライドショー**（1 枚ずつ残す／落とす）。
+                    // **4 をおすすめとして真ん中に据える。**
                     // 多いほど 1 回で絞れるが、1 枚が小さくなる。
                     //
                     // **折り返す。** 9 枚を 1 行に並べると 588dp 必要で、
@@ -92,10 +93,11 @@ fun StartSheet(
                         verticalArrangement = Arrangement.spacedBy(6.dp),
                         maxItemsInEachRow = 5
                     ) {
-                        for (size in 2..10) {
+                        for (size in 1..10) {
                             SizeCard(
                                 number = "$size",
                                 note = when (size) {
+                                    1 -> "1 枚ずつ"
                                     2 -> "大きく"
                                     4 -> "おすすめ"
                                     10 -> "小さく"
@@ -109,7 +111,10 @@ fun StartSheet(
                     // 枚数を選ぶときに一番知りたいこと。
                     val rounds = if (groupSize > 0) (photoCount + groupSize - 1) / groupSize else 0
                     Text(
-                        "$groupSize 枚なら約 $rounds 回で ROUND 1 が終わります。" +
+                        (if (groupSize == Prefs.SLIDESHOW_SIZE)
+                            "スライドショー: 1 枚ずつ出して、残す（右）か落とす（左）かを決めます。" +
+                                "約 $rounds 回で ROUND 1 が終わります。"
+                        else "$groupSize 枚なら約 $rounds 回で ROUND 1 が終わります。") +
                             "選別中に … から変えられます",
                         fontSize = 11.sp, color = Faint,
                         modifier = Modifier.padding(top = 10.dp)

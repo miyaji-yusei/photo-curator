@@ -221,6 +221,10 @@ fun CullScreen(
         return
     }
 
+    // **スライドショーは「1 グループ 1 枚」。** 同じセッション・同じ core の
+    // 処理で、違いは 1 組が 1 枚かどうかだけ（トーナメントは 2 枚以上）。
+    val slideshow = live.groupSize.toInt() == Prefs.SLIDESHOW_SIZE
+
     /** 確定して次へ。**確定のたびに保存する。どこで止めても失わない。** */
     fun commit(picked: Set<String>) {
         // 手を動かした分だけ時間を足す（間が開いた分は数えない）。
@@ -361,6 +365,8 @@ fun CullScreen(
                 Prefs.setGroupSize(context, size)
                 val next = resize(live, size.toUInt())
                 session = next
+                // スライドショーに複数選択は無い。
+                if (size == Prefs.SLIDESHOW_SIZE) multi = false
                 // 画面から外れた写真の印は落とす。**残っていると数が合わない。**
                 selected = selected.filter { it in next.current }.toSet()
                 scope.launch { Store.save(context, project.id, next) }
@@ -471,7 +477,8 @@ fun CullScreen(
             canJoin = canJoin,
             onJoin = { joinSelected() },
             onOptions = { options = true },
-            onCommit = { commit(selected) }
+            onCommit = { commit(selected) },
+            slideshow = slideshow
         )
 
         // 進捗は 2px の線 1 本。数字はバーの中央 1 か所だけ。
@@ -505,6 +512,32 @@ fun CullScreen(
                 onResults = onResults,
                 onBack = onBack
             )
+            return@Column
+        }
+
+        if (slideshow) {
+            val path = live.current.firstOrNull()
+            if (path != null) {
+                val photo = byPath[path]
+                SlideshowStage(
+                    path = path,
+                    photo = photo,
+                    stands = live.members[path]?.size ?: 1,
+                    displayEdge = displayEdge,
+                    // 落とす＝1 枚も通さず確定、残す＝通して確定、上＝★5 で確定。
+                    // どれも core（advance・keepAndTop）が判断する。
+                    onDecide = { decision ->
+                        when (decision) {
+                            SlideDecision.Keep -> commit(setOf(path))
+                            SlideDecision.Drop -> commit(emptySet())
+                            SlideDecision.Top -> keepTop(path)
+                        }
+                    },
+                    onZoom = { if (photo != null) zooming = listOf(photo) to 0 },
+                    onOpenBurst = { editingBurst = path },
+                    modifier = Modifier.weight(1f).fillMaxWidth()
+                )
+            }
             return@Column
         }
 
@@ -587,7 +620,9 @@ private fun CullBar(
     canJoin: Boolean,
     onJoin: () -> Unit,
     onOptions: () -> Unit,
-    onCommit: () -> Unit
+    onCommit: () -> Unit,
+    /** スライドショー。**複数選択・まとめる・確定のボタンは出さない。** */
+    slideshow: Boolean = false
 ) {
     Row(
         Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 4.dp),
@@ -601,7 +636,7 @@ private fun CullBar(
                 Icon(Icons.Filled.Undo, "1 つ戻す")
             }
             // 設計どおりアイコンだけ。**帯の幅は写真に回す。**
-            FilterChip(
+            if (!slideshow) FilterChip(
                 selected = multi, onClick = onToggleMulti,
                 label = {
                     Icon(
@@ -610,11 +645,11 @@ private fun CullBar(
                     )
                 }
             )
-            if (multi && selectedCount > 0) {
+            if (!slideshow && multi && selectedCount > 0) {
                 TextButton(onClick = onClear) { Text("解除", fontSize = 12.sp) }
             }
             // 隣り合う代表を選んでいるときだけ。**繋げないときは出さない。**
-            if (canJoin) {
+            if (!slideshow && canJoin) {
                 TextButton(onClick = onJoin) {
                     Text("ひとまとまりにする", fontSize = 12.sp, color = Lime)
                 }
@@ -647,8 +682,8 @@ private fun CullBar(
             IconButton(onClick = onOptions) {
                 Icon(Icons.Filled.MoreHoriz, "設定")
             }
-            Spacer(Modifier.width(4.dp))
-            Button(
+            if (!slideshow) Spacer(Modifier.width(4.dp))
+            if (!slideshow) Button(
                 onClick = onCommit,
                 shape = androidx.compose.foundation.shape.RoundedCornerShape(50)
             ) {
@@ -747,36 +782,52 @@ internal fun Tile(
         // どこにも出ていないと、消えたのではないかと思われる。
         // 残せば仲間にも同じ星が付くので、そのことも読み取れる必要がある。
         if (stands > 1) {
-            Box(
-                Modifier
-                    .align(Alignment.TopStart)
-                    .padding(start = 40.dp, top = 6.dp)
-                    .clip(androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
-                    .background(Color(0xB3101114))
-                    // **バッジは押せる。** ここを押すと中身が開く。
-                    // タイル本体の「押したら確定」を邪魔しないよう、
-                    // この当たり判定が先に受け取る。指で押せる高さにする
-                    // （小さすぎて押しにくかった）。
-                    .clickable(onClick = onOpenBurst)
-                    .padding(horizontal = 12.dp, vertical = 10.dp)
-            ) {
-                Text("連写 $stands 枚", fontSize = 11.sp, color = Lime)
-            }
+            BurstBadge(
+                stands, onOpenBurst,
+                Modifier.align(Alignment.TopStart).padding(start = 40.dp, top = 6.dp)
+            )
         }
 
         // ---- 右上: 拡大 と ★5。**押したらすぐ効く。** ----
         // 長押しでも同じことができるが、長押しは 300ms 待つ。何百回も
         // 触る画面なので、待たずに押せる場所を置く。
         if ((wide || alwaysZoom) && photo != null) {
-            Column(
-                Modifier.align(Alignment.TopEnd).padding(6.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                RoundButton(Icons.Filled.ZoomIn, "大きく見る", onZoom)
-                if (onTop != null) {
-                    RoundButton(Icons.Filled.Star, "★5 で確定", onTop, tint = Lime)
-                }
-            }
+            TileTools(onZoom, onTop, Modifier.align(Alignment.TopEnd))
+        }
+    }
+}
+
+/**
+ * 「連写 n 枚」の印。**トーナメントとスライドショーで同じ部品。**
+ * 押すと中身（まとまりの手直し）が開く。
+ */
+@Composable
+internal fun BurstBadge(stands: Int, onClick: () -> Unit, modifier: Modifier = Modifier) {
+    Box(
+        modifier
+            .clip(androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
+            .background(Color(0xB3101114))
+            // **バッジは押せる。** ここを押すと中身が開く。
+            // タイル本体の「押したら確定」を邪魔しないよう、
+            // この当たり判定が先に受け取る。指で押せる高さにする
+            // （小さすぎて押しにくかった）。
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 10.dp)
+    ) {
+        Text("連写 $stands 枚", fontSize = 11.sp, color = Lime)
+    }
+}
+
+/** 写真の右上の「拡大」「★5 で確定」。**トーナメントとスライドショーで同じ部品。** */
+@Composable
+internal fun TileTools(onZoom: () -> Unit, onTop: (() -> Unit)?, modifier: Modifier = Modifier) {
+    Column(
+        modifier.padding(6.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        RoundButton(Icons.Filled.ZoomIn, "大きく見る", onZoom)
+        if (onTop != null) {
+            RoundButton(Icons.Filled.Star, "★5 で確定", onTop, tint = Lime)
         }
     }
 }
@@ -886,7 +937,10 @@ private fun RoundDone(
                 val turns = (nextGroups + upcoming.groupSize.toInt() - 1) /
                     maxOf(1, upcoming.groupSize.toInt())
                 Text(
-                    "次は ★${session.targetStar + 1} の $keptPhotos 枚を " +
+                    // 方式は次のラウンドでも保たれる（スライドショーなら 1 枚ずつ）。
+                    if (upcoming.groupSize.toInt() == Prefs.SLIDESHOW_SIZE)
+                        "次は ★${session.targetStar + 1} の $keptPhotos 枚を 1 枚ずつ見ます（約 $turns 回）。"
+                    else "次は ★${session.targetStar + 1} の $keptPhotos 枚を " +
                         "${upcoming.groupSize} 枚ずつ見比べます（約 $turns 回）。",
                     fontSize = 13.sp, color = Faint
                 )
