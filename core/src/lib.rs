@@ -292,6 +292,11 @@ pub struct Decision {
     /// 戻すときは上げ下げではなく元の星に返す必要がある。
     #[serde(default)]
     pub topped: Option<Topped>,
+    /// 確定の前の星の控え（写真 → 確定の前の星）。確定で星を動かした写真
+    /// （代表と仲間）の分。戻すときは差分ではなく、この値を書き戻す。
+    /// 空なら古い形の履歴として、差分で戻す。
+    #[serde(default)]
+    pub before: HashMap<String, i32>,
 }
 
 /// ★5 で確定した 1 枚の控え。
@@ -408,6 +413,15 @@ pub fn advance(session: Session, selected: Vec<String>) -> Session {
         .filter(|id| group.contains(id))
         .collect();
 
+    // 確定の前の星を控える（代表と仲間）。
+    let mut before: HashMap<String, i32> = HashMap::new();
+    for id in &chosen {
+        for member in family(&next, id) {
+            let star = next.ratings.get(&member).copied().unwrap_or(0);
+            before.entry(member).or_insert(star);
+        }
+    }
+
     for id in &chosen {
         next.survivors.push(id.clone());
         // 仲間には星だけ配り、survivors には入れない。
@@ -415,7 +429,7 @@ pub fn advance(session: Session, selected: Vec<String>) -> Session {
         shift_star(&mut next, id, 1);
     }
 
-    next.history.push(Decision { group, chosen, topped: None });
+    next.history.push(Decision { group, chosen, topped: None, before });
     fill(&mut next);
     next
 }
@@ -440,12 +454,21 @@ pub fn undo(session: Session) -> Session {
         if let Some(position) = next.survivors.iter().rposition(|s| s == id) {
             next.survivors.remove(position);
         }
-        shift_star(&mut next, id, -1);
+        // 控えが無い古い形の履歴だけ、差分で戻す。
+        if last.before.is_empty() {
+            shift_star(&mut next, id, -1);
+        }
+    }
+
+    // 控えがあれば、確定の前の星をそのまま書き戻す（手直しの星も保たれる）。
+    for (id, star) in &last.before {
+        next.ratings.insert(id.clone(), *star);
     }
 
     // ★5 で確定した分は 1 つ下げるのではなく、**押す前の星に返す**。
     // 5 から 1 つ下げると 4 が残り、押していないはずの星が残る。
-    if let Some(top) = &last.topped {
+    // （控えがある履歴は上で戻し済み。これは古い形の履歴用。）
+    if let (true, Some(top)) = (last.before.is_empty(), &last.topped) {
         for id in family(&next, &top.path) {
             next.ratings.insert(id, top.previous);
         }
@@ -999,6 +1022,44 @@ mod tests {
         assert!(!after.survivors.contains(&"1".to_string()));
         // グループは進んでいる。
         assert_eq!(after.current, vec!["3", "4"]);
+    }
+
+    #[test]
+    fn 手直しした仲間の星5は確定して戻しても保たれる() {
+        let mut session = round(&["1", "2", "3", "4"], 2);
+        session.members.insert("1".into(), vec!["1".into(), "1b".into()]);
+        session.ratings.insert("1b".into(), 5);
+        let after = advance(session, vec!["1".into()]);
+        assert_eq!(after.ratings.get("1b"), Some(&5));
+        let back = undo(after);
+        assert_eq!(back.ratings.get("1b"), Some(&5));
+        assert_eq!(back.ratings.get("1").copied().unwrap_or(0), 0);
+        assert_eq!(back.current, vec!["1", "2"]);
+    }
+
+    #[test]
+    fn 星5で確定した手直しの仲間も戻すと元の星に返る() {
+        let mut session = round(&["1", "2", "3", "4"], 2);
+        session.members.insert("1".into(), vec!["1".into(), "1b".into()]);
+        session.ratings.insert("1b".into(), 3);
+        let back = undo(keep_top(session, "1".into()));
+        assert_eq!(back.ratings.get("1b"), Some(&3));
+        assert_eq!(back.ratings.get("1").copied().unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn 控えの無い古い形の履歴は差分で戻る() {
+        let mut session = round(&["1", "2", "3", "4"], 2);
+        session.members.insert("1".into(), vec!["1".into(), "1b".into()]);
+        let mut after = advance(session, vec!["1".into()]);
+        // 古い Session の JSON には before が無い。
+        let mut value = serde_json::to_value(&after).unwrap();
+        value["history"][0].as_object_mut().unwrap().remove("before");
+        after = serde_json::from_value(value).unwrap();
+        assert!(after.history[0].before.is_empty());
+        let back = undo(after);
+        assert_eq!(back.ratings.get("1").copied().unwrap_or(0), 0);
+        assert_eq!(back.ratings.get("1b").copied().unwrap_or(0), 0);
     }
 
     #[test]
