@@ -13,6 +13,8 @@ import { analyzePhotoFile } from '~/utils/analyzePhoto'
 export interface AnalyzeWorkerRequest {
   id: string
   file: File
+  /** 表示用画像の長辺。無ければ既定。 */
+  displayEdge?: number
 }
 
 export interface AnalyzeWorkerResponse extends AnalyzedPhoto {
@@ -20,8 +22,8 @@ export interface AnalyzeWorkerResponse extends AnalyzedPhoto {
 }
 
 self.onmessage = async (event: MessageEvent<AnalyzeWorkerRequest>) => {
-  const { id, file } = event.data
-  const analyzed = await analyzePhotoFile(file)
+  const { id, file, displayEdge } = event.data
+  const analyzed = await analyzePhotoFile(file, displayEdge)
   const response: AnalyzeWorkerResponse = { id, ...analyzed }
   // Blob は構造化複製で渡る（転送不可なのでそのまま postMessage する）。
   self.postMessage(response)

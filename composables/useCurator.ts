@@ -43,6 +43,7 @@ type View = 'home' | 'project' | 'method' | 'settings' | 'burst-threshold' | 'bu
 
 function createCurator() {
   const desktop = useDesktop()
+  const { notify } = useNotice()
   // サイドカー（写真のフォルダの `.photo-curator/catalog.json`）。4 通りの判断は core が行う。
   const sidecar = useSidecarSync(desktop)
   const {
@@ -218,7 +219,6 @@ function createCurator() {
   /** ダイアログ内に出すエラー。画面上部に出すとモーダルに隠れて気づけない。 */
   const moveError = ref('')
   /** 移動が終わったことを画面上部で知らせる。 */
-  const moveReport = ref('')
   /**
    * 既定は「全選択」。個別のチェックは**ここからの差分**だけを持つ。
    * 5,000 枚の id を並べて持たないための形。詳細は `utils/ratingMove.ts`。
@@ -850,7 +850,39 @@ function createCurator() {
     amazonPreview.value = null
     amazonError.value = ''
   })
-  watch(createDialog, open => { if (!open) resetAmazonDraft() })
+  watch(createDialog, open => {
+    if (!open) resetAmazonDraft()
+    else void loadCreateDisplay()
+  })
+
+  // 作成ダイアログの「表示用画像の大きさ」。既定はアプリの設定の値。
+  const createDisplayChoices = ref<number[]>([])
+  const createDisplayEdge = ref(0)
+  async function loadCreateDisplay() {
+    try {
+      const settings = await desktop.getDisplaySettings()
+      createDisplayChoices.value = settings.choices
+      createDisplayEdge.value = settings.edge
+    } catch {
+      // 読めなければ選択欄を出さず、あとから設定で変えられる。
+      createDisplayChoices.value = []
+    }
+  }
+
+  /**
+   * 作成した直後、**準備（表示用画像づくり）を始める前**に、選んだ長辺をこのプロジェクトに書く
+   * （あとで作り直さないため）。選んだ値はアプリの既定にもする。
+   */
+  async function applyCreateDisplayEdge(projectId: string) {
+    const edge = createDisplayEdge.value
+    if (!edge || !createDisplayChoices.value.length) return
+    try {
+      await desktop.saveDisplayEdge(edge)
+      await desktop.saveProjectDisplayEdge(projectId, edge)
+    } catch {
+      // 保存できなくても作成は続ける（既定の大きさで作られる）。
+    }
+  }
 
   /** Amazon のプロジェクトを作る。作ると走査が始まる（`openProject` が読み込みを始める）。 */
   async function createAmazonProject() {
@@ -859,6 +891,7 @@ function createCurator() {
     loading.value = true
     try {
       const project = await desktop.createAmazonProject(projectName.value.trim() || preview.name, amazonUrl.value.trim())
+      await applyCreateDisplayEdge(project.id)
       createDialog.value = false
       projectName.value = ''
       await refreshProjects()
@@ -885,6 +918,7 @@ function createCurator() {
       const project = await desktop.createProject(
         projectName.value.trim() || fallbackName, devPath ? `dev:${devPath}` : folderPath.value
       )
+      await applyCreateDisplayEdge(project.id)
       createDialog.value = false
       projectName.value = ''
       folderPath.value = ''
@@ -1744,7 +1778,15 @@ function createCurator() {
         activeProject.value.id, exportDestination.value,
         photos.map(photo => photo.id), exportMode.value === 'move'
       )
-      if (exportMode.value === 'move') await refreshProjects()
+      if (exportMode.value === 'move') {
+        // 移動した写真は、原本がそのフォルダに無いのでプロジェクトから外れる。数・一覧・対応表を読み直す。
+        coreInputs.value = null
+        await refreshProjects()
+        await loadSummary()
+        if (view.value === 'results') await loadResultsPage(true)
+        const moved = exportResult.value?.processed ?? 0
+        if (moved > 0) notify(`${moved.toLocaleString()} 枚を移動しました（このプロジェクトからは外れます）`)
+      }
     } catch (cause) {
       // ダイアログの外に出すと、モーダルに隠れて気づけない。中に出す。
       exportError.value = cause instanceof Error ? cause.message : '書き出しに失敗しました。'
@@ -1787,11 +1829,9 @@ function createCurator() {
   }
 
   /** 結果の画面の「CSV を書き出す」。いまの絞り込み（すべてなら全部の星）が対象。 */
-  const resultsMessage = ref('')
   async function exportResultsCsv() {
-    resultsMessage.value = ''
     try {
-      resultsMessage.value = await saveResultsCsv(resultsRating.value === null ? [5, 4, 3, 2, 1, 0] : [resultsRating.value])
+      notify(await saveResultsCsv(resultsRating.value === null ? [5, 4, 3, 2, 1, 0] : [resultsRating.value]))
     } catch (cause) {
       error.value = cause instanceof Error ? cause.message : 'CSV を書き出せませんでした。'
     }
@@ -1803,7 +1843,6 @@ function createCurator() {
     view.value = 'results'
     resultsOffset.value = 0
     resultsPhotos.value = []
-    resultsMessage.value = ''
     await loadSummary()
     // 星の指定が無ければ、その結果で実際に付いている一番高い星に絞る（全部 ★0 なら「すべて」）。
     // プロジェクトの画面の星の行から来たときは、その星のまま。
@@ -2113,7 +2152,7 @@ function createCurator() {
       await loadSummary()
       if (view.value === 'results') await loadResultsPage(true)
       error.value = ''
-      moveReport.value = `${moved.toLocaleString()} 枚を ★${moveFrom.value} から ★${moveTo.value} へ移しました。`
+      notify(`${moved.toLocaleString()} 枚を ★${moveFrom.value} から ★${moveTo.value} へ移しました。`)
     } catch (cause) {
       moveError.value = cause instanceof Error ? cause.message : 'レートを移動できませんでした。'
     } finally {
@@ -2541,6 +2580,8 @@ function createCurator() {
     loading,
     error,
     createDialog,
+    createDisplayChoices,
+    createDisplayEdge,
     createTab,
     amazonUrl,
     amazonPreview,
@@ -2609,7 +2650,6 @@ function createCurator() {
     moveTotal,
     moveOffset,
     moveError,
-    moveReport,
     moveSelection,
     moveSelectedCount,
     isMoveSelected,
@@ -2764,7 +2804,6 @@ function createCurator() {
     exportZipByRating,
     exportCsvByRating,
     exportResultsCsv,
-    resultsMessage,
     resultsTiles,
     loadMoreResults,
     returnToResults,

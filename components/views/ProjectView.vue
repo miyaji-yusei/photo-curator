@@ -27,6 +27,7 @@ const {
   previewDensity,
   previewPhotos,
   regenerateDisplayImages,
+  restartDialog,
   resumeSession,
   saveSidecarNow,
   scanRunning,
@@ -45,7 +46,7 @@ const activeProject = nullableActiveProject as Ref<Project>
 </script>
 
 <template>
-    <div class="d-flex align-center justify-space-between flex-wrap ga-4 mb-7"><div><v-btn variant="text" prepend-icon="mdi-arrow-left" class="px-0" @click="view = 'home'">ホーム</v-btn><h1 class="text-h4 font-weight-bold">{{ activeProject.name }}</h1><p class="text-body-2 text-medium-emphasis mt-1"><v-icon v-if="activeProject.sourceKind === 'amazon'" icon="mdi-cloud-outline" size="small" class="mr-1" aria-label="Amazon Photos" />{{ activeProject.folderPath }}</p></div><div class="d-flex flex-wrap ga-2"><v-btn variant="text" prepend-icon="mdi-delete-outline" @click="askDeleteProject(activeProject)">削除</v-btn><v-btn v-if="hasSelectionData" variant="text" prepend-icon="mdi-star-outline" @click="openResults">選別結果を見る</v-btn><v-btn v-if="importsByPicker" variant="outlined" prepend-icon="mdi-image-plus" :loading="scanRunning" @click="openPhotoPicker">写真を追加</v-btn><v-btn v-else-if="activeProject.folderAccess === 'needs-permission'" variant="outlined" color="warning" prepend-icon="mdi-folder-key-outline" :loading="scanRunning" @click="startScan">フォルダへのアクセスを許可</v-btn><v-btn v-else variant="outlined" prepend-icon="mdi-refresh" :loading="scanRunning" @click="startScan">{{ activeProject.sourceKind === 'amazon' && activeProject.status === 'missing' ? '再試行' : '写真を再読み込み' }}</v-btn><v-btn color="primary" prepend-icon="mdi-play" :disabled="!activeProject.photoCount || !!sidecarClash" @click="session ? resumeSession() : enterMethod()">{{ session ? '選別を再開' : '選別を開始' }}</v-btn></div></div>
+    <div class="d-flex align-center justify-space-between flex-wrap ga-4 mb-7"><div><v-btn variant="text" prepend-icon="mdi-arrow-left" class="px-0" @click="view = 'home'">ホーム</v-btn><h1 class="text-h4 font-weight-bold">{{ activeProject.name }}</h1><p class="text-body-2 text-medium-emphasis mt-1"><v-icon v-if="activeProject.sourceKind === 'amazon'" icon="mdi-cloud-outline" size="small" class="mr-1" aria-label="Amazon Photos" />{{ activeProject.folderPath }}</p></div><div class="d-flex flex-wrap ga-2"><v-btn variant="text" prepend-icon="mdi-delete-outline" @click="askDeleteProject(activeProject)">削除</v-btn><v-menu><template #activator="{ props: menuProps }"><v-btn v-bind="menuProps" variant="text" icon="mdi-dots-vertical" aria-label="その他の操作" /></template><v-list density="compact"><v-list-item prepend-icon="mdi-restart" title="選別を最初からやり直す" base-color="error" @click="restartDialog = true" /></v-list></v-menu><v-btn v-if="hasSelectionData" variant="text" prepend-icon="mdi-star-outline" @click="openResults">選別結果を見る</v-btn><v-btn v-if="importsByPicker" variant="outlined" prepend-icon="mdi-image-plus" :loading="scanRunning" @click="openPhotoPicker">写真を追加</v-btn><v-btn v-else-if="activeProject.folderAccess === 'needs-permission'" variant="outlined" color="warning" prepend-icon="mdi-folder-key-outline" :loading="scanRunning" @click="startScan">フォルダへのアクセスを許可</v-btn><v-btn v-else variant="outlined" prepend-icon="mdi-refresh" :loading="scanRunning" @click="startScan">{{ activeProject.sourceKind === 'amazon' && activeProject.status === 'missing' ? '再試行' : '写真を再読み込み' }}</v-btn><v-btn color="primary" prepend-icon="mdi-play" :disabled="!activeProject.photoCount || !!sidecarClash" @click="session ? resumeSession() : enterMethod()">{{ session ? '選別を再開' : '選別を開始' }}</v-btn></div></div>
     <v-card class="mb-6"><v-card-text class="d-flex align-center ga-5"><v-avatar color="primary" size="50"><v-icon color="black" icon="mdi-image-multiple" /></v-avatar><div><div class="text-h6">{{ activeProject.photoCount.toLocaleString() }} 枚の写真</div><div class="text-body-2 text-medium-emphasis">{{ activeProject.sourceKind === 'amazon' ? 'Amazon Photos の共有リンクから読んでいます。写真は変更しません。原本は拡大したときだけ取ってきます。' : importsByPicker ? '星とサムネイルはこの端末に保存されます。写真ライブラリは変更しません。' : 'サブフォルダも含めて参照します。写真ファイルは変更しません。' }}</div></div></v-card-text></v-card>
     <!-- 準備の進み。総数が分からない間（走査中）は `n / ?`。 -->
     <v-card class="mb-6">
@@ -100,7 +101,7 @@ const activeProject = nullableActiveProject as Ref<Project>
         <div class="d-flex align-center flex-wrap ga-4">
           <v-switch
             v-model="largeDisplay" color="primary" hide-details density="comfortable"
-            :disabled="displayBusy || displaySettings.choices.length < 2"
+            :disabled="displayBusy || displaySettings.choices.length < 2 || displaySettings.canRebuild === false"
             label="大きな画像で選別する"
           />
           <span class="text-caption text-medium-emphasis">
@@ -110,7 +111,7 @@ const activeProject = nullableActiveProject as Ref<Project>
           <v-spacer />
           <v-btn
             size="small" variant="text" prepend-icon="mdi-refresh"
-            :loading="displayBusy" :disabled="displaySettings.choices.length < 2"
+            :loading="displayBusy" :disabled="displaySettings.choices.length < 2 || displaySettings.canRebuild === false"
             @click="regenerateDisplayImages"
           >作り直す</v-btn>
         </div>

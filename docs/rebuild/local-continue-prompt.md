@@ -7,14 +7,15 @@ Photo Curator の再構成の続きをやってほしい。
 
 ## 最初に
 1. メモリ MEMORY.md を読む。`pwd`・`git worktree list`・`git branch --show-current` で場所を確かめる。既存のワークツリー・ブランチは触らない
-2. `git fetch origin`。`origin/feat/main-base` の `docs/rebuild/` を読む（README.md → next-tasks.md → 10-再構成プラン.md の §0・§6・§7）
+2. `git fetch origin`。`origin/feat/mb-next` の `docs/rebuild/` を読む（README.md → next-tasks.md（とくに「ブランチの運用」と表の「状態」）→ 10-再構成プラン.md の §0・§6・§7）
 3. まだなら、`docs/rebuild/obsidian-transfer-prompt.md` の手順で Obsidian へ転記する（07章の追記・10章の新規・各章の直し。`next-tasks.md` も 10章の末尾に「次の作業」として写す）
 
 ## 作業
-- `docs/rebuild/next-tasks.md` の U1〜U14 を、上から順（おすすめの順）に進める
-- 1 件 = 1 ブランチ（`origin/feat/main-base` から `fix/mb-uNN-<名前>`）= 1 PR（`feat/main-base` 向け）
-- ワークツリーは `..\photo-curator-mb-work` に作る（`git worktree add ..\photo-curator-mb-work -b fix/mb-u01-… origin/feat/main-base`）
+- `docs/rebuild/next-tasks.md` の表で「状態」が「未」の U を、上から順（おすすめの順）に進める
+- 1 件 = 1 ブランチ（`origin/feat/mb-next` の先端から `fix/mb-uNN-<名前>`）= 1 PR（`feat/mb-next` 向け）
+- ワークツリーは `..\photo-curator-mb-work` に作る（無ければ `git worktree add ..\photo-curator-mb-work origin/feat/mb-next --detach`。そこで `git switch -c fix/mb-uNN-… origin/feat/mb-next`）
 - 実装は Agent ツール（model: "sonnet"）に 1 件ずつ任せ、返ってきたら自分で差分とテストを確かめてから push・PR を出す
+- 確かめたら `feat/mb-next` に `git merge --no-ff` で取り込んで push し、next-tasks.md の「状態」を「済（#PR）」にし、まとめの PR（`feat/mb-next` → `feat/main-base`）の概要の一覧を更新する（**`feat/main-base`・main へは取り込まない。マージはユーザー**）
 - サブエージェントへのプロンプトには次を必ず入れる:
   - 作業場所
   - `next-tasks.md` の担当の節
@@ -31,5 +32,5 @@ Photo Curator の再構成の続きをやってほしい。
   - ブラウザペインは前面でないと IntersectionObserver が動かない
   - IndexedDB の版は下げられない
   - ポート 3000 の `pnpm tauri:dev` を止めない
-- push・PR まではしてよい。merge・force・rebase・ブランチ削除はしない
+- push・PR と、`feat/mb-next` への取り込みまではしてよい。それ以外の merge・force・rebase・ブランチ削除はしない
 ```

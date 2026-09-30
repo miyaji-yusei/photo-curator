@@ -28,6 +28,9 @@ body { margin: 0; }
 /* 列数は枚数に応じて JS が --tournament-columns で渡す。auto-fit に任せると
    2枚のときに1枚が極端に大きくなったり、10枚で列が増えすぎたりして安定しない。
    幅は余さず使い、高さは「1画面に1グループが収まる」ことを優先して決める。 */
+.tournament-bar { min-height: 56px; flex-wrap: wrap; margin-bottom: 4px; }
+.tournament-bar__side { flex: 0 1 auto; }
+.tournament-bar__center { flex: 1 1 200px; min-width: 0; }
 .tournament-grid {
   display: grid;
   grid-template-columns: repeat(var(--tournament-columns, 5), 1fr);
@@ -43,7 +46,7 @@ body { margin: 0; }
   width: 100%;
   /* 列が広いとカードだけ極端な横長になり、contain の写真の左右が大きく余る。
      写真の縦横比（3:2 前後）に合わせて幅の上限を高さから決める。 */
-  max-width: calc(1.6 * (100vh - 300px) / var(--tournament-rows, 2));
+  max-width: calc(1.6 * (100vh - 175px) / var(--tournament-rows, 2));
 }
 /* v-card はホバーで白い膜（.v-card__overlay）を写真の上に掛ける。写真の見えを
    変える経路はすべて塞ぐので、.choice-card と同じように無効化する。 */
@@ -105,7 +108,7 @@ body { margin: 0; }
    高さは行数で割って、グループ全体がスクロールなしで収まるようにする。 */
 .tournament-card img {
   width: 100%;
-  height: calc((100vh - 300px) / var(--tournament-rows, 2));
+  height: calc((100vh - 175px) / var(--tournament-rows, 2));
   min-height: 140px;
   object-fit: contain;
   display: block;
@@ -222,7 +225,7 @@ body { margin: 0; }
   /* 列数と高さは実測から決まるので、ここでは触らない。 */
   /* 列を最大3つに抑える。狭い幅で5列にすると1枚が小さくなりすぎる。 */
   .tournament-grid { grid-template-columns: repeat(min(var(--tournament-columns, 3), 3), 1fr); gap: 10px; }
-  .tournament-card img { height: calc((100vh - 340px) / var(--tournament-rows, 2)); min-height: 120px; }
+  .tournament-card img { height: calc((100vh - 215px) / var(--tournament-rows, 2)); min-height: 120px; }
   .photo-grid:not(.is-fixed) { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 12px; }
 }
 
@@ -244,3 +247,9 @@ body { margin: 0; }
 @media (max-height: 620px) {
   .compare-pair img { max-height: 46vh; min-height: 180px; }
 }
+
+/* エラー通知は本文を下げず、上に重ねる（消えない）。 */
+.error-overlay { position: fixed; top: 72px; left: 50%; transform: translateX(-50%); z-index: 2000; width: min(720px, calc(100vw - 32px)); }
+
+.zoom-overlay__photo { position: relative; display: flex; justify-content: center; min-width: 0; }
+.zoom-overlay__spinner { position: absolute; top: 50%; left: 50%; margin: -24px 0 0 -24px; filter: drop-shadow(0 0 4px rgba(0,0,0,.6)); pointer-events: none; }
