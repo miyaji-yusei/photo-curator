@@ -37,6 +37,9 @@
 | U12 | まとまり編集を、Android と同じ横並び＋境目のバーで切る／ずらす UI にする | M | `components/dialogs/BurstDialog.vue`・`utils/burstEdit.ts` | 未 |
 | U13 | 表示用画像の大きさを、PC・Web でもプロジェクトの作成時から決められるようにする | S〜M | 作成ダイアログ・アプリの設定・`save_display_edge` | 済（#30。Web の Amazon の表示用は 1024 固定のまま） |
 | U14 | PC の Amazon の読み込みが遅い（Web は速い）→ 速くできるか調べて比べる | 調査 → M | `src-tauri/src/amazon.rs`・`lib.rs` の Amazon の準備 | 未 |
+| U15 | プロジェクト詳細の上のボタンの高さをそろえ、並びを「⋮・選別結果を見る・削除・写真を再読み込み・選別を再開」にする（2026-09-30 #27 の確認で） | S | `components/views/ProjectView.vue` 49 行付近 | 未 |
+| U16 | 拡大のぐるぐるを、右上でなく写真の真ん中に重ねる（Android と同じ）。U10 の見直し | S | `app.vue`（`zoom-overlay__photo`）・`assets/main.css` 254〜255 行 | 未 |
+| U17 | アプリの設定の画面を足し、表示用画像の既定の大きさを変えられるようにする（Android の設定と同じ） | S〜M | 新規 `components/views/AppSettingsView.vue`・`AppNav.vue`・`useCurator.ts`（`view`）・`displayEdge` まわり | 未 |
 
 ---
 
@@ -163,6 +166,34 @@
   - (d) サムネは `viewBox=160` を先に全部、表示用はあとで（今の順を確かめる）
 - 走査と名前（一覧）は (a)(c) で速くなる見込み。撮影時刻は一覧に入っているので、別に取っていたらやめる。サムネと表示用は帯域しだいで、Android も遅い
 - 測った結果と選んだ方法を 10章 §7 に書いてから実装する
+
+## U15 プロジェクト詳細の上のボタンをそろえる（2026-09-30 追加）
+- **症状**: 上の行の「削除」「選別結果を見る」などのボタンと、⋮（三点リーダ）の高さがそろっていない
+- **場所**: `components/views/ProjectView.vue` 49 行付近（`<div class="d-flex flex-wrap ga-2">` の中）
+- **並び（左から）**: ⋮ → 選別結果を見る → 削除 → 写真を再読み込み（出所によって「写真を追加」「フォルダへのアクセスを許可」「再試行」に替わる。**この位置のまま**）→ 選別を再開（主ボタン。始まっていなければ「選別を開始」）
+- **高さ**: アイコンだけのボタン（⋮）と文字つきのボタン（text・outlined・主ボタン）で、Vuetify の既定の高さが違う。同じ `size`・同じ高さにそろえる（outlined と text で枠の分ずれないか、実測で確かめる。`min-height`・`height` を CSS で揃えるか、⋮ も `variant="outlined"` にするなど、いちばん素直なもの）
+- 画面が狭くて折り返したときも、ボタンの高さが保たれること
+- 確認: 1440×900 と 933×704 で、ボタンの `getBoundingClientRect().height` がすべて同じ
+
+## U16 拡大のぐるぐるを、写真の真ん中に重ねる（U10 の見直し）
+- **症状（ユーザー）**: 拡大のぐるぐるが右上に出る。Android と同じく、写真の中央に、写真にかぶさるように出したい
+- **今のコード**: `app.vue` 171 行（`<v-progress-circular class="zoom-overlay__spinner">`）と `assets/main.css` 254〜255 行（`.zoom-overlay__photo { position: relative; … }`、`.zoom-overlay__spinner { position: absolute; top: 50%; left: 50%; margin: -24px 0 0 -24px; … }`）。**コードの上では中央に見える**ので、**まず実際に開いて位置を測る**（`getBoundingClientRect` とスクリーンショット）
+- 右上に出るなら、その原因を直す（Vuetify の `.v-progress-circular { position: relative }` が勝っている、`.zoom-overlay__photo` の幅が写真より広く中央が写真の外にずれる、`img` が `display: grid` の子で高さが違う、など）。写真の見えている範囲の真ん中（画像の `getBoundingClientRect` の中心）に重ねる
+- 中央に出ているなら、ユーザーが見たのが古い版（U10 の前）かを確かめ、測定値とスクリーンショットを報告して終わる（直さない）
+- 原本に替わったら消える／替わる前は表示用画像を出したまま、その上に重ねる（今のとおり）
+- 確認: 幅の違う写真（横長・縦長）で、ぐるぐるの中心と写真の中心の差が 2px 以内
+
+## U17 アプリの設定の画面（表示用画像の既定）
+- **背景**: 作成ダイアログには表示用画像の大きさの選択があり（U13）、選んだ値はアプリの既定にもなる。ただし**アプリの設定の画面が無い**ので、既定だけを後から変える場所が無い。表示用画像は作成時に先に作られるので、選別の直前に変えても作り直しは起きる（これは今のままでよい、ユーザー了承）
+- **Android と同じにする**: `app-android/app/src/main/java/app/photocurator/next/Settings.kt` の「表示用画像の既定」（標準 1024px／大きく 1536px／詳細 768〜1920、それぞれに容量の見込み）。ホームの右上の歯車から開く
+- **Web・PC の実装**:
+  - 新規 `components/views/AppSettingsView.vue`（旧版の見た目。`SettingsView.vue` は「トーナメントの設定」で別物なので名前を混ぜない）
+  - `View` 型に `'app-settings'` を足し（`composables/useCurator.ts` の `type View`）、`app.vue` で出す
+  - 入口: ホームの右上に歯車アイコン（`mdi-cog-outline`）、`AppNav.vue` の下のほうにも「設定」（`mdi-cog-outline`）
+  - 選択肢は `utils/displayEdge.ts` の `createDisplayChoices`（作成ダイアログと同じ）。選ぶと `displayEdge` の既定（PC は `save_display_edge`、Web は `web/store.ts` の設定）を保存する。作成ダイアログの初期値がそれに変わること
+  - **既存のプロジェクトの表示用画像は作り直さない**（ここで変えるのは「これから作るプロジェクトの既定」だけ。説明文にそう書く）
+  - Android の設定にある NAS・選別の既定は、この件では扱わない
+- 確認: 設定で 1536 にする → 作成ダイアログの初期値が 1536 → 再読み込み（Web）・再起動（PC）でも残る
 
 ---
 
