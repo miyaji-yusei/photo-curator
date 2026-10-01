@@ -106,7 +106,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   /** 開いているプロジェクトの、まだ解析が要る枚数（準備の進み）。 */
   const analysisBacklog = ref(0)
   const activeProject = ref<Project | null>(null)
-  const previewPhotos = ref<Photo[]>([])
+  const previewPhotos = shallowRef<Photo[]>([])
   const previewTotal = ref(0)
   const tournamentPhotos = ref<Photo[]>([])
   /**
@@ -248,7 +248,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   const restartForStart = ref(false)
   watch(restartDialog, open => { if (!open) restartForStart.value = false })
   const restartBusy = ref(false)
-  const resultsPhotos = ref<Photo[]>([])
+  const resultsPhotos = shallowRef<Photo[]>([])
   const resultsTotal = ref(0)
   const resultsOffset = ref(0)
   const resultsBusy = ref(false)
@@ -268,7 +268,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   const moveFrom = ref(0)
   const moveTo = ref(0)
   const moveBusy = ref(false)
-  const movePhotos = ref<Photo[]>([])
+  const movePhotos = shallowRef<Photo[]>([])
   const moveTotal = ref(0)
   const moveOffset = ref(0)
   /** ダイアログ内に出すエラー。画面上部に出すとモーダルに隠れて気づけない。 */
