@@ -5,7 +5,7 @@
 import type { Ref } from 'vue'
 import type { SavedSelection } from '~/utils/selectionFlow'
 import {
-  dragFeedback, fitContain, flyTarget, isTap, judgeDrag, slideKeyDecision, tapDecision,
+  dragFeedback, fitContain, flyTarget, isDoubleTap, isTap, judgeDrag, slideKeyDecision, tapDecision, type TapRecord,
   type SlideDecision
 } from '~/utils/slideshowGesture'
 
@@ -124,6 +124,7 @@ async function decide(kind: SlideDecision) {
 }
 
 // ---- ポインタ（クリック・ドラッグ） ----
+let lastCenterTap: TapRecord | null = null
 let drag: { id: number, startX: number, startY: number, moved: boolean } | null = null
 function onPointerDown(event: PointerEvent) {
   if (busy.value || !photo.value || event.button !== 0) return
@@ -151,11 +152,27 @@ function release(event: PointerEvent, cancelled: boolean) {
   if (stage.value?.hasPointerCapture(event.pointerId)) stage.value.releasePointerCapture(event.pointerId)
   if (cancelled) return snapBack(moved)
   if (!moved) {
-    // クリック。上の帯は★5、それ以外は左半分が落とす・右半分が残す（長押しの拡大はしない）。
+    // クリック。上の帯は★5、ほぼ中心は何もしない（二度押しで拡大）、それ以外は左半分が落とす・右半分が残す
+    // （長押しの拡大はしない）。
     const rect = stage.value?.getBoundingClientRect()
-    if (rect) void decide(tapDecision(event.clientX, event.clientY, rect.left, rect.top, rect.width, rect.height))
+    if (!rect) return
+    const result = tapDecision(event.clientX, event.clientY, rect.left, rect.top, rect.width, rect.height)
+    if (result !== 'center') {
+      lastCenterTap = null
+      void decide(result)
+      return
+    }
+    // 1 回目は何もしない（遅らせない）。300ms・24px 以内の 2 回目で拡大を開く。
+    const now = { time: event.timeStamp, x: event.clientX, y: event.clientY }
+    if (isDoubleTap(lastCenterTap, now)) {
+      lastCenterTap = null
+      if (photo.value) openZoom(photo.value, [photo.value])
+    } else {
+      lastCenterTap = now
+    }
     return
   }
+  lastCenterTap = null
   const decision = judgeDrag(dx, dy, frame.value.width)
   if (decision) void decide(decision)
   else snapBack(true)
@@ -232,13 +249,13 @@ async function undo() {
           <v-btn
             icon="mdi-star-outline" size="x-small" variant="flat"
             :disabled="busy"
-            :aria-label="`${photo.name} を★${MAX_RATING} で確定（キー 5・↑、写真の上のほうのクリックでも確定）`"
+            :aria-label="`${photo.name} を★${MAX_RATING} で確定（キー 5・↑、写真の上のほうのクリックでも確定。ほぼ中心のクリックは何もせず、二度押しで拡大）`"
             :title="`★${MAX_RATING} で確定（5・↑）`"
             @click.stop="decide('top')"
           />
           <v-btn
             icon="mdi-magnify-plus-outline" size="x-small" variant="flat"
-            :aria-label="`${photo.name} を拡大`" title="拡大"
+            :aria-label="`${photo.name} を拡大`" title="拡大（写真の中心の二度押しでも開く）"
             @click.stop="openZoom(photo, [photo])"
           />
         </div>
