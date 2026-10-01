@@ -241,7 +241,7 @@
 | --- | --- | --- | --- |
 | U33 | core: 正規化・比較キー・未着手・`sidecar_plan`・混ぜ方（D・E）・鍵の変換・catalog.json v2 の項目。UDL と core-wasm に公開 | `fix/mb-u33-core-sidecar` | 済（push・PR はまだ。10章 §7 の U33） |
 | U34 | PC・Web: `useSidecarSync` を `sidecar_plan` と楽観ロック（lock → 読む → 確かめる → 一時ファイル → rename → 読み戻し）に切り替える。`sidecar_state` に `seen_token`・`seen_key`・`seen_epoch`・`detached`（移行: 古い seen_at/seen_by から `legacy:` の token、localChanged=true なら key を空に）。5 択のダイアログ・B の帯と「NAS に書き込む」・取り込みの「元に戻す」。`lib/core.ts` に新しい関数の型を足す。鍵は書くとき `sidecarKeysToFolder(…, '')`、読んだ直後に `sidecarNormalizeKeys(…, 選んだフォルダ)`、取り込むとき `sidecarKeysFromFolder(…, '', '\\')`（Windows） | 未 | 未 |
-| U35 | Android: `Sidecar.kt` の判断を core の `sidecarPlan` に置き換える（`SyncState` を token・key・epoch・detached に）。鍵は prefix＝共有の根からのフォルダで変換。プロジェクトごとに 1 本の列・一時ファイル → rename・ON_STOP は開いているプロジェクトだけ・最初の確認が終わるまで「選別を開始」を押せない・5 択のダイアログ。**先に `node scripts/build-core.mjs` で `.so` と Kotlin の束ねを作り直す（ユーザー）** | 未 | 未 |
+| U35 | Android: `Sidecar.kt` の判断を core の `sidecarPlan` に置き換える（`SyncState` を token・key・epoch・detached に）。鍵は prefix＝共有の根からのフォルダで変換。プロジェクトごとに 1 本の列・一時ファイル → rename・ON_STOP は開いているプロジェクトだけ・最初の確認が終わるまで「選別を開始」を押せない・5 択のダイアログ。**先に `node scripts/build-core.mjs` で `.so` と Kotlin の束ねを作り直す（ユーザー）** | `fix/mb-u35-android-sidecar` | 済（push・PR はまだ。下の「U35」の節。実機は未確認） |
 
 ### U33 で足した core の公開 API（`core/src/sidecar_sync.rs`。UDL・core-wasm にも同名／camelCase）
 - 正規化・比較: `normalize_key`・`canonical_judgement`・`sidecar_judgement`・`judgement_equivalent`・`judgement_key`
@@ -292,3 +292,41 @@ core の `core/src/sidecar_sync/tests.rs` に、関数名の末尾「_3のn」�
 ### 再ビルド
 - PC・Web: `pnpm core:wasm`（`core-wasm/pkg` は gitignore）
 - **Android: `node scripts/build-core.mjs`（`.so` と uniffi の Kotlin。gitignore）はユーザーの作業**。U33 では `--debug` で通ることまで確かめた（arm64-v8a の `.so`・Kotlin に `sidecarPlan` などが出る）。今の Android の動きは変わらない（新しい関数はまだ呼ばない）
+
+## U35 Android のサイドカー同期を core の `sidecarPlan` に切り替える（2026-10-02）
+設計書の PR-5（PR-1 の応急処置の中身も含む）。**PC・Web の U34 と両方がそろって初めて、PC と Android を同じ NAS のフォルダで同時に使うのが安全になる**（片方だけだと、新しくない側が確かめずに上書きする。設計書 §4.9 の最後の行）。両方を同じ時期に入れること。
+
+### 切り替えた範囲
+- 新しい `SidecarSync.kt`（Android に依存しない）: 判断は core の `sidecarPlan`。NAS は `CatalogIO`、端末の控えは `SeenStore`、端末の選別状況は `LocalState` の interface 越し（JVM テストで偽物を渡す）
+- プロジェクトごとに 1 本の列（区切りの書き込みは積むだけ、確認はその完了を待つ）・楽観ロック（`catalog.lock` → 読んで見た版と同じか → `.catalog.<writeId>.tmp` → rename → 読み戻し。違えば最大 3 回判定し直す）・取り込む前の退避（端末 `filesDir/aside/<プロジェクト>-<時刻>.json` を最後の 3 つ、NAS `catalog.<端末>.json`）
+- `Sidecar.kt` はつなぎだけ。`SyncState` は `-seenToken`・`-seenKey`・`-seenEpoch`・`-detached`・`-epoch`（古い `-seenAt`/`-seenBy`/`-dirty` は最初に読んだときに移して消す）。`touch`（dirty の印）の呼び出しは消した
+- `Smb.write` は一時ファイル → rename。`rename`・`createExclusive`（`FILE_CREATE`）・`delete` を足し、書けるのは `.photo-curator` の下だけにした
+- プロジェクト画面: 確認が終わるまで「選別を開始」を押せない（「NAS を確認中…」。つながらなければ押せる）。始める・続ける前にも同期。メニュー「NAS に保存」も同じ判断。切り離し中は「この端末だけの結果（NAS とは別）」と「NAS に書き込む」
+- 5 択のダイアログ `SidecarDialog.kt`（文言は設計書 §4.6。定数は `SidecarSync` の companion）。ON_STOP は開いているプロジェクトだけ
+- 写真の鍵: 書くとき `sidecarKeysToFolder(…, 共有の根からのフォルダ)`、読んだ直後に `sidecarNormalizeKeys(…, フォルダ)`、取り込むとき `sidecarKeysFromFolder(…, フォルダ, "/")`。取り込む前に `sidecarKeyCoverage` で一致が半分未満なら取り込まない
+- テスト: `app-android/app/src/test/.../SidecarSyncTest.kt`（20 件）。`build.gradle.kts` で PC 向けの core（`core/target/debug` の cdylib）を UniFFI の `libraryOverride` で読ませる（`testDebugUnitTest` の前に `cargo build --lib`）
+
+### 仮置きの判断（ユーザー未確認）
+1. 書けるかどうか（`writable`）は常に true で渡す（書けない共有は、書いたときの失敗として出す）
+2. ロックの古さは中身の `at`（書いた端末の時計）で 60 秒。形は `{"device","name","at"}`（U34 と同じ名前 `catalog.lock`）
+3. 書き込みが「読んでから書くまでに変わった」なら最大 3 回まで判定し直し、それでもだめなら「あとでもう一度」
+4. 取り込みの退避: 端末が未着手なら退避しない。NAS への退避（`aside_mine`）に失敗しても、端末に退避できていれば取り込む。**端末への退避に失敗したら取り込まない**
+5. セッションが無く星だけある版を取り込むときは、その星の「完了した状態」（`session_from_ratings`、ROUND 1）にする（星を落とさない）
+6. 取り込んだあとの控えの比較キーは、取り込んだあとの端末の選別状況から作る（5 のように形が変わっても、次に「変更あり」と読まない）
+7. B（残す）の控えは NAS の版（比較キーも NAS の中身）。端末と違うので「変更あり」のまま、切り離し中は書かず、NAS の同じ版では聞き直さない。NAS の早送りでも黙って取り込まない（確認になる）
+8. 意味が同じ（Settled の Same）になったら切り離しを解く
+9. ダイアログを閉じた（外を押した・戻る）ときは何も変えず、選別を始める前にもう一度聞く（03 の「選ぶまで始めさせない」は、Q8 のとおり B が「先へ進む」役を持つ）
+10. ダイアログを出したあとで NAS が変わっていたら、答えを実行せずに判定し直す（新しい確認になることもある）
+11. D・E の手直し・境目・世代は core の `merge_judgements` のまま（食い違えば端末）。1 組の枚数は端末の設定（`Prefs.groupSize`）。混ぜた結果は端末に入れてから C と同じ書き込みをする（書けなかったら端末は混ぜたまま、次に開いたときにまた判断）
+12. 背面への移動（ON_STOP）・画面を離れる・ラウンドの終わりは「書くだけ」。取り込み・確認になる場合は何もしない（次に開いたとき）
+13. やり直しは新しい `epoch`（`e-` ＋乱数 16 文字）。初めて同期する前のやり直しは世代を見ない（core）
+14. 「元に戻す」（取り込みの直後）は見送り。端末の `aside/` に最後の 3 つが残る（手で戻す手がかり）
+15. 写真の場所の一致率は、端末の一覧（`Listing`）がまだ無ければ確かめない
+16. 書き込みの通知: 書いたら「この端末の結果を NAS に保存しました」（退避したら「（NAS にあった記録は catalog.<端末>.json に残しました）」）、取り込んだら「<端末名> の記録から続きを取り込みました」。意味が同じ・変更なしは何も出さない
+17. 文言で設計書に無いもの: 理由「この端末で最初からやり直しています」（MineRestarted）、「★と選別の進みは同じで、連写のまとまりの手直しか学習した境目が違います」（ExtrasConflict）、要約の「境目を学習済み」。「こちらが進んでいます」は名札の次の行
+
+### 確かめたこと・まだのこと
+- `./gradlew testDebugUnitTest`（92 件。新規 20）・`assembleDebug`・core の `cargo test`（core は変えていない）
+- 再現テストは、今までの規則（見た版と同じか × 変更があるか、列の待ちなし）に差し替えて**赤**（9 件失敗。テスト 2 は Pull＝今回の不具合、2b・2c は確認が出る、テスト 1 は確認が書き込みを追い越して読む）を確かめてから緑にした
+- エミュレーター（dev_pixel8）: ダイアログを一時的な差し込みで出し、縦（412dp。1 列）と横（左右 2 列）で崩れないこと・クラッシュしないことを見た（差し込みはコミットしていない）
+- **未確認**: NAS を使った実機の確かめ（設計書 §5 の末尾「実機での確かめ方」の 1〜9。U34 と合わせて行う）、smbj の `rename`・`FILE_CREATE` が実際の NAS で期待どおり動くか、ほかの ABI
