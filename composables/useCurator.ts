@@ -487,9 +487,13 @@ export function createCurator(desktop: PhotoBackend = useDesktop()) {
 
   const PREVIEW_PAGE = 120
   let previewMoreBusy = false
+  /** 読み直し（先頭から）の世代。新しい読み直しが始まったら、古い読み直し・続きの応答は捨てる（W7）。 */
+  let previewToken = 0
   /** 先頭から読み直す。すでにページ送りで読んだ分は、その数まで読み直す（準備の途中の更新でスクロールが戻らないように）。 */
   async function loadPreview(projectId: string) {
+    const token = ++previewToken
     const page = await desktop.getProjectPhotoPage(projectId, 0, Math.max(PREVIEW_PAGE, previewPhotos.value.length))
+    if (token !== previewToken) return
     if (activeProject.value && activeProject.value.id !== projectId) return
     previewPhotos.value = page.photos
     previewTotal.value = page.total
@@ -500,9 +504,10 @@ export function createCurator(desktop: PhotoBackend = useDesktop()) {
     const project = activeProject.value
     if (!project || previewMoreBusy || previewPhotos.value.length >= previewTotal.value) return
     previewMoreBusy = true
+    const token = previewToken
     try {
       const page = await desktop.getProjectPhotoPage(project.id, previewPhotos.value.length, PREVIEW_PAGE)
-      if (activeProject.value?.id !== project.id) return
+      if (activeProject.value?.id !== project.id || token !== previewToken) return
       previewPhotos.value = [...previewPhotos.value, ...page.photos]
       previewTotal.value = page.total
     } catch {
@@ -1961,8 +1966,11 @@ export function createCurator(desktop: PhotoBackend = useDesktop()) {
     await loadResultsPage(true)
   }
 
+  /** 結果の読み直し（reset）の世代。reset が来たら、それ以前の読み込みの応答は捨てる（W7）。 */
+  let resultsToken = 0
   async function loadResultsPage(reset = false) {
     if (!activeProject.value) return
+    const token = reset ? ++resultsToken : resultsToken
     resultsBusy.value = true
     try {
       if (reset) {
@@ -1972,13 +1980,15 @@ export function createCurator(desktop: PhotoBackend = useDesktop()) {
       const page = await desktop.getProjectPhotoPage(
         activeProject.value.id, resultsOffset.value, 80, resultsRating.value, resultsSort.value
       )
+      if (token !== resultsToken) return
       resultsPhotos.value = [...resultsPhotos.value, ...page.photos]
       resultsTotal.value = page.total
       resultsOffset.value += page.photos.length
     } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : '選別結果を読み込めませんでした。'
+      if (token === resultsToken) error.value = cause instanceof Error ? cause.message : '選別結果を読み込めませんでした。'
     } finally {
-      resultsBusy.value = false
+      // 古い読み込みが、新しい読み込みの「読み込み中」を落とさない。
+      if (token === resultsToken) resultsBusy.value = false
     }
   }
 
@@ -2222,8 +2232,11 @@ export function createCurator(desktop: PhotoBackend = useDesktop()) {
     void loadMovePage(true)
   }
 
+  /** 移動の一覧の読み直し（reset）の世代（W7）。 */
+  let moveToken = 0
   async function loadMovePage(reset = false) {
     if (!activeProject.value) return
+    const token = reset ? ++moveToken : moveToken
     moveBusy.value = true
     try {
       if (reset) {
@@ -2233,13 +2246,14 @@ export function createCurator(desktop: PhotoBackend = useDesktop()) {
       const page = await desktop.getProjectPhotoPage(
         activeProject.value.id, moveOffset.value, 80, moveFrom.value, 'name'
       )
+      if (token !== moveToken) return
       movePhotos.value = [...movePhotos.value, ...page.photos]
       moveTotal.value = page.total
       moveOffset.value += page.photos.length
     } catch (cause) {
-      moveError.value = cause instanceof Error ? cause.message : '写真を読み込めませんでした。'
+      if (token === moveToken) moveError.value = cause instanceof Error ? cause.message : '写真を読み込めませんでした。'
     } finally {
-      moveBusy.value = false
+      if (token === moveToken) moveBusy.value = false
     }
   }
 
