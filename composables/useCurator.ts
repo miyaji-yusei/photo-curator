@@ -3,7 +3,7 @@ import type {
   SelectionResult, SelectionSummary, TournamentSettings
 } from '~/types/photo'
 import { MAX_RATING } from '~/types/photo'
-import type { DisplaySettings } from '~/composables/photoBackend'
+import type { DisplaySettings, PhotoBackend } from '~/composables/photoBackend'
 import { builtDisplayCount, displayEdgePlan } from '~/utils/displayEdge'
 import type { MoveSelection } from '~/utils/ratingMove'
 // `selectedCount` は選別画面側の computed と名前がぶつかるので別名にする。
@@ -42,8 +42,8 @@ import { registerAutoPush, useSidecarSync } from '~/composables/useSidecarSync'
 
 type View = 'home' | 'project' | 'method' | 'settings' | 'app-settings' | 'burst-threshold' | 'burst-preview' | 'tournament' | 'result' | 'results' | 'burst-review'
 
-function createCurator() {
-  const desktop = useDesktop()
+/** テストでは偽の `desktop` を渡す（既定は実行環境に合う実装）。 */
+export function createCurator(desktop: PhotoBackend = useDesktop()) {
   const { notify } = useNotice()
   // サイドカー（写真のフォルダの `.photo-curator/catalog.json`）。4 通りの判断は core が行う。
   const sidecar = useSidecarSync(desktop)
@@ -706,7 +706,11 @@ function createCurator() {
     if (activeProject.value) await sidecar.saveNow(activeProject.value)
   }
 
+  /** 開く処理の世代。新しい呼び出しが来たら古い呼び出しは、以降の結果を捨てて終わる（W6）。 */
+  let openToken = 0
   async function openProject(project: Project) {
+    const token = ++openToken
+    const stale = () => token !== openToken
     activeProject.value = project
     previewPhotos.value = []
     previewTotal.value = 0
@@ -720,6 +724,7 @@ function createCurator() {
     try {
       // 前に開いていたプロジェクトの書き途中を、読む前に書き終える。
       await saveQueue.flush()
+      if (stale()) return
       // 記録の取り込みは、選別の途中を読み込む前に済ませる（取り込んだ分が画面に出るように）。
       // 写真の行がまだ無いときは、走査のあとで確かめる（星を写す行が要る）。
       if (project.photoCount > 0) await runSidecarCheck(project)
@@ -727,14 +732,19 @@ function createCurator() {
         sidecarCheckPending = project.id
         await sidecar.refreshAccess(project.id)
       }
+      if (stale()) return
       await Promise.all([
         loadPreview(project.id),
         desktop.loadSession(project.id).then(value => {
+          // 遅れて届いた前のプロジェクトの封筒で、今のプロジェクトの session を上書きしない。
+          if (stale()) return
           if (value) value.core = markRaw(value.core)
           session.value = value
         })
       ])
+      if (stale()) return
       await healRowRatings(project.id)
+      if (stale()) return
       // 開いた時点から少しずつ解析を進めておく。「選別を開始」で待たされないように。
       // ただし**やることが無いなら起動しない**。以前は無条件に呼んでいたため、
       // 解析済みのプロジェクトを開くたびに進捗イベントだけが飛び、解析中の帯が
@@ -758,19 +768,22 @@ function createCurator() {
         return
       }
       const backlog = await desktop.getAnalysisBacklog(project.id).catch(() => 0)
+      if (stale()) return
       analysisBacklog.value = backlog
       if (backlog > 0) desktop.startBackgroundAnalysis(project.id).catch(() => undefined)
       // 表示用画像は走査とは別に溜める。**走査に混ぜると解析が桁で遅くなる**
       // （EXIF サムネイル経路 1.72ms/枚 に対しフルデコード 132ms/枚）。
       await refreshDisplayState()
+      if (stale()) return
       if (displayBacklog.value > 0) {
         desktop.startDisplayGeneration(project.id).catch(() => undefined)
       }
       await loadSummary()
     } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : 'プロジェクトを開けませんでした。'
+      if (!stale()) error.value = cause instanceof Error ? cause.message : 'プロジェクトを開けませんでした。'
     } finally {
-      loading.value = false
+      // 古い呼び出しが、新しい呼び出しの「読み込み中」を落とさない。
+      if (!stale()) loading.value = false
     }
   }
 
