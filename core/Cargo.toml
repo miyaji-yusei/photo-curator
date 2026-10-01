@@ -33,6 +33,10 @@ uniffi = { version = "0.28", features = ["cli"], optional = true }
 # サイドカー（NAS で共有する catalog.json）もこの形をそのまま使う。
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# サイドカーの選別状況の比較キー（正規形の SHA-256）。画像のハッシュ値（dHash）とは別物。
+sha2 = "0.10"
+# 写真の鍵の Unicode を NFC にそろえる（macOS 由来の NFD の名前でも同じ鍵にする）。
+unicode-normalization = "0.1"
 
 [build-dependencies]
 uniffi = { version = "0.28", features = ["build"] }
