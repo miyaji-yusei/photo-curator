@@ -121,7 +121,7 @@ fun CullScreen(
         // **前に作った分は作り直さない。**
         note = "似た写真を調べています…"
         val prepared0 = try {
-            Prepare.run(context, project) { done, total -> prepared = done to total }
+            Prepare.ready(context, project) { done, total -> prepared = done to total }
         } catch (error: kotlinx.coroutines.CancellationException) {
             throw error
         } catch (error: Exception) {

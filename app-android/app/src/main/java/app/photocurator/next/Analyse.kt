@@ -170,6 +170,14 @@ object Analyse {
      */
     const val VERSION = 3
 
+    /** 控えたハッシュ値が、いまの作り方・いまの原本のものか。 */
+    fun upToDate(known: Fingerprint?, photo: Photo): Boolean =
+        known != null && known.version == VERSION && known.size == photo.size
+
+    /** 全部の写真に、いまのハッシュ値（または「作れなかった」の印）があるか。 */
+    fun allUpToDate(photos: List<Photo>, prints: Map<String, Fingerprint>): Boolean =
+        photos.all { upToDate(prints[it.relativePath], it) }
+
     /**
      * まとめて作る。**すでにある分は作り直さない。**
      *
@@ -194,10 +202,7 @@ object Analyse {
         // 始めていると、まだ見ていない写真の指紋まで消してしまう。
         val out = HashMap(cached)
 
-        fun needsWork(photo: Photo): Boolean {
-            val known = cached[photo.relativePath]
-            return !(known != null && known.version == VERSION && known.size == photo.size)
-        }
+        fun needsWork(photo: Photo): Boolean = !upToDate(cached[photo.relativePath], photo)
 
         var done = 0
         // **新しく作った（変わった）分だけを数える。** 準備済みの写真を通るだけで
@@ -356,6 +361,57 @@ object Prepare {
         )
         if (prints != cached) Fingerprints.save(context, project.source.key, prints)
 
+        return assemble(context, project, photos, prints)
+    }
+
+    /**
+     * 選別・学習が使う入口。**準備を二重に走らせない**（A5）。
+     *
+     * 1. 控えだけで組めるなら、それを使う（準備済みなら一瞬。網へ行かず、何も書かない）。
+     * 2. 詳細画面の準備が走っているあいだは、その分が控えに出てくるのを待つ
+     *    （同じ NAS へ 2 本つなぎ、同じファイルに書くのを避ける）。
+     * 3. そうでなければ、これまでどおり [run] で足りない分だけ作る。
+     *
+     * **ハッシュ値が足りないまま始めることはしない**（連写のまとまりが変わるため）。
+     */
+    suspend fun ready(
+        context: android.content.Context,
+        project: Project,
+        onProgress: (done: Int, total: Int) -> Unit
+    ): Pair<List<Photo>, List<uniffi.photo_curator_core.PhotoRef>> {
+        loadReady(context, project)?.let { return it }
+        while (Preparations.of(project.id).running) {
+            val progress = Preparations.of(project.id).meta
+            onProgress(progress.first, progress.second)
+            kotlinx.coroutines.delay(500)
+            loadReady(context, project)?.let { return it }
+        }
+        return run(context, project, false, onProgress)
+    }
+
+    /**
+     * 控えだけで組めるなら、組んで返す（**網へ行かない・何も書き直さない**）。
+     * ハッシュ値が全部そろっていなければ null（作る側 [run] へ）。
+     * 選別・学習が、準備済みなのに準備を自前でもう一度回さないために使う（A5）。
+     */
+    suspend fun loadReady(
+        context: android.content.Context,
+        project: Project
+    ): Pair<List<Photo>, List<uniffi.photo_curator_core.PhotoRef>>? {
+        val listing = Listing.load(context, project.source.key)
+        if (listing.isNullOrEmpty()) return null
+        val prints = Fingerprints.load(context, project.source.key)
+        val photos = inShootingOrder(listing)
+        if (!Analyse.allUpToDate(photos, prints)) return null
+        return assemble(context, project, photos, prints)
+    }
+
+    private suspend fun assemble(
+        context: android.content.Context,
+        project: Project,
+        photos: List<Photo>,
+        prints: Map<String, Fingerprint>
+    ): Pair<List<Photo>, List<uniffi.photo_curator_core.PhotoRef>> {
         // **撮影時刻は EXIF のものを使う。**
         // NAS の更新時刻はコピーしたときに変わるので、撮影順にならない。
         // 指紋と同じ読みで取れているので、ここで差し替えて並べ直す。

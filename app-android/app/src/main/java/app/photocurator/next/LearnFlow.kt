@@ -40,7 +40,7 @@ fun LearnFlow(project: Project, onStart: () -> Unit, onBack: () -> Unit) {
 
     LaunchedEffect(project.id) {
         val ready = try {
-            Prepare.run(context, project) { done, total -> prepared = done to total }
+            Prepare.ready(context, project) { done, total -> prepared = done to total }
         } catch (error: kotlinx.coroutines.CancellationException) {
             throw error
         } catch (error: Exception) {
