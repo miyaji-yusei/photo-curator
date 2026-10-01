@@ -3,6 +3,7 @@
 // 方式が違うだけで、セッション・★の上げ方・1 つ戻す・連写のまとめ・拡大はトーナメントと同じ処理を通す。
 // 上のバーは TournamentView と同じ並び・文言・クラス。ここには判定を書かない（決まった操作を渡すだけ）。
 import type { Ref } from 'vue'
+import SelectionHelpButton from '~/components/dialogs/SelectionHelpButton.vue'
 import type { SavedSelection } from '~/utils/selectionFlow'
 import {
   dragFeedback, fitContain, flyTarget, isDoubleTap, isTap, judgeDrag, slideKeyDecision, tapDecision, type TapRecord,
@@ -17,6 +18,7 @@ const {
   decideSlide,
   desktop,
   groupSizeDialog,
+  helpDialog,
   openBurst,
   openGroupSizeDialog,
   openZoom,
@@ -186,7 +188,7 @@ function snapBack(moved: boolean) {
 // ---- キー（1・←＝落とす／3・→＝残す／5・↑＝★5）。Backspace（1 つ戻す）は useCurator が受ける ----
 function onKeydown(event: KeyboardEvent) {
   if (view.value !== 'tournament' || event.repeat) return
-  if (zoomPhoto.value || burstDialog.value || groupSizeDialog.value) return
+  if (zoomPhoto.value || burstDialog.value || groupSizeDialog.value || helpDialog.value) return
   if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return
   const decision = slideKeyDecision(event)
   if (!decision) return
@@ -216,6 +218,7 @@ async function undo() {
 
       <div class="d-flex align-center justify-end ga-2 tournament-bar__side">
         <v-btn icon="mdi-dots-horizontal" variant="text" aria-label="選別中の設定（表示枚数）" title="選別中の設定（表示枚数）" @click="openGroupSizeDialog" />
+        <SelectionHelpButton />
       </div>
     </div>
     <v-progress-linear :model-value="roundProgress" color="primary" height="4" rounded class="mb-3" />

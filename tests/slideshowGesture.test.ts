@@ -169,6 +169,22 @@ describe('slideKeyDecision', () => {
     expect(slideKeyDecision({ key: '1', code: 'Numpad1' })).toBe('drop')
     expect(slideKeyDecision({ key: '3', code: 'Numpad3' })).toBe('keep')
     expect(slideKeyDecision({ key: '5', code: 'Numpad5' })).toBe('top')
+    expect(slideKeyDecision({ key: '1', code: 'Digit1' })).toBe('drop')
+    expect(slideKeyDecision({ key: '3', code: 'Digit3' })).toBe('keep')
+    expect(slideKeyDecision({ key: '5', code: 'Digit5' })).toBe('top')
+  })
+  it('テンキーは NumLock が切れていても（key が End・PageDown・Clear でも）code で判定する', () => {
+    expect(slideKeyDecision({ key: 'End', code: 'Numpad1' })).toBe('drop')
+    expect(slideKeyDecision({ key: 'PageDown', code: 'Numpad3' })).toBe('keep')
+    expect(slideKeyDecision({ key: 'Clear', code: 'Numpad5' })).toBe('top')
+    expect(slideKeyDecision({ key: '1', code: 'Numpad1' })).toBe('drop')
+  })
+  it('テンキーの 0・2 などは何もしない。修飾キー付きのテンキーも拾わない', () => {
+    expect(slideKeyDecision({ key: '2', code: 'Numpad2' })).toBeNull()
+    expect(slideKeyDecision({ key: 'ArrowDown', code: 'Numpad2' })).toBeNull()
+    expect(slideKeyDecision({ key: '0', code: 'Numpad0' })).toBeNull()
+    expect(slideKeyDecision({ key: 'Enter', code: 'NumpadEnter' })).toBeNull()
+    expect(slideKeyDecision({ key: 'End', code: 'Numpad1', ctrlKey: true })).toBeNull()
   })
   it('2・4・↓・Enter などは何もしない', () => {
     expect(slideKeyDecision({ key: '2' })).toBeNull()

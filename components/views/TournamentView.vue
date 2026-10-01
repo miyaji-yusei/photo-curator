@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import type { Ref } from 'vue'
+import SelectionHelpButton from '~/components/dialogs/SelectionHelpButton.vue'
 import type { SavedSelection } from '~/utils/selectionFlow'
 import { gridFor, type GridShape } from '~/utils/gridFor'
 
@@ -113,6 +114,7 @@ function clearSelection() {
           @click="groupSelectedAsBurst"
         >この写真をまとめる</v-btn>
         <v-btn icon="mdi-dots-horizontal" variant="text" aria-label="選別中の設定（表示枚数）" title="選別中の設定（表示枚数）" @click="openGroupSizeDialog" />
+        <SelectionHelpButton />
         <v-btn color="primary" @click="confirmChoices">
           {{ session.selectedInGroup.length ? `${session.selectedInGroup.length} 枚を選択` : '選択なしで次へ' }}<span v-if="!isTouchOnly" class="ms-1 text-caption">（Enter）</span>
         </v-btn>
