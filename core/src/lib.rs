@@ -408,13 +408,21 @@ fn shift_star(session: &mut Session, id: &str, delta: i32) {
 /// **選ばれたものだけ星が 1 つ上がる。** 選ばれなかったものは据え置きで、
 /// そのラウンドから外れる。「落とす」は星を下げることではない。
 pub fn advance(session: Session, selected: Vec<String>) -> Session {
+    // 出しているものが無い（終わっている）なら何もしない。空の判断を履歴に
+    // 積むと、次の「1 つ戻す」が何も戻さず、1 回無駄に押させる（U38・R16）。
+    if session.current.is_empty() {
+        return session;
+    }
     let mut next = session;
     let group = next.current.clone();
     // 画面に無いものが渡ってきても無視する。**呼び出し側を信用しない。**
-    let chosen: Vec<String> = selected
-        .into_iter()
-        .filter(|id| group.contains(id))
-        .collect();
+    // 同じものが 2 回来ても 1 回として扱う（2 回入れると星が +2 になる。R16）。
+    let mut chosen: Vec<String> = Vec::new();
+    for id in selected {
+        if group.contains(&id) && !chosen.contains(&id) {
+            chosen.push(id);
+        }
+    }
 
     // 確定の前の星を控える（代表と仲間）。
     let mut before: HashMap<String, i32> = HashMap::new();
@@ -2371,5 +2379,43 @@ mod tests {
         let after = advance(second, vec!["A1".into()]);
         assert_eq!(after.ratings["A2"], 2);
         assert_eq!(after.ratings["B"], 1);
+    }
+
+    #[test]
+    fn r16_同じidを2回渡しても星は1つだけ上がる() {
+        let session = round(&["1", "2", "3", "4"], 2);
+        let after = advance(session, vec!["1".into(), "1".into()]);
+        assert_eq!(after.ratings["1"], 1);
+        assert_eq!(after.survivors, vec!["1"]);
+        assert_eq!(after.history.last().unwrap().chosen, vec!["1"]);
+        // 戻すと元どおり。
+        let back = undo(after);
+        assert_eq!(back.ratings["1"], 0);
+        assert!(back.survivors.is_empty());
+    }
+
+    #[test]
+    fn r16_連写の代表を2回渡しても仲間の星は1つだけ上がる() {
+        let session = start_round(burst_photos(), 2, 0, true, threshold(), vec![]);
+        let after = advance(session, vec!["1.jpg".into(), "1.jpg".into()]);
+        assert_eq!(after.ratings["1.jpg"], 1);
+        assert_eq!(after.ratings["2.jpg"], 1);
+        assert_eq!(after.survivors, vec!["1.jpg"]);
+    }
+
+    #[test]
+    fn r16_終わったあとに確定しても履歴は増えない() {
+        let session = round(&["1", "2"], 2);
+        let done = advance(session, vec!["1".into()]);
+        assert!(done.finished);
+        let history = done.history.len();
+        let again = advance(done, vec!["1".into()]);
+        assert!(again.finished);
+        assert_eq!(again.history.len(), history, "空の判断が履歴に積まれた");
+        assert_eq!(again.ratings["1"], 1);
+        // 1 回の「戻す」で直前の判断が戻る（無駄押しが要らない）。
+        let back = undo(again);
+        assert_eq!(back.ratings["1"], 0);
+        assert_eq!(back.current, vec!["1", "2"]);
     }
 }
