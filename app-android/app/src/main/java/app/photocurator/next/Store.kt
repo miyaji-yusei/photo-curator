@@ -200,10 +200,28 @@ object Prefs {
             .getInt("display_edge", 1024)
             .coerceIn(768, 1920)
 
+    /**
+     * 既定を変える。**効くのは新しいプロジェクトだけ**（設定画面にもそう書いてある）。
+     * 自分の値をまだ持たない既存のプロジェクトには、変える前の既定をここで書き留める。
+     * 書き留めないと、次に開いたとき新しい既定として扱われて、全部作り直しになる（A7）。
+     */
     fun setDisplayEdge(context: Context, edge: Int) {
-        context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
-            .edit().putInt("display_edge", edge.coerceIn(768, 1920)).apply()
+        val preferences = context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+        val old = displayEdge(context)
+        val editor = preferences.edit()
+        if (old != edge.coerceIn(768, 1920)) {
+            // 設定の画面から呼ばれる。一覧のファイルは小さいので、その場で読む。
+            val ids = kotlinx.coroutines.runBlocking { Projects.all(context) }.map { it.id }
+            for (id in edgesToPin(ids) { preferences.contains("display_edge_$it") }) {
+                editor.putInt("display_edge_$id", old)
+            }
+        }
+        editor.putInt("display_edge", edge.coerceIn(768, 1920)).apply()
     }
+
+    /** 自分の大きさをまだ持たないプロジェクト。 */
+    fun edgesToPin(ids: List<String>, hasOwn: (String) -> Boolean): List<String> =
+        ids.filterNot(hasOwn)
 
     /**
      * プロジェクトごとの長辺。**設定の値は「新しいプロジェクトの既定」**で、
