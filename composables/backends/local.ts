@@ -197,10 +197,12 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
   }
 
   /** 行に URL を付けて画面が使える形にする。サムネイルは 1 枚ずつ読む。 */
-  async function decorate(rows: StoredPhoto[], projectId?: string): Promise<Photo[]> {
+  async function decorate(
+    rows: StoredPhoto[], projectId?: string, options?: { display?: boolean }
+  ): Promise<Photo[]> {
     const links = rows.length ? await linksOf(rows[0]!.projectId) : null
     if (links) return decorateAmazon(rows, links)
-    const urls = await blobStore.load(rows.map(row => row.id))
+    const urls = await blobStore.load(rows.map(row => row.id), options)
     const fallbacks = projectId ? await originalsOfUnprepared(rows, urls, projectId) : new Map<string, string>()
     return rows.map(row => {
       const found: PhotoUrls | undefined = urls.get(row.id)
@@ -684,7 +686,9 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
       const rows = await store.photosOfProject(projectId)
       const matched = filterPhotos(rows.filter(row => !row.isMissing), rating).sort(comparePhotos(sort))
       // 画面に渡すのは 1 ページぶんだけ。全件を載せない。
-      return { photos: await decorate(pagePhotos(matched, offset, limit)), total: matched.length }
+      // 一覧のタイルはサムネイルしか使わない。表示用は読まない（拡大のときに 1 枚だけ作る）。
+      const photos = await decorate(pagePhotos(matched, offset, limit), undefined, { display: false })
+      return { photos, total: matched.length }
     },
 
     getPhotosByIds: async (projectId: string, photoIds: string[]) => {
@@ -815,7 +819,16 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
 
     // ブラウザでは既に表示できる URL が入っている。
     photoUrl: (path: string) => path,
-    photoOriginalUrl: async (photo: Photo) => photo.path,
+    // 拡大のとき、その 1 枚の URL を**そのとき作る**。一覧を読んだときに持っていた URL は、
+    // 上限を超えて revoke されていることがある（W3）。
+    photoOriginalUrl: async (photo: Photo) => {
+      const file = originals.get(photo.id)
+      if (file) return blobStore.originalUrl(photo.id, file)
+      // Amazon（https）など、revoke されない URL はそのまま。
+      if (!photo.path.startsWith('blob:')) return photo.path
+      const found = (await blobStore.load([photo.id])).get(photo.id)
+      return found?.displayUrl ?? found?.thumbnailUrl ?? photo.path
+    },
     photoThumbnailUrl: (photo: Photo) => photo.thumbnailPath ?? photo.path,
     photoDisplayUrl: (photo: Photo) => photo.displayPath ?? photo.thumbnailPath ?? photo.path,
 
