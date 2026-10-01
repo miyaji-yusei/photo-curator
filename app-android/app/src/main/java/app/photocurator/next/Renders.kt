@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 
@@ -37,6 +38,25 @@ object Renders {
      */
     private fun name(cacheId: String, path: String, edge: Int): String =
         "${cacheId}_${path.hashCode().toUInt().toString(16)}_$edge.jpg"
+
+    private val locks = java.util.concurrent.ConcurrentHashMap<String, kotlinx.coroutines.sync.Mutex>()
+
+    /**
+     * 同じ表示用画像を**同時に作らせない**（U26）。先読みが取りかけの写真へ
+     * 選別が進むと、同じ原本を 2 本の接続で読むことになる。後から来たほうは
+     * 待って、できたものを読む（block の先頭で read し直すこと）。
+     */
+    suspend fun <T> exclusive(
+        cacheId: String, path: String, edge: Int, block: suspend () -> T
+    ): T {
+        val key = name(cacheId, path, edge)
+        val mutex = locks.computeIfAbsent(key) { kotlinx.coroutines.sync.Mutex() }
+        try {
+            return mutex.withLock { block() }
+        } finally {
+            if (!mutex.isLocked) locks.remove(key, mutex)
+        }
+    }
 
     fun file(context: Context, cacheId: String, path: String, edge: Int) =
         File(dir(context), name(cacheId, path, edge))

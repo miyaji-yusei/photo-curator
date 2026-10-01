@@ -136,7 +136,10 @@ class SmbFetcher(
      * まだ無ければその場で作る（原本を読む）。それも無理なら、
      * せめてサムネイルを出す。**何も出さないよりは粗くても出す。**
      */
-    private suspend fun display(): FetchResult? {
+    private suspend fun display(): FetchResult? =
+        Renders.exclusive(image.nasId, image.path, image.edge) { displayLocked() }
+
+    private suspend fun displayLocked(): FetchResult? {
         Renders.read(context, image.nasId, image.path, image.edge)?.let {
             return bytesResult(it, DataSource.DISK)
         }

@@ -26,14 +26,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import coil.compose.AsyncImage
-import coil.request.ImageRequest
 import kotlinx.coroutines.launch
 import uniffi.photo_curator_core.BurstThreshold
 import uniffi.photo_curator_core.PhotoRef
@@ -227,6 +224,17 @@ fun CullScreen(
     // **スライドショーは「1 グループ 1 枚」。** 同じセッション・同じ core の
     // 処理で、違いは 1 組が 1 枚かどうかだけ（トーナメントは 2 枚以上）。
     val slideshow = live.groupSize.toInt() == Prefs.SLIDESHOW_SIZE
+
+    // **次に出す写真を先に読んでおく**（U26）。終わったラウンドでは対象が空になり、
+    // この画面を離れれば止まる。拡大中も続ける（戻ったときに間に合う）。
+    if (!live.finished) {
+        val ahead = Prefetch.targets(live.queue, live.groupSize.toInt(), slideshow)
+            .mapNotNull { byPath[it] }
+        PrefetchAhead(
+            ahead, displayEdge,
+            if (slideshow) Prefetch.SLIDESHOW_PX else Prefetch.TILE_PX
+        )
+    }
 
     /** 確定して次へ。**確定のたびに保存する。どこで止めても失わない。** */
     fun commit(picked: Set<String>) {
@@ -778,20 +786,15 @@ internal fun Tile(
                 Text("読めません", fontSize = 11.sp, color = Faint)
             }
         } else {
-            AsyncImage(
-                model = ImageRequest.Builder(LocalContext.current)
-                    // **ここは大きく出すので原本を読む。**
-                    // EXIF の縮小画像は 160x120 しかなく、選別の判断には足りない。
-                    // 一度読めば端末に残るので、2 回目からは網に行かない。
-                    .data(photo.displayModel(displayEdge))
-                    .size(1280)
-                    .build(),
-                contentDescription = photo.name,
-                // **このアプリの読み込み器を通す。** 既定の Coil は NAS の
-                // 写真の読み方を知らないので、渡し忘れると何も出ない。
-                imageLoader = Images.loader(LocalContext.current),
-                // 切らずに全部見せる。縦横比が合わなくても黒帯にしない。
-                contentScale = ContentScale.Fit,
+            // **ここは大きく出すので表示用画像を読む。**
+            // EXIF の縮小画像は 160x120 しかなく、選別の判断には足りない。
+            // 一度読めば端末に残るので、2 回目からは網に行かない。読めるまでは
+            // 置いてあるサムネイルを出す。読み込み器はこのアプリのもの
+            // （既定の Coil は NAS の写真の読み方を知らない）。
+            DisplayImage(
+                photo = photo,
+                displayEdge = displayEdge,
+                px = Prefetch.TILE_PX,
                 modifier = Modifier.fillMaxSize()
             )
         }

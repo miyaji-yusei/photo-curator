@@ -32,16 +32,12 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import coil.compose.AsyncImage
-import coil.request.ImageRequest
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
@@ -215,18 +211,12 @@ internal fun SlideshowStage(
                     Text("読めません", fontSize = 11.sp, color = Faint)
                 }
             } else {
-                AsyncImage(
-                    model = ImageRequest.Builder(LocalContext.current)
-                        .data(photo.displayModel(displayEdge))
-                        .size(1600)
-                        .build(),
-                    contentDescription = photo.name,
-                    imageLoader = Images.loader(LocalContext.current),
-                    contentScale = ContentScale.Fit,
-                    onSuccess = { state ->
-                        val size = state.painter.intrinsicSize
-                        if (size.width > 0f && size.height > 0f) natural = size.width to size.height
-                    },
+                // 表示用画像が読めるまでは、置いてあるサムネイルを先に出す（U26）。
+                DisplayImage(
+                    photo = photo,
+                    displayEdge = displayEdge,
+                    px = Prefetch.SLIDESHOW_PX,
+                    onSize = { w, h -> natural = w to h },
                     modifier = Modifier.fillMaxSize()
                 )
             }
