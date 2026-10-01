@@ -15,7 +15,7 @@ import {
 import * as core from '~/lib/core'
 import type { BurstThreshold, PairOverride, PhotoRef, Session } from '~/lib/core'
 import {
-  blocksFromCuts, cutAll, cutAroundSelection, cutsFromGroups, joinAt, moveCut, toggleAt
+  blocksFromCuts, cutAll, cutAroundSelection, cutsFromGroups, moveCut, toggleAt
 } from '~/utils/burstEdit'
 import { buildBurstQuestions } from '~/utils/burstQuestions'
 import { burstNeighborhood } from '~/utils/burstNeighborhood'
@@ -231,10 +231,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     const byCount: Record<number, number> = { 1: 1, 2: 2, 3: 3, 4: 2, 5: 3, 6: 3, 7: 4, 8: 4, 9: 3, 10: 5 }
     return byCount[count] ?? Math.min(5, Math.max(1, Math.ceil(Math.sqrt(count))))
   }
-  const tournamentColumns = computed(() => columnsFor(tournamentPhotos.value.length))
-  const tournamentRows = computed(() =>
-    Math.max(1, Math.ceil(tournamentPhotos.value.length / tournamentColumns.value))
-  )
   /** 写真を見比べている画面かどうか。余白の詰め方を変える。 */
   const isSelecting = computed(() =>
     view.value === 'tournament' || view.value === 'burst-threshold' || view.value === 'burst-review'
@@ -274,7 +270,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   const moveOffset = ref(0)
   /** ダイアログ内に出すエラー。画面上部に出すとモーダルに隠れて気づけない。 */
   const moveError = ref('')
-  /** 移動が終わったことを画面上部で知らせる。 */
   /**
    * 既定は「全選択」。個別のチェックは**ここからの差分**だけを持つ。
    * 5,000 枚の id を並べて持たないための形。詳細は `utils/ratingMove.ts`。
@@ -1589,13 +1584,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     blocksFromCuts(burstPhotos.value.map(photo => photo.id), burstCuts.value)
   )
   const burstPhotoOf = (photoId: string) => burstPhotos.value.find(photo => photo.id === photoId) ?? null
-  /**
-   * まだまとめの外にある塊か。**1枚でも元のまとめの写真を含んでいれば「中」**。
-   * 外の写真を繋いで取り込んだ塊を「外」と呼び続けないため。
-   */
-  const isOutsideBurst = (block: string[]) =>
-    !block.some(id => burstOriginal.value.includes(id))
-
   /** その塊の代表。指名があればそれ、無ければ撮影順の先頭。 */
   const representativeOf = (block: string[]) =>
     block.find(id => burstReps.value.includes(id)) ?? block[0]!
@@ -1615,11 +1603,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     burstPicked.value = []
   }
 
-  /** 隣り合うまとまりを繋ぐ。近くの写真を取り込むのもこれ。 */
-  function joinBurstAt(boundaryIndex: number) {
-    burstCuts.value = joinAt(burstCuts.value, boundaryIndex)
-  }
-
   /** 境目をひとつ、切る／つなぐ（バーのタップ）。 */
   function toggleBurstCut(boundaryIndex: number) {
     burstCuts.value = toggleAt(burstCuts.value, boundaryIndex)
@@ -1633,11 +1616,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   function scatterBurst() {
     burstCuts.value = cutAll(burstCuts.value)
     burstPicked.value = []
-  }
-
-  /** ある写真の直前の境目。まとまりの先頭以外は必ずある。 */
-  function boundaryBefore(photoId: string) {
-    return burstPhotos.value.findIndex(photo => photo.id === photoId) - 1
   }
 
   /**
@@ -2876,11 +2854,9 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     groupLimits,
     settings,
     isTouchOnly,
-    COMPACT_QUERY,
     isCompact,
     drawerOpen,
     drawerRail,
-    syncCompact,
     currentPair,
     pairPhotos,
     previewThreshold,
@@ -2894,15 +2870,11 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     deleteDialog,
     deleteTarget,
     deleteBusy,
-    columnsFor,
-    tournamentColumns,
-    tournamentRows,
     isSelecting,
     nextRoundDialog,
     nextRoundGroupSize,
     nextRoundRating,
     restartDialog,
-    restartForStart,
     confirmRestartDialog,
     restartBusy,
     resultsPhotos,
@@ -2922,7 +2894,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     moveTotal,
     moveOffset,
     moveError,
-    moveSelection,
     moveSelectedCount,
     isMoveSelected,
     exportDialog,
@@ -2952,12 +2923,10 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     gridClass,
     gridStyle,
     burstDialog,
-    burstOwner,
     burstPhotos,
     burstCuts,
     burstOriginal,
     burstPicked,
-    burstReps,
     burstBusy,
     burstReviewGroups,
     burstReviewIndex,
@@ -2992,7 +2961,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     shortPath,
     fileName,
     statusLabel,
-    refreshProjects,
     loadPreview,
     loadCurrentPhotos,
     openProject,
@@ -3011,11 +2979,8 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     openSlideshowSettings,
     beginTournament,
     finishTournamentStart,
-    enterStage,
-    showNextPair,
     answerPair,
     skipCurrentPair,
-    finishThresholdLearning,
     refreshBurstPreview,
     askMorePairs,
     acceptBurstThreshold,
@@ -3023,7 +2988,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     saveSession,
     toggleChoice,
     confirmChoices,
-    skipGroup,
     confirmPhoto,
     openZoom,
     zoomIndex,
@@ -3031,16 +2995,12 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     openBurst,
     burstBlocks,
     burstPhotoOf,
-    isOutsideBurst,
     representativeOf,
     toggleBurstPick,
     splitBurstSelection,
-    joinBurstAt,
     toggleBurstCut,
     moveBurstCut,
     scatterBurst,
-    boundaryBefore,
-    settleBurstPhoto,
     confirmBurstPhoto,
     dropBurstPhoto,
     makeBurstRepresentative,
@@ -3051,7 +3011,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     groupSelectedAsBurst,
     openNextRoundDialog,
     startRatingSelection,
-    restartFromScratch,
     chooseExportDestination,
     runExport,
     runMetadataWrite,
@@ -3059,14 +3018,10 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     loadSummary,
     selectResultsRating,
     loadResultsPage,
-    burstReviewGroup,
     openBurstReview,
-    loadBurstReviewPhotos,
     toggleBurstReviewKeep,
-    advanceBurstReview,
     applyBurstReview,
     skipBurstReview,
-    refreshDisplayState,
     applyDisplayEdge,
     regenerateDisplayImages,
     openMoveDialog,
@@ -3074,7 +3029,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     toggleMoveSelection,
     setMoveSelectAll,
     runMove,
-    collectShareCandidates,
     shareSelectedPhotos,
     exportZipByRating,
     exportCsvByRating,
@@ -3100,7 +3054,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     cancelTask,
     cancelAnalysis,
     onKeydown,
-    onZoomKeydown,
     mount,
     unmount
   }
