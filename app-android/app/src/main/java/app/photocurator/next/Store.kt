@@ -22,7 +22,7 @@ import java.io.File
 object Store {
     private const val TAG = "Store"
 
-    private fun file(context: Context, projectId: String) =
+    internal fun file(context: Context, projectId: String) =
         File(context.filesDir, "session-$projectId.json")
 
     /**
@@ -113,7 +113,7 @@ object Fingerprints {
      * NAS の鍵は "nasId|フォルダ道筋" の形で、区切り記号がそのまま入ると
      * **扱いにくい名前のファイル**ができる。英数字以外は _ に潰す。
      */
-    private fun file(context: Context, sourceKey: String) =
+    internal fun file(context: Context, sourceKey: String) =
         File(context.filesDir, "fingerprints-${sourceKey.replace(Regex("[^A-Za-z0-9_-]"), "_")}.json")
 
     suspend fun load(context: Context, sourceKey: String): Map<String, Fingerprint> =
@@ -320,7 +320,7 @@ object Prefs {
 object Overrides {
     private const val TAG = "Overrides"
 
-    private fun file(context: Context, projectId: String) =
+    internal fun file(context: Context, projectId: String) =
         File(context.filesDir, "overrides-$projectId.json")
 
     suspend fun load(context: Context, projectId: String): List<PairOverride> =
@@ -392,7 +392,7 @@ object Overrides {
 object Listing {
     private const val TAG = "Listing"
 
-    private fun file(context: Context, sourceKey: String) =
+    internal fun file(context: Context, sourceKey: String) =
         File(context.filesDir, "listing-${sourceKey.replace(Regex("[^A-Za-z0-9_-]"), "_")}.json")
 
     suspend fun load(context: Context, sourceKey: String): List<Photo>? = withContext(Dispatchers.IO) {
@@ -462,7 +462,7 @@ object Listing {
 object Trouble {
     private const val TAG = "Trouble"
 
-    private fun file(context: Context, sourceKey: String) =
+    internal fun file(context: Context, sourceKey: String) =
         File(context.filesDir, "trouble-${sourceKey.replace(Regex("[^A-Za-z0-9_-]"), "_")}.txt")
 
     suspend fun note(context: Context, sourceKey: String, message: String) =

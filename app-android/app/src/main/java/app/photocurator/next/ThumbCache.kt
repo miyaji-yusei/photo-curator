@@ -22,6 +22,9 @@ object ThumbCache {
 
     private fun dir(context: Context) = File(context.filesDir, "thumbs").apply { mkdirs() }
 
+    /** 置き場そのもの（更新時刻を見て、変わったかを知るため）。 */
+    fun dirOf(context: Context): File = dir(context)
+
     /** 道筋から決まる名前。**同じ写真なら同じファイル。** */
     private fun name(cacheId: String, path: String): String =
         "${cacheId}_${CacheName.of(path)}.jpg"

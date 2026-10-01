@@ -71,17 +71,22 @@ object Covers {
      */
     suspend fun forProject(context: Context, project: Project): Any? =
         withContext(Dispatchers.IO) {
-            val known = Listing.load(context, project.source.key) ?: return@withContext null
-            val first = known.firstOrNull() ?: return@withContext null
-            // Amazon も端末に残っているサムネイルだけ。**取りに行かない。**
-            first.amazon?.let { ref ->
-                val file = ThumbCache.file(context, Amazon.linkOf(ref.shareKey).cacheId, ref.nodeId)
-                return@withContext if (file.exists() && file.length() > 0) file else null
-            }
-            val smb = first.smb
-            if (smb == null) return@withContext first.uri
-            // NAS は端末に残っているときだけ。**取りに行かない。**
-            val file = ThumbCache.file(context, smb.nasId, smb.path)
-            if (file.exists() && file.length() > 0) file else null
+            coverOf(context, Listing.load(context, project.source.key))
         }
+
+    /**
+     * 読んである顔ぶれから、見本の 1 枚を決める。**顔ぶれをもう一度パースしない**（A3）。
+     */
+    fun coverOf(context: Context, known: List<Photo>?): Any? {
+        val first = known?.firstOrNull() ?: return null
+        // Amazon も端末に残っているサムネイルだけ。**取りに行かない。**
+        first.amazon?.let { ref ->
+            val file = ThumbCache.file(context, Amazon.linkOf(ref.shareKey).cacheId, ref.nodeId)
+            return if (file.exists() && file.length() > 0) file else null
+        }
+        val smb = first.smb ?: return first.uri
+        // NAS は端末に残っているときだけ。**取りに行かない。**
+        val file = ThumbCache.file(context, smb.nasId, smb.path)
+        return if (file.exists() && file.length() > 0) file else null
+    }
 }

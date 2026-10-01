@@ -71,12 +71,12 @@ fun HomeScreen(
     LaunchedEffect(reloads) {
         projects = Projects.all(context)
         loaded = true
-        // 状態は一覧を出してから足す。**印のために一覧を待たせない。**
-        standings = projects.associate { it.id to standingOf(context, it) }
-        // 見本も同じく後から。**網へは行かない**ので、出なければ出ないまま。
-        covers = projects.mapNotNull { project ->
-            Covers.forProject(context, project)?.let { project.id to it }
-        }.toMap()
+        // 状態も見本も一覧を出してから足す。**印のために一覧を待たせない。**
+        // プロジェクトは並列に読み、前回から変わっていないものは作り直さない（A3）。
+        // 見本は**網へは行かない**ので、出なければ出ないまま。
+        val cards = HomeCards.load(context, projects)
+        standings = cards.mapValues { it.value.standing }
+        covers = cards.mapNotNull { (id, card) -> card.cover?.let { id to it } }.toMap()
     }
 
     Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
@@ -372,7 +372,15 @@ fun sourceIcon(kind: SourceKind): androidx.compose.ui.graphics.vector.ImageVecto
  * 「開いたら NAS を待つ」は作らない。準備の進みは端末に置いたもの
  * （顔ぶれ・指紋・表示用画像）を数えれば分かる。
  */
-private suspend fun standingOf(context: Context, project: Project): Standing {
+internal suspend fun standingOf(
+    context: Context,
+    project: Project,
+    // 読んである顔ぶれ（見本と共有して、パースを 1 回で済ませる）。
+    known: List<Photo>?,
+    edge: Int,
+    // 表示用画像の枚数（置き場の id, 大きさ）→ 枚数。全プロジェクトで 1 回の列挙を共有する。
+    renderTally: suspend () -> Map<Pair<String, Int>, Int>
+): Standing {
     val session = Store.load(context, project.id)
 
     // ---- つまずき ----
@@ -383,7 +391,6 @@ private suspend fun standingOf(context: Context, project: Project): Standing {
     }
 
     // ---- 準備中 ----
-    val known = Listing.load(context, project.source.key)
     if (session == null) {
         if (known == null) {
             // 一度も数えていない。**開けば走査が始まる。**
@@ -398,8 +405,7 @@ private suspend fun standingOf(context: Context, project: Project): Standing {
         }
         val cacheId = project.source.cacheId
         if (project.source.remote && cacheId != null) {
-            val edge = Prefs.projectEdge(context, project.id)
-            val made = Renders.count(context, cacheId, edge)
+            val made = renderTally()[cacheId to edge] ?: 0
             if (made < known.size) {
                 return Standing(
                     "準備中 · 表示用画像を作成",
