@@ -20,6 +20,7 @@ import { buildBurstQuestions } from '~/utils/burstQuestions'
 import { burstNeighborhood } from '~/utils/burstNeighborhood'
 import { joinSpanOverrides, overridesFromShape } from '~/utils/burstShape'
 import { createSaveQueue } from '~/utils/saveQueue'
+import { createSerialQueue } from '~/utils/serialQueue'
 import {
   BURST_WINDOW_MS, D_HASH_VERSION, DEFAULT_BURST_DISTANCE,
   buildCoreInputs, maxNeighborDistance, toPhotoRef
@@ -42,8 +43,52 @@ import { registerAutoPush, useSidecarSync } from '~/composables/useSidecarSync'
 
 type View = 'home' | 'project' | 'method' | 'settings' | 'app-settings' | 'burst-threshold' | 'burst-preview' | 'tournament' | 'result' | 'results' | 'burst-review'
 
-/** テストでは偽の `desktop` を渡す（既定は実行環境に合う実装）。 */
-export function createCurator(desktop: PhotoBackend = useDesktop()) {
+/**
+ * 行の星を**読む・消す・動かす**メソッド。選別の 1 タップは行の星の書き込みを待たずに次の組を出す（W1）ので、
+ * これらは入っている書き込みが終わってから走らせる（自分の書き込みを読み損ねない）。
+ * 行の星に触るメソッドを PhotoBackend に足したら、ここにも足すこと。`getPhotosByIds`・`saveSession` は
+ * 1 タップの道なので入れない。
+ */
+const ROW_RATING_METHODS = new Set<string>([
+  'getSelectionSummary', 'getCoreInputs', 'getProjectPhotoPage', 'getAnalysisBacklog',
+  'resetSelectionResults', 'moveRating', 'exportPhotos', 'exportAmazon', 'writeRatingsToPhotos',
+  'saveCsv', 'deleteProject'
+])
+
+function withRatingsBarrier(base: PhotoBackend, waitForWrites: () => Promise<void>): PhotoBackend {
+  return new Proxy(base, {
+    get(target, key, receiver) {
+      const value = Reflect.get(target, key, receiver)
+      if (typeof key !== 'string' || typeof value !== 'function' || !ROW_RATING_METHODS.has(key)) return value
+      return async (...args: unknown[]) => {
+        await waitForWrites()
+        return (value as (...a: unknown[]) => unknown).apply(target, args)
+      }
+    }
+  })
+}
+
+/** テストでは偽の `PhotoBackend` を渡す（既定は実行環境に合う実装）。 */
+export function createCurator(backend: PhotoBackend = useDesktop()) {
+  /**
+   * 行の星の書き込みの直列キュー（W1）。1 タップごとの書き込み・集計の完了を待たずに次の組を出す。
+   * 入れた順に 1 本ずつ書く（「1 つ戻す」が前の書き込みを追い越さない）。空になったら集計を 1 回だけ読み直す。
+   */
+  const ratingsQueue = createSerialQueue(
+    (cause) => { error.value = cause instanceof Error ? cause.message : '選別結果を保存できませんでした。' },
+    async () => {
+      const project = activeProject.value
+      if (!project) return
+      try {
+        // 自分の待ち行列の中なので、待たない素の backend を使う。
+        const summary = await backend.getSelectionSummary(project.id)
+        if (activeProject.value?.id === project.id) selectionSummary.value = summary
+      } catch {
+        selectionSummary.value = null
+      }
+    }
+  )
+  const desktop = withRatingsBarrier(backend, () => ratingsQueue.flush())
   const { notify } = useNotice()
   // サイドカー（写真のフォルダの `.photo-curator/catalog.json`）。4 通りの判断は core が行う。
   const sidecar = useSidecarSync(desktop)
@@ -85,6 +130,8 @@ export function createCurator(desktop: PhotoBackend = useDesktop()) {
   )
   /** 保存を書き終えてから、サイドカーに変更があれば書く（サイドカーは封筒も持つので順序が要る）。 */
   async function flushThenPush() {
+    // 行の星の書き込みが先（サイドカーの「変わった」印も、その書き込みのあとに付く）。
+    await ratingsQueue.flush()
     await saveQueue.flush()
     await sidecar.pushAuto(pushableProject())
   }
@@ -615,8 +662,12 @@ export function createCurator(desktop: PhotoBackend = useDesktop()) {
     if (projectId && projectId !== deletingProjectId) sidecar.markChanged(projectId)
   }
 
-  /** 前後の星を比べ、変わった写真の行だけ書く。`undo` も同じ。 */
-  async function writeRatings(changes: RatingChange[]) {
+  /**
+   * 前後の星を比べ、変わった写真の行だけ書く。`undo` も同じ。書き込みは直列キューに入れる。
+   * `wait` が true（既定）なら、書き込みと集計の読み直しが終わるまで待つ。選別の 1 タップ
+   * （`advanceWith`・`undoChoice`）だけ false で、待たずに次の組を出す。
+   */
+  async function writeRatings(changes: RatingChange[], wait = true) {
     const projectId = activeProject.value?.id
     if (!projectId || !changes.length) return
     const entries: SelectionResult[] = []
@@ -625,23 +676,21 @@ export function createCurator(desktop: PhotoBackend = useDesktop()) {
       if (id) entries.push({ id, rating: change.rating })
     }
     if (!entries.length) return
-    try {
-      await desktop.saveSelectionResults(projectId, entries)
+    ratingsQueue.enqueue(async () => {
+      await backend.saveSelectionResults(projectId, entries)
       noteJudgementChanged(projectId)
-      await loadSummary()
-    } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : '選別結果を保存できませんでした。'
-    }
+    })
+    if (wait) await ratingsQueue.flush()
   }
 
-  /** core の新しい Session を受け取り、星を行にも写す。 */
-  async function applyCore(next: Session) {
+  /** core の新しい Session を受け取り、星を行にも写す。`wait` は `writeRatings` と同じ。 */
+  async function applyCore(next: Session, wait = true) {
     const previous = session.value?.core ?? null
     setCore(next)
     // Session を先に待ち行列へ入れる。行の星の書き込みの途中で終了しても、Session は新しい組になる
     // （逆順だと、行の星だけ進んで Session が前の組のまま残り、次に開いて同じ組を確定すると +1 が重なる）。
     saveSession()
-    await writeRatings(syncRatings(previous, next))
+    await writeRatings(syncRatings(previous, next), wait)
   }
 
   /**
@@ -1356,8 +1405,10 @@ export function createCurator(desktop: PhotoBackend = useDesktop()) {
     current.selectedInGroup = []
     current.multiSelect = false
     if (next.finished) current.stage = 'result'
-    await applyCore(next)
+    // 行の星の書き込み・集計は待たずに次の組を出す（W1）。終わったときだけ、結果の数字のために待つ。
+    await applyCore(next, false)
     if (next.finished) {
+      await ratingsQueue.flush()
       view.value = 'result'
     } else {
       await loadCurrentPhotos()
@@ -1644,7 +1695,7 @@ export function createCurator(desktop: PhotoBackend = useDesktop()) {
     const current = session.value
     if (!current || !current.core.history.length) return
     // 戻した星（仲間の分も）は、前後の差で行にも戻る。
-    await applyCore(core.undo(current.core))
+    await applyCore(core.undo(current.core), false)
     current.selectedInGroup = []
     current.multiSelect = false
     current.stage = 'tournament'
@@ -2696,7 +2747,10 @@ export function createCurator(desktop: PhotoBackend = useDesktop()) {
       error.value = cause instanceof Error ? cause.message : '進み具合を受け取れませんでした。'
     }
     // 背面へ回る・窓を閉じるときに書く。ホームへ戻るときは `view` の監視で書く。
-    stopAutoPush = registerAutoPush(() => sidecar.pushAuto(pushableProject()), () => saveQueue.flush())
+    stopAutoPush = registerAutoPush(
+      () => sidecar.pushAuto(pushableProject()),
+      async () => { await ratingsQueue.flush(); await saveQueue.flush() }
+    )
     // Tauri の窓を閉じるとき: 保存とサイドカーの書き込みを待ってから閉じる（待ちすぎないよう 5 秒で切る）。
     if (desktop.kind === 'tauri') {
       try {
