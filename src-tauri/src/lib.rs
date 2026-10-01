@@ -3058,6 +3058,35 @@ async fn delete_project(app: AppHandle, project_id: String) -> Result<(), String
         .map_err(|e| e.to_string())?
 }
 
+/// そのプロジェクトの表示用画像（`display/<photo_id>.jpg`）を消す。消すのは DB の
+/// `display_path` が **表示用画像の置き場の直下** を指すファイルだけ。置き場の外を指す
+/// 値（壊れた行・原本を指す値）には触れない。消せた数を返す（U27 R7）。
+fn remove_project_display_files(
+    conn: &Connection,
+    project_id: &str,
+    display_dir: &Path,
+) -> Result<usize, String> {
+    let mut statement = conn
+        .prepare("SELECT display_path FROM photos WHERE project_id=?1 AND display_path IS NOT NULL")
+        .map_err(|error| error.to_string())?;
+    let paths = statement
+        .query_map(params![project_id], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let mut removed = 0usize;
+    for path in paths {
+        let path = Path::new(&path);
+        let inside = path.parent() == Some(display_dir)
+            && path.file_name().is_some()
+            && !path.components().any(|part| matches!(part, std::path::Component::ParentDir));
+        if inside && fs::remove_file(path).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 fn delete_project_blocking(app: AppHandle, project_id: String) -> Result<(), String> {
     let conn = connection(&app)?;
 
@@ -3079,6 +3108,12 @@ fn delete_project_blocking(app: AppHandle, project_id: String) -> Result<(), Str
             removed += 1;
         }
     }
+
+    // 表示用画像も、DB を消す前に（対象が分からなくなる前に）消す。
+    let removed_display = match display_dir(&app) {
+        Ok(dir) => remove_project_display_files(&conn, &project_id, &dir).unwrap_or(0),
+        Err(_) => 0,
+    };
 
     let transaction = conn
         .unchecked_transaction()
@@ -3123,7 +3158,9 @@ fn delete_project_blocking(app: AppHandle, project_id: String) -> Result<(), Str
     if let Ok(dir) = data_subdir(&app, SAMPLES_DIR) {
         clear_dir(&dir);
     }
-    eprintln!("削除: プロジェクト {project_id} / サムネイル {removed} 件");
+    eprintln!(
+        "削除: プロジェクト {project_id} / サムネイル {removed} 件 / 表示用画像 {removed_display} 件"
+    );
     Ok(())
 }
 
@@ -6899,6 +6936,57 @@ mod tests {
         assert_eq!(photos, 1);
         assert_eq!(states, 1);
 
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    // プロジェクト削除で、そのプロジェクトの表示用画像だけが消える（U27 R7）。
+    // 他のプロジェクトの画像・原本・置き場の外を指す値は残る。
+    #[test]
+    fn deleting_a_project_removes_only_its_display_images() {
+        let directory = test_directory("delete-display");
+        let display = directory.join("display");
+        fs::create_dir_all(&display).expect("create display dir");
+        let original = directory.join("original.jpg");
+        fs::write(&original, b"original photo bytes").expect("write original");
+        let drop_image = display.join("photo-drop.jpg");
+        let drop_second = display.join("photo-drop-2.jpg");
+        let keep_image = display.join("photo-keep.jpg");
+        for file in [&drop_image, &drop_second, &keep_image] {
+            fs::write(file, b"display").expect("write display image");
+        }
+        let conn = open_database(&directory.join("delete.sqlite3")).expect("open database");
+        for project in ["keep", "drop"] {
+            conn.execute(
+                "INSERT INTO projects (id,name,folder_path,photo_count,status,created_at,updated_at)
+                 VALUES (?1,?1,'x',1,'ready',1,1)",
+                params![project],
+            )
+            .expect("insert project");
+        }
+        for (id, project, display_path) in [
+            ("photo-keep", "keep", keep_image.clone()),
+            ("photo-drop", "drop", drop_image.clone()),
+            ("photo-drop-2", "drop", drop_second.clone()),
+            // 壊れた行: 原本を指している。置き場の外なので消してはいけない。
+            ("photo-bad", "drop", original.clone()),
+            // 置き場の外へ抜ける相対表記。
+            ("photo-dots", "drop", display.join("..").join("original.jpg")),
+        ] {
+            conn.execute(
+                "INSERT INTO photos (id,project_id,path,relative_path,name,display_path)
+                 VALUES (?1,?2,?1,'r','n',?3)",
+                params![id, project, display_path.to_string_lossy().to_string()],
+            )
+            .expect("insert photo");
+        }
+
+        let removed = remove_project_display_files(&conn, "drop", &display).expect("remove");
+
+        assert_eq!(removed, 2);
+        assert!(!drop_image.exists() && !drop_second.exists(), "そのプロジェクトの画像は消える");
+        assert!(keep_image.is_file(), "他のプロジェクトの画像は残る");
+        assert!(original.is_file(), "原本・置き場の外を指す値は消さない");
         drop(conn);
         fs::remove_dir_all(&directory).expect("remove test directory");
     }
