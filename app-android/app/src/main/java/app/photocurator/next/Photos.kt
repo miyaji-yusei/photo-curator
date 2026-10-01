@@ -216,7 +216,7 @@ object Photos {
      * NAS のフォルダの写真。**撮影時刻は EXIF から取る。**
      *
      * 更新時刻はコピーしたときに変わってしまい、撮影順にならない。
-     * EXIF は原本の先頭 128KB に入っているので、そこだけ読む。
+     * EXIF は原本の先頭 64KB に入っているので、そこだけ読む。
      * 読めたぶんは指紋と一緒に控えるので、2 回目以降は網に行かない。
      */
     private suspend fun fromNas(context: Context, key: String): List<Photo> {
