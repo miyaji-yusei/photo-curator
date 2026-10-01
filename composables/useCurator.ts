@@ -169,6 +169,8 @@ function createCurator() {
 
   // 選別中の枚数変更とプロジェクト削除
   const groupSizeDialog = ref(false)
+  /** 選別中の「？」ヘルプ（U24）。開いている間は、選別のキーを後ろの画面へ流さない。 */
+  const helpDialog = ref(false)
   const pendingGroupSize = ref(10)
   /** 「選別中の設定」で選んでいる方式。true＝スライドショー（1 枚ずつ）、false＝トーナメント。 */
   const pendingSlideshow = ref(false)
@@ -2477,6 +2479,8 @@ function createCurator() {
       return
     }
     if (event.target instanceof HTMLInputElement) return
+    // ヘルプを開いている間は、選別のキー（数字・Enter・Backspace など）を後ろの画面へ流さない。
+    if (helpDialog.value) return
 
     // 連写の見直し。**セッションが無くても開ける**画面なので、下の session 判定より
     // 手前で拾う。操作は選別画面と同じ（数字で選ぶ／Ctrl+数字で拡大／Enter で確定）。
@@ -2755,6 +2759,7 @@ function createCurator() {
     previewThreshold,
     previewBusy,
     groupSizeDialog,
+    helpDialog,
     pendingGroupSize,
     pendingSlideshow,
     isSlideshow,

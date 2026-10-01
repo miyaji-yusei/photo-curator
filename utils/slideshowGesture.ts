@@ -109,7 +109,9 @@ export function slideKeyDecision(event: KeyLike): SlideDecision | null {
   if (event.key === 'ArrowLeft') return 'drop'
   if (event.key === 'ArrowRight') return 'keep'
   if (event.key === 'ArrowUp') return 'top'
-  const digit = /^(Digit|Numpad)(\d)$/.exec(event.code ?? '')?.[2] ?? event.key
+  // 数字は event.key のほかに event.code（Digit1・Numpad1 …）でも受ける。テンキーは NumLock が切れていると
+  // event.key が End・PageDown・Clear になるが、event.code は Numpad1・3・5 のままなので、NumLock の状態によらず効く。
+  const digit = /^(?:Digit|Numpad)(\d)$/.exec(event.code ?? '')?.[1] ?? event.key
   if (digit === '1') return 'drop'
   if (digit === '3') return 'keep'
   if (digit === '5') return 'top'
