@@ -29,6 +29,19 @@ class LatestWriter<T>(
     private var pending: Box<T>? = null
     private var waiters = ArrayList<CompletableDeferred<Unit>>()
     private var running: Job? = null
+    private var idleWaiters = ArrayList<CompletableDeferred<Unit>>()
+
+    /**
+     * 頼まれている分を**書き終えるまで待つ**（新しい値は足さない）。何も書いていなければすぐ返る。
+     * サイドカーへ渡す前に、最後の 1 組まで端末に書き終えるため。
+     */
+    fun idle(): CompletableDeferred<Unit> {
+        val done = CompletableDeferred<Unit>()
+        synchronized(lock) {
+            if (running == null) done.complete(Unit) else idleWaiters.add(done)
+        }
+        return done
+    }
 
     fun submit(value: T): CompletableDeferred<Unit> {
         val done = CompletableDeferred<Unit>()
@@ -44,16 +57,20 @@ class LatestWriter<T>(
         while (true) {
             var next: Box<T>? = null
             var batch: ArrayList<CompletableDeferred<Unit>> = ArrayList()
+            var idled: ArrayList<CompletableDeferred<Unit>>? = null
             synchronized(lock) {
                 next = pending
                 if (next == null) {
                     running = null
+                    idled = idleWaiters
+                    idleWaiters = ArrayList()
                 } else {
                     pending = null
                     batch = waiters
                     waiters = ArrayList()
                 }
             }
+            idled?.forEach { it.complete(Unit) }
             val box = next ?: return
             try {
                 write(box.value)
@@ -86,6 +103,11 @@ object Persist {
                 onError = { android.util.Log.w("Persist", "保存に失敗した: $key", it) }
             )
         }.submit(job).await()
+    }
+
+    /** その書き込み先の列が空になるまで待つ。**値は足さない**（頼まれた最後の保存を消さない）。 */
+    suspend fun settle(key: String) {
+        writers[key]?.idle()?.await()
     }
 }
 
