@@ -94,6 +94,77 @@ namespace photo_curator_core {
     // 保存の形は core が持つ。各環境が独自に組み立てない。
     string session_to_json(Session session);
     Session? session_from_json(string json);
+
+    // ---- サイドカー（.photo-curator/catalog.json）の同期（U33） ----
+    // 判断は core の 1 か所。PC・Web（wasm）と同じ規則で動く。Android の呼び出しの
+    // 切り替えは U35（いまはまだ Kotlin の Sidecar.kt が使われている）。
+    // 形は core が持つ。壊れていたら null（中途半端に読んで上書きしない）。
+    string sidecar_to_json(Sidecar sidecar);
+    Sidecar? sidecar_from_json(string json);
+
+    // 写真の鍵をそろえる（区切り `/`・NFC）。
+    string normalize_key(string key);
+
+    // 選別状況（星・セッション・手直し・学習した境目）の正規形。**ここに無いものは比べない。**
+    // 星は Session があれば session.ratings、無ければ photos。★0 は持たない。
+    Judgement canonical_judgement(
+        Session? session,
+        record<DOMString, i32> photos,
+        sequence<PairOverride> overrides,
+        u32? burst_distance,
+        string? epoch
+    );
+    Judgement sidecar_judgement(Sidecar sidecar);
+    // 意味として同じか。JSON の並び・空白・updatedAt・updatedBy・writeId では違わない。
+    boolean judgement_equivalent(Judgement a, Judgement b);
+    // 比較キー（正規形の SHA-256）。画像のハッシュ値とは別物。
+    string judgement_key(Judgement judgement);
+    // 未着手か（★1 以上が無い・1 手も進んでいない・手直しも境目も無い）。
+    boolean is_untouched(Judgement judgement);
+    SidecarProgress judgement_progress(Judgement judgement);
+    // どちらが進んでいるか（表示用。自動の判断には使わない）。
+    ProgressOrder progress_cmp(SidecarProgress a, SidecarProgress b);
+
+    // 版の見分け（writeId。無ければ legacy:<updatedAt>:<updatedBy>）。
+    string sidecar_token(Sidecar sidecar);
+    // その版を見たときの控え（取り込んだあと・意味が同じだったとき）。
+    SeenRecord sidecar_seen(Sidecar sidecar);
+    // 開き方の判断。remote は読めたもの（無ければ null）。つながらないときは呼ばない。
+    SidecarPlan sidecar_plan(
+        SeenRecord seen,
+        Judgement local,
+        Sidecar? remote,
+        boolean writable,
+        boolean detached
+    );
+    // 書く直前に v2 の印（version・writeId・basedOn・lineage・keyBase・progress）を入れる。
+    Sidecar sidecar_stamp(Sidecar sidecar, string write_id, Sidecar? base);
+
+    // 混ぜる（ダイアログの D・E）。
+    record<DOMString, i32> merge_stars(Judgement mine, Judgement theirs, MergeMode mode);
+    sequence<PairOverride> merge_overrides(sequence<PairOverride> mine, sequence<PairOverride> theirs);
+    Session session_from_ratings(
+        record<DOMString, i32> ratings,
+        u32 round,
+        i32 target_star,
+        u32 group_size,
+        record<DOMString, sequence<string>> members
+    );
+    MergeResult merge_judgements(
+        Judgement mine,
+        Judgement theirs,
+        MergeMode mode,
+        u32 group_size,
+        string fresh_epoch
+    );
+    MergePreview merge_preview(Judgement mine, Judgement theirs);
+
+    // 写真の鍵の変換（サイドカーは「選んだフォルダからの相対・`/`」）。
+    Sidecar sidecar_keys_to_folder(Sidecar sidecar, string prefix);
+    Sidecar sidecar_keys_from_folder(Sidecar sidecar, string prefix, string separator);
+    // 読んだ直後に通す。keyBase が無い古い版は、頭のフォルダが folder_hint の末尾と合えば外す。
+    Sidecar sidecar_normalize_keys(Sidecar sidecar, string folder_hint);
+    KeyCoverage sidecar_key_coverage(Sidecar sidecar, sequence<string> photo_keys);
 };
 
 // 選別に出す 1 枚。**端末ごとの指し先は持たない。**
@@ -181,4 +252,140 @@ dictionary Decision {
 dictionary Topped {
     string path;
     i32 previous;
+};
+
+// ---------------------------------------------------------------------------
+// サイドカー（U33）。形は core の Sidecar と同じ（JSON の名前は camelCase）。
+// ---------------------------------------------------------------------------
+
+dictionary SidecarPhoto {
+    i32 rating;
+};
+
+dictionary SidecarSessions {
+    Session? tournament;
+};
+
+dictionary Sidecar {
+    i32 version;
+    i64 updated_at;
+    string updated_by;
+    string updated_by_name;
+    // 写真の鍵（選んだフォルダからの相対）→ 星。
+    record<DOMString, SidecarPhoto> photos;
+    sequence<PairOverride> burst_overrides;
+    SidecarSessions sessions;
+    u32? burst_distance;
+    // v2 で足した項目。すべて省略できる。
+    string? write_id;
+    string? based_on;
+    sequence<string>? lineage;
+    string? epoch;
+    string? key_base;
+    SidecarProgress? progress;
+};
+
+// 判断と画面のための要約（Session から作り直せる値）。
+dictionary SidecarProgress {
+    boolean started;
+    u32 round;
+    boolean finished;
+    u32 decided;
+    u32 remaining;
+    u32 starred;
+    u32? total;
+    u32 overrides;
+    boolean learned;
+};
+
+dictionary PhotoStar {
+    string path;
+    i32 rating;
+};
+
+dictionary MemberGroup {
+    string representative;
+    sequence<string> members;
+};
+
+dictionary JudgementDecision {
+    sequence<string> group;
+    sequence<string> chosen;
+    string? topped;
+};
+
+// セッションの正規形。1 組の枚数は持たない（表示の設定なので比べない）。
+dictionary JudgementSession {
+    u32 round;
+    i32 target_star;
+    boolean finished;
+    sequence<string> remaining;
+    sequence<string> survivors;
+    sequence<MemberGroup> members;
+    sequence<JudgementDecision> history;
+};
+
+// 選別状況の正規形。
+dictionary Judgement {
+    sequence<PhotoStar> stars;
+    JudgementSession? session;
+    sequence<PairOverride> overrides;
+    u32? burst_distance;
+    string? epoch;
+};
+
+// 端末の控え（最後に読んだ／書いた版）。一度も見ていなければ token は空。
+// key が空なら「端末に変更あり」と見なす。
+dictionary SeenRecord {
+    string token;
+    string key;
+    string? epoch;
+};
+
+enum SettledReason { "Nothing", "Same", "NoChange", "Detached", "ReadOnly", "NewerVersion" };
+enum PushReason { "NoSidecar", "LocalChanged", "TheirsUntouched", "MineHasMore" };
+enum PullReason { "LocalUntouched", "FastForward", "TheirsHasMore" };
+enum ClashReason { "Diverged", "TheirsRestarted", "MineRestarted", "ExtrasConflict" };
+enum ProgressOrder { "Ahead", "Behind", "Even", "Unclear" };
+enum MergeMode { "Intersection", "Union" };
+
+dictionary MergePreview {
+    u32 mine_starred;
+    u32 theirs_starred;
+    u32 intersection_starred;
+    u32 union_starred;
+    u32 undecided;
+    boolean mid_round;
+};
+
+dictionary MergeResult {
+    Session session;
+    record<DOMString, i32> ratings;
+    sequence<PairOverride> overrides;
+    u32? burst_distance;
+    string? epoch;
+    u32 starred;
+    u32 undecided;
+};
+
+dictionary KeyCoverage {
+    u32 matched;
+    u32 total;
+};
+
+// 開き方の判断。Settled（何もしない）／Push（書く）／Pull（確認なしに取り込む）／
+// Clash（両方の要約を出して 5 択で選ばせる）。
+[Enum]
+interface SidecarPlan {
+    Settled(SeenRecord? seen, SettledReason reason);
+    Push(string? expected, boolean aside_theirs, PushReason reason);
+    Pull(Sidecar theirs, boolean aside_mine, SeenRecord seen, PullReason reason);
+    Clash(
+        Sidecar theirs,
+        SidecarProgress mine_progress,
+        SidecarProgress theirs_progress,
+        ProgressOrder order,
+        ClashReason reason,
+        MergePreview preview
+    );
 };
