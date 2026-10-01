@@ -3,6 +3,7 @@ import HomeView from '~/components/views/HomeView.vue'
 import ProjectView from '~/components/views/ProjectView.vue'
 import MethodView from '~/components/views/MethodView.vue'
 import SettingsView from '~/components/views/SettingsView.vue'
+import AppSettingsView from '~/components/views/AppSettingsView.vue'
 import BurstThresholdView from '~/components/views/BurstThresholdView.vue'
 import BurstPreviewView from '~/components/views/BurstPreviewView.vue'
 import TournamentView from '~/components/views/TournamentView.vue'
@@ -17,11 +18,13 @@ import MoveDialog from '~/components/dialogs/MoveDialog.vue'
 import BurstDialog from '~/components/dialogs/BurstDialog.vue'
 import NextRoundDialog from '~/components/dialogs/NextRoundDialog.vue'
 import RestartDialog from '~/components/dialogs/RestartDialog.vue'
+import DisplayEdgeDialog from '~/components/dialogs/DisplayEdgeDialog.vue'
 import ExportDialog from '~/components/dialogs/ExportDialog.vue'
 import MetadataDialog from '~/components/dialogs/MetadataDialog.vue'
 import DeleteDialog from '~/components/dialogs/DeleteDialog.vue'
 import SidecarConflictDialog from '~/components/dialogs/SidecarConflictDialog.vue'
 import AppNav from '~/components/AppNav.vue'
+import { panBy, wheelFactor, ZOOM_RESET, zoomAt, zoomLabel, type ZoomView } from '~/utils/zoomPan'
 
 const c = useCurator()
 onMounted(c.mount)
@@ -57,6 +60,68 @@ const {
   zoomPhoto,
   zoomSrc
 } = c
+
+// ---- 拡大の倍率・移動（Ctrl+ホイール、ドラッグ、ダブルクリック） ----
+const zoomView = ref<ZoomView>({ ...ZOOM_RESET })
+const zoomBox = ref<HTMLElement | null>(null)
+const zoomImage = ref<HTMLImageElement | null>(null)
+const zoomTransform = computed(() => {
+  const v = zoomView.value
+  return v.scale > 1 ? { transform: `translate(${v.x}px, ${v.y}px) scale(${v.scale})` } : undefined
+})
+const zoomScaleLabel = computed(() => zoomLabel(zoomView.value.scale))
+// 写真を前後に送る・閉じる・開き直すときは 1 倍に戻す。
+watch(zoomPhoto, () => { zoomView.value = { ...ZOOM_RESET } })
+
+function zoomSize() {
+  return { w: zoomImage.value?.offsetWidth ?? 0, h: zoomImage.value?.offsetHeight ?? 0 }
+}
+
+// 拡大中だけ window で受ける。Ctrl+ホイール（ページ全体の拡大）を止めるため passive: false。
+function onZoomWheel(event: WheelEvent) {
+  if (!event.ctrlKey) return
+  event.preventDefault()
+  const box = zoomBox.value
+  if (!box) return
+  const rect = box.getBoundingClientRect()
+  const { w, h } = zoomSize()
+  zoomView.value = zoomAt(
+    zoomView.value,
+    wheelFactor(event.deltaY),
+    event.clientX - (rect.left + rect.width / 2),
+    event.clientY - (rect.top + rect.height / 2),
+    w,
+    h
+  )
+}
+watch(() => !!zoomPhoto.value, (open) => {
+  if (open) window.addEventListener('wheel', onZoomWheel, { passive: false })
+  else window.removeEventListener('wheel', onZoomWheel)
+})
+onBeforeUnmount(() => window.removeEventListener('wheel', onZoomWheel))
+
+let dragFrom: { x: number, y: number, id: number } | null = null
+function onZoomPointerDown(event: PointerEvent) {
+  if (zoomView.value.scale <= 1 || event.button !== 0) return
+  dragFrom = { x: event.clientX, y: event.clientY, id: event.pointerId }
+  ;(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId)
+}
+function onZoomPointerMove(event: PointerEvent) {
+  if (!dragFrom || dragFrom.id !== event.pointerId) return
+  const { w, h } = zoomSize()
+  zoomView.value = panBy(zoomView.value, event.clientX - dragFrom.x, event.clientY - dragFrom.y, w, h)
+  dragFrom = { ...dragFrom, x: event.clientX, y: event.clientY }
+}
+function onZoomPointerUp(event: PointerEvent) {
+  if (dragFrom?.id === event.pointerId) dragFrom = null
+}
+// 倍率が 1 を超えているあいだの写真のクリックは閉じない（ドラッグ直後の click も同じ）。
+function onZoomPhotoClick(event: MouseEvent) {
+  if (zoomView.value.scale > 1) event.stopPropagation()
+}
+function onZoomReset() {
+  zoomView.value = { ...ZOOM_RESET }
+}
 </script>
 
 <template>
@@ -110,6 +175,10 @@ const {
           <SettingsView />
         </template>
 
+        <template v-else-if="view === 'app-settings'">
+          <AppSettingsView />
+        </template>
+
         <template v-else-if="view === 'burst-threshold' && session">
           <BurstThresholdView />
         </template>
@@ -146,7 +215,7 @@ const {
     >
 
     <!-- 拡大表示。写真だけを見せたいので余計な枠は置かない。
-         ← → だけ前後送りに使い、それ以外のキーでは閉じる。 -->
+         ← → は前後送り、Esc・Enter・Space は閉じる。Ctrl+スクロールで拡大・縮小。 -->
     <v-overlay
       :model-value="!!zoomPhoto"
       class="zoom-overlay align-center justify-center"
@@ -165,8 +234,13 @@ const {
             aria-label="前の写真" :disabled="zoomIndex <= 0"
             @click.stop="stepZoom(-1)"
           />
-          <div class="zoom-overlay__photo">
-            <img :src="zoomSrc" :alt="zoomPhoto.name">
+          <div
+            ref="zoomBox" class="zoom-overlay__photo" :class="{ 'is-zoomed': zoomView.scale > 1 }"
+            @click="onZoomPhotoClick" @dblclick="onZoomReset"
+            @pointerdown="onZoomPointerDown" @pointermove="onZoomPointerMove"
+            @pointerup="onZoomPointerUp" @pointercancel="onZoomPointerUp"
+          >
+            <img ref="zoomImage" :src="zoomSrc" :alt="zoomPhoto.name" :style="zoomTransform" draggable="false">
             <!-- 原本に替わるまで、表示用画像の上にぐるぐるを重ねる。 -->
             <v-progress-circular v-if="zoomLoading" class="zoom-overlay__spinner" indeterminate color="white" size="48" width="4" aria-label="原本を読み込み中" />
           </div>
@@ -181,8 +255,9 @@ const {
           {{ zoomPhoto.name }}
           <template v-if="zoomLoading"> ・ 原本を読み込み中…</template>
           <span v-if="zoomError" class="text-error"> ・ {{ zoomError }}</span>
+          <span v-if="zoomScaleLabel" class="zoom-overlay__scale"> ・ {{ zoomScaleLabel }}</span>
           <template v-if="zoomList.length > 1"> ・ ← → で前後</template>
-          ・ クリックか他のキーで閉じる
+          ・ Esc かクリックで閉じる ・ Ctrl+スクロールで拡大・縮小
         </div>
       </div>
     </v-overlay>
@@ -195,6 +270,7 @@ const {
     <BurstDialog />
     <NextRoundDialog />
     <RestartDialog />
+    <DisplayEdgeDialog />
     <ExportDialog />
     <MetadataDialog />
     <DeleteDialog />

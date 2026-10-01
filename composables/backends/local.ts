@@ -182,6 +182,8 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
    */
   async function decorateAmazon(rows: StoredPhoto[], links: Record<string, string>): Promise<Photo[]> {
     const urls = await blobStore.load(rows.map(row => row.id))
+    // 表示用の URL の長辺は、そのプロジェクトで選んだ値（無ければアプリの既定）。
+    const edge = rows.length ? await displayEdgeOf(rows[0]!.projectId) : DISPLAY_EDGE_DEFAULT
     return rows.map(row => {
       const found = urls.get(row.id)
       const link = links[row.relativePath] ?? null
@@ -189,7 +191,7 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
         row,
         found?.thumbnailUrl ?? (link ? viewBoxUrl(link, AMAZON_THUMB_EDGE) : null),
         link,
-        found?.displayUrl ?? (link ? viewBoxUrl(link, DISPLAY_EDGE_DEFAULT) : null)
+        found?.displayUrl ?? (link ? viewBoxUrl(link, edge) : null)
       )
     })
   }
@@ -820,14 +822,19 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
     // ブラウザでは表示用画像を準備のときに、作成時に選んだ長辺で作る。**原本を保存しない**
     // ので、あとから別の大きさで作り直すことはできない（`canRebuild: false`）。
     // 変えられるのはこれから作る分だけ。
-    getDisplaySettings: async () => {
+    // Amazon は URL で出す（画像を端末に置かない）ので、選んだ長辺を保存するだけで変えられる。
+    getDisplaySettings: async (projectId?: string) => {
       const saved = await store.readDisplayEdge().catch(() => null)
+      const row = projectId ? await store.getProject(projectId) : null
+      const amazon = !!row && sourceOf(row).kind === 'amazon'
       return {
         edge: saved ? nearestDisplayEdge(saved) : DISPLAY_EDGE_DEFAULT,
         choices: [...DISPLAY_EDGE_CHOICES],
         defaultEdge: DISPLAY_EDGE_DEFAULT,
         largeEdge: 1536,
-        canRebuild: false
+        canRebuild: amazon,
+        rebuildsOnChange: !amazon,
+        projectEdge: projectId ? await displayEdgeOf(projectId) : undefined
       }
     },
     saveDisplayEdge: async (edge: number) => {

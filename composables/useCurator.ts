@@ -4,6 +4,7 @@ import type {
 } from '~/types/photo'
 import { MAX_RATING } from '~/types/photo'
 import type { DisplaySettings } from '~/composables/photoBackend'
+import { builtDisplayCount, displayEdgePlan } from '~/utils/displayEdge'
 import type { MoveSelection } from '~/utils/ratingMove'
 // `selectedCount` は選別画面側の computed と名前がぶつかるので別名にする。
 import {
@@ -13,7 +14,7 @@ import {
 import * as core from '~/lib/core'
 import type { BurstThreshold, PairOverride, PhotoRef, Session } from '~/lib/core'
 import {
-  blocksFromCuts, cutAll, cutAroundSelection, cutsFromGroups, joinAt
+  blocksFromCuts, cutAll, cutAroundSelection, cutsFromGroups, joinAt, moveCut, toggleAt
 } from '~/utils/burstEdit'
 import { buildBurstQuestions } from '~/utils/burstQuestions'
 import { burstNeighborhood } from '~/utils/burstNeighborhood'
@@ -39,7 +40,7 @@ import {
 import { createStoredZip } from '~/utils/zip'
 import { registerAutoPush, useSidecarSync } from '~/composables/useSidecarSync'
 
-type View = 'home' | 'project' | 'method' | 'settings' | 'burst-threshold' | 'burst-preview' | 'tournament' | 'result' | 'results' | 'burst-review'
+type View = 'home' | 'project' | 'method' | 'settings' | 'app-settings' | 'burst-threshold' | 'burst-preview' | 'tournament' | 'result' | 'results' | 'burst-review'
 
 function createCurator() {
   const desktop = useDesktop()
@@ -124,9 +125,12 @@ function createCurator() {
     get: () => displayEdge.value >= (displaySettings.value?.largeEdge ?? 1536),
     set: (on: boolean) => {
       const settings = displaySettings.value
-      if (settings) void applyDisplayEdge(on ? settings.largeEdge : settings.defaultEdge)
+      if (settings) void requestDisplayEdge(on ? settings.largeEdge : settings.defaultEdge)
     }
   })
+  /** 「表示用画像を作り直します。よろしいですか」の確認。OK までは px を変えない（選択は元のまま）。 */
+  const displayEdgeDialog = ref(false)
+  const pendingDisplayEdge = ref<number | null>(null)
   const pendingTournamentSettings = ref<TournamentSettings | null>(null)
   /**
    * 1 グループの枚数の既定と上限。デスクトップは 10 枚、iPad などブラウザは
@@ -869,18 +873,44 @@ function createCurator() {
     }
   }
 
+  // アプリの設定の画面。表示用画像の既定（これから作るプロジェクトの分）。
+  const appDisplayChoices = ref<number[]>([])
+  const appDisplayEdge = ref(0)
+  async function loadAppSettings() {
+    try {
+      const settings = await desktop.getDisplaySettings()
+      appDisplayChoices.value = settings.choices
+      appDisplayEdge.value = settings.edge
+    } catch {
+      appDisplayChoices.value = []
+    }
+  }
+  /** 選んだらその場で既定に保存する。既存のプロジェクトの表示用画像は作り直さない。 */
+  async function saveAppDisplayEdge(edge: number) {
+    const previous = appDisplayEdge.value
+    appDisplayEdge.value = edge
+    try {
+      appDisplayEdge.value = await desktop.saveDisplayEdge(edge)
+    } catch (caught) {
+      appDisplayEdge.value = previous
+      notify(caught instanceof Error ? caught.message : '設定を保存できませんでした')
+    }
+  }
+  watch(view, next => { if (next === 'app-settings') void loadAppSettings() })
+
   /**
-   * 作成した直後、**準備（表示用画像づくり）を始める前**に、選んだ長辺をこのプロジェクトに書く
-   * （あとで作り直さないため）。選んだ値はアプリの既定にもする。
+   * 作成した直後、**準備（表示用画像づくり）を始める前**に、ダイアログで選んだ長辺を
+   * このプロジェクトに書く（生成はこの値で行う）。**アプリの既定は変えない**
+   * （既定はダイアログの初期値にだけ効く。変えるのはアプリの設定の画面）。
    */
   async function applyCreateDisplayEdge(projectId: string) {
     const edge = createDisplayEdge.value
     if (!edge || !createDisplayChoices.value.length) return
     try {
-      await desktop.saveDisplayEdge(edge)
       await desktop.saveProjectDisplayEdge(projectId, edge)
-    } catch {
-      // 保存できなくても作成は続ける（既定の大きさで作られる）。
+    } catch (cause) {
+      // 作成は続ける（既定の大きさで作られる）が、黙らずに知らせる。
+      error.value = cause instanceof Error ? cause.message : '表示用画像の大きさを保存できませんでした。既定の大きさで作ります。'
     }
   }
 
@@ -1452,6 +1482,16 @@ function createCurator() {
   /** 隣り合うまとまりを繋ぐ。近くの写真を取り込むのもこれ。 */
   function joinBurstAt(boundaryIndex: number) {
     burstCuts.value = joinAt(burstCuts.value, boundaryIndex)
+  }
+
+  /** 境目をひとつ、切る／つなぐ（バーのタップ）。 */
+  function toggleBurstCut(boundaryIndex: number) {
+    burstCuts.value = toggleAt(burstCuts.value, boundaryIndex)
+  }
+
+  /** 切れている境目を別の境目へずらす（バーのドラッグ）。 */
+  function moveBurstCut(from: number, to: number) {
+    burstCuts.value = moveCut(burstCuts.value, from, to)
   }
 
   function scatterBurst() {
@@ -2029,9 +2069,10 @@ function createCurator() {
     // 表示用画像が替わりうるので、先読みした行（表示用の場所を含む）は捨てる。
     prefetched.clear()
     try {
-      displaySettings.value = await desktop.getDisplaySettings()
-      // プロジェクトの上書きを反映した実効値。null を渡すと現状のまま返る。
-      displayEdge.value = await desktop.saveProjectDisplayEdge(activeProject.value.id, null)
+      // プロジェクトの上書きを反映した実効値（読むだけ。上書きは消さない）。
+      const settings = await desktop.getDisplaySettings(activeProject.value.id)
+      displaySettings.value = settings
+      displayEdge.value = settings.projectEdge ?? settings.edge
       displayBacklog.value = await desktop.getDisplayBacklog(activeProject.value.id)
     } catch {
       // 設定が読めなくても選別は続けられる。表示用が無ければ原本に落ちるだけ。
@@ -2057,6 +2098,50 @@ function createCurator() {
     } finally {
       displayBusy.value = false
     }
+  }
+
+  /** 走査が終わったプロジェクトの表示用画像を、選んだ長辺で作り始める。 */
+  async function startDisplayAfterScan(projectId: string) {
+    if (activeProject.value?.id !== projectId) return
+    await refreshDisplayState()
+    if (displayBacklog.value > 0) desktop.startDisplayGeneration(projectId).catch(() => undefined)
+  }
+
+  /**
+   * プロジェクトの画面から px を変える。作り直しが要るとき（作られた画像があり、値が変わる）だけ
+   * 確認を出す。要らなければ保存だけ。変えられないとき・同じ値のときは何もしない。
+   */
+  async function requestDisplayEdge(edge: number) {
+    const project = activeProject.value
+    if (!project || displayBusy.value) return
+    const plan = displayEdgePlan({
+      current: displayEdge.value,
+      next: edge,
+      canRebuild: displaySettings.value?.canRebuild,
+      rebuildsOnChange: displaySettings.value?.rebuildsOnChange,
+      builtCount: builtDisplayCount(project.photoCount, displayBacklog.value)
+    })
+    if (plan === 'locked' || plan === 'same') return
+    if (plan === 'confirm') {
+      pendingDisplayEdge.value = edge
+      displayEdgeDialog.value = true
+      return
+    }
+    await applyDisplayEdge(edge)
+  }
+
+  /** 確認の OK。選んだ px で作り直す。 */
+  async function confirmDisplayEdge() {
+    const edge = pendingDisplayEdge.value
+    displayEdgeDialog.value = false
+    pendingDisplayEdge.value = null
+    if (edge !== null) await applyDisplayEdge(edge)
+  }
+
+  /** 確認のキャンセル。選択は元のまま、作り直さない。 */
+  function cancelDisplayEdge() {
+    displayEdgeDialog.value = false
+    pendingDisplayEdge.value = null
   }
 
   /** 明示的に作り直す。壊れたときや、途中で止まったときの逃げ道。 */
@@ -2359,7 +2444,7 @@ function createCurator() {
   }
 
   function onKeydown(event: KeyboardEvent) {
-    // 拡大中はどのキーでも閉じるだけ。選択には流さない。
+    // 拡大中は拡大のキーだけ。選択には流さない。
     if (zoomPhoto.value) {
       onZoomKeydown(event)
       return
@@ -2436,14 +2521,20 @@ function createCurator() {
     else void toggleChoice(photo.id)
   }
 
-  /** 拡大表示は、左右キーだけ前後送りに使い、それ以外のキーでは閉じる。 */
+  /**
+   * 拡大表示のキー。← → は前後送り、Esc・Enter・Space は閉じる。
+   * Ctrl・Shift・Alt・Meta の単独の押下や、ほかのキーでは閉じない（Ctrl+ホイールの前に Ctrl を押すだけで閉じない）。
+   * どのキーでも、選別画面の操作には流さない。
+   */
   function onZoomKeydown(event: KeyboardEvent) {
     if (!zoomPhoto.value) return
-    event.preventDefault()
     event.stopPropagation()
-    if (event.key === 'ArrowLeft') { stepZoom(-1); return }
-    if (event.key === 'ArrowRight') { stepZoom(1); return }
-    zoomPhoto.value = null
+    if (event.key === 'ArrowLeft') { event.preventDefault(); stepZoom(-1); return }
+    if (event.key === 'ArrowRight') { event.preventDefault(); stepZoom(1); return }
+    if (event.key === 'Escape' || event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault()
+      zoomPhoto.value = null
+    }
   }
 
   /** 準備の途中で、格子のサムネイルを少しずつ埋める（ブラウザだけ。PC は元から原本が見える）。 */
@@ -2509,6 +2600,8 @@ function createCurator() {
           await loadPreview(progress.projectId)
           void refreshPrepareCounts(progress.projectId, true)
           await loadCoreInputs(progress.projectId).catch(() => undefined)
+          // 表示用画像は走査のあとに溜める（開き直さないと始まらなかった）。
+          await startDisplayAfterScan(progress.projectId)
           await sidecar.refreshAccess(progress.projectId)
           if (sidecarCheckPending === progress.projectId && activeProject.value) {
             // 写真の行ができたので、開いたときの確認をここで行う（取り込んだ星を行へ写せる）。
@@ -2582,6 +2675,9 @@ function createCurator() {
     createDialog,
     createDisplayChoices,
     createDisplayEdge,
+    appDisplayChoices,
+    appDisplayEdge,
+    saveAppDisplayEdge,
     createTab,
     amazonUrl,
     amazonPreview,
@@ -2603,6 +2699,11 @@ function createCurator() {
     displayEdge,
     displayBacklog,
     displayBusy,
+    displayEdgeDialog,
+    pendingDisplayEdge,
+    requestDisplayEdge,
+    confirmDisplayEdge,
+    cancelDisplayEdge,
     largeDisplay,
     pendingTournamentSettings,
     groupLimits,
@@ -2763,6 +2864,8 @@ function createCurator() {
     toggleBurstPick,
     splitBurstSelection,
     joinBurstAt,
+    toggleBurstCut,
+    moveBurstCut,
     scatterBurst,
     boundaryBefore,
     settleBurstPhoto,

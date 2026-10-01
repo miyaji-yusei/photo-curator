@@ -23,3 +23,50 @@ export function displayEdgeLabel(edge: number): string {
 export function nearestDisplayEdge(edge: number, choices: readonly number[] = DISPLAY_EDGE_CHOICES): number {
   return choices.reduce((best, choice) => (Math.abs(choice - edge) < Math.abs(best - edge) ? choice : best), choices[0]!)
 }
+
+/** プロジェクトの画面から表示用画像の px を変えたときの扱い。 */
+export type DisplayEdgePlan =
+  /** 変えられない（原本が無く、作り直せない）。 */
+  | 'locked'
+  /** 同じ値。何もしない。 */
+  | 'same'
+  /** 警告なしで保存だけ（まだ何も作られていない・作り直しが要らない）。 */
+  | 'save'
+  /** 作り直しになる。「よろしいですか」を出してから。 */
+  | 'confirm'
+
+export interface DisplayEdgePlanInput {
+  current: number
+  next: number
+  /** 作り直せるか（DisplaySettings.canRebuild。未指定は true）。 */
+  canRebuild?: boolean
+  /** 長辺を変えると画像を作り直すか（DisplaySettings.rebuildsOnChange。未指定は true）。 */
+  rebuildsOnChange?: boolean
+  /** 今の長辺で、すでに作られた表示用画像の枚数。 */
+  builtCount: number
+}
+
+/** 変えられるか。原本が無く作り直せないときは false（画面は項目を押せなくし、理由を出す）。 */
+export function canChangeDisplayEdge(canRebuild?: boolean): boolean {
+  return canRebuild !== false
+}
+
+/** 作られた枚数。写真の数から、今の長辺でまだ要る枚数を引く。 */
+export function builtDisplayCount(photoCount: number, backlog: number): number {
+  return Math.max(0, photoCount - Math.max(0, backlog))
+}
+
+/** px を変えるときの扱い。再作成が要るのは、すでに作られた画像があり、値が変わり、作り直す環境のときだけ。 */
+export function displayEdgePlan(input: DisplayEdgePlanInput): DisplayEdgePlan {
+  if (!canChangeDisplayEdge(input.canRebuild)) return 'locked'
+  if (input.next === input.current) return 'same'
+  if (input.rebuildsOnChange === false) return 'save'
+  return input.builtCount > 0 ? 'confirm' : 'save'
+}
+
+/** 警告ダイアログの本文に出す、作り直しの説明。 */
+export function displayRebuildNote(isAmazon: boolean): string {
+  return isAmazon
+    ? 'Amazon Photos から写真を取り直すので、通信と時間がかかります。'
+    : '写真を読み直すので、時間がかかります（小さくするときは一瞬です）。'
+}
