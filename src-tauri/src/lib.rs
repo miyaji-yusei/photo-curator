@@ -802,7 +802,9 @@ where
     if total == 0 {
         return Ok(ParallelOutcome::default());
     }
-    let workers = workers.clamp(1, MAX_ANALYSIS_WORKERS).min(total);
+    // 上限は呼び出し側が決める（ローカル・NAS は `analysis_worker_count*` が
+    // MAX_ANALYSIS_WORKERS に丸め済み。Amazon は amazon::WORKERS を使う）。
+    let workers = workers.max(1).min(total);
 
     // worker 側はこのフラグだけを見る。`is_cancelled` は Tauri の State を
     // 借りていて 'static にできないため、writer が毎ティック転記する。
@@ -6127,6 +6129,37 @@ mod tests {
             .expect("insert photo");
         }
         conn
+    }
+
+    // Amazon の並列数（amazon::WORKERS = 8）が run_in_parallel で 4 に切られないこと（U27 R6）。
+    #[test]
+    fn run_in_parallel_honours_a_worker_count_above_the_local_cap() {
+        let total = 32;
+        let threads = Arc::new(Mutex::new(HashSet::new()));
+        let seen = threads.clone();
+        let mut received = 0usize;
+        run_in_parallel(
+            Arc::new(fake_jobs(total)),
+            amazon::WORKERS,
+            Duration::from_secs(30),
+            &|| false,
+            move |index, job: &FakeJob| {
+                seen.lock().unwrap().insert(std::thread::current().id());
+                std::thread::sleep(Duration::from_millis(30));
+                PhotoWork::new(index, &job.id)
+            },
+            &mut |_item| {
+                received += 1;
+                Ok(())
+            },
+        )
+        .expect("run workers");
+        assert_eq!(received, total);
+        assert!(
+            threads.lock().unwrap().len() > MAX_ANALYSIS_WORKERS,
+            "worker は {} 本まで使える",
+            amazon::WORKERS
+        );
     }
 
     // 並列に読んだ結果を単一の writer が書く構造が、重複も欠落も起こさないこと。
