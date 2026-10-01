@@ -17,7 +17,7 @@ import java.util.concurrent.TimeUnit
  * 一切使わないので、うまくいかなくても「このリンクが読めない」で済む。
  *
  * **規約の約束**（設計 08 章 13）: 本人が渡したリンクだけ／本人の操作のときだけ／
- * 並列 4 まで／同じ絵は二度取らない／Amazon の画面を取り込まない。
+ * 並列 8 まで／同じ絵は二度取らない／Amazon の画面を取り込まない。
  */
 object Amazon {
     private const val TAG = "Amazon"
@@ -25,8 +25,8 @@ object Amazon {
     /** 一覧は 200 件ずつ。**これより大きいと 400 が返る**（実測）。 */
     private const val PAGE = 200
 
-    /** 並べて取る数。**実測では 8 で問題ないが、通常の利用に収めるため 4。** */
-    const val PARALLEL = 4
+    /** 並べて取る数。PC（amazon.rs の WORKERS）と同じ 8。ユーザー決定で 08章の約束を 4 から 8 に変えた（U14）。 */
+    const val PARALLEL = 8
 
     /** 一覧用の縮小。長辺 160 で約 7KB（実測）。 */
     const val THUMB = 160
