@@ -24,7 +24,7 @@ object ThumbCache {
 
     /** 道筋から決まる名前。**同じ写真なら同じファイル。** */
     private fun name(cacheId: String, path: String): String =
-        "${cacheId}_${path.hashCode().toUInt().toString(16)}.jpg"
+        "${cacheId}_${CacheName.of(path)}.jpg"
 
     fun file(context: Context, cacheId: String, path: String) =
         File(dir(context), name(cacheId, path))

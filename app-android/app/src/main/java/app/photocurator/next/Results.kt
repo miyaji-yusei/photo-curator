@@ -364,7 +364,7 @@ fun ResultsScreen(
                 modifier = Modifier.weight(1f),
                 contentPadding = PaddingValues(horizontal = 14.dp)
             ) {
-                items(shown, key = { it.id }) { photo ->
+                items(shown, key = { it.relativePath }) { photo ->
                     val on = photo.relativePath in picked
                     val burst = members[photo.relativePath]?.size ?: 1
                     Box(
@@ -403,8 +403,8 @@ fun ResultsScreen(
                                 }
                             )
                     ) {
-                        val format = remember(photo.id) { unsupportedFormat(photo) }
-                        var state by remember(photo.id) {
+                        val format = remember(photo.relativePath) { unsupportedFormat(photo) }
+                        var state by remember(photo.relativePath) {
                             mutableStateOf(
                                 if (format != null) Preview.Unsupported else Preview.Generating
                             )

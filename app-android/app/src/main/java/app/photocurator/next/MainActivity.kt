@@ -50,6 +50,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         // 網の状態を言い分けるために預ける。**ここでしか渡さない。**
         Smb.remember(this)
+        // 旧い名前の絵のキャッシュを一度だけ片付ける（A6）。
+        Thread { runCatching { CacheName.dropLegacy(applicationContext) } }.start()
         requestPhotoPermissions()
         take(intent)
         setContent { App() }

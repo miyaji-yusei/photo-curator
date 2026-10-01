@@ -459,11 +459,11 @@ fun ProjectScreen(
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                     horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
-                    items(shown, key = { it.id }) { photo ->
+                    items(shown, key = { it.relativePath }) { photo ->
                         // **なぜ絵が無いのかを、タイルの中で言う。**
                         // 読めない形式・まだ作っていない・作れなかった、を分ける。
-                        val format = remember(photo.id) { unsupportedFormat(photo) }
-                        var state by remember(photo.id) {
+                        val format = remember(photo.relativePath) { unsupportedFormat(photo) }
+                        var state by remember(photo.relativePath) {
                             mutableStateOf(
                                 when {
                                     format != null -> Preview.Unsupported

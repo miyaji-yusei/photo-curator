@@ -37,7 +37,7 @@ object Renders {
      * そのまま出してしまわないため。
      */
     private fun name(cacheId: String, path: String, edge: Int): String =
-        "${cacheId}_${path.hashCode().toUInt().toString(16)}_$edge.jpg"
+        "${cacheId}_${CacheName.of(path)}_$edge.jpg"
 
     private val locks = java.util.concurrent.ConcurrentHashMap<String, kotlinx.coroutines.sync.Mutex>()
 
@@ -182,7 +182,7 @@ object Renders {
     /** いま置いてある枚数。準備の進み具合に使う。 */
     fun count(context: Context, cacheId: String, edge: Int): Int =
         dir(context).listFiles { file ->
-            file.name.startsWith("${cacheId}_") && file.name.endsWith("_$edge.jpg")
+            CacheName.isRender(file.name, cacheId, edge)
         }?.size ?: 0
 
     /** 置いてある量。**消すときに何 MB 消えるかを言うため。** */
