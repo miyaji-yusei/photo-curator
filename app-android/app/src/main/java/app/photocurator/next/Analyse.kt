@@ -258,7 +258,12 @@ object Analyse {
             // **1 本の接続で全部読む。** 1 枚ごとに張り直すと、網の往復が
             // そのまま待ち時間になる（実測 50 枚で 40 秒）。
             val (nas, password) = nasAccess
-            Smb.reading(nas, password) { reader -> sweepNetwork(reader) }
+            val result = Smb.reading(nas, password) { reader -> sweepNetwork(reader) }
+            if (result is SmbResult.Failed) {
+                // **失敗を握りつぶさない。** ここまでに作った分は残してから、準備を失敗にする。
+                onPartial(HashMap(out))
+                throw IllegalStateException(result.reason)
+            }
         } else if (photos.any { it.amazon != null }) {
             sweepAmazon()
         } else {
@@ -267,8 +272,11 @@ object Analyse {
 
         // 最後まで来たときだけ、無くなったものを片付ける。
         // 途中で刈ると、まだ見ていない写真を「消えた」と誤解する。
-        val living = photos.mapTo(HashSet()) { it.relativePath }
-        out.keys.retainAll(living)
+        // **顔ぶれが空なら刈らない。** 取れなかっただけかもしれず、全部消えてしまう。
+        if (photos.isNotEmpty()) {
+            val living = photos.mapTo(HashSet()) { it.relativePath }
+            out.keys.retainAll(living)
+        }
         out
     }
 }
@@ -283,6 +291,28 @@ object Prepare {
     fun inShootingOrder(photos: List<Photo>): List<Photo> =
         photos.sortedWith(compareBy({ it.takenAt }, { it.relativePath }))
 
+    /** 新しく取った顔ぶれをどうするか。 */
+    enum class ListingDecision {
+        /** 控えを置き換える。 */
+        Replace,
+
+        /** 控えは書かない（元から無く、今回も空）。 */
+        Skip,
+
+        /** 前は写真があったのに空で返ってきた。**前の控えを残し、失敗として扱う。** */
+        KeepPrevious
+    }
+
+    /**
+     * 取り直した顔ぶれを控えに書いてよいか。**空で上書きしない。**
+     * 失敗が空に見える形（網の途切れなど）で、ハッシュ値まで失うのを防ぐ。
+     */
+    fun decideListing(previous: List<Photo>?, fresh: List<Photo>): ListingDecision = when {
+        fresh.isNotEmpty() -> ListingDecision.Replace
+        !previous.isNullOrEmpty() -> ListingDecision.KeepPrevious
+        else -> ListingDecision.Skip
+    }
+
     suspend fun run(
         context: android.content.Context,
         project: Project,
@@ -292,10 +322,18 @@ object Prepare {
     ): Pair<List<Photo>, List<uniffi.photo_curator_core.PhotoRef>> {
         // 顔ぶれは控えたものを使う。開くたびに数え直すと、NAS では
         // そのたびに網の往復が要る。
-        val known = if (rescan) null else Listing.load(context, project.source.key)
-        val photos = (known ?: Photos.list(context, project.source).also {
-            Listing.save(context, project.source.key, it)
-        }).let(::inShootingOrder)
+        val previous = Listing.load(context, project.source.key)
+        val listed = if (!rescan && previous != null) previous else {
+            val fresh = Photos.list(context, project.source)
+            when (decideListing(previous, fresh)) {
+                ListingDecision.Replace -> Listing.save(context, project.source.key, fresh)
+                ListingDecision.Skip -> Unit
+                ListingDecision.KeepPrevious ->
+                    throw IllegalStateException("写真の一覧を取れませんでした（前の状態は残してあります）")
+            }
+            fresh
+        }
+        val photos = inShootingOrder(listed)
         val cached = Fingerprints.load(context, project.source.key)
 
         // NAS のときだけ、つなぎ先とパスワードを渡す。
@@ -303,7 +341,7 @@ object Prepare {
             val nasId = project.source.key.substringBefore("|")
             NasStore.all(context).firstOrNull { it.id == nasId }?.let { nas ->
                 NasPasswords.password(context, nas)?.let { nas to it }
-            }
+            } ?: throw IllegalStateException("NAS につなぐ情報（登録かパスワード）がありません")
         } else null
 
         val prints = Analyse.fingerprints(
@@ -381,7 +419,7 @@ object Prepare {
         if (missing.isEmpty()) return@withContext 0
 
         var made = 0
-        Smb.reading(nas, password) { reader ->
+        val result = Smb.reading(nas, password) { reader ->
             // **1 本の接続で通す。** 原本は大きいので、並べすぎると
             // 端末のメモリと NAS の両方を圧迫する。少しずつ重ねる。
             for (chunk in missing.chunked(3)) {
@@ -399,6 +437,8 @@ object Prepare {
                 onProgress(done, photos.size)
             }
         }
+        // **接続や認証の失敗を成功にしない。** 準備の側の「止まっています」に載せる。
+        if (result is SmbResult.Failed) throw IllegalStateException(result.reason)
         made
     }
 

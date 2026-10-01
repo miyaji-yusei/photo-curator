@@ -120,7 +120,15 @@ fun CullScreen(
         // 指紋は OS の縮小画像から作るので**原本を読まない**（1 枚 3ms）。
         // **前に作った分は作り直さない。**
         note = "似た写真を調べています…"
-        val prepared0 = Prepare.run(context, project) { done, total -> prepared = done to total }
+        val prepared0 = try {
+            Prepare.run(context, project) { done, total -> prepared = done to total }
+        } catch (error: kotlinx.coroutines.CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            // **準備の失敗で落とさない。** 理由を出して、戻れるようにしておく。
+            note = "準備が止まっています: " + Smb.describe(error)
+            return@LaunchedEffect
+        }
         photos = prepared0.first
         refs = prepared0.second
         // **読んだ値はその場の変数で使う。**

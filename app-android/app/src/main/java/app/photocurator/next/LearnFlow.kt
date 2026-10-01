@@ -33,11 +33,21 @@ fun LearnFlow(project: Project, onStart: () -> Unit, onBack: () -> Unit) {
     var prepared by remember { mutableStateOf(0 to 0) }
     var phase by remember { mutableStateOf("prepare") }
     var distance by remember { mutableStateOf(DEFAULT_DISTANCE) }
+    // 準備が止まった理由。**出して戻れるようにする。**
+    var failure by remember { mutableStateOf<String?>(null) }
 
     val byPath = remember(photos) { photos.associateBy { it.relativePath } }
 
     LaunchedEffect(project.id) {
-        val ready = Prepare.run(context, project) { done, total -> prepared = done to total }
+        val ready = try {
+            Prepare.run(context, project) { done, total -> prepared = done to total }
+        } catch (error: kotlinx.coroutines.CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            // **準備の失敗で落とさない。** 理由を出して、戻れるようにしておく。
+            failure = Smb.describe(error)
+            return@LaunchedEffect
+        }
         photos = ready.first
         refs = ready.second
         questions = Learning.questions(refs, 4000)
@@ -54,7 +64,10 @@ fun LearnFlow(project: Project, onStart: () -> Unit, onBack: () -> Unit) {
                 Modifier.align(Alignment.Center),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                Text("似た写真を調べています…", color = Faint, fontSize = 13.sp)
+                Text(
+                    failure?.let { "準備が止まっています: $it" } ?: "似た写真を調べています…",
+                    color = Faint, fontSize = 13.sp
+                )
                 if (prepared.second > 0) {
                     Text(
                         "${prepared.first} / ${prepared.second}",

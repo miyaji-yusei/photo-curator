@@ -221,12 +221,17 @@ object Photos {
         val nasId = key.substringBefore("|")
         val deep = key.endsWith("|**")
         val folder = key.removeSuffix("|**").substringAfter("|")
-        val nas = NasStore.all(context).firstOrNull { it.id == nasId } ?: return emptyList()
-        val password = NasPasswords.password(context, nas) ?: return emptyList()
+        // **取れなかったことを「空」にしない。** 空として控えると、作り終えたハッシュ値まで
+        // 消えて、失敗が成功に見える（Amazon と同じく理由を投げる）。
+        val nas = NasStore.all(context).firstOrNull { it.id == nasId }
+            ?: throw IllegalStateException("NAS の登録が見つかりません")
+        val password = NasPasswords.password(context, nas)
+            ?: throw IllegalStateException("NAS のパスワードが要ります")
         // **「以下ぜんぶ」なら入れ子もたどる。** 印は鍵の末尾に付いている。
         val listed = if (deep) Smb.photosDeep(nas, password, folder)
         else Smb.photos(nas, password, folder)
-        if (listed !is SmbResult.Ok) return emptyList()
+        if (listed is SmbResult.Failed) throw IllegalStateException(listed.reason)
+        listed as SmbResult.Ok
         return listed.value.map { entry ->
             Photo(
                 // MediaStore の id は無いので、道筋から作る。**同じ道筋なら同じ値。**
