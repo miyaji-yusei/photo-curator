@@ -29,18 +29,22 @@ object Store {
      * 保存する。**確定のたびに呼ばれる想定なので、失敗しても選別は止めない。**
      * 書けなかったことは記録する（黙って落とさない）。
      */
-    suspend fun save(context: Context, projectId: String, session: Session) =
-        withContext(Dispatchers.IO) {
-            // **判断が変わった。** サイドカーへ渡すべきものが端末にできた印。
-            SyncState.touch(context, projectId)
+    suspend fun save(context: Context, projectId: String, session: Session) {
+        // **判断が変わった。** サイドカーへ渡すべきものが端末にできた印。
+        withContext(Dispatchers.IO) { SyncState.touch(context, projectId) }
+        // **保存はアプリの列で 1 本ずつ。最後に頼んだ状態が必ず残る**（A2）。
+        // 確定を連打しても、同じ一時ファイルを奪い合わず、古い状態が新しい状態を戻さない。
+        val target = file(context, projectId)
+        Persist.latest("session:$projectId") {
             try {
                 // 途中で落ちても壊れた JSON を残さないよう、書いてから差し替える。
                 // rename が使えない環境ではコピーで置き換える。
-                file(context, projectId).writeAtomically { it.writeText(sessionToJson(session)) }
+                target.writeAtomically { it.writeText(sessionToJson(session)) }
             } catch (error: Exception) {
                 Log.w(TAG, "選別の途中を保存できなかった: $projectId", error)
             }
         }
+    }
 
     /** 読み戻す。**形が合わなければ null。** 最初からやり直してもらう。 */
     suspend fun load(context: Context, projectId: String): Session? =
@@ -70,9 +74,10 @@ object Store {
         }
     }
 
-    suspend fun clear(context: Context, projectId: String) = withContext(Dispatchers.IO) {
-        file(context, projectId).delete()
-        Unit
+    suspend fun clear(context: Context, projectId: String) {
+        // 保存と同じ列に載せる。**消したあとに、前の保存が書き戻さない。**
+        val target = file(context, projectId)
+        Persist.latest("session:$projectId") { target.delete() }
     }
 }
 
@@ -136,7 +141,7 @@ object Fingerprints {
         }
 
     suspend fun save(context: Context, sourceKey: String, prints: Map<String, Fingerprint>) =
-        withContext(Dispatchers.IO) {
+        Persist.latest("fingerprints:$sourceKey") {
             try {
                 val root = org.json.JSONObject()
                 for ((path, print) in prints) {
@@ -340,13 +345,12 @@ object Overrides {
         }
 
     /** 手直しを全部消す。**やり直しのときだけ。** */
-    suspend fun clear(context: Context, projectId: String) = withContext(Dispatchers.IO) {
-        file(context, projectId).delete()
-        Unit
+    suspend fun clear(context: Context, projectId: String) {
+        Persist.latest("overrides:$projectId") { file(context, projectId).delete() }
     }
 
     suspend fun save(context: Context, projectId: String, list: List<PairOverride>) =
-        withContext(Dispatchers.IO) {
+        Persist.latest("overrides:$projectId") {
             // 手直しも判断。**サイドカーへ渡すもの。**
             SyncState.touch(context, projectId)
             try {
@@ -418,7 +422,7 @@ object Listing {
     }
 
     suspend fun save(context: Context, sourceKey: String, photos: List<Photo>) =
-        withContext(Dispatchers.IO) {
+        Persist.latest("listing:$sourceKey") {
             try {
                 val array = org.json.JSONArray()
                 for (photo in photos) {
@@ -443,9 +447,8 @@ object Listing {
             }
         }
 
-    suspend fun clear(context: Context, sourceKey: String) = withContext(Dispatchers.IO) {
-        file(context, sourceKey).delete()
-        Unit
+    suspend fun clear(context: Context, sourceKey: String) {
+        Persist.latest("listing:$sourceKey") { file(context, sourceKey).delete() }
     }
 }
 
