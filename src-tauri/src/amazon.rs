@@ -11,7 +11,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -365,7 +365,14 @@ pub struct LinkBook {
 struct BookInner {
     generation: u64,
     links: HashMap<String, String>,
+    /// 一覧の読み直しが最後に失敗した時刻と理由。`REFRESH_RETRY_AFTER` のあいだは網を使わず、
+    /// 同じ理由を返す（回線が切れているとき、写真の枚数ぶん、読み直しの接続待ちを
+    /// 順番に繰り返さないため）。
+    failed: Option<(Instant, String)>,
 }
+
+/// 一覧の読み直しが失敗したあと、次に試すまで待つ時間。
+const REFRESH_RETRY_AFTER: Duration = Duration::from_secs(15);
 
 impl LinkBook {
     pub fn load(db_path: PathBuf, conn: &Connection, project_id: &str, source: AmazonSource) -> Result<Self, String> {
@@ -373,7 +380,11 @@ impl LinkBook {
             project_id: project_id.to_string(),
             source,
             db_path,
-            inner: Mutex::new(BookInner { generation: 0, links: load_links(conn, project_id)? }),
+            inner: Mutex::new(BookInner {
+                generation: 0,
+                links: load_links(conn, project_id)?,
+                failed: None,
+            }),
             gone: AtomicBool::new(false),
         })
     }
@@ -395,16 +406,24 @@ impl LinkBook {
         if inner.generation != seen_generation {
             return Ok(());
         }
+        if let Some((at, message)) = &inner.failed {
+            if at.elapsed() < REFRESH_RETRY_AFTER {
+                return Err(message.clone());
+            }
+        }
         let result = fetch_share_root(&self.source).and_then(|root| list_photos(&self.source, &root.node_id));
         let nodes = match result {
             Ok(nodes) => nodes,
             Err(message) => {
                 if message == GONE_MESSAGE {
                     self.gone.store(true, Ordering::SeqCst);
+                } else {
+                    inner.failed = Some((Instant::now(), message.clone()));
                 }
                 return Err(message);
             }
         };
+        inner.failed = None;
         let links = links_of(&nodes);
         inner.links = links.iter().cloned().collect();
         inner.generation += 1;
@@ -449,6 +468,26 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         ensure_tables(&conn).unwrap();
         conn
+    }
+
+    // 回線が切れているとき、一覧の読み直しが失敗するたびに次の写真がまた読み直しに
+    // 入り、接続待ちを写真の枚数ぶん順番に繰り返していた（レビュー R14）。失敗の
+    // 直後は網を使わず、同じ理由をすぐ返す。試験は網を使わない（使えば別の文言になる）。
+    #[test]
+    fn a_failed_refresh_is_not_retried_straight_away() {
+        let source = parse_share_url("https://www.amazon.co.jp/photos/share/abc").unwrap();
+        let book = LinkBook::load(PathBuf::from("unused.sqlite3"), &memory(), "p1", source).unwrap();
+        book.inner.lock().unwrap().failed = Some((Instant::now(), "ネットワークにつながっていません。".to_string()));
+        let started = Instant::now();
+        // リンクの控えに無い写真 → 読み直し → 失敗の直後なので、網を使わずに返る。
+        for _ in 0..50 {
+            assert_eq!(
+                book.fetch("node-without-link", None).unwrap_err(),
+                "ネットワークにつながっていません。"
+            );
+        }
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(!book.is_gone());
     }
 
     #[test]
