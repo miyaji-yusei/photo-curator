@@ -4,6 +4,7 @@ import type {
 } from '~/types/photo'
 import { MAX_RATING } from '~/types/photo'
 import type { DisplaySettings, PhotoBackend } from '~/composables/photoBackend'
+import { previewRefreshPlan, withNewThumbnails } from '~/utils/previewRefresh'
 import { builtDisplayCount, displayEdgePlan } from '~/utils/displayEdge'
 import type { MoveSelection } from '~/utils/ratingMove'
 // `selectedCount` は選別画面側の computed と名前がぶつかるので別名にする。
@@ -14,7 +15,7 @@ import {
 import * as core from '~/lib/core'
 import type { BurstThreshold, PairOverride, PhotoRef, Session } from '~/lib/core'
 import {
-  blocksFromCuts, cutAll, cutAroundSelection, cutsFromGroups, joinAt, moveCut, toggleAt
+  blocksFromCuts, cutAll, cutAroundSelection, cutsFromGroups, moveCut, toggleAt
 } from '~/utils/burstEdit'
 import { buildBurstQuestions } from '~/utils/burstQuestions'
 import { burstNeighborhood } from '~/utils/burstNeighborhood'
@@ -106,7 +107,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   /** 開いているプロジェクトの、まだ解析が要る枚数（準備の進み）。 */
   const analysisBacklog = ref(0)
   const activeProject = ref<Project | null>(null)
-  const previewPhotos = ref<Photo[]>([])
+  const previewPhotos = shallowRef<Photo[]>([])
   const previewTotal = ref(0)
   const tournamentPhotos = ref<Photo[]>([])
   /**
@@ -230,10 +231,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     const byCount: Record<number, number> = { 1: 1, 2: 2, 3: 3, 4: 2, 5: 3, 6: 3, 7: 4, 8: 4, 9: 3, 10: 5 }
     return byCount[count] ?? Math.min(5, Math.max(1, Math.ceil(Math.sqrt(count))))
   }
-  const tournamentColumns = computed(() => columnsFor(tournamentPhotos.value.length))
-  const tournamentRows = computed(() =>
-    Math.max(1, Math.ceil(tournamentPhotos.value.length / tournamentColumns.value))
-  )
   /** 写真を見比べている画面かどうか。余白の詰め方を変える。 */
   const isSelecting = computed(() =>
     view.value === 'tournament' || view.value === 'burst-threshold' || view.value === 'burst-review'
@@ -248,7 +245,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   const restartForStart = ref(false)
   watch(restartDialog, open => { if (!open) restartForStart.value = false })
   const restartBusy = ref(false)
-  const resultsPhotos = ref<Photo[]>([])
+  const resultsPhotos = shallowRef<Photo[]>([])
   const resultsTotal = ref(0)
   const resultsOffset = ref(0)
   const resultsBusy = ref(false)
@@ -268,12 +265,11 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   const moveFrom = ref(0)
   const moveTo = ref(0)
   const moveBusy = ref(false)
-  const movePhotos = ref<Photo[]>([])
+  const movePhotos = shallowRef<Photo[]>([])
   const moveTotal = ref(0)
   const moveOffset = ref(0)
   /** ダイアログ内に出すエラー。画面上部に出すとモーダルに隠れて気づけない。 */
   const moveError = ref('')
-  /** 移動が終わったことを画面上部で知らせる。 */
   /**
    * 既定は「全選択」。個別のチェックは**ここからの差分**だけを持つ。
    * 5,000 枚の id を並べて持たないための形。詳細は `utils/ratingMove.ts`。
@@ -471,6 +467,12 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     void refreshProjectCards()
   }
 
+  /** 開いたときの準備（解析・表示用画像）が始められなかったとき。黙らず、通知に出す。 */
+  function warnPrepareNotStarted(what: string, cause: unknown) {
+    console.warn(`${what}を始められませんでした`, cause)
+    taskWarning.value = `${what}を始められませんでした。${cause instanceof Error ? cause.message : ''}`.trim()
+  }
+
   let cardsToken = 0
   /** 各プロジェクトの状態と見本を読み直す（網へは行かない）。新しい呼び出しがあれば古い結果は捨てる。 */
   async function refreshProjectCards() {
@@ -480,11 +482,13 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     const list = projects.value
     const entries = await Promise.all(list.map(async (project) => {
       try {
+        // 状態を決める 4 つのどれかが読めなかったら、状態を作らない（0・null にして
+        // 「準備完了」「選別なし」と誤表示しない）。見本だけは読めなくても状態に関係しない。
         const [analysis, display, saved, summary, first] = await Promise.all([
-          desktop.getAnalysisBacklog(project.id).catch(() => 0),
-          desktop.getDisplayBacklog(project.id).catch(() => 0),
-          desktop.loadSession(project.id).catch(() => null),
-          desktop.getSelectionSummary(project.id).catch(() => null),
+          desktop.getAnalysisBacklog(project.id),
+          desktop.getDisplayBacklog(project.id),
+          desktop.loadSession(project.id),
+          desktop.getSelectionSummary(project.id),
           desktop.getProjectPhotoPage(project.id, 0, 1).catch(() => null)
         ])
         const status = projectStatus({
@@ -494,8 +498,11 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
         })
         const photo = first?.photos[0]
         return [project.id, { status, thumbnailUrl: photo ? desktop.photoThumbnailUrl(photo) : null }] as const
-      } catch {
-        return null
+      } catch (cause) {
+        // 前に読めた値があればそのまま残す（無ければ状態の行を出さない）。
+        console.warn('プロジェクトの状態を読めませんでした', project.id, cause)
+        const previous = projectCards.value[project.id]
+        return previous ? [project.id, previous] as const : null
       }
     }))
     if (token !== cardsToken) return
@@ -546,6 +553,21 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     previewTotal.value = page.total
   }
 
+  /**
+   * 準備の途中の更新（W11）。サムネイルがまだ無い行だけを読み直して、その場で置き換える
+   * （全件の読み直しは、準備が終わったときだけ）。読み込み中に一覧が読み直されたら捨てる。
+   */
+  async function refreshPreviewThumbnails(projectId: string) {
+    const plan = previewRefreshPlan(previewPhotos.value, previewTotal.value, PREVIEW_PAGE)
+    if (plan.kind === 'full') return loadPreview(projectId)
+    if (!plan.ids.length) return
+    const token = previewToken
+    const fresh = await desktop.getPhotosByIds(projectId, plan.ids)
+    if (token !== previewToken || activeProject.value?.id !== projectId) return
+    const next = withNewThumbnails(previewPhotos.value, fresh)
+    if (next) previewPhotos.value = next
+  }
+
   /** 格子の末尾が見えたら次のページ（全部を見られる）。 */
   async function loadMorePreview() {
     const project = activeProject.value
@@ -583,7 +605,28 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
    * `Image` を持ち続けることでデコード済みの絵を手放さない。
    */
   const PREFETCH_GROUPS = 2
-  const prefetched = new Map<string, { projectId: string, photos: Photo[], images: HTMLImageElement[] }>()
+  type Prefetched = { projectId: string, photos: Photo[], images: HTMLImageElement[] }
+  const prefetched = new Map<string, Prefetched>()
+  /** 読み込み中の先読み。連打で `loadCurrentPhotos` が続けて呼ばれても、同じ組を重複して読まない。 */
+  const prefetching = new Map<string, Promise<Prefetched>>()
+  function readAhead(projectId: string, key: string, ids: string[]): Promise<Prefetched> {
+    const flightKey = `${projectId}\u0001${key}`
+    const running = prefetching.get(flightKey)
+    if (running) return running
+    const started = (async () => {
+      const photos = await desktop.getPhotosByIds(projectId, ids)
+      const images = photos.map((photo) => {
+        const image = new Image()
+        image.decoding = 'async'
+        image.src = desktop.photoDisplayUrl(photo)
+        image.decode().catch(() => undefined)
+        return image
+      })
+      return { projectId, photos, images }
+    })().finally(() => prefetching.delete(flightKey))
+    prefetching.set(flightKey, started)
+    return started
+  }
   async function prefetchNextGroups() {
     const current = session.value
     const project = activeProject.value
@@ -599,25 +642,18 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     for (const key of [...prefetched.keys()]) {
       if (!wanted.has(key) || prefetched.get(key)!.projectId !== project.id) prefetched.delete(key)
     }
-    for (const ids of groups) {
+    // 2 組は並べて読む。待っている間に組が進んだ・プロジェクトが変わったら、その結果は捨てる。
+    await Promise.all(groups.map(async (ids) => {
       const key = ids.join('\u0000')
-      if (prefetched.has(key)) continue
+      if (prefetched.has(key)) return
       try {
-        const photos = await desktop.getPhotosByIds(project.id, ids)
-        // 待っている間に組が進んだ・プロジェクトが変わったら、この結果は捨てる。
+        const entry = await readAhead(project.id, key, ids)
         if (activeProject.value?.id !== project.id || session.value !== current) return
-        const images = photos.map((photo) => {
-          const image = new Image()
-          image.decoding = 'async'
-          image.src = desktop.photoDisplayUrl(photo)
-          image.decode().catch(() => undefined)
-          return image
-        })
-        prefetched.set(key, { projectId: project.id, photos, images })
+        prefetched.set(key, entry)
       } catch {
         // 先読みは無くても困らない。
       }
-    }
+    }))
   }
 
   /**
@@ -833,11 +869,11 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
       ])
       if (stale()) return
       analysisBacklog.value = backlog
-      if (backlog > 0) desktop.startBackgroundAnalysis(project.id).catch(() => undefined)
+      if (backlog > 0) desktop.startBackgroundAnalysis(project.id).catch(cause => warnPrepareNotStarted('解析', cause))
       // 表示用画像は走査とは別に溜める。**走査に混ぜると解析が桁で遅くなる**
       // （EXIF サムネイル経路 1.72ms/枚 に対しフルデコード 132ms/枚）。
       if (displayBacklog.value > 0) {
-        desktop.startDisplayGeneration(project.id).catch(() => undefined)
+        desktop.startDisplayGeneration(project.id).catch(cause => warnPrepareNotStarted('表示用画像の作成', cause))
       }
     } catch (cause) {
       if (!stale()) error.value = cause instanceof Error ? cause.message : 'プロジェクトを開けませんでした。'
@@ -1559,13 +1595,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     blocksFromCuts(burstPhotos.value.map(photo => photo.id), burstCuts.value)
   )
   const burstPhotoOf = (photoId: string) => burstPhotos.value.find(photo => photo.id === photoId) ?? null
-  /**
-   * まだまとめの外にある塊か。**1枚でも元のまとめの写真を含んでいれば「中」**。
-   * 外の写真を繋いで取り込んだ塊を「外」と呼び続けないため。
-   */
-  const isOutsideBurst = (block: string[]) =>
-    !block.some(id => burstOriginal.value.includes(id))
-
   /** その塊の代表。指名があればそれ、無ければ撮影順の先頭。 */
   const representativeOf = (block: string[]) =>
     block.find(id => burstReps.value.includes(id)) ?? block[0]!
@@ -1585,11 +1614,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     burstPicked.value = []
   }
 
-  /** 隣り合うまとまりを繋ぐ。近くの写真を取り込むのもこれ。 */
-  function joinBurstAt(boundaryIndex: number) {
-    burstCuts.value = joinAt(burstCuts.value, boundaryIndex)
-  }
-
   /** 境目をひとつ、切る／つなぐ（バーのタップ）。 */
   function toggleBurstCut(boundaryIndex: number) {
     burstCuts.value = toggleAt(burstCuts.value, boundaryIndex)
@@ -1603,11 +1627,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   function scatterBurst() {
     burstCuts.value = cutAll(burstCuts.value)
     burstPicked.value = []
-  }
-
-  /** ある写真の直前の境目。まとまりの先頭以外は必ずある。 */
-  function boundaryBefore(photoId: string) {
-    return burstPhotos.value.findIndex(photo => photo.id === photoId) - 1
   }
 
   /**
@@ -2018,8 +2037,11 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     if (!activeProject.value) return
     try {
       selectionSummary.value = await desktop.getSelectionSummary(activeProject.value.id)
-    } catch {
+    } catch (cause) {
+      // 「選別結果を見る」が黙って消えないように、読めなかったことを出す。
       selectionSummary.value = null
+      console.warn('選別の集計を読めませんでした', cause)
+      error.value = cause instanceof Error ? `選別の集計を読めませんでした（${cause.message}）` : '選別の集計を読めませんでした。'
     }
   }
 
@@ -2186,9 +2208,12 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
       displaySettings.value = settings
       displayEdge.value = settings.projectEdge ?? settings.edge
       displayBacklog.value = await desktop.getDisplayBacklog(activeProject.value.id)
-    } catch {
+    } catch (cause) {
       // 設定が読めなくても選別は続けられる。表示用が無ければ原本に落ちるだけ。
+      // ただし設定のカードが黙って消えるので、読めなかったことは通知に出す。
       displaySettings.value = null
+      console.warn('表示用画像の設定を読めませんでした', cause)
+      taskWarning.value = '表示用画像の設定を読めませんでした。'
     }
   }
 
@@ -2558,7 +2583,11 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   async function cancelAnalysis() {
     const progress = analysisProgress.value
     if (!progress) return
-    await desktop.cancelProjectTask(progress.projectId, progress.task)
+    try {
+      await desktop.cancelProjectTask(progress.projectId, progress.task)
+    } catch (cause) {
+      error.value = cause instanceof Error ? cause.message : '中止できませんでした。'
+    }
   }
 
   function onKeydown(event: KeyboardEvent) {
@@ -2674,7 +2703,8 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     const now = Date.now()
     if (!finished && now - previewRefreshedAt < 3000) return
     previewRefreshedAt = now
-    await loadPreview(progress.projectId).catch(() => undefined)
+    await (finished ? loadPreview(progress.projectId) : refreshPreviewThumbnails(progress.projectId))
+      .catch(() => undefined)
     if (!finished) return
     await refreshProjects().catch(() => undefined)
     await loadCoreInputs(progress.projectId).catch(() => undefined)
@@ -2845,11 +2875,9 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     groupLimits,
     settings,
     isTouchOnly,
-    COMPACT_QUERY,
     isCompact,
     drawerOpen,
     drawerRail,
-    syncCompact,
     currentPair,
     pairPhotos,
     previewThreshold,
@@ -2863,15 +2891,11 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     deleteDialog,
     deleteTarget,
     deleteBusy,
-    columnsFor,
-    tournamentColumns,
-    tournamentRows,
     isSelecting,
     nextRoundDialog,
     nextRoundGroupSize,
     nextRoundRating,
     restartDialog,
-    restartForStart,
     confirmRestartDialog,
     restartBusy,
     resultsPhotos,
@@ -2891,7 +2915,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     moveTotal,
     moveOffset,
     moveError,
-    moveSelection,
     moveSelectedCount,
     isMoveSelected,
     exportDialog,
@@ -2921,12 +2944,10 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     gridClass,
     gridStyle,
     burstDialog,
-    burstOwner,
     burstPhotos,
     burstCuts,
     burstOriginal,
     burstPicked,
-    burstReps,
     burstBusy,
     burstReviewGroups,
     burstReviewIndex,
@@ -2961,7 +2982,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     shortPath,
     fileName,
     statusLabel,
-    refreshProjects,
     loadPreview,
     loadCurrentPhotos,
     openProject,
@@ -2980,11 +3000,8 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     openSlideshowSettings,
     beginTournament,
     finishTournamentStart,
-    enterStage,
-    showNextPair,
     answerPair,
     skipCurrentPair,
-    finishThresholdLearning,
     refreshBurstPreview,
     askMorePairs,
     acceptBurstThreshold,
@@ -2992,7 +3009,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     saveSession,
     toggleChoice,
     confirmChoices,
-    skipGroup,
     confirmPhoto,
     openZoom,
     zoomIndex,
@@ -3000,16 +3016,12 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     openBurst,
     burstBlocks,
     burstPhotoOf,
-    isOutsideBurst,
     representativeOf,
     toggleBurstPick,
     splitBurstSelection,
-    joinBurstAt,
     toggleBurstCut,
     moveBurstCut,
     scatterBurst,
-    boundaryBefore,
-    settleBurstPhoto,
     confirmBurstPhoto,
     dropBurstPhoto,
     makeBurstRepresentative,
@@ -3020,7 +3032,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     groupSelectedAsBurst,
     openNextRoundDialog,
     startRatingSelection,
-    restartFromScratch,
     chooseExportDestination,
     runExport,
     runMetadataWrite,
@@ -3028,14 +3039,10 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     loadSummary,
     selectResultsRating,
     loadResultsPage,
-    burstReviewGroup,
     openBurstReview,
-    loadBurstReviewPhotos,
     toggleBurstReviewKeep,
-    advanceBurstReview,
     applyBurstReview,
     skipBurstReview,
-    refreshDisplayState,
     applyDisplayEdge,
     regenerateDisplayImages,
     openMoveDialog,
@@ -3043,7 +3050,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     toggleMoveSelection,
     setMoveSelectAll,
     runMove,
-    collectShareCandidates,
     shareSelectedPhotos,
     exportZipByRating,
     exportCsvByRating,
@@ -3069,7 +3075,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     cancelTask,
     cancelAnalysis,
     onKeydown,
-    onZoomKeydown,
     mount,
     unmount
   }

@@ -39,6 +39,7 @@ import { scanFolder } from '~/utils/folderScan'
 import {
   comparePhotos, filterPhotos, pagePhotos, summarizeRatings
 } from '~/utils/photoQuery'
+import { orderForAnalysis } from '~/utils/analysisOrder'
 import { uniquePaths } from '~/utils/uniquePath'
 import { randomUUID } from '~/utils/uuid'
 import type { Fetcher } from '~/composables/backends/web/fetcher'
@@ -315,9 +316,11 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
   /** 指紋がまだ無い（かつ失敗もしていない）写真の解析を、出所から読んで回す。 */
   async function analyzeBacklog(projectId: string, io: SourceIO): Promise<void> {
     const rows = await store.photosOfProject(projectId)
-    const jobs: AnalysisJob[] = rows
-      .filter(row => !row.isMissing && row.dHash === null && row.analysisError === null)
-      .map(row => ({ id: row.id, load: () => io.readFile(subPathOf(row), row.name) }))
+    // 撮影時刻の昇順（選別の順）。分からないものは最後に取り込み順（`orderForAnalysis`）。
+    const jobs: AnalysisJob[] = orderForAnalysis(
+      rows.filter(row => !row.isMissing && row.dHash === null && row.analysisError === null),
+      row => row
+    ).map(row => ({ id: row.id, load: () => io.readFile(subPathOf(row), row.name) }))
     if (!jobs.length) return
     await analyze(projectId, jobs)
   }
@@ -489,8 +492,11 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
   async function hashBacklog(projectId: string): Promise<void> {
     const links = await linksOf(projectId)
     if (!links) return
-    const rows = (await store.photosOfProject(projectId))
-      .filter(row => !row.isMissing && row.dHash === null && row.analysisError === null && links[row.relativePath])
+    const rows = orderForAnalysis(
+      (await store.photosOfProject(projectId))
+        .filter(row => !row.isMissing && row.dHash === null && row.analysisError === null && links[row.relativePath]),
+      row => row
+    )
     if (!rows.length) return
     const total = rows.length
     let processed = 0
