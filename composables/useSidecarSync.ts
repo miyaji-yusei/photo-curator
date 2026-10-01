@@ -1,29 +1,48 @@
 /**
- * サイドカー（写真のフォルダ直下の `.photo-curator/catalog.json`）との同期（設計 03 章）。
+ * サイドカー（写真のフォルダ直下の `.photo-curator/catalog.json`）との同期（設計 03 章・U34）。
  *
- * - **4 通りの判断は core の `sidecarDecide` だけ**が行う。ここは「読む → 判断に渡す → 結果どおりに動く」だけ。
- * - 時刻の大小で勝敗を決めない。変更が無ければ書かない。
- *   書いたら `seenAt`・`seenBy` を必ず更新し、書けなかったら更新しない。
- * - 書くのは `localChanged` のときだけ（ラウンドの終わり・背面へ回る／窓を閉じる・ホームへ戻る・「今すぐ保存」）。
- * - 書けない出所（ピッカー・書き込みの許可が無いフォルダ・開発用）は、読めれば取り込むだけ。ダイアログは出さない。
+ * - **判断は core の `sidecarPlan` だけ**が行う（設計書「サイドカー同期の調査と直し方の設計」§4.3）。
+ *   ここは「読む → 判断に渡す → 結果どおりに動く」だけ。時刻の大小では決めない。
+ *   - 意味が同じ → 何もしない（警告も出さない。控えだけ NAS の版に進める）
+ *   - 端末が未着手 → 確認なしに取り込む／NAS が未着手で端末が着手済み → 書く（NAS の版は退避）
+ *   - 早送り（NAS の版が、端末の見た版から続けたもの）→ 確認なしに取り込む
+ *   - 両方とも着手済みで違う → 確認（5 択のダイアログ）
+ * - 「端末が変わったか」は印ではなく「見た版の比較キー（`seenKey`）と今の比較キーが違うか」で決める。
+ *   古い控え（`seenAt`・`seenBy`・`localChanged`）しか無いときは、そこから `legacy:` の控えを作る。
+ * - 書き込みは楽観ロック（backend の `writeSidecarChecked`: ロック → 読んで見た版と同じか → 一時ファイル →
+ *   置き換え → 読み戻し）。違えば書かずに判定し直す。
+ * - 端末の中では、サイドカーの読み書きと控えの保存を**プロジェクトごとに 1 本の列**に並べる（`serialized`）。
+ * - 写真の鍵は、書くとき「選んだフォルダからの相対・`/` 区切り」にし、読んだら core で同じ形にそろえ、
+ *   取り込むときに端末の形（Windows の PC は `\`）へ戻す。
  *
  * `createSidecarSync(backend)` は Vue に依存しない（テストは偽の backend で動かす）。
  * `useSidecarSync()` はそれを画面の状態（refs）に繋ぐ。
+ *
+ * 用語: 「選別状況」＝星・選別の途中（Session）・連写の手直し・学習した境目。「比較キー」は選別状況から作る値で、
+ * 画像のハッシュ値とは関係が無い。
  */
 import * as core from '~/lib/core'
-import type { Session, Sidecar } from '~/lib/core'
-import type { PhotoBackend, SidecarAccess } from '~/composables/photoBackend'
+import type {
+  ClashReason, Judgement, MergeMode, MergePreview, ProgressOrder, PullReason, PushReason, SeenRecord, Session,
+  SettledReason, Sidecar, SidecarProgress
+} from '~/lib/core'
+import type { PhotoBackend, SidecarAccess, SidecarState } from '~/composables/photoBackend'
 import type { SavedSelection } from '~/utils/selectionFlow'
+import { applyChanges } from '~/utils/ratingEdit'
 
-/** サイドカーの `version`（core の形の版）。 */
-export const SIDECAR_VERSION = 1
+/** 新しく書くサイドカーの `version`（core の `SIDECAR_VERSION` と同じ）。 */
+export const SIDECAR_VERSION = 2
+
+/** 判定し直す回数の上限（書く直前に別の端末が書いた、が続いたとき）。 */
+const MAX_ATTEMPTS = 3
 
 export type SidecarBackend = Pick<PhotoBackend,
-  | 'sidecarSupported' | 'readSidecar' | 'writeSidecar' | 'loadSidecarState' | 'saveSidecarState'
-  | 'deviceIdentity' | 'getCoreInputs' | 'saveSelectionResults' | 'getPairOverrides' | 'savePairOverrides'
-  | 'loadSession' | 'saveSession' | 'listProjects' | 'saveBurstThreshold' | 'clearBurstThreshold'>
+  | 'sidecarSupported' | 'readSidecar' | 'writeSidecar' | 'writeSidecarChecked' | 'loadSidecarState'
+  | 'saveSidecarState' | 'deviceIdentity' | 'getCoreInputs' | 'saveSelectionResults' | 'getPairOverrides'
+  | 'savePairOverrides' | 'loadSession' | 'saveSession' | 'listProjects' | 'saveBurstThreshold'
+  | 'clearBurstThreshold'>
 
-/** ダイアログに並べる要約。 */
+/** 古い要約（表示用。今は使っていないが、外から使えるよう残す）。 */
 export interface SidecarSummary {
   /** ★1 以上の枚数。 */
   starred: number
@@ -32,12 +51,53 @@ export interface SidecarSummary {
   deviceName: string
 }
 
-export type OpenOutcome =
+/** 食い違いのダイアログに渡すもの。 */
+export interface ClashInfo {
+  /** NAS の版（鍵はフォルダ形式）。 */
+  theirs: Sidecar
+  /** ダイアログを出したときに読んだ catalog.json の中身（答えたときに変わっていないか確かめる）。 */
+  theirsText: string
+  mineName: string
+  theirsName: string
+  /** NAS の版を書いた端末の時刻（表示だけに使う）。 */
+  theirsAt: number
+  mineProgress: SidecarProgress
+  theirsProgress: SidecarProgress
+  /** この端末から見て（Ahead＝この端末の方が進んでいる）。 */
+  order: ProgressOrder
+  reason: ClashReason
+  preview: MergePreview
+  access: SidecarAccess
+}
+
+export type ClashChoice = 'theirs' | 'keep' | 'mine' | 'intersection' | 'union'
+
+export type SyncOutcome =
   | { kind: 'skipped', access: SidecarAccess }
-  | { kind: 'settled', access: SidecarAccess }
-  | { kind: 'pushed', access: SidecarAccess }
-  | { kind: 'pulled', access: SidecarAccess }
-  | { kind: 'clash', access: SidecarAccess, theirs: Sidecar, mine: SidecarSummary, theirsSummary: SidecarSummary }
+  | { kind: 'settled', access: SidecarAccess, reason: SettledReason }
+  | { kind: 'pushed', access: SidecarAccess, reason: PushReason }
+  | { kind: 'pulled', access: SidecarAccess, reason: PullReason, from: string }
+  | { kind: 'clash', access: SidecarAccess, clash: ClashInfo }
+  /** 自動の書き込みのとき、取り込みと確認は次に開いたときへ回した。 */
+  | { kind: 'deferred', access: SidecarAccess }
+  /** ほかの端末が書いている（ロック）。次の契機に回した。 */
+  | { kind: 'locked', access: SidecarAccess }
+  /** 書く直前に何度も別の端末が書いた。次の契機に回した。 */
+  | { kind: 'busy', access: SidecarAccess }
+  /** 写真の場所が違う記録（鍵の一致が半分未満）。取り込まなかった。 */
+  | { kind: 'mismatch', access: SidecarAccess, matched: number, total: number }
+  /** 載せる写真の行が 0 件。空の記録で共有を上書きしない。 */
+  | { kind: 'empty', access: SidecarAccess }
+
+/** 互換のための別名。 */
+export type OpenOutcome = SyncOutcome
+
+export type ResolveResult =
+  | { kind: 'done' }
+  /** ダイアログを出したあとに NAS が変わった。実行せずに判定し直した（新しい結果）。 */
+  | { kind: 'changed', outcome: SyncOutcome }
+  /** 書けなかった（つながらない・書けない共有だった）。何も変えていない。 */
+  | { kind: 'failed', reason: string, access: SidecarAccess }
 
 export function summarize(sidecar: Sidecar): SidecarSummary {
   return {
@@ -70,34 +130,80 @@ export function envelopeFromSidecar(sidecar: Sidecar, session: Session): SavedSe
   }
 }
 
+/** 版の見分けに使う乱数。 */
+function randomId(): string {
+  const crypto = globalThis.crypto
+  if (crypto?.randomUUID) return crypto.randomUUID()
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`
+}
+
+/** 控えの、古い形からの読み替え。`localKey` は今の端末の比較キー（古い印が「変更なし」のとき使う）。 */
+export function seenOf(state: SidecarState, localKey: string): SeenRecord {
+  if (typeof state.seenToken === 'string') {
+    return { token: state.seenToken, key: state.seenKey ?? '', epoch: state.seenEpoch ?? null }
+  }
+  // 古い形: seenAt/seenBy は、その版の updatedAt/updatedBy（core の legacy: の見分けと同じ形）。
+  const never = !state.seenAt && !state.seenBy
+  return {
+    token: never ? '' : `legacy:${state.seenAt}:${state.seenBy}`,
+    // 古い印が立っていれば「分からない＝変更あり」、立っていなければ今の中身が見た版のまま。
+    key: state.localChanged ? '' : localKey,
+    epoch: null
+  }
+}
+
+interface ProjectRef { id: string }
+
+/** 判断のための、いまの両側の写し。 */
+interface Snapshot {
+  access: SidecarAccess
+  /** 読んだ catalog.json の中身（無ければ null）。楽観ロックの「見た版」。 */
+  text: string | null
+  /** NAS の版（鍵はフォルダ形式）。 */
+  remote: Sidecar | null
+  /** 端末の分（端末の鍵）。 */
+  mineRaw: Sidecar
+  /** 端末の分（フォルダ形式の鍵）。 */
+  mine: Sidecar
+  local: Judgement
+  localKey: string
+  state: SidecarState
+  seen: SeenRecord
+  /** 端末の鍵の区切り（Windows の PC は `\`）。 */
+  separator: string
+  /** 端末の写真の鍵（フォルダ形式）。 */
+  photoKeys: string[]
+  identity: { id: string, name: string }
+}
+
 export interface SidecarSync {
-  /** 開いたときの確認。Push・Pull はここで片付け、Clash だけ呼び出し側にダイアログを出させる。 */
-  checkOnOpen: (project: { id: string }) => Promise<OpenOutcome>
-  /** `localChanged` のときだけ、今の状態から組んで書く。書いたら true。 */
-  pushIfChanged: (project: { id: string }) => Promise<boolean>
-  /** 相手の記録を取り込む（Session・手直し・距離・星）。 */
-  adopt: (project: { id: string }, sidecar: Sidecar) => Promise<void>
-  /** 「この端末の結果を使う」。相手を退避してから、この端末の分を書く。 */
-  keepMine: (project: { id: string }, theirs: Sidecar) => Promise<void>
-  /** 「NAS の記録を使う」。この端末の分を退避してから、相手の分を取り込む。 */
-  keepTheirs: (project: { id: string }, theirs: Sidecar) => Promise<void>
-  /** 食い違いの答えを実行する。書けなければ、書けない共有として相手を取り込む（理由を返す）。 */
-  resolveClash: (
-    project: { id: string }, theirs: Sidecar, choice: 'mine' | 'theirs'
-  ) => Promise<{ kind: 'done' } | { kind: 'readonly', reason: string }>
-  /** 判断が変わった印を付ける。同じ状態のあいだは書き込まない。 */
+  /** 開いたとき・選別を始める前・「今すぐ保存」の確認。書く・取り込むはここで片付け、食い違いだけ返す。 */
+  checkOnOpen: (project: ProjectRef) => Promise<SyncOutcome>
+  /** 自動の書き込み（背面へ回る・窓を閉じる・ホームへ戻る・ラウンドの終わり）。取り込みと確認は次へ回す。書いたら true。 */
+  pushIfChanged: (project: ProjectRef) => Promise<boolean>
+  /** 自動の書き込みの結果を全部返す版。 */
+  pushAuto: (project: ProjectRef) => Promise<SyncOutcome>
+  /** 相手の記録を取り込む（星・Session・手直し・距離）。相手に無い Session・距離は、端末が未着手でない限り消さない。 */
+  adopt: (project: ProjectRef, sidecar: Sidecar) => Promise<void>
+  /** 食い違いの 5 択を実行する。 */
+  resolveClash: (project: ProjectRef, clash: ClashInfo, choice: ClashChoice) => Promise<ResolveResult>
+  /** 切り離し中（B のあと）に「NAS に書き込む」。NAS の版を退避して端末の分を書く。 */
+  writeToNas: (project: ProjectRef) => Promise<boolean>
+  /** 古い形の「判断が変わった」印（古い版のアプリに戻したとき用）。書き込みの列に並ぶ。 */
   markChanged: (projectId: string) => Promise<void>
-  /** 端末の分から Sidecar を組む。 */
-  buildSidecar: (project: { id: string }, updatedAt?: number) => Promise<Sidecar>
+  /** 「最初からやり直す」。この端末の選別状況の世代を新しくする。 */
+  markRestarted: (projectId: string) => Promise<void>
+  /** 端末の分から Sidecar を組む（端末の鍵のまま）。 */
+  buildSidecar: (project: ProjectRef, updatedAt?: number) => Promise<Sidecar>
+  /** 切り離し中か。 */
+  isDetached: (projectId: string) => Promise<boolean>
   access: (projectId: string) => Promise<SidecarAccess>
 }
 
 export function createSidecarSync(backend: SidecarBackend, now: () => number = Date.now): SidecarSync {
-  /** 印を付けた回数。書いている最中に付いた印を、書き終わりに消さないため。 */
-  const generation = new Map<string, number>()
-  /** 印がすでに付いていると分かっているプロジェクト（保存を繰り返さない）。 */
+  /** 古い印がすでに付いていると分かっているプロジェクト（保存を繰り返さない）。 */
   const knownChanged = new Set<string>()
-  /** プロジェクトごとの書き込みの直列化。 */
+  /** プロジェクトごとの読み書きの直列化。 */
   const chains = new Map<string, Promise<unknown>>()
 
   function serialized<T>(projectId: string, task: () => Promise<T>): Promise<T> {
@@ -107,8 +213,6 @@ export function createSidecarSync(backend: SidecarBackend, now: () => number = D
     return next
   }
 
-  const generationOf = (projectId: string) => generation.get(projectId) ?? 0
-
   async function access(projectId: string): Promise<SidecarAccess> {
     try {
       return await backend.sidecarSupported(projectId)
@@ -117,26 +221,25 @@ export function createSidecarSync(backend: SidecarBackend, now: () => number = D
     }
   }
 
-  async function markChanged(projectId: string): Promise<void> {
-    generation.set(projectId, generationOf(projectId) + 1)
-    if (knownChanged.has(projectId)) return
-    const state = await backend.loadSidecarState(projectId)
-    if (!state.localChanged) await backend.saveSidecarState(projectId, { ...state, localChanged: true })
-    knownChanged.add(projectId)
+  async function saveState(projectId: string, state: SidecarState) {
+    await backend.saveSidecarState(projectId, state)
+    if (!state.localChanged) knownChanged.delete(projectId)
   }
 
-  async function buildSidecar(project: { id: string }, updatedAt?: number): Promise<Sidecar> {
-    const [identity, rows, overrides, saved, projects] = await Promise.all([
+  async function buildWith(project: ProjectRef, updatedAt?: number) {
+    const [identity, rows, overrides, saved, projects, state] = await Promise.all([
       backend.deviceIdentity(),
       backend.getCoreInputs(project.id),
       backend.getPairOverrides(project.id),
       backend.loadSession(project.id),
-      backend.listProjects()
+      backend.listProjects(),
+      backend.loadSidecarState(project.id)
     ])
     // 星は写真の行が持っている（結果・移動・書き出しが読む）。全部載せる。
     const photos: Sidecar['photos'] = {}
     for (const row of rows) photos[row.relativePath] = { rating: row.rating }
-    const distance = projects.find(item => item.id === project.id)?.burstThreshold
+    const info = projects.find(item => item.id === project.id)
+    const distance = info?.burstThreshold
     const sidecar: Sidecar = {
       version: SIDECAR_VERSION,
       updatedAt: updatedAt ?? (saved?.updatedAt || now()),
@@ -147,126 +250,347 @@ export function createSidecarSync(backend: SidecarBackend, now: () => number = D
       sessions: saved ? { tournament: saved.core } : {}
     }
     if (typeof distance === 'number') sidecar.burstDistance = distance
-    return sidecar
+    if (state.localEpoch) sidecar.epoch = state.localEpoch
+    const separator = rows.some(row => row.relativePath.includes('\\')) ? '\\' : '/'
+    return { sidecar, identity, rows, saved, state, folderPath: info?.folderPath ?? '', separator }
   }
 
-  async function writeOut(project: { id: string }): Promise<boolean> {
-    const projectId = project.id
-    if ((await access(projectId)) !== 'readwrite') return false
-    const state = await backend.loadSidecarState(projectId)
-    if (!state.localChanged) return false
-    const before = generationOf(projectId)
-    const sidecar = await buildSidecar(project, now())
-    // 載せる行が 0 件（例: 全部が欠損扱いの間）なら書かない。空の記録で共有を上書きしない。
-    // localChanged も落とさず、行が戻ったあとの書き出しに残す。
-    if (Object.keys(sidecar.photos).length === 0) return false
-    await backend.writeSidecar(projectId, core.sidecarToJson(sidecar))
-    // 書けたときだけ印を更新する。書いている間にまた変わっていたら、変更ありのまま残す。
-    const changedMeanwhile = generationOf(projectId) !== before
-    await backend.saveSidecarState(projectId, {
-      seenAt: sidecar.updatedAt,
-      seenBy: sidecar.updatedBy,
-      localChanged: changedMeanwhile
-    })
-    if (!changedMeanwhile) knownChanged.delete(projectId)
-    return true
+  async function buildSidecar(project: ProjectRef, updatedAt?: number): Promise<Sidecar> {
+    return (await buildWith(project, updatedAt)).sidecar
   }
 
-  const pushIfChanged = (project: { id: string }) => serialized(project.id, () => writeOut(project))
-
-  async function applyAdopt(project: { id: string }, sidecar: Sidecar): Promise<void> {
-    const projectId = project.id
-    const tournament = sidecar.sessions.tournament
-    await backend.saveSession(projectId, tournament ? envelopeFromSidecar(sidecar, tournament) : null)
-    await backend.savePairOverrides(projectId, sidecar.burstOverrides)
-    if (typeof sidecar.burstDistance === 'number') await backend.saveBurstThreshold(projectId, sidecar.burstDistance)
-    else await backend.clearBurstThreshold(projectId)
-    // 星を記録に合わせる。記録に無い写真は 0。変わる行だけ書く。
-    const rows = await backend.getCoreInputs(projectId)
-    const entries = rows
-      .map(row => ({ id: row.id, rating: sidecar.photos[row.relativePath]?.rating ?? 0, was: row.rating }))
-      .filter(entry => entry.rating !== entry.was)
-      .map(({ id, rating }) => ({ id, rating }))
-    if (entries.length) await backend.saveSelectionResults(projectId, entries)
-    await backend.saveSidecarState(projectId, {
-      seenAt: sidecar.updatedAt, seenBy: sidecar.updatedBy, localChanged: false
-    })
-    knownChanged.delete(projectId)
-  }
-
-  const adopt = (project: { id: string }, sidecar: Sidecar) =>
-    serialized(project.id, () => applyAdopt(project, sidecar))
-
-  async function checkOnOpen(project: { id: string }): Promise<OpenOutcome> {
-    const projectId = project.id
-    const level = await access(projectId)
-    if (level === 'none') return { kind: 'skipped', access: level }
-    const json = await backend.readSidecar(projectId)
-    const remote = json === null ? null : core.sidecarFromJson(json)
-    // 読めない（壊れている・新しすぎる）ものを、無いものとして扱って上書きしない。
-    if (json !== null && remote === null) {
-      throw new Error('サイドカー（.photo-curator/catalog.json）の形式を読めませんでした。')
-    }
-    const state = await backend.loadSidecarState(projectId)
-    // 書けない出所では、端末の分を書き戻せない。ダイアログで選ばせず、読めれば取り込むだけにする。
-    const decision = core.sidecarDecide(
-      state.seenAt, state.seenBy, level === 'readwrite' ? state.localChanged : false, remote
-    )
-    if (decision === 'Settled') return { kind: 'settled', access: level }
-    if (decision === 'Push') {
-      await pushIfChanged(project)
-      return { kind: 'pushed', access: level }
-    }
-    if ('Pull' in decision) {
-      await adopt(project, decision.Pull)
-      return { kind: 'pulled', access: level }
-    }
-    const mine = summarize(await buildSidecar(project))
-    return {
-      kind: 'clash', access: level, theirs: decision.Clash, mine, theirsSummary: summarize(decision.Clash)
-    }
-  }
-
-  async function keepMine(project: { id: string }, theirs: Sidecar): Promise<void> {
-    const projectId = project.id
-    await serialized(projectId, async () => {
-      // 相手を捨てない。退避が書けなければ、ここで止める（自分の分も書かない）。
-      await backend.writeSidecar(projectId, core.sidecarToJson(theirs), asideFileName(theirs.updatedBy))
-    })
-    await markChanged(projectId)
-    await pushIfChanged(project)
-  }
-
-  async function keepTheirs(project: { id: string }, theirs: Sidecar): Promise<void> {
-    const projectId = project.id
-    await serialized(projectId, async () => {
-      // この端末の分も捨てない。退避が書けなければ、取り込まない。
-      const mine = await buildSidecar(project)
-      await backend.writeSidecar(projectId, core.sidecarToJson(mine), asideFileName(mine.updatedBy))
-      await applyAdopt(project, theirs)
-    })
+  /** 端末の今の比較キー（取り込んだ・混ぜたあとの控えに使う）。 */
+  async function currentKey(project: ProjectRef): Promise<string> {
+    const { sidecar } = await buildWith(project)
+    return core.judgementKey(core.sidecarJudgement(core.sidecarKeysToFolder(sidecar, '')))
   }
 
   /**
-   * 食い違いの答えを実行する。書き込みに失敗したら、その出所を書けない共有（readonly）として扱い直し、
-   * 相手の記録を取り込む（仕様: 書けない共有ではダイアログを出さず、取り込むだけ）。
-   * 取り込みまで失敗したときは投げる（呼び出し側がダイアログを残す）。
+   * 両側を読んで写しを作る。**読めない（つながらない）なら投げる**（判断に渡さない）。
+   * 壊れている catalog.json は、無いものとして扱って上書きしない（投げる）。
    */
-  async function resolveClash(
-    project: { id: string }, theirs: Sidecar, choice: 'mine' | 'theirs'
-  ): Promise<{ kind: 'done' } | { kind: 'readonly', reason: string }> {
-    try {
-      if (choice === 'mine') await keepMine(project, theirs)
-      else await keepTheirs(project, theirs)
-      return { kind: 'done' }
-    } catch (cause) {
-      const reason = cause instanceof Error ? cause.message : '記録を書けませんでした。'
-      await adopt(project, theirs)
-      return { kind: 'readonly', reason }
+  async function snapshot(project: ProjectRef, level: SidecarAccess): Promise<Snapshot> {
+    const text = await backend.readSidecar(project.id)
+    const parsed = text === null ? null : core.sidecarFromJson(text)
+    if (text !== null && parsed === null) {
+      throw new Error('サイドカー（.photo-curator/catalog.json）の形式を読めませんでした。')
+    }
+    const built = await buildWith(project, now())
+    const mine = core.sidecarKeysToFolder(built.sidecar, '')
+    const local = core.sidecarJudgement(mine)
+    const localKey = core.judgementKey(local)
+    return {
+      access: level,
+      text,
+      remote: parsed ? core.sidecarNormalizeKeys(parsed, built.folderPath) : null,
+      mineRaw: built.sidecar,
+      mine,
+      local,
+      localKey,
+      state: built.state,
+      seen: seenOf(built.state, localKey),
+      separator: built.separator,
+      photoKeys: Object.keys(mine.photos),
+      identity: built.identity
     }
   }
 
-  return { checkOnOpen, pushIfChanged, adopt, keepMine, keepTheirs, resolveClash, markChanged, buildSidecar, access }
+  /** 控えを書いた／読んだ版にする。古い 3 つも合わせて書く（古い版のアプリに戻したとき用）。 */
+  function stateFor(previous: SidecarState, version: Sidecar, seen: SeenRecord, extra: Partial<SidecarState> = {}): SidecarState {
+    return {
+      ...previous,
+      seenAt: version.updatedAt,
+      seenBy: version.updatedBy,
+      localChanged: false,
+      seenToken: seen.token,
+      seenKey: seen.key,
+      seenEpoch: seen.epoch,
+      localEpoch: previous.localEpoch ?? null,
+      detached: false,
+      ...extra
+    }
+  }
+
+  /**
+   * 端末の分を楽観ロックで書く。`base` は置き換える NAS の版（無ければ null）、`expected` はその中身。
+   * `aside` なら NAS の版を `catalog.<相手>.json` へ先に退避する（退避が書けなければ書かない）。
+   */
+  async function writeMine(
+    project: ProjectRef, snap: Snapshot, aside: boolean
+  ): Promise<'written' | 'changed' | 'locked' | 'empty'> {
+    // 載せる行が 0 件（例: 全部が欠損扱いの間）なら書かない。空の記録で共有を上書きしない。
+    if (snap.photoKeys.length === 0) return 'empty'
+    if (aside && snap.text !== null && snap.remote) {
+      await backend.writeSidecar(project.id, snap.text, asideFileName(snap.remote.updatedBy))
+    }
+    const writeId = randomId()
+    const stamped = core.sidecarStamp(snap.mine, writeId, snap.remote)
+    const result = await backend.writeSidecarChecked(project.id, core.sidecarToJson(stamped), snap.text)
+    if (result !== 'written') return result
+    // 控えの比較キーは「書いた写し」のもの。書いている間に増えた判断は、次に変更ありとして残る。
+    await saveState(project.id, stateFor(snap.state, stamped, {
+      token: writeId, key: snap.localKey, epoch: stamped.epoch ?? null
+    }))
+    return 'written'
+  }
+
+  /** 端末の分を NAS の `catalog.<自分>.json` に退避する（取り込む・混ぜる前）。 */
+  async function asideMine(project: ProjectRef, snap: Snapshot) {
+    await backend.writeSidecar(project.id, core.sidecarToJson(snap.mine), asideFileName(snap.identity.id))
+  }
+
+  /** 端末の鍵の Sidecar を、端末の選別状況に入れる（星・Session・手直し・距離）。 */
+  async function applyLocal(project: ProjectRef, incoming: Sidecar, untouched: boolean) {
+    const projectId = project.id
+    const tournament = incoming.sessions.tournament ?? null
+    // 星の出どころは core の正規形と同じ: Session があれば Session の星、無ければ行の星（photos）。
+    const stars: Record<string, number> = {}
+    if (tournament) for (const [path, rating] of Object.entries(tournament.ratings)) stars[path] = rating
+    else for (const [path, photo] of Object.entries(incoming.photos)) stars[path] = photo.rating
+    const rows = await backend.getCoreInputs(projectId)
+    if (tournament) {
+      await backend.saveSession(projectId, envelopeFromSidecar(incoming, tournament))
+    } else if (untouched) {
+      await backend.saveSession(projectId, null)
+    } else {
+      // 相手に Session が無くても、端末の進んだ Session は消さない（U34 の仕様の変更）。
+      // 星だけ取り込んだ値にそろえる（開いたときの自己修復で、行の星が Session に戻されないように）。
+      const saved = await backend.loadSession(projectId)
+      if (saved) {
+        const changes = Object.fromEntries(rows.map(row => [row.relativePath, stars[row.relativePath] ?? 0]))
+        await backend.saveSession(projectId, { ...saved, core: applyChanges(saved.core, changes), updatedAt: now() })
+      }
+    }
+    await backend.savePairOverrides(projectId, incoming.burstOverrides)
+    if (typeof incoming.burstDistance === 'number') await backend.saveBurstThreshold(projectId, incoming.burstDistance)
+    else if (untouched) await backend.clearBurstThreshold(projectId)
+    // 端末に学習した距離があり、相手に無ければ残す（Session と同じ扱い）。
+    // 星を記録に合わせる。記録に無い写真は 0。変わる行だけ書く。
+    const entries = rows
+      .map(row => ({ id: row.id, rating: stars[row.relativePath] ?? 0, was: row.rating }))
+      .filter(entry => entry.rating !== entry.was)
+      .map(({ id, rating }) => ({ id, rating }))
+    if (entries.length) await backend.saveSelectionResults(projectId, entries)
+  }
+
+  /** NAS の版（フォルダ形式の鍵）を取り込み、控えをその版にする。 */
+  async function pull(project: ProjectRef, snap: Snapshot, theirs: Sidecar, token: string) {
+    const untouched = core.isUntouched(snap.local)
+    await applyLocal(project, core.sidecarKeysFromFolder(theirs, '', snap.separator), untouched)
+    // 控えの比較キーは「取り込んだあとの端末」のもの（端末に残した分があっても、変更ありと読み違えない）。
+    const key = await currentKey(project)
+    await saveState(project.id, stateFor(snap.state, theirs, { token, key, epoch: theirs.epoch ?? null }, {
+      localEpoch: theirs.epoch ?? null
+    }))
+  }
+
+  function coverageProblem(snap: Snapshot, theirs: Sidecar): { matched: number, total: number } | null {
+    const coverage = core.sidecarKeyCoverage(theirs, snap.photoKeys)
+    return coverage.total > 0 && coverage.matched * 2 < coverage.total ? coverage : null
+  }
+
+  function clashInfo(snap: Snapshot, plan: Extract<core.SidecarPlan, { Clash: unknown }>['Clash']): ClashInfo {
+    return {
+      theirs: plan.theirs,
+      theirsText: snap.text ?? '',
+      mineName: snap.identity.name,
+      theirsName: plan.theirs.updatedByName,
+      theirsAt: plan.theirs.updatedAt,
+      mineProgress: plan.mine_progress,
+      theirsProgress: plan.theirs_progress,
+      order: plan.order,
+      reason: plan.reason,
+      preview: plan.preview,
+      access: snap.access
+    }
+  }
+
+  /**
+   * 読む → 判断 → 実行。`full` は開いたとき（書く・取り込む・確認）、`auto` は自動の書き込み
+   * （書くだけ。取り込みと確認は次に開いたときへ回す）。列の中で呼ぶこと。
+   */
+  async function syncNow(project: ProjectRef, mode: 'full' | 'auto'): Promise<SyncOutcome> {
+    const level = await access(project.id)
+    if (level === 'none') return { kind: 'skipped', access: level }
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      const snap = await snapshot(project, level)
+      const plan = core.sidecarPlan(snap.seen, snap.local, snap.remote, level === 'readwrite', snap.state.detached === true)
+      if ('Settled' in plan) {
+        const { seen, reason } = plan.Settled
+        if (seen && snap.remote) {
+          // 意味が同じ。控えだけ NAS の版に進める（警告は出さない）。切り離しも終わる。
+          await saveState(project.id, stateFor(snap.state, snap.remote, seen))
+        } else if (reason === 'NoChange' && typeof snap.state.seenToken !== 'string') {
+          // 古い形の控えのまま変わっていない。今の比較キーで新しい形に移しておく（以後は印に頼らない）。
+          await saveState(project.id, {
+            ...snap.state, localChanged: false, seenToken: snap.seen.token, seenKey: snap.seen.key, seenEpoch: null
+          })
+        }
+        return { kind: 'settled', access: level, reason }
+      }
+      if ('Push' in plan) {
+        const written = await writeMine(project, snap, plan.Push.aside_theirs)
+        if (written === 'written') return { kind: 'pushed', access: level, reason: plan.Push.reason }
+        if (written === 'empty') return { kind: 'empty', access: level }
+        if (written === 'locked') return { kind: 'locked', access: level }
+        continue // 見た版と違った → 読み直して判定し直す
+      }
+      if (mode === 'auto') return { kind: 'deferred', access: level }
+      if ('Pull' in plan) {
+        const { theirs, aside_mine: asideFirst, seen, reason } = plan.Pull
+        const problem = coverageProblem(snap, theirs)
+        if (problem) return { kind: 'mismatch', access: level, ...problem }
+        if (asideFirst && level === 'readwrite' && !core.isUntouched(snap.local)) await asideMine(project, snap)
+        await pull(project, snap, theirs, seen.token)
+        return { kind: 'pulled', access: level, reason, from: theirs.updatedByName }
+      }
+      return { kind: 'clash', access: level, clash: clashInfo(snap, plan.Clash) }
+    }
+    return { kind: 'busy', access: level }
+  }
+
+  const checkOnOpen = (project: ProjectRef) => serialized(project.id, () => syncNow(project, 'full'))
+  const pushAuto = (project: ProjectRef) => serialized(project.id, () => syncNow(project, 'auto'))
+  const pushIfChanged = async (project: ProjectRef) => (await pushAuto(project)).kind === 'pushed'
+
+  async function adopt(project: ProjectRef, sidecar: Sidecar): Promise<void> {
+    await serialized(project.id, async () => {
+      const snap = await snapshot(project, await access(project.id))
+      const built = await buildWith(project)
+      const theirs = core.sidecarNormalizeKeys(sidecar, built.folderPath)
+      await pull(project, snap, theirs, core.sidecarToken(theirs))
+    })
+  }
+
+  /** D・E: 両側から新しい 1 つを作る（フォルダ形式の鍵）。 */
+  function merged(snap: Snapshot, theirs: Sidecar, mode: MergeMode): Sidecar {
+    const groupSize = snap.mine.sessions.tournament?.group_size ?? theirs.sessions.tournament?.group_size ?? 4
+    const result = core.mergeJudgements(snap.local, core.sidecarJudgement(theirs), mode, groupSize, randomId())
+    const photos: Sidecar['photos'] = {}
+    for (const key of snap.photoKeys) photos[key] = { rating: result.ratings[key] ?? 0 }
+    const out: Sidecar = {
+      ...snap.mine,
+      photos,
+      burstOverrides: result.overrides,
+      sessions: { tournament: result.session }
+    }
+    delete out.burstDistance
+    if (typeof result.burst_distance === 'number') out.burstDistance = result.burst_distance
+    out.epoch = result.epoch
+    return out
+  }
+
+  async function resolveClash(project: ProjectRef, clash: ClashInfo, choice: ClashChoice): Promise<ResolveResult> {
+    return serialized(project.id, async () => {
+      const level = await access(project.id)
+      try {
+        const snap = await snapshot(project, level)
+        // ダイアログを出したあとに NAS が変わっていたら、実行せずに出し直す。
+        if (snap.text !== clash.theirsText || !snap.remote) {
+          return { kind: 'changed', outcome: await syncNow(project, 'full') } as const
+        }
+        const theirs = snap.remote
+        const writable = level === 'readwrite'
+        const needsWrite = choice === 'mine' || choice === 'intersection' || choice === 'union'
+        if (needsWrite && !writable) {
+          return { kind: 'failed', reason: 'この共有には書き込めません。', access: level } as const
+        }
+        if (choice === 'keep') {
+          // B: NAS には触らず、この端末を切り離す。控えは NAS の版（また変われば聞き直す）。
+          await saveState(project.id, stateFor(snap.state, theirs, core.sidecarSeen(theirs), { detached: true }))
+          return { kind: 'done' } as const
+        }
+        if (choice === 'theirs') {
+          const problem = coverageProblem(snap, theirs)
+          if (problem) {
+            return {
+              kind: 'failed',
+              reason: `写真の場所が違う記録のようです（一致 ${problem.matched}/${problem.total}）。取り込みませんでした。`,
+              access: level
+            } as const
+          }
+          // A: 端末の分を NAS に退避してから取り込む（退避が書けなければ取り込まない）。
+          if (writable && !core.isUntouched(snap.local)) await asideMine(project, snap)
+          await pull(project, snap, theirs, core.sidecarToken(theirs))
+          return { kind: 'done' } as const
+        }
+        if (choice === 'mine') {
+          // C: NAS の版を退避して、端末の分を書く。
+          const written = await writeMine(project, snap, true)
+          return afterWrite(project, written, level)
+        }
+        // D・E: 混ぜる。両方を退避し、混ぜた結果を書いてから端末にも入れる。
+        const mode: MergeMode = choice === 'intersection' ? 'Intersection' : 'Union'
+        const next = merged(snap, theirs, mode)
+        await asideMine(project, snap)
+        await backend.writeSidecar(project.id, snap.text ?? '', asideFileName(theirs.updatedBy))
+        const writeId = randomId()
+        const stamped = core.sidecarStamp(next, writeId, theirs)
+        const written = await backend.writeSidecarChecked(project.id, core.sidecarToJson(stamped), snap.text)
+        if (written !== 'written') return afterWrite(project, written, level)
+        await applyLocal(project, core.sidecarKeysFromFolder(next, '', snap.separator), false)
+        const key = await currentKey(project)
+        await saveState(project.id, stateFor(snap.state, stamped, {
+          token: writeId, key, epoch: stamped.epoch ?? null
+        }, { localEpoch: stamped.epoch ?? null }))
+        return { kind: 'done' } as const
+      } catch (cause) {
+        // 書けなかった。読むだけの共有と決めつけず、何も変えずに理由を返す（つながらないだけなら、選び直せる）。
+        const reason = cause instanceof Error ? cause.message : '記録を書けませんでした。'
+        return { kind: 'failed', reason, access: await access(project.id) } as const
+      }
+    })
+  }
+
+  async function afterWrite(
+    project: ProjectRef, written: 'written' | 'changed' | 'locked' | 'empty', level: SidecarAccess
+  ): Promise<ResolveResult> {
+    if (written === 'written') return { kind: 'done' }
+    if (written === 'locked') return { kind: 'failed', reason: 'ほかの端末が書き込んでいます。少し待ってから選んでください。', access: level }
+    if (written === 'empty') return { kind: 'failed', reason: '写真の行が無いため、書きませんでした。', access: level }
+    return { kind: 'changed', outcome: await syncNow(project, 'full') }
+  }
+
+  async function writeToNas(project: ProjectRef): Promise<boolean> {
+    return serialized(project.id, async () => {
+      const level = await access(project.id)
+      if (level !== 'readwrite') return false
+      for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+        const snap = await snapshot(project, level)
+        const same = snap.remote ? core.judgementEquivalent(snap.local, core.sidecarJudgement(snap.remote)) : false
+        const written = await writeMine(project, snap, !same)
+        if (written === 'written') return true
+        if (written !== 'changed') return false
+      }
+      return false
+    })
+  }
+
+  function markChanged(projectId: string): Promise<void> {
+    if (knownChanged.has(projectId)) return Promise.resolve()
+    // 列に並べる（書き終えた控えを、読んだ時点の古い値で上書きしない）。
+    return serialized(projectId, async () => {
+      const state = await backend.loadSidecarState(projectId)
+      if (!state.localChanged) await backend.saveSidecarState(projectId, { ...state, localChanged: true })
+      knownChanged.add(projectId)
+    })
+  }
+
+  function markRestarted(projectId: string): Promise<void> {
+    return serialized(projectId, async () => {
+      const state = await backend.loadSidecarState(projectId)
+      await backend.saveSidecarState(projectId, { ...state, localEpoch: `e-${randomId()}`, localChanged: true })
+    })
+  }
+
+  async function isDetached(projectId: string): Promise<boolean> {
+    return (await backend.loadSidecarState(projectId)).detached === true
+  }
+
+  return {
+    checkOnOpen, pushIfChanged, pushAuto, adopt, resolveClash, writeToNas, markChanged, markRestarted,
+    buildSidecar, isDetached, access
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -274,11 +598,8 @@ export function createSidecarSync(backend: SidecarBackend, now: () => number = D
 // ---------------------------------------------------------------------------
 
 /** 食い違いのダイアログに渡すもの。 */
-export interface SidecarClash {
+export interface SidecarClash extends ClashInfo {
   projectId: string
-  theirs: Sidecar
-  mine: SidecarSummary
-  theirsSummary: SidecarSummary
 }
 
 /**
@@ -290,53 +611,84 @@ export function useSidecarSync(backend: PhotoBackend) {
   const access = ref<SidecarAccess>('none')
   const clash = ref<SidecarClash | null>(null)
   const busy = ref(false)
+  /** 失敗の理由（赤）。 */
   const message = ref('')
+  /** お知らせ（取り込んだ など）。 */
+  const notice = ref('')
+  /** 「この端末の状況を残す」を選んだあと（NAS とは別）。 */
+  const detached = ref(false)
   /** 最後にこの端末が書いた時刻。表示用。 */
   const savedAt = ref<number | null>(null)
 
   async function refreshAccess(projectId: string) {
     access.value = await sync.access(projectId)
+    detached.value = await sync.isDetached(projectId).catch(() => false)
   }
 
-  async function checkOnOpen(project: { id: string }): Promise<OpenOutcome | null> {
+  function show(project: ProjectRef, outcome: SyncOutcome) {
+    access.value = outcome.access
+    if (outcome.kind === 'clash') clash.value = { projectId: project.id, ...outcome.clash }
+    if (outcome.kind === 'pushed') savedAt.value = Date.now()
+    if (outcome.kind === 'pulled') notice.value = `${outcome.from} の記録を取り込みました。`
+    if (outcome.kind === 'mismatch') {
+      message.value = `写真の場所が違う記録のようです（一致 ${outcome.matched}/${outcome.total}）。取り込みませんでした。`
+    }
+    if (outcome.kind === 'locked') message.value = 'ほかの端末が書き込んでいたため、今回は書きませんでした。'
+  }
+
+  async function checkOnOpen(project: ProjectRef): Promise<SyncOutcome | null> {
     clash.value = null
     message.value = ''
+    notice.value = ''
     try {
       const outcome = await sync.checkOnOpen(project)
-      access.value = outcome.access
-      if (outcome.kind === 'clash') {
-        clash.value = {
-          projectId: project.id, theirs: outcome.theirs, mine: outcome.mine, theirsSummary: outcome.theirsSummary
-        }
-      }
-      if (outcome.kind === 'pushed') savedAt.value = Date.now()
+      show(project, outcome)
+      detached.value = await sync.isDetached(project.id).catch(() => false)
       return outcome
     } catch (cause) {
-      // 読めない・つながらない。選別は続けられるので、理由だけ出す。
-      await refreshAccess(project.id)
+      // 読めない・つながらない。選別は続けられるので、理由だけ出す（判断はしない）。
+      await refreshAccess(project.id).catch(() => undefined)
       message.value = cause instanceof Error ? cause.message : 'サイドカーを確認できませんでした。'
       return null
     }
   }
 
-  /** 自動の書き込み。書けなくても画面は止めない。 */
-  async function pushAuto(project: { id: string } | null) {
+  /** 自動の書き込み。書けなくても画面は止めない。取り込みと確認は次に開いたときへ回す。 */
+  async function pushAuto(project: ProjectRef | null) {
     if (!project || clash.value) return
     try {
-      if (await sync.pushIfChanged(project)) savedAt.value = Date.now()
+      const outcome = await sync.pushAuto(project)
+      if (outcome.kind === 'pushed') savedAt.value = Date.now()
     } catch (cause) {
       message.value = cause instanceof Error ? cause.message : 'サイドカーに書けませんでした。'
     }
   }
 
-  /** 「今すぐ保存」。 */
-  async function saveNow(project: { id: string }) {
+  /** 「今すぐ保存」。開いたときと同じ判断（食い違えばダイアログ）。 */
+  async function saveNow(project: ProjectRef) {
     if (clash.value) return
+    busy.value = true
+    try {
+      const outcome = await checkOnOpen(project)
+      if (outcome?.kind === 'settled' && outcome.reason !== 'ReadOnly') notice.value = '保存する変更はありません。'
+      return outcome
+    } finally {
+      busy.value = false
+    }
+  }
+
+  /** 切り離し中の「NAS に書き込む」。 */
+  async function writeToNas(project: ProjectRef) {
     busy.value = true
     message.value = ''
     try {
-      if (await sync.pushIfChanged(project)) savedAt.value = Date.now()
-      else message.value = '保存する変更はありません。'
+      if (await sync.writeToNas(project)) {
+        savedAt.value = Date.now()
+        detached.value = false
+        notice.value = 'この端末の状況をサイドカーに書き込みました。'
+      } else {
+        message.value = 'サイドカーに書き込めませんでした。少し待ってからもう一度試してください。'
+      }
     } catch (cause) {
       message.value = cause instanceof Error ? cause.message : 'サイドカーに書けませんでした。'
     } finally {
@@ -344,23 +696,41 @@ export function useSidecarSync(backend: PhotoBackend) {
     }
   }
 
-  async function resolve(choice: 'mine' | 'theirs'): Promise<boolean> {
+  /** 食い違いの答え。終わったら true（ダイアログを閉じる）。 */
+  async function resolve(choice: ClashChoice): Promise<boolean> {
     const current = clash.value
     if (!current) return false
     busy.value = true
+    message.value = ''
     try {
-      const result = await sync.resolveClash({ id: current.projectId }, current.theirs, choice)
+      const result = await sync.resolveClash({ id: current.projectId }, current, choice)
+      if (result.kind === 'failed') {
+        // 何も変えていない。ダイアログを残して選び直してもらう（書けない共有なら書く選択肢は消える）。
+        access.value = result.access
+        clash.value = { ...current, access: result.access }
+        message.value = result.reason
+        return false
+      }
       clash.value = null
-      if (result.kind === 'readonly') {
-        // 書けない共有だった。ダイアログを閉じ、読むだけの出所として相手を取り込んだ。
-        access.value = 'readonly'
-        message.value = `この共有には書き込めないため、共有側の記録を取り込みました（${result.reason}）`
+      if (result.kind === 'changed') {
+        // NAS が変わっていた。新しい判断を出す（また食い違えば、新しい中身でダイアログ）。
+        show({ id: current.projectId }, result.outcome)
+        if (result.outcome.kind === 'clash') {
+          message.value = '確認している間に NAS の記録が変わりました。もう一度選んでください。'
+          return false
+        }
       } else {
-        savedAt.value = Date.now()
+        if (choice === 'keep') {
+          detached.value = true
+          notice.value = 'この端末の状況を残しました（NAS とは別）。'
+        } else {
+          detached.value = false
+          if (choice !== 'theirs') savedAt.value = Date.now()
+          notice.value = choice === 'theirs' ? 'サイドカーの記録を取り込みました。' : 'サイドカーに書き込みました。'
+        }
       }
       return true
     } catch (cause) {
-      // 取り込みまで失敗したときは、選び直せるようダイアログを残す。
       message.value = cause instanceof Error ? cause.message : '記録を切り替えられませんでした。'
       return false
     } finally {
@@ -374,7 +744,14 @@ export function useSidecarSync(backend: PhotoBackend) {
     })
   }
 
-  return { sync, access, clash, busy, message, savedAt, refreshAccess, checkOnOpen, pushAuto, saveNow, resolve, markChanged }
+  async function markRestarted(projectId: string) {
+    await sync.markRestarted(projectId).catch(() => undefined)
+  }
+
+  return {
+    sync, access, clash, busy, message, notice, detached, savedAt, refreshAccess, checkOnOpen, pushAuto, saveNow,
+    writeToNas, resolve, markChanged, markRestarted
+  }
 }
 
 /**

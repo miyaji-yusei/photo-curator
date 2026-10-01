@@ -817,6 +817,13 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
       }
       await io.writeSidecar(json, fileName)
     },
+    writeSidecarChecked: async (projectId: string, json: string, expected: string | null) => {
+      const io = await sidecarIO(projectId)
+      if (!io || (await io.sidecarAccess()) !== 'readwrite') {
+        throw new Error('この出所にはサイドカーを書けません。フォルダへのアクセスを許可してください。')
+      }
+      return io.writeSidecarChecked(json, expected)
+    },
     loadSidecarState: (projectId: string): Promise<SidecarState> => store.readSidecarState(projectId),
     saveSidecarState: (projectId: string, state: SidecarState) => store.writeSidecarState(projectId, state),
     deviceIdentity: async (): Promise<DeviceIdentity> => ({ id: await store.deviceId(), name: 'ブラウザ' }),

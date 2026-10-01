@@ -1,5 +1,11 @@
-// サイドカーの同期を確かめる。backend は偽物（メモリ）。判断は本物の core（wasm）。
+// サイドカーの同期を確かめる。backend は偽物（メモリ）。判断は本物の core（wasm の sidecarPlan）。
 // node:fs を使うため .mjs にしてある（`selectionFlow.test.mjs` と同じ理由）。
+//
+// U34（設計書「サイドカー同期の調査と直し方の設計」の PR-2・PR-4）で、判断を core の `sidecarPlan` に
+// 切り替えた。**2 台（PC と Android）が 1 つの catalog.json を共有する**偽物で、報告された
+// 「選別状況が同期の取り込みで消える」を両方の視点で再現している（「2 台で 1 つのファイル」の節）。
+// Android 側は、U35 で同じ core の判断に切り替える前提で、同じ `createSidecarSync` を
+// 「Android の端末」として動かしている（判断の表は core が 1 か所に持つ）。
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { beforeAll, describe, expect, it } from 'vitest'
@@ -13,34 +19,63 @@ beforeAll(() => {
 })
 
 const threshold = { window_ms: 4000, distance: 9, d_hash_version: 2 }
-const refs = count =>
+const refs = (count, names) =>
   Array.from({ length: count }, (_unused, index) => ({
-    relative_path: `IMG_${index}.JPG`, captured_at: index * 60_000, d_hash: null, d_hash_version: 2
+    relative_path: names?.[index] ?? `IMG_${index}.JPG`, captured_at: index * 60_000, d_hash: null, d_hash_version: 2
   }))
 
-/** 写真 6 枚のプロジェクト 1 つを持つ偽の backend。 */
+const PC = { id: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', name: 'この PC' }
+const ANDROID = { id: 'zzzzzzzz-1111-2222-3333-444444444444', name: 'Pixel' }
+
+/** 2 台が共有する NAS の `.photo-curator/`（メモリ上）。 */
+function sharedNas() {
+  return {
+    files: new Map(), // ファイル名 → JSON
+    writes: [], // 書いたファイル名の記録（どの端末からでも）
+    failWrite: false,
+    locked: false,
+    /** 楽観ロックの書き込みで、「読んで確かめる」直前に 1 回だけ呼ぶ（別の端末の割り込み）。 */
+    beforeCheck: null
+  }
+}
+
+/** 写真 6 枚のプロジェクト 1 つを持つ、1 台ぶんの偽の backend。`nas` を渡すと 2 台で共有する。 */
 function fakeBackend(options = {}) {
-  const files = new Map() // ファイル名 → JSON
-  const writes = [] // 書いたファイル名の記録
+  const nas = options.nas ?? sharedNas()
+  const names = options.names
   const backend = {
     access: options.access ?? 'readwrite',
-    files,
-    writes,
-    failWrite: false,
-    rows: refs(6).map((ref, index) => ({
+    nas,
+    files: nas.files,
+    writes: nas.writes,
+    get failWrite() { return nas.failWrite },
+    set failWrite(value) { nas.failWrite = value },
+    rows: refs(6, names).map((ref, index) => ({
       id: `id-${index}`, relativePath: ref.relative_path, rating: 0
     })),
     session: null,
     overrides: [],
     distance: null,
+    folderPath: options.folderPath ?? 'C:\\photos\\x',
     state: { seenAt: 0, seenBy: '', localChanged: false },
-    identity: { id: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', name: 'この PC' },
+    identity: options.identity ?? PC,
     sidecarSupported: async () => backend.access,
-    readSidecar: async () => files.get('catalog.json') ?? null,
+    readSidecar: async () => nas.files.get('catalog.json') ?? null,
     writeSidecar: async (_projectId, json, fileName = 'catalog.json') => {
-      if (backend.failWrite) throw new Error('書けません')
-      files.set(fileName, json)
-      writes.push(fileName)
+      if (nas.failWrite) throw new Error('書けません')
+      nas.files.set(fileName, json)
+      nas.writes.push(fileName)
+    },
+    writeSidecarChecked: async (_projectId, json, expected) => {
+      if (nas.failWrite) throw new Error('書けません')
+      if (nas.locked) return 'locked'
+      const hook = nas.beforeCheck
+      nas.beforeCheck = null
+      if (hook) await hook()
+      if ((nas.files.get('catalog.json') ?? null) !== expected) return 'changed'
+      nas.files.set('catalog.json', json)
+      nas.writes.push('catalog.json')
+      return 'written'
     },
     loadSidecarState: async () => ({ ...backend.state }),
     saveSidecarState: async (_projectId, state) => { backend.state = { ...state } },
@@ -56,7 +91,7 @@ function fakeBackend(options = {}) {
     savePairOverrides: async (_projectId, overrides) => { backend.overrides = overrides },
     loadSession: async () => backend.session,
     saveSession: async (_projectId, value) => { backend.session = value },
-    listProjects: async () => [{ id: 'p1', burstThreshold: backend.distance }],
+    listProjects: async () => [{ id: 'p1', burstThreshold: backend.distance, folderPath: backend.folderPath }],
     saveBurstThreshold: async (_projectId, value) => { backend.distance = value },
     clearBurstThreshold: async () => { backend.distance = null }
   }
@@ -67,15 +102,41 @@ const project = { id: 'p1' }
 let clock = 1_000_000
 const nextClock = () => (clock += 1000)
 
-/** 別の端末が書いた、★の付いた記録。 */
+const envelope = session => ({
+  v: 2,
+  core: session,
+  stage: session.finished ? 'result' : 'tournament',
+  settings: { groupSize: session.group_size, groupBursts: false },
+  multiSelect: false,
+  selectedInGroup: [],
+  learning: null,
+  burstDistance: null,
+  updatedAt: 1
+})
+
+/** 端末で選別を進める（行の星も Session に合わせる。PC の applyCore と同じ）。 */
+function play(backend, picks, groupSize = 2) {
+  let session = core.startRound(refs(6, backend.rows.map(row => row.relativePath)), groupSize, 0, false, threshold, [])
+  for (const chosen of picks) session = core.advance(session, chosen)
+  backend.session = envelope(session)
+  for (const row of backend.rows) row.rating = session.ratings[row.relativePath] ?? 0
+  return session
+}
+
+/** 「選別を開始」を押しただけ（判断 0 件）。 */
+const startOnly = backend => play(backend, [])
+
+/** 別の端末が書いた、★の付いた記録（Session と星がそろっている）。 */
 function remoteSidecar(overrides = {}) {
   const session = core.advance(core.startRound(refs(6), 4, 0, false, threshold, []), ['IMG_1.JPG', 'IMG_2.JPG'])
+  const photos = {}
+  for (const [path, rating] of Object.entries(session.ratings)) photos[path] = { rating }
   return {
     version: 1,
     updatedAt: 500,
-    updatedBy: 'zzzzzzzz-1111-2222-3333-444444444444',
+    updatedBy: ANDROID.id,
     updatedByName: 'Pixel',
-    photos: { 'IMG_1.JPG': { rating: 1 }, 'IMG_2.JPG': { rating: 3 }, 'IMG_9.JPG': { rating: 2 } },
+    photos,
     burstOverrides: [{ left: 'IMG_1.JPG', right: 'IMG_2.JPG', decision: 'split' }],
     sessions: { tournament: session },
     burstDistance: 7,
@@ -84,9 +145,11 @@ function remoteSidecar(overrides = {}) {
 }
 
 const seeFor = sidecar => ({ seenAt: sidecar.updatedAt, seenBy: sidecar.updatedBy })
+const nasCatalog = backend => core.sidecarFromJson(backend.files.get('catalog.json'))
+const ratingsOf = backend => backend.rows.map(row => row.rating)
 
 describe('Sidecar の組み立て', () => {
-  it('星は全部・手直し・学習した距離・Session を載せ、撮影時刻と指紋は載せない', async () => {
+  it('星は全部・手直し・学習した距離・Session を載せ、撮影時刻とハッシュ値は載せない', async () => {
     const backend = fakeBackend()
     backend.rows[3].rating = 2
     backend.overrides = [{ left: 'IMG_0.JPG', right: 'IMG_1.JPG', decision: 'join' }]
@@ -116,7 +179,7 @@ describe('Sidecar の組み立て', () => {
   })
 
   it('要約は ★1 以上の枚数・ROUND・最終更新・端末名', () => {
-    const summary = summarize(remoteSidecar())
+    const summary = summarize(remoteSidecar({ photos: { 'IMG_1.JPG': { rating: 1 }, 'IMG_2.JPG': { rating: 3 }, 'IMG_9.JPG': { rating: 2 } } }))
     expect(summary.starred).toBe(3)
     expect(summary.round).toBe(1)
     expect(summary.updatedAt).toBe(500)
@@ -130,8 +193,8 @@ describe('Sidecar の組み立て', () => {
   })
 })
 
-describe('開いたときの 4 通り', () => {
-  it('Settled: 何もしない（書かない・状態も変えない）', async () => {
+describe('開いたとき（core の sidecarPlan）', () => {
+  it('Settled: 見た版のままで端末も変わっていなければ、何もしない（書かない・取り込まない）', async () => {
     const backend = fakeBackend()
     const remote = remoteSidecar()
     backend.files.set('catalog.json', core.sidecarToJson(remote))
@@ -144,7 +207,7 @@ describe('開いたときの 4 通り', () => {
     expect(backend.state.localChanged).toBe(false)
   })
 
-  it('Push（サイドカーがまだ無い）: 端末の分を書き、seen を更新して変更なしにする', async () => {
+  it('Push（サイドカーがまだ無い）: 端末の分を書き、控えを書いた版にする', async () => {
     const backend = fakeBackend()
     backend.rows[1].rating = 1
     backend.state = { seenAt: 0, seenBy: '', localChanged: true }
@@ -152,10 +215,14 @@ describe('開いたときの 4 通り', () => {
     const outcome = await sync.checkOnOpen(project)
     expect(outcome.kind).toBe('pushed')
     expect(backend.writes).toEqual(['catalog.json'])
-    const written = core.sidecarFromJson(backend.files.get('catalog.json'))
+    const written = nasCatalog(backend)
     expect(written.photos['IMG_1.JPG']).toEqual({ rating: 1 })
-    expect(backend.state).toEqual({
-      seenAt: written.updatedAt, seenBy: backend.identity.id, localChanged: false
+    expect(written.version).toBe(2)
+    expect(written.keyBase).toBe('folder')
+    expect(written.writeId).toBeTruthy()
+    // 状態の形が増えたので toMatchObject（古い 3 つの値は今までどおり）。
+    expect(backend.state).toMatchObject({
+      seenAt: written.updatedAt, seenBy: backend.identity.id, localChanged: false, seenToken: written.writeId
     })
   })
 
@@ -164,17 +231,15 @@ describe('開いたときの 4 通り', () => {
     const mine = remoteSidecar({ updatedBy: backend.identity.id, updatedByName: 'この PC' })
     backend.files.set('catalog.json', core.sidecarToJson(mine))
     backend.state = { ...seeFor(mine), localChanged: true }
+    // 端末には進んだ分がある（U34: 未着手の端末で着手済みの版を置き換えるときは退避が増えるため、端末に分を持たせる）。
+    play(backend, [['IMG_0.JPG']])
     const sync = createSidecarSync(backend, nextClock)
     expect((await sync.checkOnOpen(project)).kind).toBe('pushed')
     expect(backend.writes).toEqual(['catalog.json'])
   })
 
-  it('Pull: 取り込む。Session・手直し・距離・星が置き換わり、無い写真は 0、警告は出さない', async () => {
+  it('Pull（端末が未着手）: 確認なしに取り込む。Session・手直し・距離・星が NAS の分になる', async () => {
     const backend = fakeBackend()
-    backend.rows[0].rating = 4 // 記録に無い → 0 になる
-    backend.rows[1].rating = 5
-    backend.overrides = [{ left: 'IMG_4.JPG', right: 'IMG_5.JPG', decision: 'join' }]
-    backend.distance = 3
     const remote = remoteSidecar()
     backend.files.set('catalog.json', core.sidecarToJson(remote))
     backend.state = { seenAt: 100, seenBy: 'old', localChanged: false }
@@ -182,48 +247,79 @@ describe('開いたときの 4 通り', () => {
 
     const outcome = await sync.checkOnOpen(project)
     expect(outcome.kind).toBe('pulled')
+    expect(outcome.reason).toBe('LocalUntouched')
     expect(backend.writes).toEqual([])
-    expect(backend.rows.map(row => row.rating)).toEqual([0, 1, 3, 0, 0, 0])
+    expect(ratingsOf(backend)).toEqual([0, 1, 1, 0, 0, 0])
     expect(backend.overrides).toEqual([{ left: 'IMG_1.JPG', right: 'IMG_2.JPG', decision: 'split' }])
     expect(backend.distance).toBe(7)
     expect(backend.session.v).toBe(2)
     expect(backend.session.core.round).toBe(remote.sessions.tournament.round)
     expect(backend.session.stage).toBe('tournament')
     expect(backend.session.settings.groupSize).toBe(4)
-    expect(backend.state).toEqual({ seenAt: 500, seenBy: remote.updatedBy, localChanged: false })
+    expect(backend.state).toMatchObject({ seenAt: 500, seenBy: remote.updatedBy, localChanged: false })
+    expect(backend.state.seenToken).toBe(core.sidecarToken(remote))
     // 取り込んだ直後は、何も変えていなければ書かない。
     expect(await sync.pushIfChanged(project)).toBe(false)
   })
 
-  it('Pull: 記録に Session も距離も無ければ、Session と距離を空にする', async () => {
+  it('Pull（端末が未着手）: 記録に無い写真は★0、Session の無い記録は行の星（photos）から取り込む', async () => {
     const backend = fakeBackend()
-    backend.distance = 5
-    backend.session = { v: 2, core: core.startRound(refs(6), 4, 0, false, threshold, []), updatedAt: 1 }
-    const remote = remoteSidecar({ sessions: {}, burstDistance: undefined })
+    const remote = remoteSidecar({ sessions: {}, photos: { 'IMG_3.JPG': { rating: 2 } } })
     backend.files.set('catalog.json', core.sidecarToJson(remote))
     const sync = createSidecarSync(backend, nextClock)
     expect((await sync.checkOnOpen(project)).kind).toBe('pulled')
-    expect(backend.session).toBeNull()
-    expect(backend.distance).toBeNull()
+    expect(ratingsOf(backend)).toEqual([0, 0, 0, 2, 0, 0])
   })
 
-  it('Clash: どちらも進んでいる。何も書かず、両方の要約を返す', async () => {
+  // 仕様の変更（U34・ユーザーの決定。設計書 §1.6・PR-2 の 1）: 以前は「相手に Session が無ければ端末の Session を
+  // 消す」を仕様として固定していた。それが「選別状況が同期の取り込みで消える」の一因だったので、
+  // **端末が未着手でない限り、相手に無い Session・境目は消さない**に反転した。
+  it('取り込み: 相手に Session も距離も無くても、端末の進んだ Session と距離は消さない', async () => {
     const backend = fakeBackend()
-    backend.rows[0].rating = 1
+    backend.distance = 5
+    const before = play(backend, [['IMG_0.JPG'], ['IMG_2.JPG']])
+    const remote = remoteSidecar({ sessions: {}, burstDistance: undefined, photos: { 'IMG_4.JPG': { rating: 3 } } })
+    const sync = createSidecarSync(backend, nextClock)
+    await sync.adopt(project, remote)
+    expect(backend.session).not.toBeNull()
+    expect(backend.session.core.history).toHaveLength(before.history.length)
+    expect(backend.distance).toBe(5)
+    // 星は取り込む（行と Session の星をそろえる。開いたときの自己修復で戻されないように）。
+    expect(ratingsOf(backend)).toEqual([0, 0, 0, 0, 3, 0])
+    expect(backend.session.core.ratings['IMG_4.JPG']).toBe(3)
+    expect(backend.session.core.ratings['IMG_0.JPG']).toBe(0)
+  })
+
+  it('取り込み: 端末が未着手なら、相手に Session が無いとき端末の Session を空にする', async () => {
+    const backend = fakeBackend()
+    startOnly(backend)
+    const sync = createSidecarSync(backend, nextClock)
+    await sync.adopt(project, remoteSidecar({ sessions: {} }))
+    expect(backend.session).toBeNull()
+  })
+
+  it('Clash: どちらも進んでいて中身が違う。何も書かず、両方の要約と見込みを返す', async () => {
+    const backend = fakeBackend()
+    play(backend, [['IMG_0.JPG']])
     const remote = remoteSidecar()
     backend.files.set('catalog.json', core.sidecarToJson(remote))
     backend.state = { seenAt: 100, seenBy: 'old', localChanged: true }
     const sync = createSidecarSync(backend, nextClock)
     const outcome = await sync.checkOnOpen(project)
     expect(outcome.kind).toBe('clash')
-    expect(outcome.theirsSummary).toMatchObject({ starred: 3, deviceName: 'Pixel', updatedAt: 500 })
-    expect(outcome.mine).toMatchObject({ starred: 1, deviceName: 'この PC' })
+    expect(outcome.clash.reason).toBe('Diverged')
+    expect(outcome.clash.theirsName).toBe('Pixel')
+    expect(outcome.clash.theirsAt).toBe(500)
+    expect(outcome.clash.mineName).toBe('この PC')
+    expect(outcome.clash.theirsProgress).toMatchObject({ started: true, starred: 2, decided: 1 })
+    expect(outcome.clash.mineProgress).toMatchObject({ started: true, starred: 1, decided: 1 })
+    expect(outcome.clash.preview.union_starred).toBe(3)
     expect(backend.writes).toEqual([])
     expect(backend.rows[0].rating).toBe(1)
     expect(backend.state).toEqual({ seenAt: 100, seenBy: 'old', localChanged: true })
   })
 
-  it('時刻の大小では決めない: 端末の時計が進んでいても、変更なしなら相手を取り込む', async () => {
+  it('時刻の大小では決めない: 端末の時計が進んでいても、端末が未着手なら相手を取り込む', async () => {
     const backend = fakeBackend()
     const remote = remoteSidecar({ updatedAt: 5 }) // とても古い時刻
     backend.files.set('catalog.json', core.sidecarToJson(remote))
@@ -251,89 +347,160 @@ describe('開いたときの 4 通り', () => {
     const backend = fakeBackend()
     backend.files.set('catalog.json', '{ これは JSON ではない')
     backend.state = { seenAt: 0, seenBy: '', localChanged: true }
+    play(backend, [['IMG_0.JPG']])
     const sync = createSidecarSync(backend, nextClock)
     await expect(sync.checkOnOpen(project)).rejects.toThrow('形式を読めません')
     expect(backend.writes).toEqual([])
   })
-})
 
-describe('食い違いの選択', () => {
-  async function clashed() {
+  it('意味が同じなら、並び・空白・updatedAt・updatedBy が違っても何もしない（警告も書き込みも無し）', async () => {
     const backend = fakeBackend()
-    backend.rows[0].rating = 1
-    const remote = remoteSidecar()
-    backend.files.set('catalog.json', core.sidecarToJson(remote))
-    backend.state = { seenAt: 100, seenBy: 'old', localChanged: true }
+    play(backend, [['IMG_0.JPG'], ['IMG_3.JPG']])
+    const sync = createSidecarSync(backend, nextClock)
+    // 端末と同じ選別状況を、別の端末が別の書き方で書いた（PC は★0 の写真も載せるが、Android は載せない）。
+    const mine = await sync.buildSidecar(project, 1)
+    const rewritten = { ...mine, updatedAt: 99_999, updatedBy: ANDROID.id, updatedByName: 'Pixel', photos: {} }
+    const text = JSON.stringify(Object.fromEntries(Object.entries(JSON.parse(core.sidecarToJson(rewritten))).reverse()), null, 2)
+    backend.files.set('catalog.json', text)
+    backend.state = { seenAt: 1, seenBy: 'old', localChanged: true }
+    const outcome = await sync.checkOnOpen(project)
+    expect(outcome).toMatchObject({ kind: 'settled', reason: 'Same' })
+    expect(backend.writes).toEqual([])
+    expect(backend.state.seenToken).toBe(core.sidecarToken(core.sidecarFromJson(text)))
+  })
+
+  it('写真の場所が違う記録（鍵の一致が半分未満）は取り込まずに理由を返す', async () => {
+    const backend = fakeBackend()
+    const session = core.advance(core.startRound(refs(6, ['a/1.JPG', 'a/2.JPG', 'a/3.JPG', 'a/4.JPG', 'a/5.JPG', 'a/6.JPG']), 2, 0, false, threshold, []), ['a/1.JPG'])
+    backend.files.set('catalog.json', core.sidecarToJson(remoteSidecar({ photos: {}, burstOverrides: [], sessions: { tournament: session }, keyBase: 'folder' })))
     const sync = createSidecarSync(backend, nextClock)
     const outcome = await sync.checkOnOpen(project)
-    return { backend, remote, sync, outcome }
-  }
-
-  it('この端末の結果を使う: 相手を catalog.<id 先頭 12 文字>.json に残し、自分の分を書く', async () => {
-    const { backend, remote, sync, outcome } = await clashed()
-    await sync.keepMine(project, outcome.theirs)
-    expect(backend.writes).toEqual(['catalog.zzzzzzzz-111.json', 'catalog.json'])
-    expect(core.sidecarFromJson(backend.files.get('catalog.zzzzzzzz-111.json')).updatedByName).toBe('Pixel')
-    const now = core.sidecarFromJson(backend.files.get('catalog.json'))
-    expect(now.updatedBy).toBe(backend.identity.id)
-    expect(now.photos['IMG_0.JPG']).toEqual({ rating: 1 })
-    expect(backend.state).toEqual({ seenAt: now.updatedAt, seenBy: backend.identity.id, localChanged: false })
-    expect(backend.rows[0].rating).toBe(1)
-    expect(remote.updatedAt).toBe(500)
-  })
-
-  it('NAS の記録を使う: この端末の分を catalog.<自分の id 先頭 12 文字>.json に残し、相手を取り込む', async () => {
-    const { backend, sync, outcome } = await clashed()
-    await sync.keepTheirs(project, outcome.theirs)
-    expect(backend.writes).toEqual(['catalog.aaaaaaaa-bbb.json'])
-    const aside = core.sidecarFromJson(backend.files.get('catalog.aaaaaaaa-bbb.json'))
-    expect(aside.photos['IMG_0.JPG']).toEqual({ rating: 1 })
-    // catalog.json は相手のまま。
-    expect(core.sidecarFromJson(backend.files.get('catalog.json')).updatedBy).toContain('zzzzzzzz')
-    expect(backend.rows.map(row => row.rating)).toEqual([0, 1, 3, 0, 0, 0])
-    expect(backend.state).toEqual({ seenAt: 500, seenBy: outcome.theirs.updatedBy, localChanged: false })
-  })
-
-  it('退避が書けなければ、どちらも実行しない（選ばなかった方を失わない）', async () => {
-    const { backend, sync, outcome } = await clashed()
-    backend.failWrite = true
-    await expect(sync.keepTheirs(project, outcome.theirs)).rejects.toThrow('書けません')
-    expect(backend.rows[0].rating).toBe(1)
-    expect(backend.state).toEqual({ seenAt: 100, seenBy: 'old', localChanged: true })
+    expect(outcome).toMatchObject({ kind: 'mismatch', matched: 0 })
+    expect(backend.session).toBeNull()
   })
 })
 
-describe('食い違いの解決で書けなかったとき', () => {
-  async function clashedUnwritable() {
-    const backend = fakeBackend()
-    backend.rows[0].rating = 1
-    backend.files.set('catalog.json', core.sidecarToJson(remoteSidecar()))
-    backend.state = { seenAt: 100, seenBy: 'old', localChanged: true }
-    const sync = createSidecarSync(backend, nextClock)
-    const outcome = await sync.checkOnOpen(project)
-    backend.failWrite = true
-    return { backend, sync, outcome }
+describe('2 台で 1 つのファイル（報告されたシナリオ）', () => {
+  function twoDevices() {
+    const nas = sharedNas()
+    const pc = fakeBackend({ nas, identity: PC })
+    const android = fakeBackend({ nas, identity: ANDROID })
+    return { nas, pc, android, pcSync: createSidecarSync(pc, nextClock), androidSync: createSidecarSync(android, nextClock) }
   }
 
-  for (const choice of ['mine', 'theirs']) {
-    it(`${choice}: 書けなければ読むだけの出所として相手を取り込み、理由を返す`, async () => {
-      const { backend, sync, outcome } = await clashedUnwritable()
-      const result = await sync.resolveClash(project, outcome.theirs, choice)
-      expect(result).toEqual({ kind: 'readonly', reason: '書けません' })
-      expect(backend.rows.map(row => row.rating)).toEqual([0, 1, 3, 0, 0, 0])
-      expect(backend.state).toEqual({ seenAt: 500, seenBy: outcome.theirs.updatedBy, localChanged: false })
-    })
-  }
+  it('Android が選別を進めて書いたあと、PC が「選別を開始」だけで書いても、Android の版を上書きしない', async () => {
+    const { pc, android, pcSync, androidSync } = twoDevices()
+    await androidSync.checkOnOpen(project) // 最初の確認（まだ無い）
+    play(android, [['IMG_0.JPG'], ['IMG_2.JPG']])
+    expect(await androidSync.pushIfChanged(project)).toBe(true) // ラウンドの途中で書いた（A1）
+    const a1 = pc.files.get('catalog.json')
 
-  it('書ければ普通に実行する', async () => {
-    const { backend, sync, outcome } = await clashedUnwritable()
-    backend.failWrite = false
-    expect(await sync.resolveClash(project, outcome.theirs, 'mine')).toEqual({ kind: 'done' })
-    expect(backend.writes).toEqual(['catalog.zzzzzzzz-111.json', 'catalog.json'])
+    startOnly(pc) // PC は判断 0 件
+    expect(await pcSync.pushIfChanged(project)).toBe(false) // 窓を隠す・ホームへ戻る
+    expect(pc.files.get('catalog.json')).toBe(a1)
+
+    // Android がプロジェクト画面に戻る → 何もしない。Android の選別状況はそのまま。
+    const androidBefore = JSON.stringify(android.session)
+    expect((await androidSync.checkOnOpen(project)).kind).toBe('settled')
+    expect(JSON.stringify(android.session)).toBe(androidBefore)
+    expect(ratingsOf(android)).toEqual([1, 0, 1, 0, 0, 0])
+  })
+
+  it('PC 側の視点: PC が未着手なら、開いた（開始の前の）確認で Android の進んだ版を確認なしに取り込む', async () => {
+    const { pc, android, pcSync, androidSync } = twoDevices()
+    play(android, [['IMG_0.JPG'], ['IMG_2.JPG']])
+    await androidSync.pushIfChanged(project)
+    startOnly(pc)
+    const outcome = await pcSync.checkOnOpen(project)
+    expect(outcome).toMatchObject({ kind: 'pulled', reason: 'LocalUntouched' })
+    expect(ratingsOf(pc)).toEqual([1, 0, 1, 0, 0, 0])
+    expect(pc.session.core.history).toHaveLength(2)
+    // 書いていない（NAS は Android の版のまま）。
+    expect(pc.writes).toEqual(['catalog.json'])
+  })
+
+  it('古い PC が書いた未着手の版（P1）が Android の上に来ても、Android は取り込まずに自分の分を書き、P1 は退避する', async () => {
+    const { pc, android, androidSync } = twoDevices()
+    play(android, [['IMG_0.JPG'], ['IMG_2.JPG']])
+    await androidSync.pushIfChanged(project) // A1。Android の控え＝A1
+    // 古い版の PC（U34 より前）が、判断 0 件の Session を確かめずに書いた（writeId 無し・PC 形式の鍵）。
+    const untouched = core.startRound(refs(6), 4, 0, false, threshold, [])
+    const p1 = {
+      version: 1, updatedAt: 9_000_000, updatedBy: PC.id, updatedByName: 'DESKTOP-ABC',
+      photos: Object.fromEntries(refs(6).map(ref => [ref.relative_path, { rating: 0 }])),
+      burstOverrides: [], sessions: { tournament: untouched }
+    }
+    pc.files.set('catalog.json', core.sidecarToJson(p1))
+
+    const androidBefore = JSON.stringify(android.session)
+    const outcome = await androidSync.checkOnOpen(project) // 選別画面から戻った
+    expect(outcome).toMatchObject({ kind: 'pushed', reason: 'TheirsUntouched' })
+    expect(JSON.stringify(android.session)).toBe(androidBefore)
+    expect(nasCatalog(android).updatedBy).toBe(ANDROID.id)
+    expect(core.sidecarFromJson(android.files.get(asideFileName(PC.id))).updatedByName).toBe('DESKTOP-ABC')
+  })
+
+  it('PC 側の視点: PC も進んでいるときは、Android の進んだ版を黙って取り込まずに確認する（端末の分を失わない）', async () => {
+    const { pc, android, pcSync, androidSync } = twoDevices()
+    play(android, [['IMG_0.JPG'], ['IMG_2.JPG']])
+    await androidSync.pushIfChanged(project)
+    play(pc, [['IMG_1.JPG']])
+    const outcome = await pcSync.checkOnOpen(project)
+    expect(outcome.kind).toBe('clash')
+    expect(ratingsOf(pc)).toEqual([0, 1, 0, 0, 0, 0])
+    expect(nasCatalog(pc).updatedBy).toBe(ANDROID.id)
+  })
+
+  it('早送り: PC が Android の版から続けて書いたら、Android は確認なしに取り込み、自分の分を NAS に退避する', async () => {
+    const { pc, android, pcSync, androidSync } = twoDevices()
+    play(android, [['IMG_0.JPG']])
+    await androidSync.pushIfChanged(project) // A1
+    expect((await pcSync.checkOnOpen(project)).kind).toBe('pulled') // PC は未着手 → 取り込む
+    const continued = core.advance(pc.session.core, ['IMG_2.JPG'])
+    pc.session = envelope(continued)
+    for (const row of pc.rows) row.rating = continued.ratings[row.relativePath] ?? 0
+    expect(await pcSync.pushIfChanged(project)).toBe(true) // P2（A1 から続けた）
+
+    const outcome = await androidSync.checkOnOpen(project)
+    expect(outcome).toMatchObject({ kind: 'pulled', reason: 'FastForward' })
+    expect(android.session.core.history).toHaveLength(2)
+    expect(ratingsOf(android)).toEqual(ratingsOf(pc))
+    expect(android.files.has(asideFileName(ANDROID.id))).toBe(true)
+  })
+
+  it('PC が書いた（\\ 区切りの）入れ子の写真の星を、Android 形式の古い記録とも行き来できる', async () => {
+    const nas = sharedNas()
+    const names = ['IMG_0.JPG', 'IMG_1.JPG', 'IMG_2.JPG', 'sub\\IMG_3.JPG', 'sub\\IMG_4.JPG', 'IMG_5.JPG']
+    const pc = fakeBackend({ nas, names, folderPath: '\\\\NAS\\share\\photo\\x' })
+    // 古い Android（U35 より前）の形: 共有の根からの相対（フォルダ名付き）・keyBase なし。
+    const androidSession = core.advance(
+      core.startRound(refs(6, names.map(name => `photo/x/${name.replace('\\', '/')}`)), 2, 0, false, threshold, []),
+      ['photo/x/IMG_0.JPG']
+    )
+    const advanced = core.advance(androidSession, ['photo/x/sub/IMG_3.JPG'])
+    nas.files.set('catalog.json', JSON.stringify({
+      version: 1, updatedAt: 10, updatedBy: ANDROID.id, updatedByName: 'Pixel',
+      photos: {}, burstOverrides: [], sessions: { tournament: advanced }
+    }))
+    const sync = createSidecarSync(pc, nextClock)
+    expect((await sync.checkOnOpen(project)).kind).toBe('pulled')
+    expect(ratingsOf(pc)).toEqual([1, 0, 0, 1, 0, 0])
+    expect(Object.keys(pc.session.core.ratings)).toContain('sub\\IMG_3.JPG')
+
+    // PC が続けて書くと、鍵は「選んだフォルダからの相対・/ 区切り」になる。
+    const next = core.advance(pc.session.core, ['IMG_5.JPG'])
+    pc.session = envelope(next)
+    for (const row of pc.rows) row.rating = next.ratings[row.relativePath] ?? 0
+    expect(await sync.pushIfChanged(project)).toBe(true)
+    const written = nasCatalog(pc)
+    expect(written.keyBase).toBe('folder')
+    expect(Object.keys(written.photos)).toContain('sub/IMG_3.JPG')
+    expect(Object.keys(written.sessions.tournament.ratings)).toContain('sub/IMG_3.JPG')
+    expect(JSON.stringify(written)).not.toContain('\\\\')
   })
 })
 
-describe('書き込み', () => {
+describe('書き込み（楽観ロック）', () => {
   it('変更が無ければ書かない', async () => {
     const backend = fakeBackend()
     const sync = createSidecarSync(backend, nextClock)
@@ -341,14 +508,18 @@ describe('書き込み', () => {
     expect(backend.writes).toEqual([])
   })
 
-  it('markChanged のあと書く。書けたら seen を更新して localChanged を戻す', async () => {
+  it('判断が変わったら書く。書けたら控えを書いた版にし、もう一度は書かない', async () => {
     const backend = fakeBackend()
     const sync = createSidecarSync(backend, nextClock)
+    // U34: 書くかどうかは印ではなく中身（比較キー）で決める。印だけでは書かない。
     await sync.markChanged('p1')
     expect(backend.state.localChanged).toBe(true)
+    expect(await sync.pushIfChanged(project)).toBe(false)
+    play(backend, [['IMG_0.JPG']])
+    await sync.markChanged('p1')
     expect(await sync.pushIfChanged(project)).toBe(true)
-    const written = core.sidecarFromJson(backend.files.get('catalog.json'))
-    expect(backend.state).toEqual({ seenAt: written.updatedAt, seenBy: backend.identity.id, localChanged: false })
+    const written = nasCatalog(backend)
+    expect(backend.state).toMatchObject({ seenAt: written.updatedAt, seenBy: backend.identity.id, localChanged: false })
     // もう一度は書かない。
     expect(await sync.pushIfChanged(project)).toBe(false)
     expect(backend.writes).toHaveLength(1)
@@ -357,6 +528,7 @@ describe('書き込み', () => {
   it('書けなかったら seen も localChanged も変えない', async () => {
     const backend = fakeBackend()
     const sync = createSidecarSync(backend, nextClock)
+    play(backend, [['IMG_0.JPG']])
     await sync.markChanged('p1')
     backend.failWrite = true
     await expect(sync.pushIfChanged(project)).rejects.toThrow('書けません')
@@ -366,41 +538,271 @@ describe('書き込み', () => {
     expect(await sync.pushIfChanged(project)).toBe(true)
   })
 
-  it('書いている間にまた変わったら、変更ありのまま残す', async () => {
-    const backend = fakeBackend()
-    const sync = createSidecarSync(backend, nextClock)
-    await sync.markChanged('p1')
-    const original = backend.writeSidecar
-    backend.writeSidecar = async (...args) => {
-      await original(...args)
-      await sync.markChanged('p1')
-    }
-    expect(await sync.pushIfChanged(project)).toBe(true)
-    expect(backend.state.localChanged).toBe(true)
-    expect(backend.state.seenBy).toBe(backend.identity.id)
+  it('開いたあとに相手が書いた版の上には、自動の書き込みは書かない（読んで確かめる）', async () => {
+    const nas = sharedNas()
+    const pc = fakeBackend({ nas, identity: PC })
+    const android = fakeBackend({ nas, identity: ANDROID })
+    const pcSync = createSidecarSync(pc, nextClock)
+    const androidSync = createSidecarSync(android, nextClock)
+    play(android, [['IMG_0.JPG']])
+    await androidSync.pushIfChanged(project) // A1
+    await pcSync.checkOnOpen(project) // PC は未着手 → 取り込む
+    const pcNext = core.advance(pc.session.core, ['IMG_3.JPG'])
+    pc.session = envelope(pcNext)
+    for (const row of pc.rows) row.rating = pcNext.ratings[row.relativePath] ?? 0
+    // その間に Android が別の続きを書いた（A2）。
+    const androidNext = core.advance(android.session.core, ['IMG_2.JPG'])
+    android.session = envelope(androidNext)
+    for (const row of android.rows) row.rating = androidNext.ratings[row.relativePath] ?? 0
+    await androidSync.pushIfChanged(project)
+    const a2 = nas.files.get('catalog.json')
+
+    expect(await pcSync.pushIfChanged(project)).toBe(false) // 窓を隠した
+    expect(nas.files.get('catalog.json')).toBe(a2)
+    expect((await pcSync.checkOnOpen(project)).kind).toBe('clash') // 次に開いたときに確認
   })
 
-  it('載せる行が 0 件なら書かない。localChanged も落とさない', async () => {
+  it('判断してから書くまでの間に別の端末が書いたら、書かずに判定し直す', async () => {
+    const backend = fakeBackend()
+    play(backend, [['IMG_0.JPG']])
+    const sync = createSidecarSync(backend, nextClock)
+    const other = core.sidecarToJson(remoteSidecar({ writeId: 'w-other' }))
+    backend.nas.beforeCheck = async () => { backend.files.set('catalog.json', other) }
+    expect(await sync.pushIfChanged(project)).toBe(false)
+    expect(backend.files.get('catalog.json')).toBe(other)
+    expect(backend.state.seenToken ?? null).toBeNull()
+  })
+
+  it('ほかの端末が書いている最中（ロック）なら書かず、控えも変えない', async () => {
+    const backend = fakeBackend()
+    play(backend, [['IMG_0.JPG']])
+    backend.nas.locked = true
+    const sync = createSidecarSync(backend, nextClock)
+    expect(await sync.pushIfChanged(project)).toBe(false)
+    expect(backend.writes).toEqual([])
+    expect(backend.state).toEqual({ seenAt: 0, seenBy: '', localChanged: false })
+    backend.nas.locked = false
+    expect(await sync.pushIfChanged(project)).toBe(true)
+  })
+
+  it('書いている間に判断が変わったら、次も変更ありとして書く（控えは書いた写しの比較キー）', async () => {
+    const backend = fakeBackend()
+    play(backend, [['IMG_0.JPG']])
+    const sync = createSidecarSync(backend, nextClock)
+    backend.nas.beforeCheck = async () => { // 書いている最中の判断（次の組で IMG_2 を残した）
+      const next = core.advance(backend.session.core, ['IMG_2.JPG'])
+      backend.session = envelope(next)
+      for (const row of backend.rows) row.rating = next.ratings[row.relativePath] ?? 0
+    }
+    expect(await sync.pushIfChanged(project)).toBe(true)
+    expect(nasCatalog(backend).sessions.tournament.ratings['IMG_2.JPG']).toBe(0)
+    expect(await sync.pushIfChanged(project)).toBe(true)
+    expect(nasCatalog(backend).sessions.tournament.ratings['IMG_2.JPG']).toBe(1)
+    expect(await sync.pushIfChanged(project)).toBe(false)
+  })
+
+  it('markChanged は書き込みの列に並び、書き終えた控え（seen）を古い値に戻さない', async () => {
+    const backend = fakeBackend()
+    play(backend, [['IMG_0.JPG']])
+    const sync = createSidecarSync(backend, nextClock)
+    let pending = null
+    backend.nas.beforeCheck = async () => { pending = sync.markChanged('p1') } // 書いている最中に付いた印
+    expect(await sync.pushIfChanged(project)).toBe(true)
+    await pending
+    const written = nasCatalog(backend)
+    expect(backend.state.seenToken).toBe(written.writeId)
+    expect(backend.state.seenAt).toBe(written.updatedAt)
+    // 中身は変わっていないので、次は書かない（以前は seen が戻り、自分の版を他人の変更と読み違えた）。
+    expect(await sync.pushIfChanged(project)).toBe(false)
+    expect((await sync.checkOnOpen(project)).kind).toBe('settled')
+  })
+
+  it('載せる行が 0 件なら書かない。行が戻れば書く', async () => {
     const backend = fakeBackend()
     const sync = createSidecarSync(backend, nextClock)
+    play(backend, [['IMG_0.JPG']])
     await sync.markChanged('p1')
     const rows = backend.rows
+    const saved = backend.session
     backend.rows = []
+    backend.session = null
     expect(await sync.pushIfChanged(project)).toBe(false)
     expect(backend.writes).toEqual([])
     expect(backend.state.localChanged).toBe(true)
     // 行が戻れば、残っていた変更が書かれる。
     backend.rows = rows
+    backend.session = saved
     expect(await sync.pushIfChanged(project)).toBe(true)
     expect(backend.state.localChanged).toBe(false)
   })
 
   it('書けない出所（readonly）へは書かない', async () => {
     const backend = fakeBackend({ access: 'readonly' })
+    play(backend, [['IMG_0.JPG']])
     const sync = createSidecarSync(backend, nextClock)
     await sync.markChanged('p1')
     expect(await sync.pushIfChanged(project)).toBe(false)
     expect(backend.writes).toEqual([])
+  })
+
+  it('古い控え（seenAt/seenBy だけ）から legacy: の控えを作り、自分の書いた古い版を他人の変更と読み違えない', async () => {
+    const backend = fakeBackend()
+    play(backend, [['IMG_0.JPG']])
+    const sync = createSidecarSync(backend, nextClock)
+    // U34 より前の PC が書いた版（writeId なし）と、その控え。
+    const old = { ...(await sync.buildSidecar(project, 4242)), version: 1 }
+    backend.files.set('catalog.json', core.sidecarToJson(old))
+    backend.state = { seenAt: 4242, seenBy: PC.id, localChanged: false }
+    expect((await sync.checkOnOpen(project)).kind).toBe('settled')
+    expect(backend.writes).toEqual([])
+  })
+})
+
+describe('食い違いの 5 択', () => {
+  async function clashed() {
+    const nas = sharedNas()
+    const pc = fakeBackend({ nas, identity: PC })
+    const android = fakeBackend({ nas, identity: ANDROID })
+    const pcSync = createSidecarSync(pc, nextClock)
+    const androidSync = createSidecarSync(android, nextClock)
+    // Android: ROUND 1 の途中（IMG_0 と IMG_2 を残した）。PC: 別の 2 組（IMG_1 と IMG_2 を残した）。
+    play(android, [['IMG_0.JPG'], ['IMG_2.JPG']])
+    await androidSync.pushIfChanged(project)
+    play(pc, [['IMG_1.JPG'], ['IMG_2.JPG']])
+    const outcome = await pcSync.checkOnOpen(project)
+    expect(outcome.kind).toBe('clash')
+    pc.nas.writes.length = 0
+    return { nas, pc, android, pcSync, androidSync, clash: outcome.clash }
+  }
+
+  it('A 取り込む: 端末の分を NAS に退避し、NAS の分（星・Session・手直し・境目）にする', async () => {
+    const { pc, pcSync, clash } = await clashed()
+    const result = await pcSync.resolveClash(project, clash, 'theirs')
+    expect(result.kind).toBe('done')
+    expect(pc.writes).toEqual([asideFileName(PC.id)])
+    const aside = core.sidecarFromJson(pc.files.get(asideFileName(PC.id)))
+    expect(aside.sessions.tournament.ratings['IMG_1.JPG']).toBe(1)
+    expect(ratingsOf(pc)).toEqual([1, 0, 1, 0, 0, 0])
+    expect(nasCatalog(pc).updatedBy).toBe(ANDROID.id)
+    expect(pc.state.seenToken).toBe(clash.theirs.writeId)
+    expect(pc.state.detached).toBe(false)
+  })
+
+  it('B 残す: NAS には触らず切り離す。自動では書かず、NAS がまた変われば聞き直す', async () => {
+    const { pc, android, pcSync, androidSync, clash } = await clashed()
+    expect((await pcSync.resolveClash(project, clash, 'keep')).kind).toBe('done')
+    expect(pc.writes).toEqual([])
+    expect(ratingsOf(pc)).toEqual([0, 1, 1, 0, 0, 0])
+    expect(pc.state.detached).toBe(true)
+    expect(await pcSync.pushIfChanged(project)).toBe(false)
+    expect(await pcSync.checkOnOpen(project)).toMatchObject({ kind: 'settled', reason: 'Detached' })
+    // Android が続きを書いた → もう一度聞く。
+    const next = core.advance(android.session.core, ['IMG_4.JPG'])
+    android.session = envelope(next)
+    for (const row of android.rows) row.rating = next.ratings[row.relativePath] ?? 0
+    await androidSync.pushIfChanged(project)
+    expect((await pcSync.checkOnOpen(project)).kind).toBe('clash')
+  })
+
+  it('B のあと「NAS に書き込む」: C と同じく、NAS の版を退避して端末の分を書く', async () => {
+    const { pc, pcSync, clash } = await clashed()
+    await pcSync.resolveClash(project, clash, 'keep')
+    expect(await pcSync.writeToNas(project)).toBe(true)
+    expect(pc.writes).toEqual([asideFileName(ANDROID.id), 'catalog.json'])
+    expect(nasCatalog(pc).updatedBy).toBe(PC.id)
+    expect(pc.state.detached).toBe(false)
+  })
+
+  it('C 書き込む: NAS の版を退避して端末の分を書く。Android は次に開いたとき確認なしに取り込む', async () => {
+    const { pc, android, pcSync, androidSync, clash } = await clashed()
+    expect((await pcSync.resolveClash(project, clash, 'mine')).kind).toBe('done')
+    expect(pc.writes).toEqual([asideFileName(ANDROID.id), 'catalog.json'])
+    const written = nasCatalog(pc)
+    expect(written.updatedBy).toBe(PC.id)
+    expect(written.basedOn).toBe(clash.theirs.writeId)
+    expect(pc.state.seenToken).toBe(written.writeId)
+    expect(ratingsOf(pc)).toEqual([0, 1, 1, 0, 0, 0])
+    const outcome = await androidSync.checkOnOpen(project)
+    expect(outcome).toMatchObject({ kind: 'pulled', reason: 'FastForward' })
+    expect(ratingsOf(android)).toEqual([0, 1, 1, 0, 0, 0])
+  })
+
+  for (const [choice, mode, expected] of [
+    ['intersection', 'Intersection', null],
+    ['union', 'Union', [1, 1, 1, 0, 0, 0]]
+  ]) {
+    it(`${choice === 'intersection' ? 'D 積集合' : 'E 和集合'}: 混ぜた星の完了状態にし、両方を退避して NAS にも書く`, async () => {
+      const { pc, android, pcSync, androidSync, clash } = await clashed()
+      const mineJ = core.sidecarJudgement(core.sidecarKeysToFolder(await pcSync.buildSidecar(project, 1), ''))
+      const theirsJ = core.sidecarJudgement(clash.theirs)
+      const stars = core.mergeJudgements(mineJ, theirsJ, mode, 2, 'e').ratings
+      const want = expected ?? pc.rows.map(row => stars[row.relativePath] ?? 0)
+
+      expect((await pcSync.resolveClash(project, clash, choice)).kind).toBe('done')
+      expect(pc.writes).toEqual([asideFileName(PC.id), asideFileName(ANDROID.id), 'catalog.json'])
+      expect(ratingsOf(pc)).toEqual(want)
+      expect(pc.session.core.finished).toBe(true)
+      expect(pc.session.core.history).toEqual([])
+      expect(pc.session.stage).toBe('result')
+      const written = nasCatalog(pc)
+      expect(written.sessions.tournament.finished).toBe(true)
+      // Android は確認なしに混ぜた結果を取り込む（早送り）。
+      expect((await androidSync.checkOnOpen(project)).kind).toBe('pulled')
+      expect(ratingsOf(android)).toEqual(want)
+      // もう落ち着いている。
+      expect((await pcSync.checkOnOpen(project)).kind).toBe('settled')
+    })
+  }
+
+  it('積集合: 片方で未判定の写真は判定済みの側の★を採る（Android で未判定の IMG_4 は PC の★）', async () => {
+    const { pc, pcSync, clash } = await clashed()
+    // PC はもう 1 組進めて IMG_4 を残した。Android では IMG_4 はまだ見ていない。
+    const next = core.advance(pc.session.core, ['IMG_4.JPG'])
+    pc.session = envelope(next)
+    for (const row of pc.rows) row.rating = next.ratings[row.relativePath] ?? 0
+    const fresh = await pcSync.checkOnOpen(project)
+    expect(fresh.kind).toBe('clash')
+    await pcSync.resolveClash(project, fresh.clash, 'intersection')
+    expect(pc.rows[4].rating).toBe(1)
+    expect(pc.rows[2].rating).toBe(1) // 両方で残した
+    expect(pc.rows[1].rating).toBe(0) // Android で落とした
+  })
+
+  it('ダイアログを出したあとに NAS が変わったら、実行せずに出し直す', async () => {
+    const { pc, android, pcSync, androidSync, clash } = await clashed()
+    const next = core.advance(android.session.core, ['IMG_4.JPG'])
+    android.session = envelope(next)
+    for (const row of android.rows) row.rating = next.ratings[row.relativePath] ?? 0
+    await androidSync.pushIfChanged(project)
+    pc.nas.writes.length = 0
+    const result = await pcSync.resolveClash(project, clash, 'mine')
+    expect(result.kind).toBe('changed')
+    expect(result.outcome.kind).toBe('clash')
+    expect(pc.writes).toEqual([])
+    expect(nasCatalog(pc).updatedBy).toBe(ANDROID.id)
+  })
+
+  it('一時的に書けないときは、読むだけの共有と決めつけて相手を取り込まない（何も変えずに理由を返す）', async () => {
+    const { pc, pcSync, clash } = await clashed()
+    const stateBefore = { ...pc.state }
+    pc.failWrite = true
+    for (const choice of ['mine', 'theirs', 'union']) {
+      const result = await pcSync.resolveClash(project, clash, choice)
+      expect(result).toMatchObject({ kind: 'failed', reason: '書けません', access: 'readwrite' })
+    }
+    expect(ratingsOf(pc)).toEqual([0, 1, 1, 0, 0, 0])
+    expect(pc.state).toEqual(stateBefore)
+    // 直れば選び直せる。
+    pc.failWrite = false
+    expect((await pcSync.resolveClash(project, clash, 'mine')).kind).toBe('done')
+  })
+
+  it('書けない共有だと分かったら、その理由と access を返す（取り込みはしない）', async () => {
+    const { pc, pcSync, clash } = await clashed()
+    pc.access = 'readonly'
+    const result = await pcSync.resolveClash(project, clash, 'mine')
+    expect(result).toMatchObject({ kind: 'failed', access: 'readonly' })
+    expect(ratingsOf(pc)).toEqual([0, 1, 1, 0, 0, 0])
   })
 })
 
@@ -413,24 +815,64 @@ describe('書けない出所', () => {
     expect(backend.rows.every(row => row.rating === 0)).toBe(true)
   })
 
-  it('readonly（開発用）: 読めれば取り込むだけ。端末に変更があってもダイアログは出さない', async () => {
+  it('readonly（開発用）: 端末が未着手なら読めた分を取り込む', async () => {
     const backend = fakeBackend({ access: 'readonly' })
-    backend.rows[0].rating = 1
-    backend.state = { seenAt: 100, seenBy: 'old', localChanged: true }
     backend.files.set('catalog.json', core.sidecarToJson(remoteSidecar()))
     const sync = createSidecarSync(backend, nextClock)
     const outcome = await sync.checkOnOpen(project)
     expect(outcome.kind).toBe('pulled')
     expect(outcome.access).toBe('readonly')
-    expect(backend.rows.map(row => row.rating)).toEqual([0, 1, 3, 0, 0, 0])
+    expect(ratingsOf(backend)).toEqual([0, 1, 1, 0, 0, 0])
+    expect(backend.writes).toEqual([])
+  })
+
+  // 仕様の変更（U34・設計書 §4.3 の #8）: 以前は「端末に変更があっても、読めれば取り込む」だった。
+  // 端末の選別状況を確認なしに捨てないため、書けない共有では端末の分をそのまま残す（この端末だけの結果）。
+  it('readonly: 端末が進んでいれば取り込まず、ダイアログも出さない（この端末だけの結果）', async () => {
+    const backend = fakeBackend({ access: 'readonly' })
+    play(backend, [['IMG_0.JPG']])
+    backend.state = { seenAt: 100, seenBy: 'old', localChanged: true }
+    backend.files.set('catalog.json', core.sidecarToJson(remoteSidecar()))
+    const sync = createSidecarSync(backend, nextClock)
+    const outcome = await sync.checkOnOpen(project)
+    expect(outcome).toMatchObject({ kind: 'settled', reason: 'ReadOnly', access: 'readonly' })
+    expect(ratingsOf(backend)).toEqual([1, 0, 0, 0, 0, 0])
     expect(backend.writes).toEqual([])
   })
 
   it('readonly: サイドカーが無ければ何もしない', async () => {
     const backend = fakeBackend({ access: 'readonly' })
+    play(backend, [['IMG_0.JPG']])
     backend.state = { seenAt: 0, seenBy: '', localChanged: true }
     const sync = createSidecarSync(backend, nextClock)
     expect((await sync.checkOnOpen(project)).kind).toBe('settled')
     expect(backend.writes).toEqual([])
+  })
+})
+
+describe('やり直し（epoch）', () => {
+  it('PC がやり直したら、Android（まだ共有していない判断がある）は黙って空にせず確認する', async () => {
+    const nas = sharedNas()
+    const pc = fakeBackend({ nas, identity: PC })
+    const android = fakeBackend({ nas, identity: ANDROID })
+    const pcSync = createSidecarSync(pc, nextClock)
+    const androidSync = createSidecarSync(android, nextClock)
+    play(android, [['IMG_0.JPG']])
+    await androidSync.pushIfChanged(project)
+    await pcSync.checkOnOpen(project) // PC は取り込む
+    // Android はその後も進めた（まだ書いていない）。
+    play(android, [['IMG_0.JPG'], ['IMG_3.JPG']])
+    // PC で「最初からやり直す」（星・Session・手直し・距離を消し、世代を変える）。
+    for (const row of pc.rows) row.rating = 0
+    pc.session = null
+    await pcSync.markRestarted('p1')
+    expect(await pcSync.pushIfChanged(project)).toBe(true)
+    // 着手済みの版（Android の A1）を未着手で置き換える前に退避している。
+    expect(core.sidecarFromJson(nas.files.get(asideFileName(ANDROID.id))).updatedBy).toBe(ANDROID.id)
+    expect(nasCatalog(pc).epoch).toMatch(/^e-/)
+    const outcome = await androidSync.checkOnOpen(project)
+    expect(outcome.kind).toBe('clash')
+    expect(outcome.clash.reason).toBe('TheirsRestarted')
+    expect(ratingsOf(android)).toEqual([1, 0, 0, 1, 0, 0])
   })
 })

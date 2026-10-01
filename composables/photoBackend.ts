@@ -117,14 +117,20 @@ export interface PhotoBackend {
   loadSession: (projectId: string) => Promise<SavedSelection | null>
 
   // ---- サイドカー（写真のフォルダ直下の `.photo-curator/catalog.json`）----
-  // 口だけ。**4 通りの判断は持たない**（`useSidecarSync` が core の `sidecarDecide` を呼ぶ）。
+  // 口だけ。**判断は持たない**（`useSidecarSync` が core の `sidecarPlan` を呼ぶ）。
 
   /** この出所にサイドカーを書けるか。`readonly` は読むだけ、`none` は読み書きとも無い。 */
   sidecarSupported: (projectId: string) => Promise<SidecarAccess>
   /** サイドカーの JSON の文字列。無ければ null。 */
   readSidecar: (projectId: string) => Promise<string | null>
-  /** 原子的に書く（一時ファイル → rename）。`fileName` は退避（`catalog.<id>.json`）のときだけ変える。 */
+  /** 原子的に書く（一時ファイル → rename）。退避（`catalog.<id>.json`）に使う。 */
   writeSidecar: (projectId: string, json: string, fileName?: string) => Promise<void>
+  /**
+   * `catalog.json` を楽観ロックで書く（設計書 §4.4）: ロック → 読んで `expected`（判断に使った中身。
+   * 無かったなら null）と同じか確かめる → 一時ファイル → 置き換え → 読み戻して確かめる → ロックを放す。
+   * 見た版と違えば書かずに `changed`、ほかの端末が書いている最中なら `locked`。
+   */
+  writeSidecarChecked: (projectId: string, json: string, expected: string | null) => Promise<SidecarWriteResult>
   /** 端末が覚える、最後に読んだ／書いたサイドカーの印と、判断が変わったか。 */
   loadSidecarState: (projectId: string) => Promise<SidecarState>
   saveSidecarState: (projectId: string, state: SidecarState) => Promise<void>
@@ -197,13 +203,33 @@ export interface PhotoBackend {
 
 export type SidecarAccess = 'readwrite' | 'readonly' | 'none'
 
+export type SidecarWriteResult = 'written' | 'changed' | 'locked'
+
+/**
+ * 端末が覚える、サイドカーの控え。
+ *
+ * U34 から、変わったかどうかは印（`localChanged`）ではなく「見た版の比較キー（`seenKey`）と
+ * 今の比較キーが違うか」で決める。古い 3 つ（`seenAt`・`seenBy`・`localChanged`）は、
+ * まだ新しい項目が無い控え（`seenToken` が null／無い）から `legacy:` の控えを作るためと、
+ * 古い版のアプリに戻したときのために書き続ける。
+ */
 export interface SidecarState {
   /** 最後に読んだ／書いたサイドカーの `updatedAt`。未確認は 0。 */
   seenAt: number
   /** 同じく `updatedBy`。未確認は空文字。 */
   seenBy: string
-  /** 判断（星・連写の手直し・学習した距離・やり直し）が変わったか。 */
+  /** 古い形の「判断が変わった」印。新しい控えがあるときは判断に使わない。 */
   localChanged: boolean
+  /** 最後に読んだ／書いた版の見分け（core の `sidecarToken`）。null／無いは古い形。空は一度も見ていない。 */
+  seenToken?: string | null
+  /** その版を読んだ／書いたときの、この端末の選別状況の比較キー。空は「分からない＝変更あり」。 */
+  seenKey?: string
+  /** その版のやり直しの世代。 */
+  seenEpoch?: string | null
+  /** この端末の選別状況のやり直しの世代。 */
+  localEpoch?: string | null
+  /** 「この端末の状況を残す」を選んだあと（自動では書かない）。 */
+  detached?: boolean
 }
 
 export interface DeviceIdentity {
