@@ -191,4 +191,31 @@ class SlideshowGestureTest {
         assertEquals(50f to 50f, fitContain(10f, 10f, 100f, 50f))
         assertEquals(100f to 50f, fitContain(0f, 0f, 100f, 50f))
     }
+
+    // U29: 実機で「中央を押したのに振り分けられる」と報告された状況。エミュレーターでは再現せず、
+    // 純関数の側で「指が少し動いても中心からは決定しない」ことを固定する（幅 411dp の折りたたみ閉じ）。
+    @Test fun 指が少し動いても決定にならない() {
+        val width = 411f
+        // 8dp 以上動いてドラッグ扱いになっても、決定量（幅の 18% = 約 74dp）に届かなければ戻すだけ
+        for (d in listOf(8f, 12f, 30f, 60f, 73f)) {
+            assertNull(judgeDrag(d, 0f, width))
+            assertNull(judgeDrag(-d, d / 2, width))
+            assertNull(judgeDrag(0f, -d, width))
+        }
+        assertTrue(isTap(7.9f, 0f))
+        assertTrue(!isTap(8f, 0f))
+    }
+
+    // 幅 411dp・高さ 781dp（Pixel 8 相当のステージ）の中心の範囲は 約 99 × 187dp
+    @Test fun 中心の範囲をdpで確かめる() {
+        val w = 411f
+        val h = 781f
+        val halfW = w * SlideshowGesture.CENTER_RATIO
+        val halfH = h * SlideshowGesture.CENTER_RATIO
+        assertEquals(98.64f, halfW * 2, 0.01f)
+        assertEquals(187.44f, halfH * 2, 0.01f)
+        assertNull(tapDecision(w / 2 + halfW - 0.01f, h / 2, 0f, 0f, w, h))
+        assertEquals(Keep, tapDecision(w / 2 + halfW + 0.01f, h / 2, 0f, 0f, w, h))
+        assertNull(tapDecision(w / 2, h / 2 + halfH - 0.01f, 0f, 0f, w, h))
+    }
 }

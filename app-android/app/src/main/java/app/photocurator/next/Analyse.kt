@@ -274,6 +274,15 @@ object Analyse {
 }
 
 object Prepare {
+    /**
+     * 準備（指紋・サムネイル・表示用画像）を進める順。**選別と同じ、撮影時刻の昇順
+     * （同時刻は相対パス）。** 先の写真から使えるようになるので、選別が始まる順に
+     * 用意する。NAS の一覧は名前順、Amazon は日付の昇順（同時刻の並びは不定）で
+     * 来るので、そのまま使わずここで並べる。並びだけで、中身は変えない。
+     */
+    fun inShootingOrder(photos: List<Photo>): List<Photo> =
+        photos.sortedWith(compareBy({ it.takenAt }, { it.relativePath }))
+
     suspend fun run(
         context: android.content.Context,
         project: Project,
@@ -284,9 +293,9 @@ object Prepare {
         // 顔ぶれは控えたものを使う。開くたびに数え直すと、NAS では
         // そのたびに網の往復が要る。
         val known = if (rescan) null else Listing.load(context, project.source.key)
-        val photos = known ?: Photos.list(context, project.source).also {
+        val photos = (known ?: Photos.list(context, project.source).also {
             Listing.save(context, project.source.key, it)
-        }
+        }).let(::inShootingOrder)
         val cached = Fingerprints.load(context, project.source.key)
 
         // NAS のときだけ、つなぎ先とパスワードを渡す。
@@ -315,7 +324,7 @@ object Prepare {
                 val takenAt = if (photo.amazon != null) null else prints[photo.relativePath]?.takenAt
                 if (takenAt != null && takenAt > 0) photo.copy(takenAt = takenAt) else photo
             }
-            .sortedWith(compareBy({ it.takenAt }, { it.relativePath }))
+            .let(::inShootingOrder)
 
         // 撮影時刻を当てたものを控え直す。**次に開いたときはここから始まる。**
         if (dated != photos) Listing.save(context, project.source.key, dated)
@@ -358,7 +367,7 @@ object Prepare {
             ?: return@withContext 0
         val password = NasPasswords.password(context, nas) ?: return@withContext 0
 
-        val missing = photos.filter { photo ->
+        val missing = Prepare.inShootingOrder(photos).filter { photo ->
             val path = photo.smb?.path ?: return@filter false
             when {
                 Renders.has(context, nasId, path, edge) -> false
@@ -407,7 +416,7 @@ object Prepare {
         onProgress: (done: Int, total: Int) -> Unit
     ): Int {
         val link = Amazon.linkOf(project.source.key)
-        val refs = photos.mapNotNull { it.amazon }
+        val refs = Prepare.inShootingOrder(photos).mapNotNull { it.amazon }
         if (refs.isEmpty()) return 0
         if (Prefs.amazonMaxEdge(context, link.shareId) == 0) {
             Amazon.measureMaxEdge(refs.first())?.let { Prefs.setAmazonMaxEdge(context, link.shareId, it) }
@@ -473,7 +482,7 @@ object Prepare {
         val prints = Fingerprints.load(context, key)
         val filled = HashMap<String, Fingerprint>(prints)
         var made = 0
-        for (photo in photos) {
+        for (photo in Prepare.inShootingOrder(photos)) {
             val path = photo.smb?.path ?: continue
             val print = prints[photo.relativePath] ?: continue
             if (print.hash.isNotEmpty()) continue
