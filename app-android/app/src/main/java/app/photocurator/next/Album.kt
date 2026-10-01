@@ -77,6 +77,9 @@ fun ProjectScreen(
     var troubleDetail by remember { mutableStateOf(false) }
     // 大きく見ている並びと、その何枚目か。**ここは見るだけ**なので星は動かない。
     var zooming by remember { mutableStateOf<Pair<List<Photo>, Int>?>(null) }
+    // 一覧のスクロール位置。**拡大を開くと下の一覧は組まれなくなる**が、位置はここに残して、
+    // 閉じたときに戻す（A10）。早期 return より前に置くこと。
+    val gridState = androidx.compose.foundation.lazy.grid.rememberLazyGridState()
     // サイドカーとの食い違い。**選ぶまで選別を始めさせない。**
     var clash by remember { mutableStateOf<Catalog?>(null) }
     var mineSummary by remember { mutableStateOf("") }
@@ -174,6 +177,8 @@ fun ProjectScreen(
                     else alive.reason
                 }
             }
+        } catch (error: kotlinx.coroutines.CancellationException) {
+            throw error
         } catch (error: Exception) {
             // **黙って落とさない。** 何が起きたかを 1 文にして、ホームにも残す。
             val said = Smb.describe(error)
@@ -454,16 +459,17 @@ fun ProjectScreen(
                     else -> photos
                 }
                 LazyVerticalGrid(
+                    state = gridState,
                     columns = if (columns > 0) GridCells.Fixed(columns)
                     else GridCells.Adaptive(minSize = 96.dp),
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                     horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
-                    items(shown, key = { it.id }) { photo ->
+                    items(shown, key = { it.relativePath }) { photo ->
                         // **なぜ絵が無いのかを、タイルの中で言う。**
                         // 読めない形式・まだ作っていない・作れなかった、を分ける。
-                        val format = remember(photo.id) { unsupportedFormat(photo) }
-                        var state by remember(photo.id) {
+                        val format = remember(photo.relativePath) { unsupportedFormat(photo) }
+                        var state by remember(photo.relativePath) {
                             mutableStateOf(
                                 when {
                                     format != null -> Preview.Unsupported

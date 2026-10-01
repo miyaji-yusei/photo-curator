@@ -98,7 +98,7 @@ fun BurstReviewScreen(
             verticalArrangement = Arrangement.spacedBy(6.dp),
             horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            items(photos, key = { it.id }) { photo ->
+            items(photos, key = { it.relativePath }) { photo ->
                 Box(Modifier.height(tileHeight)) {
                     Tile(
                         number = photos.indexOf(photo) + 1,

@@ -22,25 +22,29 @@ import java.io.File
 object Store {
     private const val TAG = "Store"
 
-    private fun file(context: Context, projectId: String) =
+    internal fun file(context: Context, projectId: String) =
         File(context.filesDir, "session-$projectId.json")
 
     /**
      * 保存する。**確定のたびに呼ばれる想定なので、失敗しても選別は止めない。**
      * 書けなかったことは記録する（黙って落とさない）。
      */
-    suspend fun save(context: Context, projectId: String, session: Session) =
-        withContext(Dispatchers.IO) {
-            // **判断が変わった。** サイドカーへ渡すべきものが端末にできた印。
-            SyncState.touch(context, projectId)
+    suspend fun save(context: Context, projectId: String, session: Session) {
+        // **判断が変わった。** サイドカーへ渡すべきものが端末にできた印。
+        withContext(Dispatchers.IO) { SyncState.touch(context, projectId) }
+        // **保存はアプリの列で 1 本ずつ。最後に頼んだ状態が必ず残る**（A2）。
+        // 確定を連打しても、同じ一時ファイルを奪い合わず、古い状態が新しい状態を戻さない。
+        val target = file(context, projectId)
+        Persist.latest("session:$projectId") {
             try {
                 // 途中で落ちても壊れた JSON を残さないよう、書いてから差し替える。
                 // rename が使えない環境ではコピーで置き換える。
-                file(context, projectId).writeAtomically { it.writeText(sessionToJson(session)) }
+                target.writeAtomically { it.writeText(sessionToJson(session)) }
             } catch (error: Exception) {
                 Log.w(TAG, "選別の途中を保存できなかった: $projectId", error)
             }
         }
+    }
 
     /** 読み戻す。**形が合わなければ null。** 最初からやり直してもらう。 */
     suspend fun load(context: Context, projectId: String): Session? =
@@ -70,9 +74,10 @@ object Store {
         }
     }
 
-    suspend fun clear(context: Context, projectId: String) = withContext(Dispatchers.IO) {
-        file(context, projectId).delete()
-        Unit
+    suspend fun clear(context: Context, projectId: String) {
+        // 保存と同じ列に載せる。**消したあとに、前の保存が書き戻さない。**
+        val target = file(context, projectId)
+        Persist.latest("session:$projectId") { target.delete() }
     }
 }
 
@@ -108,7 +113,7 @@ object Fingerprints {
      * NAS の鍵は "nasId|フォルダ道筋" の形で、区切り記号がそのまま入ると
      * **扱いにくい名前のファイル**ができる。英数字以外は _ に潰す。
      */
-    private fun file(context: Context, sourceKey: String) =
+    internal fun file(context: Context, sourceKey: String) =
         File(context.filesDir, "fingerprints-${sourceKey.replace(Regex("[^A-Za-z0-9_-]"), "_")}.json")
 
     suspend fun load(context: Context, sourceKey: String): Map<String, Fingerprint> =
@@ -136,7 +141,7 @@ object Fingerprints {
         }
 
     suspend fun save(context: Context, sourceKey: String, prints: Map<String, Fingerprint>) =
-        withContext(Dispatchers.IO) {
+        Persist.latest("fingerprints:$sourceKey") {
             try {
                 val root = org.json.JSONObject()
                 for ((path, print) in prints) {
@@ -195,10 +200,28 @@ object Prefs {
             .getInt("display_edge", 1024)
             .coerceIn(768, 1920)
 
+    /**
+     * 既定を変える。**効くのは新しいプロジェクトだけ**（設定画面にもそう書いてある）。
+     * 自分の値をまだ持たない既存のプロジェクトには、変える前の既定をここで書き留める。
+     * 書き留めないと、次に開いたとき新しい既定として扱われて、全部作り直しになる（A7）。
+     */
     fun setDisplayEdge(context: Context, edge: Int) {
-        context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
-            .edit().putInt("display_edge", edge.coerceIn(768, 1920)).apply()
+        val preferences = context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+        val old = displayEdge(context)
+        val editor = preferences.edit()
+        if (old != edge.coerceIn(768, 1920)) {
+            // 設定の画面から呼ばれる。一覧のファイルは小さいので、その場で読む。
+            val ids = kotlinx.coroutines.runBlocking { Projects.all(context) }.map { it.id }
+            for (id in edgesToPin(ids) { preferences.contains("display_edge_$it") }) {
+                editor.putInt("display_edge_$id", old)
+            }
+        }
+        editor.putInt("display_edge", edge.coerceIn(768, 1920)).apply()
     }
+
+    /** 自分の大きさをまだ持たないプロジェクト。 */
+    fun edgesToPin(ids: List<String>, hasOwn: (String) -> Boolean): List<String> =
+        ids.filterNot(hasOwn)
 
     /**
      * プロジェクトごとの長辺。**設定の値は「新しいプロジェクトの既定」**で、
@@ -315,7 +338,7 @@ object Prefs {
 object Overrides {
     private const val TAG = "Overrides"
 
-    private fun file(context: Context, projectId: String) =
+    internal fun file(context: Context, projectId: String) =
         File(context.filesDir, "overrides-$projectId.json")
 
     suspend fun load(context: Context, projectId: String): List<PairOverride> =
@@ -340,13 +363,12 @@ object Overrides {
         }
 
     /** 手直しを全部消す。**やり直しのときだけ。** */
-    suspend fun clear(context: Context, projectId: String) = withContext(Dispatchers.IO) {
-        file(context, projectId).delete()
-        Unit
+    suspend fun clear(context: Context, projectId: String) {
+        Persist.latest("overrides:$projectId") { file(context, projectId).delete() }
     }
 
     suspend fun save(context: Context, projectId: String, list: List<PairOverride>) =
-        withContext(Dispatchers.IO) {
+        Persist.latest("overrides:$projectId") {
             // 手直しも判断。**サイドカーへ渡すもの。**
             SyncState.touch(context, projectId)
             try {
@@ -388,7 +410,7 @@ object Overrides {
 object Listing {
     private const val TAG = "Listing"
 
-    private fun file(context: Context, sourceKey: String) =
+    internal fun file(context: Context, sourceKey: String) =
         File(context.filesDir, "listing-${sourceKey.replace(Regex("[^A-Za-z0-9_-]"), "_")}.json")
 
     suspend fun load(context: Context, sourceKey: String): List<Photo>? = withContext(Dispatchers.IO) {
@@ -418,7 +440,7 @@ object Listing {
     }
 
     suspend fun save(context: Context, sourceKey: String, photos: List<Photo>) =
-        withContext(Dispatchers.IO) {
+        Persist.latest("listing:$sourceKey") {
             try {
                 val array = org.json.JSONArray()
                 for (photo in photos) {
@@ -443,9 +465,8 @@ object Listing {
             }
         }
 
-    suspend fun clear(context: Context, sourceKey: String) = withContext(Dispatchers.IO) {
-        file(context, sourceKey).delete()
-        Unit
+    suspend fun clear(context: Context, sourceKey: String) {
+        Persist.latest("listing:$sourceKey") { file(context, sourceKey).delete() }
     }
 }
 
@@ -459,7 +480,7 @@ object Listing {
 object Trouble {
     private const val TAG = "Trouble"
 
-    private fun file(context: Context, sourceKey: String) =
+    internal fun file(context: Context, sourceKey: String) =
         File(context.filesDir, "trouble-${sourceKey.replace(Regex("[^A-Za-z0-9_-]"), "_")}.txt")
 
     suspend fun note(context: Context, sourceKey: String, message: String) =

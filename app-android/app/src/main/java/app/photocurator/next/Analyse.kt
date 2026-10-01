@@ -43,7 +43,7 @@ object Analyse {
     }
 
     /**
-     * NAS の 1 枚。**先頭 128KB だけ読んで、指紋と撮影時刻を同時に取る。**
+     * NAS の 1 枚。**先頭 64KB だけ読んで、指紋と撮影時刻を同時に取る。**
      *
      * 原本 6MB を網越しに引くと 2,000 枚で 12GB になる。EXIF は先頭にあり、
      * その中の縮小画像（160x120 程度）で指紋は十分に作れる。
@@ -170,6 +170,14 @@ object Analyse {
      */
     const val VERSION = 3
 
+    /** 控えたハッシュ値が、いまの作り方・いまの原本のものか。 */
+    fun upToDate(known: Fingerprint?, photo: Photo): Boolean =
+        known != null && known.version == VERSION && known.size == photo.size
+
+    /** 全部の写真に、いまのハッシュ値（または「作れなかった」の印）があるか。 */
+    fun allUpToDate(photos: List<Photo>, prints: Map<String, Fingerprint>): Boolean =
+        photos.all { upToDate(prints[it.relativePath], it) }
+
     /**
      * まとめて作る。**すでにある分は作り直さない。**
      *
@@ -194,13 +202,14 @@ object Analyse {
         // 始めていると、まだ見ていない写真の指紋まで消してしまう。
         val out = HashMap(cached)
 
-        fun needsWork(photo: Photo): Boolean {
-            val known = cached[photo.relativePath]
-            return !(known != null && known.version == VERSION && known.size == photo.size)
-        }
+        fun needsWork(photo: Photo): Boolean = !upToDate(cached[photo.relativePath], photo)
 
         var done = 0
+        // **新しく作った（変わった）分だけを数える。** 準備済みの写真を通るだけで
+        // 50 回ごとにファイルを書き直さない（A4）。
+        val unsaved = PartialCounter(50)
         suspend fun record(photo: Photo, made: Fingerprint?) {
+            val changed = needsWork(photo)
             if (made != null) out[photo.relativePath] = made
             // 作れなかったものは控えない。**次に開いたときにもう一度試す。**
             // 古い（大きさの違う）値が残っていたら消す。
@@ -208,7 +217,7 @@ object Analyse {
             done += 1
             if (done % 10 == 0 || done == photos.size) onProgress(done, photos.size)
             // **途中でやめても、作った分は残す。**
-            if (done % 50 == 0) onPartial(HashMap(out))
+            if (unsaved.add(changed)) onPartial(HashMap(out))
         }
 
         suspend fun sweepLocal() {
@@ -258,7 +267,12 @@ object Analyse {
             // **1 本の接続で全部読む。** 1 枚ごとに張り直すと、網の往復が
             // そのまま待ち時間になる（実測 50 枚で 40 秒）。
             val (nas, password) = nasAccess
-            Smb.reading(nas, password) { reader -> sweepNetwork(reader) }
+            val result = Smb.reading(nas, password) { reader -> sweepNetwork(reader) }
+            if (result is SmbResult.Failed) {
+                // **失敗を握りつぶさない。** ここまでに作った分は残してから、準備を失敗にする。
+                onPartial(HashMap(out))
+                throw IllegalStateException(result.reason)
+            }
         } else if (photos.any { it.amazon != null }) {
             sweepAmazon()
         } else {
@@ -267,8 +281,11 @@ object Analyse {
 
         // 最後まで来たときだけ、無くなったものを片付ける。
         // 途中で刈ると、まだ見ていない写真を「消えた」と誤解する。
-        val living = photos.mapTo(HashSet()) { it.relativePath }
-        out.keys.retainAll(living)
+        // **顔ぶれが空なら刈らない。** 取れなかっただけかもしれず、全部消えてしまう。
+        if (photos.isNotEmpty()) {
+            val living = photos.mapTo(HashSet()) { it.relativePath }
+            out.keys.retainAll(living)
+        }
         out
     }
 }
@@ -283,6 +300,28 @@ object Prepare {
     fun inShootingOrder(photos: List<Photo>): List<Photo> =
         photos.sortedWith(compareBy({ it.takenAt }, { it.relativePath }))
 
+    /** 新しく取った顔ぶれをどうするか。 */
+    enum class ListingDecision {
+        /** 控えを置き換える。 */
+        Replace,
+
+        /** 控えは書かない（元から無く、今回も空）。 */
+        Skip,
+
+        /** 前は写真があったのに空で返ってきた。**前の控えを残し、失敗として扱う。** */
+        KeepPrevious
+    }
+
+    /**
+     * 取り直した顔ぶれを控えに書いてよいか。**空で上書きしない。**
+     * 失敗が空に見える形（網の途切れなど）で、ハッシュ値まで失うのを防ぐ。
+     */
+    fun decideListing(previous: List<Photo>?, fresh: List<Photo>): ListingDecision = when {
+        fresh.isNotEmpty() -> ListingDecision.Replace
+        !previous.isNullOrEmpty() -> ListingDecision.KeepPrevious
+        else -> ListingDecision.Skip
+    }
+
     suspend fun run(
         context: android.content.Context,
         project: Project,
@@ -292,10 +331,18 @@ object Prepare {
     ): Pair<List<Photo>, List<uniffi.photo_curator_core.PhotoRef>> {
         // 顔ぶれは控えたものを使う。開くたびに数え直すと、NAS では
         // そのたびに網の往復が要る。
-        val known = if (rescan) null else Listing.load(context, project.source.key)
-        val photos = (known ?: Photos.list(context, project.source).also {
-            Listing.save(context, project.source.key, it)
-        }).let(::inShootingOrder)
+        val previous = Listing.load(context, project.source.key)
+        val listed = if (!rescan && previous != null) previous else {
+            val fresh = Photos.list(context, project.source)
+            when (decideListing(previous, fresh)) {
+                ListingDecision.Replace -> Listing.save(context, project.source.key, fresh)
+                ListingDecision.Skip -> Unit
+                ListingDecision.KeepPrevious ->
+                    throw IllegalStateException("写真の一覧を取れませんでした（前の状態は残してあります）")
+            }
+            fresh
+        }
+        val photos = inShootingOrder(listed)
         val cached = Fingerprints.load(context, project.source.key)
 
         // NAS のときだけ、つなぎ先とパスワードを渡す。
@@ -303,7 +350,7 @@ object Prepare {
             val nasId = project.source.key.substringBefore("|")
             NasStore.all(context).firstOrNull { it.id == nasId }?.let { nas ->
                 NasPasswords.password(context, nas)?.let { nas to it }
-            }
+            } ?: throw IllegalStateException("NAS につなぐ情報（登録かパスワード）がありません")
         } else null
 
         val prints = Analyse.fingerprints(
@@ -314,6 +361,57 @@ object Prepare {
         )
         if (prints != cached) Fingerprints.save(context, project.source.key, prints)
 
+        return assemble(context, project, photos, prints)
+    }
+
+    /**
+     * 選別・学習が使う入口。**準備を二重に走らせない**（A5）。
+     *
+     * 1. 控えだけで組めるなら、それを使う（準備済みなら一瞬。網へ行かず、何も書かない）。
+     * 2. 詳細画面の準備が走っているあいだは、その分が控えに出てくるのを待つ
+     *    （同じ NAS へ 2 本つなぎ、同じファイルに書くのを避ける）。
+     * 3. そうでなければ、これまでどおり [run] で足りない分だけ作る。
+     *
+     * **ハッシュ値が足りないまま始めることはしない**（連写のまとまりが変わるため）。
+     */
+    suspend fun ready(
+        context: android.content.Context,
+        project: Project,
+        onProgress: (done: Int, total: Int) -> Unit
+    ): Pair<List<Photo>, List<uniffi.photo_curator_core.PhotoRef>> {
+        loadReady(context, project)?.let { return it }
+        while (Preparations.of(project.id).running) {
+            val progress = Preparations.of(project.id).meta
+            onProgress(progress.first, progress.second)
+            kotlinx.coroutines.delay(500)
+            loadReady(context, project)?.let { return it }
+        }
+        return run(context, project, false, onProgress)
+    }
+
+    /**
+     * 控えだけで組めるなら、組んで返す（**網へ行かない・何も書き直さない**）。
+     * ハッシュ値が全部そろっていなければ null（作る側 [run] へ）。
+     * 選別・学習が、準備済みなのに準備を自前でもう一度回さないために使う（A5）。
+     */
+    suspend fun loadReady(
+        context: android.content.Context,
+        project: Project
+    ): Pair<List<Photo>, List<uniffi.photo_curator_core.PhotoRef>>? {
+        val listing = Listing.load(context, project.source.key)
+        if (listing.isNullOrEmpty()) return null
+        val prints = Fingerprints.load(context, project.source.key)
+        val photos = inShootingOrder(listing)
+        if (!Analyse.allUpToDate(photos, prints)) return null
+        return assemble(context, project, photos, prints)
+    }
+
+    private suspend fun assemble(
+        context: android.content.Context,
+        project: Project,
+        photos: List<Photo>,
+        prints: Map<String, Fingerprint>
+    ): Pair<List<Photo>, List<uniffi.photo_curator_core.PhotoRef>> {
         // **撮影時刻は EXIF のものを使う。**
         // NAS の更新時刻はコピーしたときに変わるので、撮影順にならない。
         // 指紋と同じ読みで取れているので、ここで差し替えて並べ直す。
@@ -381,7 +479,7 @@ object Prepare {
         if (missing.isEmpty()) return@withContext 0
 
         var made = 0
-        Smb.reading(nas, password) { reader ->
+        val result = Smb.reading(nas, password) { reader ->
             // **1 本の接続で通す。** 原本は大きいので、並べすぎると
             // 端末のメモリと NAS の両方を圧迫する。少しずつ重ねる。
             for (chunk in missing.chunked(3)) {
@@ -399,6 +497,8 @@ object Prepare {
                 onProgress(done, photos.size)
             }
         }
+        // **接続や認証の失敗を成功にしない。** 準備の側の「止まっています」に載せる。
+        if (result is SmbResult.Failed) throw IllegalStateException(result.reason)
         made
     }
 

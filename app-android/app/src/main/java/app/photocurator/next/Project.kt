@@ -152,6 +152,9 @@ object Projects {
     suspend fun add(context: Context, name: String, source: Source): Project {
         val now = System.currentTimeMillis()
         val project = Project("p$now", name, source, now, now)
+        // **作った時点の既定をこのプロジェクトの大きさにする。** 決めないままだと、あとで
+        // 設定の既定を変えたとき、このプロジェクトの表示用画像まで作り直しになる（A7）。
+        Prefs.setProjectEdge(context, project.id, Prefs.displayEdge(context))
         save(context, listOf(project) + all(context))
         return project
     }

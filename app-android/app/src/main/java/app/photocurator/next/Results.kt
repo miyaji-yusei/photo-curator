@@ -77,6 +77,9 @@ fun ResultsScreen(
 
     // 大きく見ている並びと、その何枚目か。**ここは見るだけ。**
     var zooming by remember { mutableStateOf<Pair<List<Photo>, Int>?>(null) }
+    // 一覧のスクロール位置。**拡大を開くと下の一覧は組まれなくなる**が、位置はここに残して、
+    // 閉じたときに戻す（A10）。早期 return より前に置くこと。
+    val gridState = androidx.compose.foundation.lazy.grid.rememberLazyGridState()
     // 中身を選別している連写の代表。
     var reviewing by remember { mutableStateOf<String?>(null) }
 
@@ -121,7 +124,11 @@ fun ResultsScreen(
     }
 
     LaunchedEffect(project.id, reloads) {
-        photos = Photos.forSource(context, project.source)
+        // **控えた顔ぶれを先に使う。** 毎回 NAS・Amazon へ一覧を取りに行くと待たされ、
+        // 圏外では空になる。選別と同じ並び（EXIF の撮影時刻）にもなる（A11）。
+        // 端末のアルバムは写真を移すと変わるので、いつも今の状態を読む。
+        photos = (if (project.source.remote) Listing.load(context, project.source.key) else null)
+            ?: Photos.forSource(context, project.source)
         val loaded = Store.load(context, project.id)
         session = loaded
         ratings = loaded?.ratings ?: emptyMap()
@@ -360,11 +367,12 @@ fun ResultsScreen(
             }
         } else {
             LazyVerticalGrid(
+                state = gridState,
                 columns = GridCells.Adaptive(minSize = 132.dp),
                 modifier = Modifier.weight(1f),
                 contentPadding = PaddingValues(horizontal = 14.dp)
             ) {
-                items(shown, key = { it.id }) { photo ->
+                items(shown, key = { it.relativePath }) { photo ->
                     val on = photo.relativePath in picked
                     val burst = members[photo.relativePath]?.size ?: 1
                     Box(
@@ -403,8 +411,8 @@ fun ResultsScreen(
                                 }
                             )
                     ) {
-                        val format = remember(photo.id) { unsupportedFormat(photo) }
-                        var state by remember(photo.id) {
+                        val format = remember(photo.relativePath) { unsupportedFormat(photo) }
+                        var state by remember(photo.relativePath) {
                             mutableStateOf(
                                 if (format != null) Preview.Unsupported else Preview.Generating
                             )

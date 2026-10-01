@@ -216,7 +216,7 @@ private fun Field(
  * アプリを閉じるまでは繰り返し聞かれない。閉じれば消える。
  */
 object NasPasswords {
-    private val held = HashMap<String, String>()
+    private val held = java.util.concurrent.ConcurrentHashMap<String, String>()
 
     fun hold(id: String, password: String) {
         held[id] = password

@@ -119,6 +119,8 @@ object Smb {
                     share.use { SmbResult.Ok(work(it)) }
                 }
             }
+        } catch (error: kotlinx.coroutines.CancellationException) {
+            throw error
         } catch (error: Exception) {
             Log.w(TAG, "NAS につなげない: ${nas.host}/${nas.share}", error)
             SmbResult.Failed(describe(error))
@@ -149,6 +151,8 @@ object Smb {
                     share.use { SmbResult.Ok(work(Reader(it))) }
                 }
             }
+        } catch (error: kotlinx.coroutines.CancellationException) {
+            throw error
         } catch (error: Exception) {
             Log.w(TAG, "NAS の読み取りが途中で切れた: ${nas.host}", error)
             SmbResult.Failed(describe(error))

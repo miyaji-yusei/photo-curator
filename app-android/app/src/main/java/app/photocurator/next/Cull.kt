@@ -120,7 +120,15 @@ fun CullScreen(
         // 指紋は OS の縮小画像から作るので**原本を読まない**（1 枚 3ms）。
         // **前に作った分は作り直さない。**
         note = "似た写真を調べています…"
-        val prepared0 = Prepare.run(context, project) { done, total -> prepared = done to total }
+        val prepared0 = try {
+            Prepare.ready(context, project) { done, total -> prepared = done to total }
+        } catch (error: kotlinx.coroutines.CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            // **準備の失敗で落とさない。** 理由を出して、戻れるようにしておく。
+            note = "準備が止まっています: " + Smb.describe(error)
+            return@LaunchedEffect
+        }
         photos = prepared0.first
         refs = prepared0.second
         // **読んだ値はその場の変数で使う。**
@@ -135,7 +143,10 @@ fun CullScreen(
         holdZooms = Prefs.holdZooms(context)
         // **大きさはプロジェクトごと。** 設定の値はその既定。
         edge = Prefs.projectEdge(context, project.id)
-        Neighbours.log(refs, loadedThreshold)
+        // 診断のログ。**全隣接ペアで距離を計算する**ので、開発用のビルドでだけ走らせる（A4）。
+        if (context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+            Neighbours.log(refs, loadedThreshold)
+        }
 
         // **途中があれば続きから。** 無ければ新しく始める。
         val saved = Store.load(context, project.id)
