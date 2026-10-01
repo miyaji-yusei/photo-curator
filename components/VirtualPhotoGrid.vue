@@ -10,6 +10,8 @@
  *
  * slot `default`: 1 タイル（`item`・`index`・`url`）。絵は `<img :src="url" loading="lazy" decoding="async">`。
  */
+import { firstRow, lastRow } from '~/utils/virtualRange'
+
 type Columns = 3 | 5 | 8 | 'auto'
 
 const props = withDefaults(defineProps<{
@@ -55,32 +57,29 @@ const estimatedRow = computed(() => Math.max(40, Math.round(tileWidth.value * pr
 const stride = computed(() => (rowHeight.value || estimatedRow.value) + props.gap)
 const rowCount = computed(() => Math.ceil(props.items.length / columnCount.value))
 
-const range = computed(() => {
-  const rows = rowCount.value
-  if (!rows) return { first: 0, last: -1 }
-  const top = Math.max(0, Math.floor(scrolled.value / stride.value))
-  const bottom = Math.max(0, Math.floor((scrolled.value + viewport.value) / stride.value))
-  return {
-    first: Math.max(0, Math.min(rows - 1, top) - props.overscanRows),
-    last: Math.min(rows - 1, bottom + props.overscanRows)
-  }
+// first・last は別々の computed（数値）にする。オブジェクトで返すと、行が変わらないフレームでも
+// 新しい参照になって、タイルの描画が毎フレーム走る（W14）。
+const rangeInput = () => ({
+  rows: rowCount.value, scrolled: scrolled.value, viewport: viewport.value,
+  stride: stride.value, overscan: props.overscanRows
 })
+const first = computed(() => firstRow(rangeInput()))
+const last = computed(() => lastRow(rangeInput()))
 
 const visible = computed(() => {
-  const { first, last } = range.value
   const cols = columnCount.value
   const out: { item: T, index: number }[] = []
-  for (let index = first * cols; index < Math.min(props.items.length, (last + 1) * cols); index++) {
+  for (let index = first.value * cols; index < Math.min(props.items.length, (last.value + 1) * cols); index++) {
     out.push({ item: props.items[index]!, index })
   }
   return out
 })
 
-const padTop = computed(() => range.value.first * stride.value)
-const padBottom = computed(() => Math.max(0, (rowCount.value - 1 - range.value.last) * stride.value))
+const padTop = computed(() => first.value * stride.value)
+const padBottom = computed(() => Math.max(0, (rowCount.value - 1 - last.value) * stride.value))
 
 watch(
-  () => [range.value.last, rowCount.value] as const,
+  () => [last.value, rowCount.value] as const,
   ([last, rows]) => { if (rows && last >= rows - 1 - props.overscanRows) emit('end') },
   { flush: 'post' }
 )
