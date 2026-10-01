@@ -44,7 +44,11 @@ fun StartSheet(
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
-    var groupSize by remember { mutableStateOf(Prefs.groupSize(context)) }
+    // 方式（トーナメント／スライドショー）と、トーナメントの枚数。保存は開始を押したときだけ。
+    var pending by remember {
+        mutableStateOf(PendingMethod.from(Prefs.groupSize(context), Prefs.tournamentSize(context)))
+    }
+    val groupSize = pending.size
     var groupBursts by remember { mutableStateOf(Prefs.groupBursts(context)) }
     // 既定 on。**設定の「毎回確認」とは裏返し**なので、ここで on＝もう出さない。
     var hideNext by remember { mutableStateOf(!Prefs.askBeforeStart(context)) }
@@ -79,43 +83,46 @@ fun StartSheet(
             FlowRow(maxItemsInEachRow = if (narrow) 1 else 2) {
                 // ---- 左: 一度に見比べる枚数 ----
                 Column(if (narrow) Modifier.fillMaxWidth() else Modifier.weight(1f)) {
-                    Text("一度に見比べる枚数", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    // ---- 方式。PC・Web の MethodView と同じ 2 択（トーナメントが左）。 ----
+                    Text("選別の方式", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                     Spacer(Modifier.height(8.dp))
-                    // 1〜10。**1 はスライドショー**（1 枚ずつ残す／落とす）。
-                    // **4 をおすすめとして真ん中に据える。**
-                    // 多いほど 1 回で絞れるが、1 枚が小さくなる。
-                    //
-                    // **折り返す。** 9 枚を 1 行に並べると 588dp 必要で、
-                    // 左カラムに入りきらず 6 以降が画面外に消える（実機で確認）。
-                    // Row は溢れても切るだけでスクロールもしない。
-                    FlowRow(
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        verticalArrangement = Arrangement.spacedBy(6.dp),
-                        maxItemsInEachRow = 5
-                    ) {
-                        // 並びは「トーナメント（2〜10）→ スライドショー（1 枚ずつ）」。PC・Web の方式の並びと同じ。
-                        for (size in (2..10) + 1) {
-                            SizeCard(
-                                number = "$size",
-                                note = when (size) {
-                                    1 -> "1 枚ずつ"
-                                    2 -> "大きく"
-                                    4 -> "おすすめ"
-                                    10 -> "小さく"
-                                    else -> ""
-                                },
-                                selected = groupSize == size
-                            ) { groupSize = size }
+                    MethodSegment(pending.method, onChange = { pending = pending.withMethod(it) })
+                    Spacer(Modifier.height(14.dp))
+                    if (pending.method == Method.Tournament) {
+                        Text("一度に見比べる枚数", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                        Spacer(Modifier.height(8.dp))
+                        // 2〜10。**4 をおすすめとして真ん中に据える。**
+                        // 多いほど 1 回で絞れるが、1 枚が小さくなる。
+                        // スライドショー（1 枚ずつ）は枚数ではなく方式なので、ここには出さない。
+                        //
+                        // **折り返す。** 9 枚を 1 行に並べると 588dp 必要で、
+                        // 左カラムに入りきらず 6 以降が画面外に消える（実機で確認）。
+                        // Row は溢れても切るだけでスクロールもしない。
+                        FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                            maxItemsInEachRow = 5
+                        ) {
+                            for (size in 2..10) {
+                                SizeCard(
+                                    number = "$size",
+                                    note = when (size) {
+                                        2 -> "大きく"
+                                        4 -> "おすすめ"
+                                        10 -> "小さく"
+                                        else -> ""
+                                    },
+                                    selected = pending.tournamentSize == size
+                                ) { pending = pending.withSize(size) }
+                            }
                         }
                     }
                     // **回数で言う。** 何回タップすることになるのかが、
                     // 枚数を選ぶときに一番知りたいこと。
                     val rounds = if (groupSize > 0) (photoCount + groupSize - 1) / groupSize else 0
                     Text(
-                        (if (groupSize == Prefs.SLIDESHOW_SIZE)
-                            "スライドショー: 1 枚ずつ出して、残す（右）か落とす（左）かを決めます。" +
-                                "上のほうのタップは ★5 で確定、中心の二度タップで拡大。" +
-                                "約 $rounds 回で ROUND 1 が終わります。"
+                        (if (pending.method == Method.Slideshow)
+                            "$SLIDESHOW_NOTE。約 $rounds 回で ROUND 1 が終わります。"
                         else "$groupSize 枚なら約 $rounds 回で ROUND 1 が終わります。") +
                             "選別中に … から変えられます",
                         fontSize = 11.sp, color = Faint,
@@ -175,6 +182,8 @@ fun StartSheet(
                 Spacer(Modifier.width(8.dp))
                 Button(
                     onClick = {
+                        // スライドショーで始めても、選んでいたトーナメントの枚数は覚えておく。
+                        if (pending.method == Method.Slideshow) Prefs.setGroupSize(context, pending.tournamentSize)
                         Prefs.setGroupSize(context, groupSize)
                         Prefs.setGroupBursts(context, groupBursts)
                         Prefs.setAskBeforeStart(context, !hideNext)

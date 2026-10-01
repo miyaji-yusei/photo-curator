@@ -192,34 +192,38 @@ fun SettingsScreen(onBack: () -> Unit) {
                     Text("選別の既定", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                     Spacer(Modifier.height(12.dp))
 
-                    Text("一度に見比べる枚数", fontSize = 13.sp)
+                    // 開始前シート・選別中の設定と同じ並び（方式 → トーナメントのときだけ枚数）。
+                    // ここは「既定」なので、押した時点で保存する。
+                    Text("選別の方式", fontSize = 13.sp)
                     Spacer(Modifier.height(6.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        for (size in 2..10) {
-                            SizeDot(size, size == groupSize) {
-                                groupSize = size; Prefs.setGroupSize(context, size)
+                    val slideshow = groupSize == Prefs.SLIDESHOW_SIZE
+                    MethodSegment(
+                        if (slideshow) Method.Slideshow else Method.Tournament,
+                        onChange = { method ->
+                            val next = if (method == Method.Slideshow) Prefs.SLIDESHOW_SIZE
+                            else Prefs.tournamentSize(context)
+                            groupSize = next; Prefs.setGroupSize(context, next)
+                        }
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    if (slideshow) {
+                        Text(SLIDESHOW_NOTE, fontSize = 11.sp, color = Faint)
+                    } else {
+                        Text("一度に見比べる枚数", fontSize = 13.sp)
+                        Spacer(Modifier.height(6.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            for (size in 2..10) {
+                                SizeDot(size, size == groupSize) {
+                                    groupSize = size; Prefs.setGroupSize(context, size)
+                                }
                             }
                         }
+                        Text(
+                            "4 枚がおすすめ。多いほど 1 回で絞れますが、1 枚が小さくなります",
+                            fontSize = 11.sp, color = Faint,
+                            modifier = Modifier.padding(top = 6.dp)
+                        )
                     }
-                    // 1 枚ずつ決める方式。**枚数ではなく方式**なので、丸とは別に置く。
-                    FilterChip(
-                        selected = groupSize == Prefs.SLIDESHOW_SIZE,
-                        onClick = {
-                            val next = if (groupSize == Prefs.SLIDESHOW_SIZE) Prefs.tournamentSize(context)
-                            else Prefs.SLIDESHOW_SIZE
-                            groupSize = next; Prefs.setGroupSize(context, next)
-                        },
-                        label = { Text("スライドショー（1 枚ずつ）", fontSize = 13.sp) },
-                        colors = FilterChipDefaults.filterChipColors(
-                            selectedContainerColor = Lime, selectedLabelColor = Color.Black
-                        ),
-                        modifier = Modifier.padding(top = 8.dp)
-                    )
-                    Text(
-                        "4 枚がおすすめ。多いほど 1 回で絞れますが、1 枚が小さくなります",
-                        fontSize = 11.sp, color = Faint,
-                        modifier = Modifier.padding(top = 6.dp)
-                    )
 
                     Spacer(Modifier.height(16.dp))
                     Toggle("連写を自動でまとめる", groupBursts) {

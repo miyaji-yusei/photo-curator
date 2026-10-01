@@ -18,6 +18,7 @@ import androidx.compose.material.icons.filled.MoreHoriz
 import androidx.compose.material.icons.filled.SelectAll
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.ZoomIn
+import androidx.compose.material.icons.outlined.HelpOutline
 import androidx.compose.material.icons.filled.Undo
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -104,6 +105,8 @@ fun CullScreen(
     var learnedDistance by remember { mutableStateOf(DEFAULT_DISTANCE) }
     // 選別中の「…」を開いているか。
     var options by remember { mutableStateOf(false) }
+    // 「？」（操作のヘルプ）を開いているか。
+    var help by remember { mutableStateOf(false) }
     var groupBursts by remember { mutableStateOf(true) }
     var edge by remember { mutableStateOf(1024) }
 
@@ -361,7 +364,8 @@ fun CullScreen(
             displayEdge = edge,
             showDisplayEdge = project.source.remote,
             maxEdge = Prefs.maxEdgeFor(context, project.source),
-            onGroupSize = { size ->
+            // 確定ボタン（「この方式にする」「この枚数にする」）を押したときだけ呼ばれる。
+            onApplyGroupSize = { size ->
                 Prefs.setGroupSize(context, size)
                 val next = resize(live, size.toUInt())
                 session = next
@@ -385,6 +389,10 @@ fun CullScreen(
             },
             onDismiss = { options = false }
         )
+    }
+
+    if (help) {
+        SelectionHelpDialog(slideshow = slideshow, onDismiss = { help = false })
     }
 
     // まとまり編集。**対象はいまの組の写真と、その前後の未判定の写真。**
@@ -477,6 +485,7 @@ fun CullScreen(
             canJoin = canJoin,
             onJoin = { joinSelected() },
             onOptions = { options = true },
+            onHelp = { help = true },
             onCommit = { commit(selected) },
             slideshow = slideshow
         )
@@ -620,6 +629,8 @@ private fun CullBar(
     canJoin: Boolean,
     onJoin: () -> Unit,
     onOptions: () -> Unit,
+    /** 「？」。操作のヘルプを開く。トーナメントとスライドショーで同じ位置・同じ部品。 */
+    onHelp: () -> Unit,
     onCommit: () -> Unit,
     /** スライドショー。**複数選択・まとめる・確定のボタンは出さない。** */
     slideshow: Boolean = false
@@ -681,6 +692,15 @@ private fun CullBar(
             // **手を止めずに設定を変えられる場所。**
             IconButton(onClick = onOptions) {
                 Icon(Icons.Filled.MoreHoriz, "設定")
+            }
+            // 「…」の右に、丸枠の「？」（操作のヘルプ）。常時表示のヒントは足さず、押したときだけ出す。
+            IconButton(
+                onClick = onHelp,
+                modifier = Modifier
+                    .size(36.dp)
+                    .border(1.dp, Color(0xFF3A3E47), androidx.compose.foundation.shape.CircleShape)
+            ) {
+                Icon(Icons.Outlined.HelpOutline, "操作のヘルプ", Modifier.size(20.dp))
             }
             if (!slideshow) Spacer(Modifier.width(4.dp))
             if (!slideshow) Button(
