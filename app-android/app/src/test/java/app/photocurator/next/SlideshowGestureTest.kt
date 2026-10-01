@@ -89,13 +89,31 @@ class SlideshowGestureTest {
         }
     }
 
+    // 枠 left=0, top=0, 幅 1000, 高さ 800 → 上の帯は y < 200（Web の tapDecision のテストと同じ値）
+    private fun tap(x: Float, y: Float) = tapDecision(x, y, 0f, 0f, 1000f, 800f)
+
     @Test fun タップは左半分が落とす右半分が残す() {
-        assertEquals(Drop, tapDecision(100f, 0f, 1000f))
-        assertEquals(Drop, tapDecision(499f, 0f, 1000f))
-        assertEquals(Keep, tapDecision(500f, 0f, 1000f))
-        assertEquals(Keep, tapDecision(900f, 0f, 1000f))
-        assertEquals(Keep, tapDecision(400f, 200f, 400f))
-        assertEquals(Drop, tapDecision(399f, 200f, 400f))
+        assertEquals(Drop, tap(100f, 400f))
+        assertEquals(Drop, tap(499f, 400f))
+        assertEquals(Keep, tap(500f, 400f))
+        assertEquals(Keep, tap(900f, 799f))
+    }
+
+    @Test fun 上の帯は左右を問わず星5() {
+        assertEquals(Top, tap(100f, 0f))
+        assertEquals(Top, tap(900f, 199f))
+        assertEquals(Top, tap(500f, 100f))
+    }
+
+    @Test fun 帯の境目から下は左右で分ける() {
+        assertEquals(Drop, tap(100f, 200f))
+        assertEquals(Keep, tap(900f, 200f))
+    }
+
+    @Test fun 枠がずれていても枠を基準にする() {
+        assertEquals(Top, tapDecision(400f, 150f, 200f, 100f, 400f, 400f))
+        assertEquals(Keep, tapDecision(400f, 200f, 200f, 100f, 400f, 400f))
+        assertEquals(Drop, tapDecision(399f, 200f, 200f, 100f, 400f, 400f))
     }
 
     @Test fun 飛んでいく先は枠の外() {

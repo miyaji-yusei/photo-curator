@@ -93,7 +93,8 @@ fun StartSheet(
                         verticalArrangement = Arrangement.spacedBy(6.dp),
                         maxItemsInEachRow = 5
                     ) {
-                        for (size in 1..10) {
+                        // 並びは「トーナメント（2〜10）→ スライドショー（1 枚ずつ）」。PC・Web の方式の並びと同じ。
+                        for (size in (2..10) + 1) {
                             SizeCard(
                                 number = "$size",
                                 note = when (size) {
@@ -113,6 +114,7 @@ fun StartSheet(
                     Text(
                         (if (groupSize == Prefs.SLIDESHOW_SIZE)
                             "スライドショー: 1 枚ずつ出して、残す（右）か落とす（左）かを決めます。" +
+                                "上のほうのタップは ★5 で確定。" +
                                 "約 $rounds 回で ROUND 1 が終わります。"
                         else "$groupSize 枚なら約 $rounds 回で ROUND 1 が終わります。") +
                             "選別中に … から変えられます",

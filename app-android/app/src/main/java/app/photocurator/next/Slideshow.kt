@@ -150,10 +150,11 @@ internal fun SlideshowStage(
                         val dy = (change.position.y - startY) / density
                         if (!change.pressed) {
                             if (!moved) {
-                                // タップ。左半分は落とす、右半分は残す（長押しの拡大はしない）。
+                                // タップ。上の帯は★5、それ以外は左半分が落とす・右半分が残す（長押しの拡大はしない）。
                                 decide(
                                     SlideshowGesture.tapDecision(
-                                        change.position.x, 0f, size.width.toFloat()
+                                        change.position.x, change.position.y, 0f, 0f,
+                                        size.width.toFloat(), size.height.toFloat()
                                     )
                                 )
                             } else {

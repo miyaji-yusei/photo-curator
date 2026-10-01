@@ -13,6 +13,7 @@ import kotlin.math.min
  * （Web の px と同じ大きさ）で受ける。画面の px は呼ぶ側が密度で割ってから渡す。
  *
  * 操作: 左＝落とす／右＝残す／上＝★5 で確定。下は使わない。
+ * タップ: 上の帯＝★5、それ以外は左半分＝落とす・右半分＝残す。
  */
 enum class SlideDecision { Drop, Keep, Top }
 
@@ -63,9 +64,19 @@ object SlideshowGesture {
         return Feedback(null, 0f, rotation)
     }
 
-    /** 画面の左半分のタップは「落とす」、右半分は「残す」。 */
-    fun tapDecision(x: Float, left: Float, width: Float): SlideDecision =
-        if (x < left + width / 2) SlideDecision.Drop else SlideDecision.Keep
+    /** 枠の上から、この割合までの帯のタップは「★5 で確定」。 */
+    const val TOP_BAND_RATIO = 0.25f
+
+    /**
+     * タップの判定。枠の上の帯（高さの上から 25% 未満）は「★5 で確定」、
+     * それ以外は左半分が「落とす」・右半分が「残す」。
+     */
+    fun tapDecision(
+        x: Float, y: Float, left: Float, top: Float, width: Float, height: Float
+    ): SlideDecision {
+        if (y < top + height * TOP_BAND_RATIO) return SlideDecision.Top
+        return if (x < left + width / 2) SlideDecision.Drop else SlideDecision.Keep
+    }
 
     /** 決定したとき、写真が飛んでいく先。 */
     data class Fly(val x: Float, val y: Float, val rotation: Float)

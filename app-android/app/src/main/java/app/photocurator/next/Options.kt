@@ -62,28 +62,28 @@ fun OptionsSheet(
             Spacer(Modifier.height(8.dp))
             SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
                 SegmentedButton(
-                    selected = slideshow,
-                    onClick = { if (!slideshow) onGroupSize(Prefs.SLIDESHOW_SIZE) },
+                    selected = !slideshow,
+                    onClick = { if (slideshow) onGroupSize(Prefs.tournamentSize(context)) },
                     shape = SegmentedButtonDefaults.itemShape(0, 2),
                     colors = SegmentedButtonDefaults.colors(
                         activeContainerColor = Lime, activeContentColor = Color.Black
                     )
-                ) { Text("スライドショー", fontSize = 13.sp) }
+                ) { Text("トーナメント", fontSize = 13.sp) }
                 SegmentedButton(
-                    selected = !slideshow,
-                    onClick = { if (slideshow) onGroupSize(Prefs.tournamentSize(context)) },
+                    selected = slideshow,
+                    onClick = { if (!slideshow) onGroupSize(Prefs.SLIDESHOW_SIZE) },
                     shape = SegmentedButtonDefaults.itemShape(1, 2),
                     colors = SegmentedButtonDefaults.colors(
                         activeContainerColor = Lime, activeContentColor = Color.Black
                     )
-                ) { Text("トーナメント", fontSize = 13.sp) }
+                ) { Text("スライドショー", fontSize = 13.sp) }
             }
 
             Spacer(Modifier.height(16.dp))
             if (slideshow) {
                 Text(
                     "1 枚ずつ出して、残す（右）か落とす（左）かを決めます。" +
-                        "上へのスワイプで ★5 にして確定します",
+                        "上へのスワイプや、写真の上のほうのタップで ★5 にして確定します",
                     fontSize = 11.sp, color = Faint
                 )
             } else {
