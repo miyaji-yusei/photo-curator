@@ -151,9 +151,9 @@ function release(event: PointerEvent, cancelled: boolean) {
   if (stage.value?.hasPointerCapture(event.pointerId)) stage.value.releasePointerCapture(event.pointerId)
   if (cancelled) return snapBack(moved)
   if (!moved) {
-    // クリック。左半分は落とす、右半分は残す（長押しの拡大はしない）。
+    // クリック。上の帯は★5、それ以外は左半分が落とす・右半分が残す（長押しの拡大はしない）。
     const rect = stage.value?.getBoundingClientRect()
-    if (rect) void decide(tapDecision(event.clientX, rect.left, rect.width))
+    if (rect) void decide(tapDecision(event.clientX, event.clientY, rect.left, rect.top, rect.width, rect.height))
     return
   }
   const decision = judgeDrag(dx, dy, frame.value.width)
@@ -166,7 +166,7 @@ function snapBack(moved: boolean) {
   setFeedback(null, 0)
 }
 
-// ---- キー（1＝落とす・2＝残す）。Backspace（1 つ戻す）は useCurator が受ける ----
+// ---- キー（1・←＝落とす／3・→＝残す／5・↑＝★5）。Backspace（1 つ戻す）は useCurator が受ける ----
 function onKeydown(event: KeyboardEvent) {
   if (view.value !== 'tournament' || event.repeat) return
   if (zoomPhoto.value || burstDialog.value || groupSizeDialog.value) return
@@ -232,12 +232,13 @@ async function undo() {
           <v-btn
             icon="mdi-star-outline" size="x-small" variant="flat"
             :disabled="busy"
-            :aria-label="`${photo.name} を★${MAX_RATING} で確定`"
+            :aria-label="`${photo.name} を★${MAX_RATING} で確定（キー 5・↑、写真の上のほうのクリックでも確定）`"
+            :title="`★${MAX_RATING} で確定（5・↑）`"
             @click.stop="decide('top')"
           />
           <v-btn
             icon="mdi-magnify-plus-outline" size="x-small" variant="flat"
-            :aria-label="`${photo.name} を拡大`"
+            :aria-label="`${photo.name} を拡大`" title="拡大"
             @click.stop="openZoom(photo, [photo])"
           />
         </div>

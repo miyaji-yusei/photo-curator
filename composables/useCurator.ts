@@ -2517,7 +2517,7 @@ function createCurator() {
       return
     }
     // スライドショーは 1 枚ずつ。Enter・M・Space は使わず（Enter で「落とす」が走らないように）、
-    // 数字の 1・2 は画面（SlideshowView）が受ける。修飾キー付き（Ctrl＝拡大など）は下の共通処理へ。
+    // 1・3・5 と ←・→・↑ は画面（SlideshowView）が受ける（2・4・↓ は何もしない）。修飾キー付き（Ctrl＝拡大など）は下の共通処理へ。
     if (isSlideshow.value) {
       if (event.key === 'Enter' || event.key === ' ' || event.key.toLowerCase() === 'm') {
         event.preventDefault()

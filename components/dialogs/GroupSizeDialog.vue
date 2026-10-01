@@ -40,11 +40,11 @@ function onArrowKey(event: KeyboardEvent) {
         class="mb-4" aria-label="選別の方式"
         @update:model-value="value => (pendingSlideshow = value === 'slideshow')"
       >
-        <v-btn value="slideshow" prepend-icon="mdi-image-outline">スライドショー</v-btn>
         <v-btn value="tournament" prepend-icon="mdi-view-grid-outline">トーナメント</v-btn>
+        <v-btn value="slideshow" prepend-icon="mdi-image-outline">スライドショー</v-btn>
       </v-btn-toggle>
       <p v-if="pendingSlideshow" class="text-caption text-medium-emphasis mb-0">
-        1 枚ずつ出して、残す（右）か落とす（左）かを決めます。上へのスワイプで★5 にして確定します。
+        1 枚ずつ出して、残す（右）か落とす（左）かを決めます。上へのスワイプや、写真の上のほうのクリック・タップで★5 にして確定します。キーは 1・←＝落とす、3・→＝残す、5・↑＝★5 で確定です。
       </p>
       <template v-else>
       <div class="text-subtitle-2 mb-1">1グループの表示枚数</div>

@@ -72,31 +72,54 @@ describe('dragFeedback', () => {
   })
 })
 
-describe('tapDecision', () => {
+describe('tapDecision（枠 left=0, top=0, 幅 1000, 高さ 800 → 上の帯は y<200）', () => {
+  const tap = (x: number, y: number) => tapDecision(x, y, 0, 0, 1000, 800)
   it('左半分は落とす、右半分は残す', () => {
-    expect(tapDecision(100, 0, 1000)).toBe('drop')
-    expect(tapDecision(499, 0, 1000)).toBe('drop')
-    expect(tapDecision(500, 0, 1000)).toBe('keep')
-    expect(tapDecision(900, 0, 1000)).toBe('keep')
+    expect(tap(100, 400)).toBe('drop')
+    expect(tap(499, 400)).toBe('drop')
+    expect(tap(500, 400)).toBe('keep')
+    expect(tap(900, 799)).toBe('keep')
   })
-  it('枠の左端がずれていても枠の中央で分ける', () => {
-    expect(tapDecision(400, 200, 400)).toBe('keep')
-    expect(tapDecision(399, 200, 400)).toBe('drop')
+  it('上の帯（上から 25% 未満）は左右を問わず ★5', () => {
+    expect(tap(100, 0)).toBe('top')
+    expect(tap(900, 199)).toBe('top')
+    expect(tap(500, 100)).toBe('top')
+  })
+  it('帯の境目（25% ちょうど）から下は左右で分ける', () => {
+    expect(tap(100, 200)).toBe('drop')
+    expect(tap(900, 200)).toBe('keep')
+  })
+  it('枠がずれていても枠を基準にする', () => {
+    expect(tapDecision(400, 150, 200, 100, 400, 400)).toBe('top')
+    expect(tapDecision(400, 200, 200, 100, 400, 400)).toBe('keep')
+    expect(tapDecision(399, 200, 200, 100, 400, 400)).toBe('drop')
   })
 })
 
 describe('slideKeyDecision', () => {
-  it('1 が落とす、2 が残す', () => {
+  it('1・← が落とす、3・→ が残す、5・↑ が ★5', () => {
     expect(slideKeyDecision({ key: '1' })).toBe('drop')
-    expect(slideKeyDecision({ key: '2' })).toBe('keep')
+    expect(slideKeyDecision({ key: 'ArrowLeft' })).toBe('drop')
+    expect(slideKeyDecision({ key: '3' })).toBe('keep')
+    expect(slideKeyDecision({ key: 'ArrowRight' })).toBe('keep')
+    expect(slideKeyDecision({ key: '5' })).toBe('top')
+    expect(slideKeyDecision({ key: 'ArrowUp' })).toBe('top')
     expect(slideKeyDecision({ key: '1', code: 'Numpad1' })).toBe('drop')
+    expect(slideKeyDecision({ key: '3', code: 'Numpad3' })).toBe('keep')
+    expect(slideKeyDecision({ key: '5', code: 'Numpad5' })).toBe('top')
   })
-  it('修飾キー付き・ほかのキーは拾わない（Ctrl+1 は拡大のまま）', () => {
+  it('2・4・↓・Enter などは何もしない', () => {
+    expect(slideKeyDecision({ key: '2' })).toBeNull()
+    expect(slideKeyDecision({ key: '4' })).toBeNull()
+    expect(slideKeyDecision({ key: 'ArrowDown' })).toBeNull()
+    expect(slideKeyDecision({ key: 'Enter' })).toBeNull()
+  })
+  it('修飾キー付きは拾わない（Ctrl+1 は拡大のまま）', () => {
     expect(slideKeyDecision({ key: '1', ctrlKey: true })).toBeNull()
     expect(slideKeyDecision({ key: '!', code: 'Digit1', shiftKey: true })).toBeNull()
-    expect(slideKeyDecision({ key: '1', altKey: true })).toBeNull()
-    expect(slideKeyDecision({ key: '3' })).toBeNull()
-    expect(slideKeyDecision({ key: 'Enter' })).toBeNull()
+    expect(slideKeyDecision({ key: '3', altKey: true })).toBeNull()
+    expect(slideKeyDecision({ key: 'ArrowLeft', ctrlKey: true })).toBeNull()
+    expect(slideKeyDecision({ key: 'ArrowUp', metaKey: true })).toBeNull()
   })
 })
 

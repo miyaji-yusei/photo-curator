@@ -3,6 +3,9 @@
  * ここでしない（決まった操作は core の `advance`・`keepAndTop` へ渡す）。
  *
  * 操作: 左＝落とす／右＝残す／上＝★5 で確定。下は使わない。
+ * クリック（タップ）: 上の帯＝★5、それ以外は左半分＝落とす・右半分＝残す。
+ * キー: 1・←＝落とす／3・→＝残す／5・↑＝★5（↓・2・4 は何もしない）。
+ * 数値・規則は Android の SlideshowGesture.kt と同じにする。
  */
 export type SlideDecision = 'drop' | 'keep' | 'top'
 
@@ -50,8 +53,17 @@ export function dragFeedback(dx: number, dy: number, width: number): DragFeedbac
   return { direction: null, strength: 0, rotation }
 }
 
-/** 画面の左半分のクリックは「落とす」、右半分は「残す」。 */
-export function tapDecision(clientX: number, left: number, width: number): SlideDecision {
+/** 枠の上から、この割合までの帯のクリック（タップ）は「★5 で確定」。 */
+export const TOP_BAND_RATIO = 0.25
+
+/**
+ * クリック（タップ）の判定。枠の上の帯（高さの上から 25% 未満）は「★5 で確定」、
+ * それ以外は左半分が「落とす」・右半分が「残す」。
+ */
+export function tapDecision(
+  clientX: number, clientY: number, left: number, top: number, width: number, height: number
+): SlideDecision {
+  if (clientY < top + height * TOP_BAND_RATIO) return 'top'
   return clientX < left + width / 2 ? 'drop' : 'keep'
 }
 
@@ -64,12 +76,19 @@ export interface KeyLike {
   altKey?: boolean
 }
 
-/** `1`＝落とす・`2`＝残す。修飾キー付きは別の操作（拡大など）なので拾わない。 */
+/**
+ * `1`・`←`＝落とす／`3`・`→`＝残す／`5`・`↑`＝★5 で確定。`2`・`4`・`↓` は何もしない。
+ * 修飾キー付きは別の操作（拡大など）なので拾わない。
+ */
 export function slideKeyDecision(event: KeyLike): SlideDecision | null {
   if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return null
+  if (event.key === 'ArrowLeft') return 'drop'
+  if (event.key === 'ArrowRight') return 'keep'
+  if (event.key === 'ArrowUp') return 'top'
   const digit = /^(Digit|Numpad)(\d)$/.exec(event.code ?? '')?.[2] ?? event.key
   if (digit === '1') return 'drop'
-  if (digit === '2') return 'keep'
+  if (digit === '3') return 'keep'
+  if (digit === '5') return 'top'
   return null
 }
 
