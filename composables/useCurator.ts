@@ -467,6 +467,12 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     void refreshProjectCards()
   }
 
+  /** 開いたときの準備（解析・表示用画像）が始められなかったとき。黙らず、通知に出す。 */
+  function warnPrepareNotStarted(what: string, cause: unknown) {
+    console.warn(`${what}を始められませんでした`, cause)
+    taskWarning.value = `${what}を始められませんでした。${cause instanceof Error ? cause.message : ''}`.trim()
+  }
+
   let cardsToken = 0
   /** 各プロジェクトの状態と見本を読み直す（網へは行かない）。新しい呼び出しがあれば古い結果は捨てる。 */
   async function refreshProjectCards() {
@@ -476,11 +482,13 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     const list = projects.value
     const entries = await Promise.all(list.map(async (project) => {
       try {
+        // 状態を決める 4 つのどれかが読めなかったら、状態を作らない（0・null にして
+        // 「準備完了」「選別なし」と誤表示しない）。見本だけは読めなくても状態に関係しない。
         const [analysis, display, saved, summary, first] = await Promise.all([
-          desktop.getAnalysisBacklog(project.id).catch(() => 0),
-          desktop.getDisplayBacklog(project.id).catch(() => 0),
-          desktop.loadSession(project.id).catch(() => null),
-          desktop.getSelectionSummary(project.id).catch(() => null),
+          desktop.getAnalysisBacklog(project.id),
+          desktop.getDisplayBacklog(project.id),
+          desktop.loadSession(project.id),
+          desktop.getSelectionSummary(project.id),
           desktop.getProjectPhotoPage(project.id, 0, 1).catch(() => null)
         ])
         const status = projectStatus({
@@ -490,8 +498,11 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
         })
         const photo = first?.photos[0]
         return [project.id, { status, thumbnailUrl: photo ? desktop.photoThumbnailUrl(photo) : null }] as const
-      } catch {
-        return null
+      } catch (cause) {
+        // 前に読めた値があればそのまま残す（無ければ状態の行を出さない）。
+        console.warn('プロジェクトの状態を読めませんでした', project.id, cause)
+        const previous = projectCards.value[project.id]
+        return previous ? [project.id, previous] as const : null
       }
     }))
     if (token !== cardsToken) return
@@ -858,11 +869,11 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
       ])
       if (stale()) return
       analysisBacklog.value = backlog
-      if (backlog > 0) desktop.startBackgroundAnalysis(project.id).catch(() => undefined)
+      if (backlog > 0) desktop.startBackgroundAnalysis(project.id).catch(cause => warnPrepareNotStarted('解析', cause))
       // 表示用画像は走査とは別に溜める。**走査に混ぜると解析が桁で遅くなる**
       // （EXIF サムネイル経路 1.72ms/枚 に対しフルデコード 132ms/枚）。
       if (displayBacklog.value > 0) {
-        desktop.startDisplayGeneration(project.id).catch(() => undefined)
+        desktop.startDisplayGeneration(project.id).catch(cause => warnPrepareNotStarted('表示用画像の作成', cause))
       }
     } catch (cause) {
       if (!stale()) error.value = cause instanceof Error ? cause.message : 'プロジェクトを開けませんでした。'
@@ -2026,8 +2037,11 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     if (!activeProject.value) return
     try {
       selectionSummary.value = await desktop.getSelectionSummary(activeProject.value.id)
-    } catch {
+    } catch (cause) {
+      // 「選別結果を見る」が黙って消えないように、読めなかったことを出す。
       selectionSummary.value = null
+      console.warn('選別の集計を読めませんでした', cause)
+      error.value = cause instanceof Error ? `選別の集計を読めませんでした（${cause.message}）` : '選別の集計を読めませんでした。'
     }
   }
 
@@ -2194,9 +2208,12 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
       displaySettings.value = settings
       displayEdge.value = settings.projectEdge ?? settings.edge
       displayBacklog.value = await desktop.getDisplayBacklog(activeProject.value.id)
-    } catch {
+    } catch (cause) {
       // 設定が読めなくても選別は続けられる。表示用が無ければ原本に落ちるだけ。
+      // ただし設定のカードが黙って消えるので、読めなかったことは通知に出す。
       displaySettings.value = null
+      console.warn('表示用画像の設定を読めませんでした', cause)
+      taskWarning.value = '表示用画像の設定を読めませんでした。'
     }
   }
 
@@ -2566,7 +2583,11 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   async function cancelAnalysis() {
     const progress = analysisProgress.value
     if (!progress) return
-    await desktop.cancelProjectTask(progress.projectId, progress.task)
+    try {
+      await desktop.cancelProjectTask(progress.projectId, progress.task)
+    } catch (cause) {
+      error.value = cause instanceof Error ? cause.message : '中止できませんでした。'
+    }
   }
 
   function onKeydown(event: KeyboardEvent) {
