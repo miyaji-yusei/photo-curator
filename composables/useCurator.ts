@@ -583,7 +583,28 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
    * `Image` を持ち続けることでデコード済みの絵を手放さない。
    */
   const PREFETCH_GROUPS = 2
-  const prefetched = new Map<string, { projectId: string, photos: Photo[], images: HTMLImageElement[] }>()
+  type Prefetched = { projectId: string, photos: Photo[], images: HTMLImageElement[] }
+  const prefetched = new Map<string, Prefetched>()
+  /** 読み込み中の先読み。連打で `loadCurrentPhotos` が続けて呼ばれても、同じ組を重複して読まない。 */
+  const prefetching = new Map<string, Promise<Prefetched>>()
+  function readAhead(projectId: string, key: string, ids: string[]): Promise<Prefetched> {
+    const flightKey = `${projectId}\u0001${key}`
+    const running = prefetching.get(flightKey)
+    if (running) return running
+    const started = (async () => {
+      const photos = await desktop.getPhotosByIds(projectId, ids)
+      const images = photos.map((photo) => {
+        const image = new Image()
+        image.decoding = 'async'
+        image.src = desktop.photoDisplayUrl(photo)
+        image.decode().catch(() => undefined)
+        return image
+      })
+      return { projectId, photos, images }
+    })().finally(() => prefetching.delete(flightKey))
+    prefetching.set(flightKey, started)
+    return started
+  }
   async function prefetchNextGroups() {
     const current = session.value
     const project = activeProject.value
@@ -599,25 +620,18 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     for (const key of [...prefetched.keys()]) {
       if (!wanted.has(key) || prefetched.get(key)!.projectId !== project.id) prefetched.delete(key)
     }
-    for (const ids of groups) {
+    // 2 組は並べて読む。待っている間に組が進んだ・プロジェクトが変わったら、その結果は捨てる。
+    await Promise.all(groups.map(async (ids) => {
       const key = ids.join('\u0000')
-      if (prefetched.has(key)) continue
+      if (prefetched.has(key)) return
       try {
-        const photos = await desktop.getPhotosByIds(project.id, ids)
-        // 待っている間に組が進んだ・プロジェクトが変わったら、この結果は捨てる。
+        const entry = await readAhead(project.id, key, ids)
         if (activeProject.value?.id !== project.id || session.value !== current) return
-        const images = photos.map((photo) => {
-          const image = new Image()
-          image.decoding = 'async'
-          image.src = desktop.photoDisplayUrl(photo)
-          image.decode().catch(() => undefined)
-          return image
-        })
-        prefetched.set(key, { projectId: project.id, photos, images })
+        prefetched.set(key, entry)
       } catch {
         // 先読みは無くても困らない。
       }
-    }
+    }))
   }
 
   /**
