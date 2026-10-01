@@ -3,8 +3,8 @@
  * ここでしない（決まった操作は core の `advance`・`keepAndTop` へ渡す）。
  *
  * 操作: 左＝落とす／右＝残す／上＝★5 で確定。下は使わない。
- * クリック（タップ）: 上の帯＝★5、ほぼ中心＝何もしない（二度押しで拡大）、
- * それ以外は左半分＝落とす・右半分＝残す。
+ * クリック（タップ）: 上の 30%＝★5、残りのうち左の 30%＝落とす・右の 30%＝残す、
+ * 中央の 40% の縦帯（下部の中央も含む）＝何もしない（二度押しで拡大）。
  * キー: 1・←＝落とす／3・→＝残す／5・↑＝★5（↓・2・4 は何もしない）。
  * 数値・規則は Android の SlideshowGesture.kt と同じにする。
  */
@@ -54,27 +54,31 @@ export function dragFeedback(dx: number, dy: number, width: number): DragFeedbac
   return { direction: null, strength: 0, rotation }
 }
 
-/** 枠の上から、この割合までの帯のクリック（タップ）は「★5 で確定」。 */
-export const TOP_BAND_RATIO = 0.25
+/** 枠の上から、この割合（未満）までのクリック（タップ）は「★5 で確定」。ちょうどの線は含まない。 */
+export const TOP_ZONE_RATIO = 0.3
 
-/** 枠の中心から、横は幅の ±12%・縦は高さの ±12%（境目を含む）の長方形が「ほぼ中心」。 */
-export const CENTER_RATIO = 0.12
+/**
+ * 上の領域を除いた部分の、左右の端の幅の割合。x がこの割合未満なら「落とす」、
+ * (1 − この割合) より大きければ「残す」。ちょうど 30%・70% の線は中央（何もしない）。
+ */
+export const SIDE_ZONE_RATIO = 0.3
 
-/** クリック（タップ）の結果。'center' は何もしない（二度押しなら拡大）。 */
+/** クリック（タップ）の結果。'center' は中央の縦帯で何もしない（二度押しなら拡大）。 */
 export type TapResult = SlideDecision | 'center'
 
 /**
- * クリック（タップ）の判定。枠の上の帯（高さの上から 25% 未満）は「★5 で確定」（帯が優先）、
- * ほぼ中心は 'center'（何もしない）、それ以外は左半分が「落とす」・右半分が「残す」。
+ * クリック（タップ）の判定。枠の上（高さの上から 30% 未満）は「★5 で確定」（優先）、
+ * それより下は、左端 30% 未満が「落とす」・右端 30%（幅の 70% より大きい）が「残す」、
+ * 中央の 40% の縦帯は下部も含めて 'center'（何もしない）。
  */
 export function tapDecision(
   clientX: number, clientY: number, left: number, top: number, width: number, height: number
 ): TapResult {
-  if (clientY < top + height * TOP_BAND_RATIO) return 'top'
-  const cx = left + width / 2
-  const cy = top + height / 2
-  if (Math.abs(clientX - cx) <= width * CENTER_RATIO && Math.abs(clientY - cy) <= height * CENTER_RATIO) return 'center'
-  return clientX < cx ? 'drop' : 'keep'
+  if (clientY < top + height * TOP_ZONE_RATIO) return 'top'
+  const x = clientX - left
+  if (x < width * SIDE_ZONE_RATIO) return 'drop'
+  if (x > width * (1 - SIDE_ZONE_RATIO)) return 'keep'
+  return 'center'
 }
 
 /** 二度押しとみなす間隔（ms）と距離（px）。どちらも境目を含む。 */
@@ -83,7 +87,7 @@ export const DOUBLE_TAP_DISTANCE = 24
 
 export interface TapRecord { time: number, x: number, y: number }
 
-/** 直前の中心タップ（なければ null）と今回の中心タップが、300ms 以内・24px 以内なら二度押し。 */
+/** 直前の中央タップ（なければ null）と今回の中央タップが、300ms 以内・24px 以内なら二度押し。 */
 export function isDoubleTap(prev: TapRecord | null, now: TapRecord): boolean {
   if (!prev) return false
   const dt = now.time - prev.time

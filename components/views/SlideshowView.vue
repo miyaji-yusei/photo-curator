@@ -158,7 +158,7 @@ function release(event: PointerEvent, cancelled: boolean) {
   if (stage.value?.hasPointerCapture(event.pointerId)) stage.value.releasePointerCapture(event.pointerId)
   if (cancelled) return snapBack(moved)
   if (!moved) {
-    // クリック。上の帯は★5、ほぼ中心は何もしない（二度押しで拡大）、それ以外は左半分が落とす・右半分が残す
+    // クリック。上のほうは★5、左のほうは落とす、右のほうは残す、中央の縦帯は何もしない（二度押しで拡大）
     // （長押しの拡大はしない）。
     const rect = stage.value?.getBoundingClientRect()
     if (!rect) return
@@ -256,13 +256,13 @@ async function undo() {
           <v-btn
             icon="mdi-star-outline" size="x-small" variant="flat"
             :disabled="busy"
-            :aria-label="`${photo.name} を★${MAX_RATING} で確定（キー 5・↑、写真の上のほうのクリックでも確定。ほぼ中心のクリックは何もせず、二度押しで拡大）`"
+            :aria-label="`${photo.name} を★${MAX_RATING} で確定（キー 5・↑、写真の上のほうのクリックでも確定。中央のクリックは何もせず、二度押しで拡大）`"
             :title="`★${MAX_RATING} で確定（5・↑）`"
             @click.stop="decide('top')"
           />
           <v-btn
             icon="mdi-magnify-plus-outline" size="x-small" variant="flat"
-            :aria-label="`${photo.name} を拡大`" title="拡大（写真の中心の二度押しでも開く）"
+            :aria-label="`${photo.name} を拡大`" title="拡大（写真の中央の二度押しでも開く）"
             @click.stop="openZoom(photo, [photo])"
           />
         </div>
