@@ -692,10 +692,8 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
     },
 
     getPhotosByIds: async (projectId: string, photoIds: string[]) => {
-      const rows = await store.photosOfProject(projectId)
-      const byId = new Map(rows.map(row => [row.id, row]))
-      // 渡された順を保つ。まとめの代表が先頭に来る前提の画面がある。
-      const ordered = photoIds.map(id => byId.get(id)).filter((row): row is StoredPhoto => !!row)
+      // 主キーで読む（全行を読まない）。渡された順を保つ。まとめの代表が先頭に来る前提の画面がある。
+      const ordered = (await store.photosByIds(projectId, photoIds)).filter((row): row is StoredPhoto => !!row)
       return decorate(ordered, projectId)
     },
 

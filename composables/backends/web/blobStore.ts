@@ -59,13 +59,15 @@ export function createIdbBlobStore(): BlobStore {
     load: async (photoIds, options) => {
       const withDisplay = options?.display !== false
       const blobs = await withStores([STORE_THUMBNAILS, STORE_DISPLAYS], 'readonly', async transaction => {
-        const result = new Map<string, { thumb?: Blob, display?: Blob }>()
-        for (const id of photoIds) {
-          const thumb = await getOne<BlobRow>(transaction, STORE_THUMBNAILS, id)
-          const display = withDisplay ? await getOne<BlobRow>(transaction, STORE_DISPLAYS, id) : undefined
-          result.set(id, { thumb: thumb?.blob, display: display?.blob })
-        }
-        return result
+        // リクエストを先に全部出してから待つ（1 件ずつ往復しない。W12）。
+        const found = await Promise.all(photoIds.map(async id => {
+          const [thumb, display] = await Promise.all([
+            getOne<BlobRow>(transaction, STORE_THUMBNAILS, id),
+            withDisplay ? getOne<BlobRow>(transaction, STORE_DISPLAYS, id) : undefined
+          ])
+          return [id, { thumb: thumb?.blob, display: display?.blob }] as const
+        }))
+        return new Map<string, { thumb?: Blob, display?: Blob }>(found)
       })
       const urls = new Map<string, PhotoUrls>()
       for (const [id, found] of blobs) {

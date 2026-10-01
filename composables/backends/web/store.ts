@@ -30,7 +30,17 @@ export interface WebStore {
   /** 行・Session・手直し・handle を消す。画像の実体は `blobStore.remove`。 */
   deleteProject: (projectId: string, photoIds: string[]) => Promise<void>
 
+  /**
+   * そのプロジェクトの全行。**読んだ結果をプロジェクトごとに覚える**（書き込みの経路は全部、覚えたものを
+   * 更新か破棄する）。返す配列は呼び出しごとの写しなので、並べ替えても覚えた側は変わらない。
+   * 他のタブの書き込みは見えない（このページ 1 つが書き手という前提）。
+   */
   photosOfProject: (projectId: string) => Promise<StoredPhoto[]>
+  /**
+   * 主キーで読む。渡した順・重複のまま返し、無い id・別のプロジェクトの行は `undefined`。
+   * 全行を読まないので、組の表示（10〜20 枚）に使う。
+   */
+  photosByIds: (projectId: string, photoIds: string[]) => Promise<(StoredPhoto | undefined)[]>
   putPhotos: (rows: StoredPhoto[]) => Promise<void>
   /** 1 枚の行だけを読み直して書く。無ければ何もしない。 */
   patchPhoto: (photoId: string, patch: Partial<StoredPhoto>) => Promise<void>
@@ -76,6 +86,22 @@ export const DEVICE_KEY = 'device'
 export const DISPLAY_EDGE_KEY = 'displayEdge'
 
 export function createIdbStore(): WebStore {
+  /** プロジェクトごとの全行。書き込みで更新か破棄する。 */
+  const rowCache = new Map<string, StoredPhoto[]>()
+  /** 書き込みのたびに進める。読みの途中で書き込みが入ったら、その読みの結果は覚えない。 */
+  let writeGeneration = 0
+  const dropRows = (projectId: string) => {
+    writeGeneration += 1
+    rowCache.delete(projectId)
+  }
+  /** 覚えた全行へ、書き込みの結果をそのまま反映する（書き込みの完了後に呼ぶ）。 */
+  const patchCachedRows = (projectId: string, changes: Map<string, StoredPhoto>) => {
+    writeGeneration += 1
+    const cached = rowCache.get(projectId)
+    if (!cached) return
+    rowCache.set(projectId, cached.map(row => changes.get(row.id) ?? row))
+  }
+
   return {
     listProjects: () =>
       withStores([STORE_PROJECTS], 'readonly', transaction => getAll<StoredProject>(transaction, STORE_PROJECTS)),
@@ -109,64 +135,108 @@ export function createIdbStore(): WebStore {
           await deleteOne(transaction, STORE_PROJECTS, projectId)
         }
       )
+      dropRows(projectId)
     },
 
-    photosOfProject: projectId =>
-      withStores([STORE_PHOTOS], 'readonly', transaction => photosOfProject(transaction, projectId)),
+    photosOfProject: async projectId => {
+      const cached = rowCache.get(projectId)
+      if (cached) return cached.slice()
+      const generation = writeGeneration
+      const rows = await withStores([STORE_PHOTOS], 'readonly', transaction => photosOfProject(transaction, projectId))
+      // 読んでいる間に書き込みが入っていたら、古いかもしれないので覚えない。
+      if (generation === writeGeneration) rowCache.set(projectId, rows)
+      return rows.slice()
+    },
+
+    photosByIds: async (projectId, photoIds) => {
+      // リクエストを先に全部出してから待つ（1 件ずつ往復しない）。
+      const rows = await withStores([STORE_PHOTOS], 'readonly', transaction =>
+        Promise.all(photoIds.map(id => getOne<StoredPhoto>(transaction, STORE_PHOTOS, id))))
+      return rows.map(row => (row && row.projectId === projectId ? row : undefined))
+    },
 
     putPhotos: async rows => {
       if (!rows.length) return
-      await withStores([STORE_PHOTOS], 'readwrite', transaction => {
-        const photos = transaction.objectStore(STORE_PHOTOS)
-        // 1 件ずつ待たない。トランザクションの完了が全部の書き込みの完了。
-        for (const row of rows) photos.put(row)
-      })
+      try {
+        await withStores([STORE_PHOTOS], 'readwrite', transaction => {
+          const photos = transaction.objectStore(STORE_PHOTOS)
+          // 1 件ずつ待たない。トランザクションの完了が全部の書き込みの完了。
+          for (const row of rows) photos.put(row)
+        })
+      } finally {
+        for (const projectId of new Set(rows.map(row => row.projectId))) dropRows(projectId)
+      }
     },
 
     patchPhoto: async (photoId, patch) => {
-      await withStores([STORE_PHOTOS], 'readwrite', async transaction => {
-        const row = await getOne<StoredPhoto>(transaction, STORE_PHOTOS, photoId)
-        if (!row) return
-        await putOne(transaction, STORE_PHOTOS, { ...row, ...patch })
-      })
+      const written: StoredPhoto[] = []
+      try {
+        await withStores([STORE_PHOTOS], 'readwrite', async transaction => {
+          const row = await getOne<StoredPhoto>(transaction, STORE_PHOTOS, photoId)
+          if (!row) return
+          const next = { ...row, ...patch }
+          await putOne(transaction, STORE_PHOTOS, next)
+          written.push(next)
+        })
+      } catch (cause) {
+        // 書けたかどうか分からないので、覚えたものは捨てる。
+        for (const row of written) dropRows(row.projectId)
+        throw cause
+      }
+      for (const row of written) patchCachedRows(row.projectId, new Map([[row.id, row]]))
     },
 
     saveSelectionResults: async (projectId, entries) => {
       if (!entries.length) return
-      await withStores([STORE_PHOTOS], 'readwrite', async transaction => {
-        for (const entry of entries) {
-          const row = await getOne<StoredPhoto>(transaction, STORE_PHOTOS, entry.id)
-          if (!row || row.projectId !== projectId) continue
-          await putOne(transaction, STORE_PHOTOS, {
-            ...row,
-            rating: Math.min(MAX_RATING, Math.max(0, entry.rating))
+      const written = new Map<string, StoredPhoto>()
+      try {
+        await withStores([STORE_PHOTOS], 'readwrite', async transaction => {
+          // 読みを先に全部出し、書きも待たずに出す（1 件ずつ往復しない。W12）。
+          // 同じ id が 2 回あっても、書くのは星だけなので最後の値が残る（前と同じ）。
+          const rows = await Promise.all(entries.map(entry => getOne<StoredPhoto>(transaction, STORE_PHOTOS, entry.id)))
+          const writes: Promise<unknown>[] = []
+          entries.forEach((entry, index) => {
+            const row = rows[index]
+            if (!row || row.projectId !== projectId) return
+            const next = { ...row, rating: Math.min(MAX_RATING, Math.max(0, entry.rating)) }
+            writes.push(putOne(transaction, STORE_PHOTOS, next))
+            written.set(next.id, next)
           })
-        }
-      })
+          await Promise.all(writes)
+        })
+      } catch (cause) {
+        dropRows(projectId)
+        throw cause
+      }
+      patchCachedRows(projectId, written)
     },
 
     resetRatings: async projectId => {
-      await withStores([STORE_PHOTOS], 'readwrite', async transaction => {
-        const rows = await photosOfProject(transaction, projectId)
-        for (const row of rows) {
-          if (row.rating === 0) continue
-          await putOne(transaction, STORE_PHOTOS, { ...row, rating: 0 })
-        }
-      })
+      try {
+        await withStores([STORE_PHOTOS], 'readwrite', async transaction => {
+          const rows = await photosOfProject(transaction, projectId)
+          await Promise.all(rows
+            .filter(row => row.rating !== 0)
+            .map(row => putOne(transaction, STORE_PHOTOS, { ...row, rating: 0 })))
+        })
+      } finally {
+        dropRows(projectId)
+      }
     },
 
-    moveRating: (projectId, fromRating, toRating, include, exclude) =>
-      withStores([STORE_PHOTOS], 'readwrite', async transaction => {
-        const rows = await photosOfProject(transaction, projectId)
-        let moved = 0
-        for (const row of rows) {
-          if (row.isMissing || row.rating !== fromRating) continue
-          if (include ? !include.has(row.id) : exclude.has(row.id)) continue
-          await putOne(transaction, STORE_PHOTOS, { ...row, rating: toRating })
-          moved += 1
-        }
-        return moved
-      }),
+    moveRating: async (projectId, fromRating, toRating, include, exclude) => {
+      try {
+        return await withStores([STORE_PHOTOS], 'readwrite', async transaction => {
+          const rows = await photosOfProject(transaction, projectId)
+          const targets = rows.filter(row =>
+            !row.isMissing && row.rating === fromRating && (include ? include.has(row.id) : !exclude.has(row.id)))
+          await Promise.all(targets.map(row => putOne(transaction, STORE_PHOTOS, { ...row, rating: toRating })))
+          return targets.length
+        })
+      } finally {
+        dropRows(projectId)
+      }
+    },
 
     readSession: projectId =>
       withStores([STORE_STATES], 'readonly', async transaction => {
