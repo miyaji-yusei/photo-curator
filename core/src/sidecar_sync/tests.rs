@@ -612,6 +612,89 @@ fn 計画_この端末のやり直しは見た版の上なら書く_3の13() {
 }
 
 #[test]
+fn 計画_書きかけで壊れたcatalogは読めないことにして判断に渡さない_3の6_3の8() {
+    // 途中で止まった書き込み（直接書き換えの途中）。中途半端に読んで上書きしない。
+    let whole = sidecar_to_json(sidecar(Some(progressed()), Some("w-a1"), "android", 10));
+    let half = whole[..whole.len() / 2].to_string();
+    assert!(sidecar_from_json(half).is_none());
+    // 空のファイルも同じ。
+    assert!(sidecar_from_json(String::new()).is_none());
+}
+
+#[test]
+fn 計画_同じフォルダの別プロジェクトも黙って上書きしない_3の11() {
+    // 先に作ったプロジェクトが書いた版。後から作ったプロジェクトはまだ見ていない。
+    let first = sidecar(Some(progressed()), Some("w-first"), "android", 10);
+    // 後のプロジェクトが未着手なら取り込むだけ（失うものが無い）。
+    assert!(matches!(
+        sidecar_plan(SeenRecord::default(), judge(Some(fresh())), Some(first.clone()), true, false),
+        SidecarPlan::Pull { reason: PullReason::LocalUntouched, .. }
+    ));
+    // 後のプロジェクトも着手済みなら確認（どちらも黙って消さない）。
+    assert!(matches!(
+        sidecar_plan(SeenRecord::default(), judge(Some(other_progress())), Some(first), true, false),
+        SidecarPlan::Clash { .. }
+    ));
+}
+
+#[test]
+fn 計画_明示の保存も同じ判断で相手の変更を上書きしない_3の14() {
+    let a1 = sidecar(Some(progressed()), Some("w-a1"), "android", 10);
+    let local = advance(progressed(), names(&["e.jpg"]));
+    // NAS が見た版のままなら書く（書く直前に NAS が w-a1 のままであることを確かめる）。
+    assert!(matches!(
+        sidecar_plan(seen_of(&a1), judge(Some(local.clone())), Some(a1.clone()), true, false),
+        SidecarPlan::Push { expected: Some(ref token), .. } if token == "w-a1"
+    ));
+    // その間に別の端末が書いていたら、書かずに確認。
+    let theirs = sidecar(Some(other_progress()), Some("w-x"), "pc", 20);
+    assert!(matches!(
+        sidecar_plan(seen_of(&a1), judge(Some(local)), Some(theirs), true, false),
+        SidecarPlan::Clash { .. }
+    ));
+}
+
+#[test]
+fn 計画_取り込んだあとは落ち着き_書き込んだ版は相手から早送りになる_3の15() {
+    // A（サイドカーから取り込む）: 控えを sidecar_seen にすると、次は何もしない。
+    let theirs = sidecar(Some(other_progress()), Some("w-x"), "pc", 20);
+    let seen = seen_of(&theirs);
+    assert_eq!(seen.key, judgement_key(sidecar_judgement(theirs.clone())));
+    assert!(matches!(
+        sidecar_plan(seen, judge(Some(other_progress())), Some(theirs.clone()), true, false),
+        SidecarPlan::Settled { .. }
+    ));
+
+    // C・D・E（書き込む）: theirs の上に書いた版は、theirs を見て変えていない端末から見て早送り。
+    let merged = merge_judgements(
+        judge(Some(progressed())),
+        judge(Some(other_progress())),
+        MergeMode::Union,
+        2,
+        "e".into(),
+    );
+    let written = sidecar_stamp(sidecar(Some(merged.session), None, "android", 30), "w-merged".into(), Some(theirs.clone()));
+    match sidecar_plan(seen_of(&theirs), judge(Some(other_progress())), Some(written), true, false) {
+        SidecarPlan::Pull { reason: PullReason::FastForward, aside_mine: true, .. } => {}
+        other => panic!("相手は確認なしに取り込むはず: {other:?}"),
+    }
+}
+
+#[test]
+fn 計画_書いている間に増えた判断は次に変更ありとして残る_3の17() {
+    // push を組んだ瞬間の写しから比較キーを控える（今の generation の代わり）。
+    let snapshot = progressed();
+    let written = sidecar_stamp(sidecar(Some(snapshot.clone()), None, "android", 10), "w-a2".into(), None);
+    let seen = SeenRecord { token: "w-a2".into(), key: judgement_key(judge(Some(snapshot))), epoch: None };
+    // 書いている間に 1 組進んだ。
+    let later = advance(progressed(), names(&["e.jpg"]));
+    assert!(matches!(
+        sidecar_plan(seen, judge(Some(later)), Some(written), true, false),
+        SidecarPlan::Push { reason: PushReason::LocalChanged, .. }
+    ));
+}
+
+#[test]
 fn 版の見分け_時計がずれても書いた版で見分ける_3の5() {
     let legacy = sidecar(None, None, "pc", 100);
     assert_eq!(sidecar_token(legacy), "legacy:100:pc");
