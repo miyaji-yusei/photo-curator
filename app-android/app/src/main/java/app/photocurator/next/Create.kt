@@ -77,6 +77,8 @@ fun CreateScreen(
     // いま開いている NAS のフォルダ（"" は共有の直下）。**潜れるようにする。**
     // 直下に写真が無くても、中のフォルダに写真があることは普通にある。
     var here by remember { mutableStateOf("") }
+    // パスワードを入れたあとに、同じタブの一覧を読み直させる合図（中身が同じリストでは動かない）。
+    var reloadKey by remember { mutableStateOf(0) }
     // 「このフォルダ以下ぜんぶ」で作るか。**中にフォルダがあるときだけ選べる。**
     var deep by remember { mutableStateOf(false) }
     var strip by remember { mutableStateOf<List<Any>>(emptyList()) }
@@ -174,7 +176,7 @@ fun CreateScreen(
 
     // **タブが変わったら必ず取り直す。** 前のタブの一覧が残っていると、
     // 見出しと中身が食い違う。
-    LaunchedEffect(tab, nasList, here) {
+    LaunchedEffect(tab, nasList, here, reloadKey) {
         albums = emptyList()
         folders = emptyList()
         covers = emptyMap()
@@ -604,7 +606,7 @@ fun CreateScreen(
                         NasPasswords.hold(nas.id, entered)
                         asking = null
                         // 同じタブをもう一度読み直させる。
-                        nasList = nasList.toList()
+                        reloadKey += 1
                     },
                     onDismiss = { asking = null; tab = "album" }
                 )
