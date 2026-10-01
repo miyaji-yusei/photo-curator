@@ -4752,6 +4752,32 @@ async fn write_sidecar(
     .map_err(|error| error.to_string())?
 }
 
+/// `catalog.json` を楽観ロックで書く（U34。設計書 §4.4）。`expected` は画面が判断に使った中身
+/// （無かったなら None）。返すのは "written" / "changed" / "locked"。
+#[tauri::command]
+async fn write_sidecar_checked(
+    app: AppHandle,
+    project_id: String,
+    json: String,
+    expected: Option<String>,
+) -> Result<sidecar::CheckedWrite, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = connection(&app)?;
+        if amazon_source_of(&conn, &project_id)?.is_some() {
+            return Err("Amazon の共有リンクにはサイドカーを書けません。".to_string());
+        }
+        let holder = sidecar::device_identity(&conn)?;
+        sidecar::write_checked(
+            &sidecar_folder(&app, &project_id)?,
+            &json,
+            expected.as_deref(),
+            &format!("{} ({})", holder.name, holder.id),
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 #[tauri::command(async)]
 fn load_sidecar_state(app: AppHandle, project_id: String) -> Result<sidecar::SidecarState, String> {
     sidecar::load_state(&connection(&app)?, &project_id)
@@ -4813,6 +4839,7 @@ pub fn run() {
             sidecar_supported,
             read_sidecar,
             write_sidecar,
+            write_sidecar_checked,
             load_sidecar_state,
             save_sidecar_state,
             device_identity
