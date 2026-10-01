@@ -2706,7 +2706,7 @@ fn run_burst_analysis(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn list_projects(app: AppHandle) -> Result<Vec<Project>, String> {
     let conn = connection(&app)?;
     let mut statement = conn
@@ -2732,7 +2732,7 @@ fn list_projects(app: AppHandle) -> Result<Vec<Project>, String> {
         .map_err(|error| error.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn create_project(app: AppHandle, name: String, folder_path: String) -> Result<Project, String> {
     if !Path::new(&folder_path).is_dir() {
         return Err(
@@ -2952,7 +2952,7 @@ fn write_atomically(file: &Path, bytes: &[u8]) -> Result<(), String> {
 /// これが無かったため、プロジェクトを開くたびに無条件で事前生成を起動しており、
 /// 実際には何もすることが無くても進捗イベントだけが飛んで、UI に解析中の帯が
 /// 一瞬出ていた。
-#[tauri::command]
+#[tauri::command(async)]
 fn get_analysis_backlog(app: AppHandle, project_id: String) -> Result<i64, String> {
     let conn = connection(&app)?;
     // Amazon の撮影時刻は走査で入る（contentDate が無い写真は空のまま）ので、空でも「未解析」に数えない。
@@ -3843,7 +3843,7 @@ async fn write_text_file(path: String, text: String) -> Result<(), String> {
     .map_err(|error| error.to_string())?
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_photos_by_ids(
     app: AppHandle,
     project_id: String,
@@ -3902,7 +3902,7 @@ struct PairOverrideRow {
     decision: String,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_pair_overrides(app: AppHandle, project_id: String) -> Result<Vec<PairOverrideRow>, String> {
     let conn = connection(&app)?;
     let mut statement = conn
@@ -4005,7 +4005,7 @@ struct DisplaySettings {
     project_edge: Option<u32>,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_display_settings(app: AppHandle, project_id: Option<String>) -> Result<DisplaySettings, String> {
     let project_edge = match project_id {
         Some(id) => Some(resolve_display_edge(&app, &id)?),
@@ -4056,7 +4056,7 @@ fn save_project_display_edge(
 
 /// まだ表示用画像が要る枚数。0 なら生成を起動しない
 /// （`get_analysis_backlog` と同じ考え方）。
-#[tauri::command]
+#[tauri::command(async)]
 fn get_display_backlog(app: AppHandle, project_id: String) -> Result<i64, String> {
     let edge = resolve_display_edge(&app, &project_id)?;
     connection(&app)?
@@ -4425,7 +4425,7 @@ fn cancel_project_task(registry: State<'_, TaskRegistry>, project_id: String, ta
     registry.cancel(&format!("{task}:{project_id}"));
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn save_project_state(
     app: AppHandle,
     project_id: String,
@@ -4438,7 +4438,7 @@ fn save_project_state(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn load_project_state(app: AppHandle, project_id: String) -> Result<Option<String>, String> {
     let conn = connection(&app)?;
     match conn.query_row(
@@ -4625,7 +4625,7 @@ async fn write_sidecar(
     .map_err(|error| error.to_string())?
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn load_sidecar_state(app: AppHandle, project_id: String) -> Result<sidecar::SidecarState, String> {
     sidecar::load_state(&connection(&app)?, &project_id)
 }
@@ -4639,7 +4639,7 @@ fn save_sidecar_state(
     sidecar::save_state(&connection(&app)?, &project_id, &state)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn device_identity(app: AppHandle) -> Result<sidecar::DeviceIdentity, String> {
     sidecar::device_identity(&connection(&app)?)
 }
