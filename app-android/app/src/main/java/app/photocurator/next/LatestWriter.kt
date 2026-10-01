@@ -88,3 +88,20 @@ object Persist {
         }.submit(job).await()
     }
 }
+
+/**
+ * 「変わった分が [every] 件たまったら 1 回保存する」の数え役。**変わらなかったものは数えない。**
+ * 準備済みの写真を通るだけで、ハッシュ値のファイルを何度も書き直さないため。
+ */
+class PartialCounter(private val every: Int) {
+    private var pending = 0
+
+    /** [changed] なら 1 件足す。保存する時期なら true（数え直す）。 */
+    fun add(changed: Boolean): Boolean {
+        if (!changed) return false
+        pending += 1
+        if (pending < every) return false
+        pending = 0
+        return true
+    }
+}

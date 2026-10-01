@@ -143,7 +143,10 @@ fun CullScreen(
         holdZooms = Prefs.holdZooms(context)
         // **大きさはプロジェクトごと。** 設定の値はその既定。
         edge = Prefs.projectEdge(context, project.id)
-        Neighbours.log(refs, loadedThreshold)
+        // 診断のログ。**全隣接ペアで距離を計算する**ので、開発用のビルドでだけ走らせる（A4）。
+        if (context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+            Neighbours.log(refs, loadedThreshold)
+        }
 
         // **途中があれば続きから。** 無ければ新しく始める。
         val saved = Store.load(context, project.id)

@@ -200,7 +200,11 @@ object Analyse {
         }
 
         var done = 0
+        // **新しく作った（変わった）分だけを数える。** 準備済みの写真を通るだけで
+        // 50 回ごとにファイルを書き直さない（A4）。
+        val unsaved = PartialCounter(50)
         suspend fun record(photo: Photo, made: Fingerprint?) {
+            val changed = needsWork(photo)
             if (made != null) out[photo.relativePath] = made
             // 作れなかったものは控えない。**次に開いたときにもう一度試す。**
             // 古い（大きさの違う）値が残っていたら消す。
@@ -208,7 +212,7 @@ object Analyse {
             done += 1
             if (done % 10 == 0 || done == photos.size) onProgress(done, photos.size)
             // **途中でやめても、作った分は残す。**
-            if (done % 50 == 0) onPartial(HashMap(out))
+            if (unsaved.add(changed)) onPartial(HashMap(out))
         }
 
         suspend fun sweepLocal() {
