@@ -329,8 +329,35 @@ fn db_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("photo-curator-v2.sqlite3"))
 }
 
+/// スキーマ整備（`open_database`）を済ませた DB ファイルのパス。プロセスの中で 1 本の
+/// ファイルにつき 1 回だけ整備し、以後の `connection()` は軽く開くだけにする（U27 R1）。
+static MIGRATED_DATABASES: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
 fn connection(app: &AppHandle) -> Result<Connection, String> {
-    open_database(&db_path(app)?)
+    open_connection(&db_path(app)?)
+}
+
+/// 初回（プロセスで最初に開くとき）だけ `open_database` で整備し、2 回目以降は
+/// 開いて接続の設定をするだけ。整備が失敗したら記録しないので、次回また整備する。
+fn open_connection(path: &Path) -> Result<Connection, String> {
+    // 整備中に別スレッドが同じ整備を重ねないよう、ロックを持ったまま整備する。
+    let mut migrated = MIGRATED_DATABASES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if migrated.iter().any(|known| known == path) {
+        drop(migrated);
+        let conn = Connection::open(path)
+            .map_err(|error| database_error("ローカルデータベースを開けませんでした", error))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|error| database_error("ローカルデータベースを設定できませんでした", error))?;
+        // journal_mode=WAL はファイルに残る。synchronous だけは接続ごとの設定。
+        conn.execute_batch("PRAGMA synchronous=NORMAL;")
+            .map_err(|error| database_error("ローカルデータベースを設定できませんでした", error))?;
+        return Ok(conn);
+    }
+    let conn = open_database(path)?;
+    migrated.push(path.to_path_buf());
+    Ok(conn)
 }
 
 // サムネイルの置き場。DB と同じ app_data_dir 配下に置くので、
@@ -409,8 +436,11 @@ fn backfill_missing_fingerprints(conn: &Connection) -> Result<(), String> {
     let pending: Vec<(String, String)> = {
         let mut statement = conn
             .prepare(
+                // Amazon の行は fingerprint を持たない（実在しない相対パスの stat が毎回
+                // 失敗するだけ）ので、フォルダ以外のプロジェクトの行は除く。
                 "SELECT id,path FROM photos
-                 WHERE fingerprint_mtime IS NULL OR fingerprint_size IS NULL
+                 WHERE (fingerprint_mtime IS NULL OR fingerprint_size IS NULL)
+                   AND project_id NOT IN (SELECT id FROM projects WHERE source_kind<>'folder')
                  LIMIT ?1",
             )
             .map_err(|error| database_error("ローカルデータベースを確認できませんでした", error))?;
@@ -5035,6 +5065,63 @@ mod tests {
             "fingerprint_size が実ファイルと一致する"
         );
 
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    // 接続の使い回し（U27 R1）: 初回だけ整備し、2 回目以降は整備なしで同じデータが見える。
+    // Amazon の行は backfill の対象外（fingerprint が NULL のまま、stat も走らない）。
+    #[test]
+    fn open_connection_migrates_once_and_keeps_data_visible() {
+        let directory = test_directory("open-connection");
+        let database = directory.join("once.sqlite3");
+        {
+            let conn = open_connection(&database).expect("first open");
+            conn.execute(
+                "INSERT INTO projects (id,name,folder_path,created_at,updated_at,source_kind) VALUES ('amz','a','https://x',1,1,'amazon')",
+                [],
+            )
+            .expect("insert project");
+            conn.execute(
+                "INSERT INTO photos (id,project_id,path,relative_path,name,rating,is_missing) VALUES ('p1','amz','node-1','node-1','n',4,0)",
+                [],
+            )
+            .expect("insert photo");
+        }
+        // 整備済みなら、整備の跡（索引）を消しても 2 回目は作り直さない。
+        {
+            let conn = open_connection(&database).expect("second open");
+            conn.execute_batch("DROP INDEX photos_project_visible;")
+                .expect("drop index");
+        }
+        let conn = open_connection(&database).expect("third open");
+        let indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='photos_project_visible'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(indexes, 0, "2 回目以降は整備しない");
+        let (rating, mtime): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT rating,fingerprint_mtime FROM photos WHERE id='p1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read");
+        assert_eq!((rating, mtime), (4, None), "データはそのまま見える");
+        // 整備し直す経路（open_database）は従来どおり索引を作る。
+        drop(conn);
+        let conn = open_database(&database).expect("full migrate");
+        let indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='photos_project_visible'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(indexes, 1);
         drop(conn);
         fs::remove_dir_all(&directory).expect("remove test directory");
     }
