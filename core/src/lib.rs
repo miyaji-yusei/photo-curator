@@ -743,6 +743,8 @@ pub fn round_for(
     if chosen.len() < 2 {
         return None;
     }
+    let in_round: std::collections::HashSet<String> =
+        chosen.iter().map(|photo| photo.relative_path.clone()).collect();
 
     let mut session = start_round(
         chosen,
@@ -757,10 +759,53 @@ pub fn round_for(
     session.ratings = previous.ratings;
     // **まとまりも引き継ぐ。** 作り直すだけだと、前のラウンドで決めた組が
     // 結果画面から消える（連写の中身を選別する入口も一緒に消える）。
-    let mut members = previous.members;
-    members.extend(session.members);
-    session.members = members;
+    session.members = carry_members(previous.members, session.members, &in_round);
     Some(session)
+}
+
+/// 前のラウンドまでのまとまりに、新しいラウンドのまとまりを重ねる。
+///
+/// 新しい組が同じ代表を使うときは新しい方で上書きする（04 章）。ただし
+/// **新しい組に入った写真が前のラウンドで連れていた仲間は、新しい組に連れてくる。**
+/// 次のラウンドに出るのは代表だけなので、別々のまとまりの代表どうしが
+/// 隣になって畳まれることがある（間の写真を落としたとき）。そのまま上書きすると
+/// 前の仲間が代表から外れ、代表を選んでも仲間の星が動かない（INV-2 が破れる。U38・R15）。
+///
+/// 連れてくるのは、**このラウンドで組み直していない仲間だけ**（`in_round` に無いもの）。
+/// このラウンドに出ている写真は、新しい組み方の方を採る。
+/// 畳まれてもう代表でなくなった写真の記録は消す（1 枚が 2 つのまとまりに入らない）。
+fn carry_members(
+    previous: HashMap<String, Vec<String>>,
+    fresh: HashMap<String, Vec<String>>,
+    in_round: &std::collections::HashSet<String>,
+) -> HashMap<String, Vec<String>> {
+    let mut all = previous.clone();
+    for (rep, mates) in fresh {
+        let mut merged: Vec<String> = Vec::new();
+        for id in &mates {
+            let carried: Vec<String> = match previous.get(id) {
+                Some(old) if old.contains(id) => old
+                    .iter()
+                    .filter(|mate| *mate == id || !in_round.contains(*mate))
+                    .cloned()
+                    .collect(),
+                Some(old) => std::iter::once(id.clone())
+                    .chain(old.iter().filter(|mate| !in_round.contains(*mate)).cloned())
+                    .collect(),
+                None => vec![id.clone()],
+            };
+            for mate in carried {
+                if !merged.contains(&mate) {
+                    merged.push(mate);
+                }
+            }
+            if id != &rep {
+                all.remove(id);
+            }
+        }
+        all.insert(rep, merged);
+    }
+    all
 }
 
 pub fn next_round(
@@ -787,6 +832,8 @@ pub fn next_round(
     if remaining.len() < 2 {
         return None;
     }
+    let in_round: std::collections::HashSet<String> =
+        remaining.iter().map(|photo| photo.relative_path.clone()).collect();
 
     let mut session = start_round(
         remaining,
@@ -802,9 +849,8 @@ pub fn next_round(
     session.ratings = previous.ratings;
     // **まとまりも引き継ぐ。** 作り直すだけだと、前のラウンドで決めた組が
     // 結果画面から消える（連写の中身を選別する入口も一緒に消える）。
-    let mut members = previous.members;
-    members.extend(session.members);
-    session.members = members;
+    // 別々のまとまりの代表が畳まれたときは、前の仲間も連れてくる（R15）。
+    session.members = carry_members(previous.members, session.members, &in_round);
     // history は引き継がない。**戻すはラウンドをまたがない。**
     // またぐと、戻した先の round と target_star が合わなくなる。
     Some(session)
@@ -2230,5 +2276,100 @@ mod tests {
     fn サイドカー_壊れたjsonはnone() {
         assert!(sidecar_from_json("{ 壊れている".into()).is_none());
         assert!(sidecar_from_json("not json at all".into()).is_none());
+    }
+
+    // ---- U38（レビュー R15〜R17）の再現 ----
+
+    /// A1・A2 が連写、B は別物、A3 は単独（A4 があれば A3・A4 が連写）。
+    /// B を挟んで切れているが、**A1 と A3 だけを並べると基準では繋がる**。
+    fn split_by_b(with_a4: bool) -> Vec<PhotoRef> {
+        let mut photos = vec![
+            photo("A1", 0, "0000000000000000"),
+            photo("A2", 1000, "0000000000000000"),
+            photo("B", 2000, "ffffffffffffffff"),
+            photo("A3", 3000, "0000000000000000"),
+        ];
+        if with_a4 {
+            photos.push(photo("A4", 3500, "0000000000000000"));
+        }
+        photos
+    }
+
+    /// 1 ラウンド目: A1 と A3 を通し、B を落とす。
+    fn pass_a1_and_a3(photos: &[PhotoRef]) -> Session {
+        let session = start_round(photos.to_vec(), 3, 0, true, threshold(), vec![]);
+        assert_eq!(session.current, vec!["A1", "B", "A3"]);
+        let session = advance(session, vec!["A1".into(), "A3".into()]);
+        assert_eq!(session.survivors, vec!["A1", "A3"]);
+        session
+    }
+
+    #[test]
+    fn r15_次のラウンドで代表どうしが畳まれても前の仲間の星が追従する() {
+        let photos = split_by_b(false);
+        let first = pass_a1_and_a3(&photos);
+        assert_eq!(first.ratings["A2"], 1);
+
+        let second = next_round(first, photos, true, threshold(), vec![]).unwrap();
+        // A1 と A3 は 1 つのまとまりとして出る（畳み方は今のまま）。
+        assert_eq!(second.current, vec!["A1"]);
+
+        let after = advance(second, vec!["A1".into()]);
+        // INV-2: 仲間の星は常に代表と同じ。
+        assert_eq!(after.ratings["A1"], 2);
+        assert_eq!(after.ratings["A3"], 2);
+        assert_eq!(after.ratings["A2"], 2, "前のラウンドの仲間 A2 が追従していない");
+    }
+
+    #[test]
+    fn r15_畳まれた代表の仲間も追従し戻すと元に返る() {
+        let photos = split_by_b(true);
+        let first = pass_a1_and_a3(&photos);
+        assert_eq!(first.ratings["A4"], 1);
+
+        let second = next_round(first, photos, true, threshold(), vec![]).unwrap();
+        // 畳まれた A3 はもう代表ではない。**1 枚が 2 つのまとまりに入らない。**
+        assert!(!second.members.contains_key("A3"));
+        assert_eq!(second.members["A1"], vec!["A1", "A2", "A3", "A4"]);
+
+        let after = advance(second, vec!["A1".into()]);
+        for id in ["A1", "A2", "A3", "A4"] {
+            assert_eq!(after.ratings[id], 2, "{id} が代表に追従していない");
+        }
+        assert_eq!(after.ratings["B"], 0);
+
+        let back = undo(after);
+        for id in ["A1", "A2", "A3", "A4"] {
+            assert_eq!(back.ratings[id], 1, "{id} が戻っていない");
+        }
+    }
+
+    #[test]
+    fn r15_星を指定したラウンドでも畳まれた代表の仲間が追従する() {
+        let photos = split_by_b(false);
+        let mut first = pass_a1_and_a3(&photos);
+        // 人が A2 だけ星を直した（04 章: 手直しの差はその後の確定でも保たれる）。
+        first.ratings.insert("A2".into(), 3);
+
+        let again = round_for(first, photos, 1, true, threshold(), vec![]).unwrap();
+        assert_eq!(again.current, vec!["A1"]);
+        let after = advance(again, vec!["A1".into()]);
+        assert_eq!(after.ratings["A1"], 2);
+        assert_eq!(after.ratings["A3"], 2);
+        // 畳まれなかったとき（A1 が単独）と同じく、差分で動く。
+        assert_eq!(after.ratings["A2"], 4, "前の仲間 A2 が差分で追従していない");
+    }
+
+    #[test]
+    fn r15_次のラウンドで畳まれなければ前のまとまりはそのまま() {
+        // 既存の挙動の固定: 代表が単独のまま上がるなら、前の仲間をそのまま持つ。
+        let photos = split_by_b(false);
+        let session = start_round(photos.clone(), 3, 0, true, threshold(), vec![]);
+        let session = advance(session, vec!["A1".into(), "B".into()]);
+        let second = next_round(session, photos, true, threshold(), vec![]).unwrap();
+        assert_eq!(second.members["A1"], vec!["A1", "A2"]);
+        let after = advance(second, vec!["A1".into()]);
+        assert_eq!(after.ratings["A2"], 2);
+        assert_eq!(after.ratings["B"], 1);
     }
 }
