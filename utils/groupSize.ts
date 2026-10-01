@@ -14,6 +14,13 @@ export interface GroupSizeLimits {
   min: number
 }
 
+/**
+ * スライドショー選別は「1 グループが 1 枚」で表す（セッションの枚数設定と同じ仕組み）。
+ * 中身のモデル（core の Session）は変えない。
+ */
+export const SLIDESHOW_GROUP_SIZE = 1
+export const isSlideshowSize = (size: number) => size === SLIDESHOW_GROUP_SIZE
+
 export const DESKTOP_GROUP_SIZE: GroupSizeLimits = { default: 10, max: 10, min: 2 }
 /** iPad などブラウザで使うときの枚数。3×3 までに抑える。 */
 export const TOUCH_GROUP_SIZE: GroupSizeLimits = { default: 4, max: 9, min: 2 }
@@ -33,5 +40,15 @@ export function groupSizeLimits(largeGroups: boolean): GroupSizeLimits {
  */
 export function clampGroupSize(size: number, limits: GroupSizeLimits): number {
   if (!Number.isFinite(size)) return limits.default
+  // 1 枚は「スライドショー」（方式）。下限（2 枚）に引き上げず、そのまま保つ。
+  if (Math.round(size) === SLIDESHOW_GROUP_SIZE) return SLIDESHOW_GROUP_SIZE
   return Math.min(limits.max, Math.max(limits.min, Math.round(size)))
+}
+
+/**
+ * トーナメントの枚数スライダーに出す値。スライドショー（1 枚）のセッションでは
+ * スライダーの下限（2 枚）を下回るので、既定の枚数に落とす。
+ */
+export function tournamentGroupSize(size: number, limits: GroupSizeLimits): number {
+  return isSlideshowSize(size) ? limits.default : clampGroupSize(size, limits)
 }

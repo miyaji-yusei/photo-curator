@@ -358,7 +358,7 @@ pub fn start_round(
     };
 
     let mut session = Session {
-        group_size: group_size.max(2),
+        group_size: group_size.max(1),
         target_star,
         round: 1,
         queue,
@@ -579,7 +579,7 @@ pub fn resize(session: Session, group_size: u32) -> Session {
     // いま出している分と、まだ見ていない分を 1 本に戻してから取り直す。
     let mut line = std::mem::take(&mut next.current);
     line.append(&mut next.queue);
-    next.group_size = group_size.max(2);
+    next.group_size = group_size.max(1);
     next.queue = line;
     fill(&mut next);
     next
@@ -1641,7 +1641,7 @@ mod tests {
 
     #[test]
     fn まだ見ていないまとまりも差し替えられる() {
-        // group_size 1 相当にはできないので、後ろに連写を置く。
+        // 先頭に連写を置くと queue 側の差し替えが試せないので、後ろに置く。
         let photos = vec![
             photo("1.jpg", 0, "ffffffffffffffff"),
             photo("2.jpg", 500_000, "0f0f0f0f0f0f0f0f"),
@@ -1942,10 +1942,60 @@ mod tests {
     }
 
     #[test]
-    fn 枚数は二枚を下回らない() {
+    fn 枚数は一枚を下回らない() {
         let session = round(&["1", "2", "3", "4"], 4);
-        let after = resize(session, 1);
-        assert_eq!(after.group_size, 2);
+        let after = resize(session, 0);
+        assert_eq!(after.group_size, 1);
+        let after = resize(after, 1);
+        assert_eq!(after.group_size, 1);
+        assert_eq!(after.current, vec!["1"]);
+    }
+
+    // ---- スライドショー（グループ 1 枚） ----
+
+    #[test]
+    fn 一枚ずつ出る() {
+        let session = round(&["1", "2", "3"], 1);
+        assert_eq!(session.group_size, 1);
+        assert_eq!(session.current, vec!["1"]);
+        assert_eq!(session.queue, vec!["2", "3"]);
+    }
+
+    #[test]
+    fn 一枚なら選ぶと星が上がり選ばないと据え置きで外れる() {
+        let session = round(&["1", "2", "3"], 1);
+        let session = advance(session, vec!["1".into()]);
+        assert_eq!(session.ratings["1"], 1);
+        assert_eq!(session.survivors, vec!["1"]);
+        let session = advance(session, vec![]);
+        assert_eq!(session.ratings["2"], 0);
+        assert_eq!(session.survivors, vec!["1"]);
+        assert_eq!(session.current, vec!["3"]);
+    }
+
+    #[test]
+    fn 一枚でも一つ戻せる() {
+        let session = round(&["1", "2", "3"], 1);
+        let session = advance(session, vec!["1".into()]);
+        let back = undo(session);
+        assert_eq!(back.ratings["1"], 0);
+        assert!(back.survivors.is_empty());
+        assert_eq!(back.current, vec!["1"]);
+        assert_eq!(back.queue, vec!["2", "3"]);
+    }
+
+    #[test]
+    fn 一枚でも連写は代表だけが出て仲間に星が揃う() {
+        let session = start_round(burst_photos(), 1, 0, true, threshold(), vec![]);
+        assert_eq!(session.current.len(), 1);
+        let rep = session.current[0].clone();
+        let mates = session.members[&rep].clone();
+        assert!(mates.len() > 1);
+        let session = advance(session, vec![rep.clone()]);
+        for mate in &mates {
+            assert_eq!(session.ratings[mate], 1);
+        }
+        assert_eq!(session.survivors, vec![rep]);
     }
 
     // ---- サイドカー ----

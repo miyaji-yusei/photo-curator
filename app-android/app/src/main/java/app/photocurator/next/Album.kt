@@ -385,7 +385,7 @@ fun ProjectScreen(
                             modifier = Modifier.padding(top = 4.dp)
                         )
                         Text(
-                            "★1 以上 $starred 枚 · ${live.groupSize} 枚ずつ · 連写まとめ on",
+                            "★1 以上 $starred 枚 · ${if (live.groupSize.toInt() == Prefs.SLIDESHOW_SIZE) "スライドショー" else "${live.groupSize} 枚ずつ"} · 連写まとめ on",
                             fontSize = 12.sp, color = Faint,
                             modifier = Modifier.padding(top = 6.dp)
                         )
