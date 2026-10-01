@@ -77,6 +77,9 @@ fun ResultsScreen(
 
     // 大きく見ている並びと、その何枚目か。**ここは見るだけ。**
     var zooming by remember { mutableStateOf<Pair<List<Photo>, Int>?>(null) }
+    // 一覧のスクロール位置。**拡大を開くと下の一覧は組まれなくなる**が、位置はここに残して、
+    // 閉じたときに戻す（A10）。早期 return より前に置くこと。
+    val gridState = androidx.compose.foundation.lazy.grid.rememberLazyGridState()
     // 中身を選別している連写の代表。
     var reviewing by remember { mutableStateOf<String?>(null) }
 
@@ -360,6 +363,7 @@ fun ResultsScreen(
             }
         } else {
             LazyVerticalGrid(
+                state = gridState,
                 columns = GridCells.Adaptive(minSize = 132.dp),
                 modifier = Modifier.weight(1f),
                 contentPadding = PaddingValues(horizontal = 14.dp)
