@@ -21,6 +21,20 @@ import androidx.compose.ui.unit.dp
  */
 private val READING_WIDTH = 620.dp
 
+/**
+ * 2 列を 1 列に畳む幅（dp）。折りたたみ端末のカバー画面は 400dp 前後、開くと 900dp 超。
+ * 開始前シート・設定・プロジェクト作成で同じ基準を使う。
+ */
+const val NARROW_WIDTH_DP = 620
+
+/** 幅（dp）が狭いか。Compose に依存しない判定で、JUnit で確かめる（`LayoutTest`）。 */
+fun isNarrowWidth(widthDp: Int): Boolean = widthDp < NARROW_WIDTH_DP
+
+/** いまの画面幅が狭いか。向きや折りたたみの開閉で幅が変わると再構成される。 */
+@Composable
+fun rememberNarrow(): Boolean =
+    isNarrowWidth(androidx.compose.ui.platform.LocalConfiguration.current.screenWidthDp)
+
 /** 文字と操作のための帯。狭い画面ではそのまま、広い画面では中央に寄せる。 */
 @Composable
 fun Reading(

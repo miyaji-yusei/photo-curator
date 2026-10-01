@@ -20,7 +20,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -79,7 +78,7 @@ fun StartSheet(
             Spacer(Modifier.height(18.dp))
 
             // 幅が足りなければ縦に積む。**2 列は 620dp から。**
-            val narrow = LocalConfiguration.current.screenWidthDp < 620
+            val narrow = rememberNarrow()
             FlowRow(maxItemsInEachRow = if (narrow) 1 else 2) {
                 // ---- 左: 一度に見比べる枚数 ----
                 Column(if (narrow) Modifier.fillMaxWidth() else Modifier.weight(1f)) {

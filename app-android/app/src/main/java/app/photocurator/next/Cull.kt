@@ -635,6 +635,17 @@ private fun CullBar(
     /** スライドショー。**複数選択・まとめる・確定のボタンは出さない。** */
     slideshow: Boolean = false
 ) {
+    // **カバー画面のトーナメントは、進み具合を 2 行目に出す。** 戻る・1 つ戻す・複数選択・
+    // …・？・「落として次へ」で 400dp 弱を使い、中央に残る幅が 40dp ほどしかなく
+    // 「★0 を／選別」と縦に折れて「残り」が消えていた（U25）。
+    val compact = rememberNarrow() && !slideshow && !session.finished
+    val remainingGroups = session.queue.size + session.current.size
+    val remainingPhotos = (session.queue + session.current)
+        .sumOf { session.members[it]?.size ?: 1 }
+    val remainingText =
+        if (remainingPhotos == remainingGroups) "残り $remainingGroups 枚"
+        else "残り $remainingGroups 組 · $remainingPhotos 枚"
+    Column(Modifier.fillMaxWidth()) {
     Row(
         Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 4.dp),
         verticalAlignment = Alignment.CenterVertically
@@ -667,6 +678,7 @@ private fun CullBar(
             }
         }
 
+        if (compact) Spacer(Modifier.weight(1f)) else
         Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
             if (session.finished) {
                 Text(project.name, fontSize = 13.sp)
@@ -677,14 +689,7 @@ private fun CullBar(
                 )
                 // **畳んだことを隠さない。** 人は枚数で考えているので、
                 // 代表の数だけを「残り」と言うと数が合わなくて不安になる。
-                val remainingGroups = session.queue.size + session.current.size
-                val remainingPhotos = (session.queue + session.current)
-                    .sumOf { session.members[it]?.size ?: 1 }
-                Text(
-                    if (remainingPhotos == remainingGroups) "残り $remainingGroups 枚"
-                    else "残り $remainingGroups 組 · $remainingPhotos 枚",
-                    fontSize = 13.sp
-                )
+                Text(remainingText, fontSize = 13.sp)
             }
         }
 
@@ -693,13 +698,10 @@ private fun CullBar(
             IconButton(onClick = onOptions) {
                 Icon(Icons.Filled.MoreHoriz, "設定")
             }
-            // 「…」の右に、丸枠の「？」（操作のヘルプ）。常時表示のヒントは足さず、押したときだけ出す。
-            IconButton(
-                onClick = onHelp,
-                modifier = Modifier
-                    .size(36.dp)
-                    .border(1.dp, Color(0xFF3A3E47), androidx.compose.foundation.shape.CircleShape)
-            ) {
+            // 「…」の右に「？」（操作のヘルプ）。常時表示のヒントは足さず、押したときだけ出す。
+            // **丸枠はアイコン自身の 1 本だけ。** HelpOutline は「？」の外に丸を持っているので、
+            // さらに border を巻くと 2 重になる（U25）。
+            IconButton(onClick = onHelp) {
                 Icon(Icons.Outlined.HelpOutline, "操作のヘルプ", Modifier.size(20.dp))
             }
             if (!slideshow) Spacer(Modifier.width(4.dp))
@@ -721,6 +723,15 @@ private fun CullBar(
                 )
             }
         }
+    }
+    if (compact) {
+        Text(
+            "★${session.targetStar} を選別中 · ROUND ${session.round} · $remainingText",
+            fontSize = 12.sp, color = Lime, maxLines = 1,
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp),
+            textAlign = androidx.compose.ui.text.style.TextAlign.Center
+        )
+    }
     }
 }
 
