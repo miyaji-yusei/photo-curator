@@ -48,7 +48,7 @@ fun PreviewScreen(
 ) {
     val context = LocalContext.current
     // まとまりの良し悪しを見る場所なので、選別と同じ絵を使う。
-    val displayEdge = remember { Prefs.displayEdge(context) }
+    val displayEdge = remember(project.id) { Prefs.projectEdge(context, project.id) }
 
     // スライダーは距離そのもの。**目盛りの数字は見せない。**
     var distance by remember { mutableStateOf(learned.coerceIn(2, 24)) }
