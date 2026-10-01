@@ -289,6 +289,7 @@ mod tests {
     /// 一般ユーザーで `cargo test -- --ignored` を実行すると確かめられる。
     #[test]
     #[ignore = "root ではパーミッションを無視して書けてしまう（一般ユーザーで --ignored を付けて実行する）"]
+    #[cfg(unix)]
     fn support_is_readonly_for_a_directory_without_write_permission() {
         use std::os::unix::fs::PermissionsExt;
         let folder = temp_dir("support-ro");

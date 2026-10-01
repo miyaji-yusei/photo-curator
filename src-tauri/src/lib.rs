@@ -82,6 +82,8 @@ const MIN_ANALYSIS_WORKERS: usize = 2;
 const WORKER_COUNT_ENV: &str = "PHOTO_CURATOR_WORKERS";
 // 1枚の処理に許す時間。異常に遅い / 壊れた1枚で全体が停滞しないようにする。
 const PHOTO_TIMEOUT_MS: u64 = 15_000;
+/// 表示用画像 1 枚の打ち切り。原本の全画素デコードが入るので解析より長くする。
+const DISPLAY_TIMEOUT_MS: u64 = 60_000;
 // writer がキャンセルと timeout を確認する間隔。キャンセルの体感応答はここで決まる。
 const WATCHDOG_TICK_MS: u64 = 100;
 // バックグラウンド事前生成でチャンクごとに空ける間隔。前面の操作を邪魔しないよう
@@ -329,8 +331,35 @@ fn db_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("photo-curator-v2.sqlite3"))
 }
 
+/// スキーマ整備（`open_database`）を済ませた DB ファイルのパス。プロセスの中で 1 本の
+/// ファイルにつき 1 回だけ整備し、以後の `connection()` は軽く開くだけにする（U27 R1）。
+static MIGRATED_DATABASES: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
 fn connection(app: &AppHandle) -> Result<Connection, String> {
-    open_database(&db_path(app)?)
+    open_connection(&db_path(app)?)
+}
+
+/// 初回（プロセスで最初に開くとき）だけ `open_database` で整備し、2 回目以降は
+/// 開いて接続の設定をするだけ。整備が失敗したら記録しないので、次回また整備する。
+fn open_connection(path: &Path) -> Result<Connection, String> {
+    // 整備中に別スレッドが同じ整備を重ねないよう、ロックを持ったまま整備する。
+    let mut migrated = MIGRATED_DATABASES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if migrated.iter().any(|known| known == path) {
+        drop(migrated);
+        let conn = Connection::open(path)
+            .map_err(|error| database_error("ローカルデータベースを開けませんでした", error))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|error| database_error("ローカルデータベースを設定できませんでした", error))?;
+        // journal_mode=WAL はファイルに残る。synchronous だけは接続ごとの設定。
+        conn.execute_batch("PRAGMA synchronous=NORMAL;")
+            .map_err(|error| database_error("ローカルデータベースを設定できませんでした", error))?;
+        return Ok(conn);
+    }
+    let conn = open_database(path)?;
+    migrated.push(path.to_path_buf());
+    Ok(conn)
 }
 
 // サムネイルの置き場。DB と同じ app_data_dir 配下に置くので、
@@ -409,8 +438,11 @@ fn backfill_missing_fingerprints(conn: &Connection) -> Result<(), String> {
     let pending: Vec<(String, String)> = {
         let mut statement = conn
             .prepare(
+                // Amazon の行は fingerprint を持たない（実在しない相対パスの stat が毎回
+                // 失敗するだけ）ので、フォルダ以外のプロジェクトの行は除く。
                 "SELECT id,path FROM photos
-                 WHERE fingerprint_mtime IS NULL OR fingerprint_size IS NULL
+                 WHERE (fingerprint_mtime IS NULL OR fingerprint_size IS NULL)
+                   AND project_id NOT IN (SELECT id FROM projects WHERE source_kind<>'folder')
                  LIMIT ?1",
             )
             .map_err(|error| database_error("ローカルデータベースを確認できませんでした", error))?;
@@ -802,7 +834,9 @@ where
     if total == 0 {
         return Ok(ParallelOutcome::default());
     }
-    let workers = workers.clamp(1, MAX_ANALYSIS_WORKERS).min(total);
+    // 上限は呼び出し側が決める（ローカル・NAS は `analysis_worker_count*` が
+    // MAX_ANALYSIS_WORKERS に丸め済み。Amazon は amazon::WORKERS を使う）。
+    let workers = workers.max(1).min(total);
 
     // worker 側はこのフラグだけを見る。`is_cancelled` は Tauri の State を
     // 借りていて 'static にできないため、writer が毎ティック転記する。
@@ -2704,7 +2738,7 @@ fn run_burst_analysis(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn list_projects(app: AppHandle) -> Result<Vec<Project>, String> {
     let conn = connection(&app)?;
     let mut statement = conn
@@ -2730,7 +2764,7 @@ fn list_projects(app: AppHandle) -> Result<Vec<Project>, String> {
         .map_err(|error| error.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn create_project(app: AppHandle, name: String, folder_path: String) -> Result<Project, String> {
     if !Path::new(&folder_path).is_dir() {
         return Err(
@@ -2950,7 +2984,7 @@ fn write_atomically(file: &Path, bytes: &[u8]) -> Result<(), String> {
 /// これが無かったため、プロジェクトを開くたびに無条件で事前生成を起動しており、
 /// 実際には何もすることが無くても進捗イベントだけが飛んで、UI に解析中の帯が
 /// 一瞬出ていた。
-#[tauri::command]
+#[tauri::command(async)]
 fn get_analysis_backlog(app: AppHandle, project_id: String) -> Result<i64, String> {
     let conn = connection(&app)?;
     // Amazon の撮影時刻は走査で入る（contentDate が無い写真は空のまま）ので、空でも「未解析」に数えない。
@@ -3026,6 +3060,35 @@ async fn delete_project(app: AppHandle, project_id: String) -> Result<(), String
         .map_err(|e| e.to_string())?
 }
 
+/// そのプロジェクトの表示用画像（`display/<photo_id>.jpg`）を消す。消すのは DB の
+/// `display_path` が **表示用画像の置き場の直下** を指すファイルだけ。置き場の外を指す
+/// 値（壊れた行・原本を指す値）には触れない。消せた数を返す（U27 R7）。
+fn remove_project_display_files(
+    conn: &Connection,
+    project_id: &str,
+    display_dir: &Path,
+) -> Result<usize, String> {
+    let mut statement = conn
+        .prepare("SELECT display_path FROM photos WHERE project_id=?1 AND display_path IS NOT NULL")
+        .map_err(|error| error.to_string())?;
+    let paths = statement
+        .query_map(params![project_id], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let mut removed = 0usize;
+    for path in paths {
+        let path = Path::new(&path);
+        let inside = path.parent() == Some(display_dir)
+            && path.file_name().is_some()
+            && !path.components().any(|part| matches!(part, std::path::Component::ParentDir));
+        if inside && fs::remove_file(path).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 fn delete_project_blocking(app: AppHandle, project_id: String) -> Result<(), String> {
     let conn = connection(&app)?;
 
@@ -3047,6 +3110,12 @@ fn delete_project_blocking(app: AppHandle, project_id: String) -> Result<(), Str
             removed += 1;
         }
     }
+
+    // 表示用画像も、DB を消す前に（対象が分からなくなる前に）消す。
+    let removed_display = match display_dir(&app) {
+        Ok(dir) => remove_project_display_files(&conn, &project_id, &dir).unwrap_or(0),
+        Err(_) => 0,
+    };
 
     let transaction = conn
         .unchecked_transaction()
@@ -3091,7 +3160,9 @@ fn delete_project_blocking(app: AppHandle, project_id: String) -> Result<(), Str
     if let Ok(dir) = data_subdir(&app, SAMPLES_DIR) {
         clear_dir(&dir);
     }
-    eprintln!("削除: プロジェクト {project_id} / サムネイル {removed} 件");
+    eprintln!(
+        "削除: プロジェクト {project_id} / サムネイル {removed} 件 / 表示用画像 {removed_display} 件"
+    );
     Ok(())
 }
 
@@ -3841,7 +3912,7 @@ async fn write_text_file(path: String, text: String) -> Result<(), String> {
     .map_err(|error| error.to_string())?
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_photos_by_ids(
     app: AppHandle,
     project_id: String,
@@ -3900,7 +3971,7 @@ struct PairOverrideRow {
     decision: String,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_pair_overrides(app: AppHandle, project_id: String) -> Result<Vec<PairOverrideRow>, String> {
     let conn = connection(&app)?;
     let mut statement = conn
@@ -4003,7 +4074,7 @@ struct DisplaySettings {
     project_edge: Option<u32>,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_display_settings(app: AppHandle, project_id: Option<String>) -> Result<DisplaySettings, String> {
     let project_edge = match project_id {
         Some(id) => Some(resolve_display_edge(&app, &id)?),
@@ -4054,7 +4125,7 @@ fn save_project_display_edge(
 
 /// まだ表示用画像が要る枚数。0 なら生成を起動しない
 /// （`get_analysis_backlog` と同じ考え方）。
-#[tauri::command]
+#[tauri::command(async)]
 fn get_display_backlog(app: AppHandle, project_id: String) -> Result<i64, String> {
     let edge = resolve_display_edge(&app, &project_id)?;
     connection(&app)?
@@ -4066,6 +4137,38 @@ fn get_display_backlog(app: AppHandle, project_id: String) -> Result<i64, String
             |row| row.get(0),
         )
         .map_err(|error| error.to_string())
+}
+
+/// 表示用画像を作る 1 枚。
+#[derive(Clone, Debug)]
+struct DisplayJob {
+    id: String,
+    path: String,
+    stored_path: Option<String>,
+    stored_edge: Option<i64>,
+}
+
+impl PhotoJob for DisplayJob {
+    fn photo_id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// 表示用画像 1 枚を作ってファイルへ書く（worker 側。DB には触れない）。
+/// 作れなかったら `error` に理由を入れる（writer が印を NULL に戻す）。
+fn display_one(dir: &Path, edge: u32, index: usize, job: &DisplayJob) -> PhotoWork {
+    let mut work = PhotoWork::new(index, &job.id);
+    let existing = match (job.stored_path.as_deref(), job.stored_edge) {
+        (Some(p), Some(e)) if e > 0 => Some((Path::new(p), e as u32)),
+        _ => None,
+    };
+    let built = build_display(&LocalPhoto(Path::new(&job.path)), edge, existing);
+    let file = display_file(dir, &job.id);
+    let saved = built.and_then(|bytes| fs::write(&file, &bytes).ok());
+    if saved.is_none() {
+        work.error = Some("表示用の画像を作れませんでした。".into());
+    }
+    work
 }
 
 /// 表示用画像をまとめて作る。**走査とは分ける。**
@@ -4122,60 +4225,86 @@ fn run_display_generation(
         "選別用の画像を作っています…",
     );
 
-    let mut done = 0usize;
-    for (photo_id, path, stored_path, stored_edge) in pending {
-        if registry.is_cancelled(&task_key) {
-            progress_note(
-                &app,
-                &project_id,
-                "display",
-                "cancelled",
-                done,
-                total,
-                format!("中断しました。{done} 件まで作成済みです。"),
-                ProgressNote {
-                    warning: None,
-                    failed: 0,
-                },
-            );
-            return Ok(());
+    // 原本を読んで表示用に縮める工程は `run_in_parallel` に載せる（U27 R2）。worker は
+    // 画像を作ってファイルへ書くだけで DB に触れない。単一の writer が 100 件ずつ UPDATE する。
+    // 並列数は解析と同じ（ローカルは 2〜4、ネットワークのフォルダは 2）。
+    let folder = project_folder(&app, &project_id)?;
+    let workers = analysis_worker_count_for(Path::new(&folder));
+    let jobs: Vec<DisplayJob> = pending
+        .into_iter()
+        .map(|(id, path, stored_path, stored_edge)| DisplayJob {
+            id,
+            path,
+            stored_path,
+            stored_edge,
+        })
+        .collect();
+    let conn = connection(&app)?;
+    let apply = |tx: &Connection, item: &PhotoWork| -> Result<(), String> {
+        if item.error.is_none() {
+            tx.execute(
+                "UPDATE photos SET display_path=?1, display_edge=?2 WHERE id=?3",
+                params![
+                    display_file(&dir, &item.photo_id).to_string_lossy().to_string(),
+                    edge as i64,
+                    item.photo_id
+                ],
+            )
+        } else {
+            // 作れなかった写真は次回また拾えるよう、印を残さない。
+            tx.execute(
+                "UPDATE photos SET display_path=NULL, display_edge=NULL WHERE id=?1",
+                params![item.photo_id],
+            )
         }
-        let existing = match (stored_path.as_deref(), stored_edge) {
-            (Some(p), Some(e)) if e > 0 => Some((Path::new(p), e as u32)),
-            _ => None,
-        };
-        let built = build_display(&LocalPhoto(Path::new(&path)), edge, existing);
-        let file = display_file(&dir, &photo_id);
-        let saved = built.and_then(|bytes| fs::write(&file, &bytes).ok().map(|_| ()));
-        {
-            let conn = connection(&app)?;
-            if saved.is_some() {
-                conn.execute(
-                    "UPDATE photos SET display_path=?1, display_edge=?2 WHERE id=?3",
-                    params![file.to_string_lossy().to_string(), edge as i64, photo_id],
-                )
-                .map_err(|error| error.to_string())?;
-            } else {
-                // 作れなかった写真は次回また拾えるよう、印を残さない。
-                conn.execute(
-                    "UPDATE photos SET display_path=NULL, display_edge=NULL WHERE id=?1",
-                    params![photo_id],
-                )
-                .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string())?;
+        Ok(())
+    };
+    let mut pending_results: Vec<PhotoWork> = Vec::new();
+    let mut committed = 0usize;
+    let dir_for_workers = dir.clone();
+    let outcome = run_in_parallel(
+        Arc::new(jobs),
+        workers,
+        Duration::from_millis(DISPLAY_TIMEOUT_MS),
+        &|| registry.is_cancelled(&task_key),
+        move |index, job: &DisplayJob| display_one(&dir_for_workers, edge, index, job),
+        &mut |item| {
+            pending_results.push(item);
+            if pending_results.len() >= ANALYSIS_CHUNK_SIZE {
+                committed += flush_results(&conn, &mut pending_results, &apply)?;
             }
-        }
-        done += 1;
-        if done % 10 == 0 || done == total {
-            progress(
-                &app,
-                &project_id,
-                "display",
-                "hashing",
-                done,
-                total,
-                "選別用の画像を作っています…",
-            );
-        }
+            let done = committed + pending_results.len();
+            if done % 10 == 0 || done == total {
+                progress(
+                    &app,
+                    &project_id,
+                    "display",
+                    "hashing",
+                    done,
+                    total,
+                    "選別用の画像を作っています…",
+                );
+            }
+            Ok(())
+        },
+    )?;
+    committed += flush_results(&conn, &mut pending_results, &apply)?;
+    if outcome.cancelled {
+        progress_note(
+            &app,
+            &project_id,
+            "display",
+            "cancelled",
+            committed,
+            total,
+            format!("中断しました。{committed} 件まで作成済みです。"),
+            ProgressNote {
+                warning: None,
+                failed: 0,
+            },
+        );
+        return Ok(());
     }
 
     progress(
@@ -4423,7 +4552,7 @@ fn cancel_project_task(registry: State<'_, TaskRegistry>, project_id: String, ta
     registry.cancel(&format!("{task}:{project_id}"));
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn save_project_state(
     app: AppHandle,
     project_id: String,
@@ -4436,7 +4565,7 @@ fn save_project_state(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn load_project_state(app: AppHandle, project_id: String) -> Result<Option<String>, String> {
     let conn = connection(&app)?;
     match conn.query_row(
@@ -4623,7 +4752,7 @@ async fn write_sidecar(
     .map_err(|error| error.to_string())?
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn load_sidecar_state(app: AppHandle, project_id: String) -> Result<sidecar::SidecarState, String> {
     sidecar::load_state(&connection(&app)?, &project_id)
 }
@@ -4637,7 +4766,7 @@ fn save_sidecar_state(
     sidecar::save_state(&connection(&app)?, &project_id, &state)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn device_identity(app: AppHandle) -> Result<sidecar::DeviceIdentity, String> {
     sidecar::device_identity(&connection(&app)?)
 }
@@ -5033,6 +5162,63 @@ mod tests {
             "fingerprint_size が実ファイルと一致する"
         );
 
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    // 接続の使い回し（U27 R1）: 初回だけ整備し、2 回目以降は整備なしで同じデータが見える。
+    // Amazon の行は backfill の対象外（fingerprint が NULL のまま、stat も走らない）。
+    #[test]
+    fn open_connection_migrates_once_and_keeps_data_visible() {
+        let directory = test_directory("open-connection");
+        let database = directory.join("once.sqlite3");
+        {
+            let conn = open_connection(&database).expect("first open");
+            conn.execute(
+                "INSERT INTO projects (id,name,folder_path,created_at,updated_at,source_kind) VALUES ('amz','a','https://x',1,1,'amazon')",
+                [],
+            )
+            .expect("insert project");
+            conn.execute(
+                "INSERT INTO photos (id,project_id,path,relative_path,name,rating,is_missing) VALUES ('p1','amz','node-1','node-1','n',4,0)",
+                [],
+            )
+            .expect("insert photo");
+        }
+        // 整備済みなら、整備の跡（索引）を消しても 2 回目は作り直さない。
+        {
+            let conn = open_connection(&database).expect("second open");
+            conn.execute_batch("DROP INDEX photos_project_visible;")
+                .expect("drop index");
+        }
+        let conn = open_connection(&database).expect("third open");
+        let indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='photos_project_visible'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(indexes, 0, "2 回目以降は整備しない");
+        let (rating, mtime): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT rating,fingerprint_mtime FROM photos WHERE id='p1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read");
+        assert_eq!((rating, mtime), (4, None), "データはそのまま見える");
+        // 整備し直す経路（open_database）は従来どおり索引を作る。
+        drop(conn);
+        let conn = open_database(&database).expect("full migrate");
+        let indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='photos_project_visible'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(indexes, 1);
         drop(conn);
         fs::remove_dir_all(&directory).expect("remove test directory");
     }
@@ -5758,6 +5944,111 @@ mod tests {
         fs::remove_dir_all(&directory).expect("remove test directory");
     }
 
+    /// 表示用画像を run_in_parallel で作っても、全行に 1 回ずつ書かれ、並列数で結果が変わらないこと
+    /// （U27 R2）。時間は `--nocapture` で見られる（debug ビルドの目安）。
+    #[test]
+    fn parallel_display_generation_writes_every_row_exactly_once() {
+        let directory = test_directory("display-parallel");
+        let total = 10usize;
+        let originals = directory.join("originals");
+        fs::create_dir_all(&originals).expect("create originals");
+        let mut jobs = Vec::new();
+        for index in 0..total {
+            let photo = originals.join(format!("{index}.jpg"));
+            Fixture {
+                size: (2000, 1333),
+                ..Default::default()
+            }
+            .write(&photo);
+            jobs.push(DisplayJob {
+                id: format!("photo-{index}"),
+                path: photo.to_string_lossy().to_string(),
+                stored_path: None,
+                stored_edge: None,
+            });
+        }
+        // 読めない 1 枚は、失敗として確定して先へ進む。
+        jobs.push(DisplayJob {
+            id: "photo-broken".into(),
+            path: originals.join("missing.jpg").to_string_lossy().to_string(),
+            stored_path: None,
+            stored_edge: None,
+        });
+        let expected = jobs.len();
+
+        let mut timings = Vec::new();
+        for workers in [1usize, 4] {
+            let display = directory.join(format!("display-{workers}"));
+            fs::create_dir_all(&display).expect("create display dir");
+            let conn = open_database(&directory.join(format!("w{workers}.sqlite3"))).expect("open");
+            for job in &jobs {
+                conn.execute(
+                    "INSERT INTO photos (id,project_id,path,relative_path,name) VALUES (?1,'p',?2,?2,'n')",
+                    params![job.id, job.path],
+                )
+                .expect("insert photo");
+            }
+            let apply = |tx: &Connection, item: &PhotoWork| -> Result<(), String> {
+                if item.error.is_none() {
+                    tx.execute(
+                        "UPDATE photos SET display_path=?1, display_edge=1024 WHERE id=?2",
+                        params![
+                            display_file(&display, &item.photo_id).to_string_lossy().to_string(),
+                            item.photo_id
+                        ],
+                    )
+                } else {
+                    tx.execute(
+                        "UPDATE photos SET display_path=NULL, display_edge=NULL WHERE id=?1",
+                        params![item.photo_id],
+                    )
+                }
+                .map_err(|error| error.to_string())?;
+                Ok(())
+            };
+            let mut pending: Vec<PhotoWork> = Vec::new();
+            let mut committed = 0usize;
+            let display_for_workers = display.clone();
+            let started = Instant::now();
+            let outcome = run_in_parallel(
+                Arc::new(jobs.clone()),
+                workers,
+                Duration::from_secs(60),
+                &|| false,
+                move |index, job: &DisplayJob| display_one(&display_for_workers, 1024, index, job),
+                &mut |item| {
+                    pending.push(item);
+                    if pending.len() >= ANALYSIS_CHUNK_SIZE {
+                        committed += flush_results(&conn, &mut pending, &apply)?;
+                    }
+                    Ok(())
+                },
+            )
+            .expect("run workers");
+            committed += flush_results(&conn, &mut pending, &apply).expect("final flush");
+            timings.push((workers, started.elapsed()));
+
+            assert_eq!(outcome.completed, expected);
+            assert_eq!(committed, expected, "全件が確定する");
+            let with_image: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM photos WHERE display_path IS NOT NULL AND display_edge=1024",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count");
+            assert_eq!(with_image as usize, total, "作れた全行に書かれ、壊れた 1 枚には印が無い");
+            for index in 0..total {
+                let bytes = fs::read(display_file(&display, &format!("photo-{index}"))).expect("read display");
+                let decoded = image::load_from_memory(&bytes).expect("decode display");
+                assert_eq!(decoded.width().max(decoded.height()), 1024);
+            }
+            assert!(!display_file(&display, "photo-broken").exists());
+        }
+        eprintln!("表示用画像 {} 枚（3000x2000）: {:?}", total, timings);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
     /// 原本より大きくは引き伸ばさない。情報は増えないのに容量だけ増える。
     #[test]
     fn the_display_image_never_upscales_the_original() {
@@ -6127,6 +6418,37 @@ mod tests {
             .expect("insert photo");
         }
         conn
+    }
+
+    // Amazon の並列数（amazon::WORKERS = 8）が run_in_parallel で 4 に切られないこと（U27 R6）。
+    #[test]
+    fn run_in_parallel_honours_a_worker_count_above_the_local_cap() {
+        let total = 32;
+        let threads = Arc::new(Mutex::new(HashSet::new()));
+        let seen = threads.clone();
+        let mut received = 0usize;
+        run_in_parallel(
+            Arc::new(fake_jobs(total)),
+            amazon::WORKERS,
+            Duration::from_secs(30),
+            &|| false,
+            move |index, job: &FakeJob| {
+                seen.lock().unwrap().insert(std::thread::current().id());
+                std::thread::sleep(Duration::from_millis(30));
+                PhotoWork::new(index, &job.id)
+            },
+            &mut |_item| {
+                received += 1;
+                Ok(())
+            },
+        )
+        .expect("run workers");
+        assert_eq!(received, total);
+        assert!(
+            threads.lock().unwrap().len() > MAX_ANALYSIS_WORKERS,
+            "worker は {} 本まで使える",
+            amazon::WORKERS
+        );
     }
 
     // 並列に読んだ結果を単一の writer が書く構造が、重複も欠落も起こさないこと。
@@ -6779,6 +7101,57 @@ mod tests {
         assert_eq!(photos, 1);
         assert_eq!(states, 1);
 
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    // プロジェクト削除で、そのプロジェクトの表示用画像だけが消える（U27 R7）。
+    // 他のプロジェクトの画像・原本・置き場の外を指す値は残る。
+    #[test]
+    fn deleting_a_project_removes_only_its_display_images() {
+        let directory = test_directory("delete-display");
+        let display = directory.join("display");
+        fs::create_dir_all(&display).expect("create display dir");
+        let original = directory.join("original.jpg");
+        fs::write(&original, b"original photo bytes").expect("write original");
+        let drop_image = display.join("photo-drop.jpg");
+        let drop_second = display.join("photo-drop-2.jpg");
+        let keep_image = display.join("photo-keep.jpg");
+        for file in [&drop_image, &drop_second, &keep_image] {
+            fs::write(file, b"display").expect("write display image");
+        }
+        let conn = open_database(&directory.join("delete.sqlite3")).expect("open database");
+        for project in ["keep", "drop"] {
+            conn.execute(
+                "INSERT INTO projects (id,name,folder_path,photo_count,status,created_at,updated_at)
+                 VALUES (?1,?1,'x',1,'ready',1,1)",
+                params![project],
+            )
+            .expect("insert project");
+        }
+        for (id, project, display_path) in [
+            ("photo-keep", "keep", keep_image.clone()),
+            ("photo-drop", "drop", drop_image.clone()),
+            ("photo-drop-2", "drop", drop_second.clone()),
+            // 壊れた行: 原本を指している。置き場の外なので消してはいけない。
+            ("photo-bad", "drop", original.clone()),
+            // 置き場の外へ抜ける相対表記。
+            ("photo-dots", "drop", display.join("..").join("original.jpg")),
+        ] {
+            conn.execute(
+                "INSERT INTO photos (id,project_id,path,relative_path,name,display_path)
+                 VALUES (?1,?2,?1,'r','n',?3)",
+                params![id, project, display_path.to_string_lossy().to_string()],
+            )
+            .expect("insert photo");
+        }
+
+        let removed = remove_project_display_files(&conn, "drop", &display).expect("remove");
+
+        assert_eq!(removed, 2);
+        assert!(!drop_image.exists() && !drop_second.exists(), "そのプロジェクトの画像は消える");
+        assert!(keep_image.is_file(), "他のプロジェクトの画像は残る");
+        assert!(original.is_file(), "原本・置き場の外を指す値は消さない");
         drop(conn);
         fs::remove_dir_all(&directory).expect("remove test directory");
     }
