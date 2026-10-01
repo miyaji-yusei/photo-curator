@@ -4,6 +4,7 @@ import type {
 } from '~/types/photo'
 import { MAX_RATING } from '~/types/photo'
 import type { DisplaySettings, PhotoBackend } from '~/composables/photoBackend'
+import { previewRefreshPlan, withNewThumbnails } from '~/utils/previewRefresh'
 import { builtDisplayCount, displayEdgePlan } from '~/utils/displayEdge'
 import type { MoveSelection } from '~/utils/ratingMove'
 // `selectedCount` は選別画面側の computed と名前がぶつかるので別名にする。
@@ -544,6 +545,21 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     if (activeProject.value && activeProject.value.id !== projectId) return
     previewPhotos.value = page.photos
     previewTotal.value = page.total
+  }
+
+  /**
+   * 準備の途中の更新（W11）。サムネイルがまだ無い行だけを読み直して、その場で置き換える
+   * （全件の読み直しは、準備が終わったときだけ）。読み込み中に一覧が読み直されたら捨てる。
+   */
+  async function refreshPreviewThumbnails(projectId: string) {
+    const plan = previewRefreshPlan(previewPhotos.value, previewTotal.value, PREVIEW_PAGE)
+    if (plan.kind === 'full') return loadPreview(projectId)
+    if (!plan.ids.length) return
+    const token = previewToken
+    const fresh = await desktop.getPhotosByIds(projectId, plan.ids)
+    if (token !== previewToken || activeProject.value?.id !== projectId) return
+    const next = withNewThumbnails(previewPhotos.value, fresh)
+    if (next) previewPhotos.value = next
   }
 
   /** 格子の末尾が見えたら次のページ（全部を見られる）。 */
@@ -2688,7 +2704,8 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     const now = Date.now()
     if (!finished && now - previewRefreshedAt < 3000) return
     previewRefreshedAt = now
-    await loadPreview(progress.projectId).catch(() => undefined)
+    await (finished ? loadPreview(progress.projectId) : refreshPreviewThumbnails(progress.projectId))
+      .catch(() => undefined)
     if (!finished) return
     await refreshProjects().catch(() => undefined)
     await loadCoreInputs(progress.projectId).catch(() => undefined)
