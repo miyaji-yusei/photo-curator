@@ -2418,4 +2418,19 @@ mod tests {
         assert_eq!(back.ratings["1"], 0);
         assert_eq!(back.current, vec!["1", "2"]);
     }
+
+    #[test]
+    fn r17_同じ2枚への手直しが重なったら先のものが効く() {
+        // 仕様（03・04 章）に重なりの決まりは無い。**今の挙動の固定**。
+        // sidecar_sync の canonical_overrides・merge_overrides もこの「先が勝つ」に
+        // 合わせてあるので、変えるならそちらと一緒に変える（PC の DB は後が勝つ）。
+        let photos = vec![
+            photo("1.jpg", 1000, "0000000000000000"),
+            photo("2.jpg", 2000, "0000000000000000"),
+        ];
+        let groups = group_bursts(photos.clone(), threshold(), vec![split("1.jpg", "2.jpg"), join("1.jpg", "2.jpg")]);
+        assert_eq!(groups.len(), 2);
+        let groups = group_bursts(photos, threshold(), vec![join("1.jpg", "2.jpg"), split("1.jpg", "2.jpg")]);
+        assert_eq!(groups.len(), 1);
+    }
 }
