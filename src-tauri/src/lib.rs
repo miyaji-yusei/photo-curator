@@ -82,6 +82,8 @@ const MIN_ANALYSIS_WORKERS: usize = 2;
 const WORKER_COUNT_ENV: &str = "PHOTO_CURATOR_WORKERS";
 // 1枚の処理に許す時間。異常に遅い / 壊れた1枚で全体が停滞しないようにする。
 const PHOTO_TIMEOUT_MS: u64 = 15_000;
+/// 表示用画像 1 枚の打ち切り。原本の全画素デコードが入るので解析より長くする。
+const DISPLAY_TIMEOUT_MS: u64 = 60_000;
 // writer がキャンセルと timeout を確認する間隔。キャンセルの体感応答はここで決まる。
 const WATCHDOG_TICK_MS: u64 = 100;
 // バックグラウンド事前生成でチャンクごとに空ける間隔。前面の操作を邪魔しないよう
@@ -4137,6 +4139,38 @@ fn get_display_backlog(app: AppHandle, project_id: String) -> Result<i64, String
         .map_err(|error| error.to_string())
 }
 
+/// 表示用画像を作る 1 枚。
+#[derive(Clone, Debug)]
+struct DisplayJob {
+    id: String,
+    path: String,
+    stored_path: Option<String>,
+    stored_edge: Option<i64>,
+}
+
+impl PhotoJob for DisplayJob {
+    fn photo_id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// 表示用画像 1 枚を作ってファイルへ書く（worker 側。DB には触れない）。
+/// 作れなかったら `error` に理由を入れる（writer が印を NULL に戻す）。
+fn display_one(dir: &Path, edge: u32, index: usize, job: &DisplayJob) -> PhotoWork {
+    let mut work = PhotoWork::new(index, &job.id);
+    let existing = match (job.stored_path.as_deref(), job.stored_edge) {
+        (Some(p), Some(e)) if e > 0 => Some((Path::new(p), e as u32)),
+        _ => None,
+    };
+    let built = build_display(&LocalPhoto(Path::new(&job.path)), edge, existing);
+    let file = display_file(dir, &job.id);
+    let saved = built.and_then(|bytes| fs::write(&file, &bytes).ok());
+    if saved.is_none() {
+        work.error = Some("表示用の画像を作れませんでした。".into());
+    }
+    work
+}
+
 /// 表示用画像をまとめて作る。**走査とは分ける。**
 ///
 /// 表示用は原本を全部読むので、走査に混ぜると解析が桁で遅くなる
@@ -4191,60 +4225,86 @@ fn run_display_generation(
         "選別用の画像を作っています…",
     );
 
-    let mut done = 0usize;
-    for (photo_id, path, stored_path, stored_edge) in pending {
-        if registry.is_cancelled(&task_key) {
-            progress_note(
-                &app,
-                &project_id,
-                "display",
-                "cancelled",
-                done,
-                total,
-                format!("中断しました。{done} 件まで作成済みです。"),
-                ProgressNote {
-                    warning: None,
-                    failed: 0,
-                },
-            );
-            return Ok(());
+    // 原本を読んで表示用に縮める工程は `run_in_parallel` に載せる（U27 R2）。worker は
+    // 画像を作ってファイルへ書くだけで DB に触れない。単一の writer が 100 件ずつ UPDATE する。
+    // 並列数は解析と同じ（ローカルは 2〜4、ネットワークのフォルダは 2）。
+    let folder = project_folder(&app, &project_id)?;
+    let workers = analysis_worker_count_for(Path::new(&folder));
+    let jobs: Vec<DisplayJob> = pending
+        .into_iter()
+        .map(|(id, path, stored_path, stored_edge)| DisplayJob {
+            id,
+            path,
+            stored_path,
+            stored_edge,
+        })
+        .collect();
+    let conn = connection(&app)?;
+    let apply = |tx: &Connection, item: &PhotoWork| -> Result<(), String> {
+        if item.error.is_none() {
+            tx.execute(
+                "UPDATE photos SET display_path=?1, display_edge=?2 WHERE id=?3",
+                params![
+                    display_file(&dir, &item.photo_id).to_string_lossy().to_string(),
+                    edge as i64,
+                    item.photo_id
+                ],
+            )
+        } else {
+            // 作れなかった写真は次回また拾えるよう、印を残さない。
+            tx.execute(
+                "UPDATE photos SET display_path=NULL, display_edge=NULL WHERE id=?1",
+                params![item.photo_id],
+            )
         }
-        let existing = match (stored_path.as_deref(), stored_edge) {
-            (Some(p), Some(e)) if e > 0 => Some((Path::new(p), e as u32)),
-            _ => None,
-        };
-        let built = build_display(&LocalPhoto(Path::new(&path)), edge, existing);
-        let file = display_file(&dir, &photo_id);
-        let saved = built.and_then(|bytes| fs::write(&file, &bytes).ok().map(|_| ()));
-        {
-            let conn = connection(&app)?;
-            if saved.is_some() {
-                conn.execute(
-                    "UPDATE photos SET display_path=?1, display_edge=?2 WHERE id=?3",
-                    params![file.to_string_lossy().to_string(), edge as i64, photo_id],
-                )
-                .map_err(|error| error.to_string())?;
-            } else {
-                // 作れなかった写真は次回また拾えるよう、印を残さない。
-                conn.execute(
-                    "UPDATE photos SET display_path=NULL, display_edge=NULL WHERE id=?1",
-                    params![photo_id],
-                )
-                .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string())?;
+        Ok(())
+    };
+    let mut pending_results: Vec<PhotoWork> = Vec::new();
+    let mut committed = 0usize;
+    let dir_for_workers = dir.clone();
+    let outcome = run_in_parallel(
+        Arc::new(jobs),
+        workers,
+        Duration::from_millis(DISPLAY_TIMEOUT_MS),
+        &|| registry.is_cancelled(&task_key),
+        move |index, job: &DisplayJob| display_one(&dir_for_workers, edge, index, job),
+        &mut |item| {
+            pending_results.push(item);
+            if pending_results.len() >= ANALYSIS_CHUNK_SIZE {
+                committed += flush_results(&conn, &mut pending_results, &apply)?;
             }
-        }
-        done += 1;
-        if done % 10 == 0 || done == total {
-            progress(
-                &app,
-                &project_id,
-                "display",
-                "hashing",
-                done,
-                total,
-                "選別用の画像を作っています…",
-            );
-        }
+            let done = committed + pending_results.len();
+            if done % 10 == 0 || done == total {
+                progress(
+                    &app,
+                    &project_id,
+                    "display",
+                    "hashing",
+                    done,
+                    total,
+                    "選別用の画像を作っています…",
+                );
+            }
+            Ok(())
+        },
+    )?;
+    committed += flush_results(&conn, &mut pending_results, &apply)?;
+    if outcome.cancelled {
+        progress_note(
+            &app,
+            &project_id,
+            "display",
+            "cancelled",
+            committed,
+            total,
+            format!("中断しました。{committed} 件まで作成済みです。"),
+            ProgressNote {
+                warning: None,
+                failed: 0,
+            },
+        );
+        return Ok(());
     }
 
     progress(
@@ -5881,6 +5941,111 @@ mod tests {
         let decoded = image::load_from_memory(&bigger).expect("decode");
         assert_eq!(decoded.width().max(decoded.height()), 1536);
 
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    /// 表示用画像を run_in_parallel で作っても、全行に 1 回ずつ書かれ、並列数で結果が変わらないこと
+    /// （U27 R2）。時間は `--nocapture` で見られる（debug ビルドの目安）。
+    #[test]
+    fn parallel_display_generation_writes_every_row_exactly_once() {
+        let directory = test_directory("display-parallel");
+        let total = 10usize;
+        let originals = directory.join("originals");
+        fs::create_dir_all(&originals).expect("create originals");
+        let mut jobs = Vec::new();
+        for index in 0..total {
+            let photo = originals.join(format!("{index}.jpg"));
+            Fixture {
+                size: (2000, 1333),
+                ..Default::default()
+            }
+            .write(&photo);
+            jobs.push(DisplayJob {
+                id: format!("photo-{index}"),
+                path: photo.to_string_lossy().to_string(),
+                stored_path: None,
+                stored_edge: None,
+            });
+        }
+        // 読めない 1 枚は、失敗として確定して先へ進む。
+        jobs.push(DisplayJob {
+            id: "photo-broken".into(),
+            path: originals.join("missing.jpg").to_string_lossy().to_string(),
+            stored_path: None,
+            stored_edge: None,
+        });
+        let expected = jobs.len();
+
+        let mut timings = Vec::new();
+        for workers in [1usize, 4] {
+            let display = directory.join(format!("display-{workers}"));
+            fs::create_dir_all(&display).expect("create display dir");
+            let conn = open_database(&directory.join(format!("w{workers}.sqlite3"))).expect("open");
+            for job in &jobs {
+                conn.execute(
+                    "INSERT INTO photos (id,project_id,path,relative_path,name) VALUES (?1,'p',?2,?2,'n')",
+                    params![job.id, job.path],
+                )
+                .expect("insert photo");
+            }
+            let apply = |tx: &Connection, item: &PhotoWork| -> Result<(), String> {
+                if item.error.is_none() {
+                    tx.execute(
+                        "UPDATE photos SET display_path=?1, display_edge=1024 WHERE id=?2",
+                        params![
+                            display_file(&display, &item.photo_id).to_string_lossy().to_string(),
+                            item.photo_id
+                        ],
+                    )
+                } else {
+                    tx.execute(
+                        "UPDATE photos SET display_path=NULL, display_edge=NULL WHERE id=?1",
+                        params![item.photo_id],
+                    )
+                }
+                .map_err(|error| error.to_string())?;
+                Ok(())
+            };
+            let mut pending: Vec<PhotoWork> = Vec::new();
+            let mut committed = 0usize;
+            let display_for_workers = display.clone();
+            let started = Instant::now();
+            let outcome = run_in_parallel(
+                Arc::new(jobs.clone()),
+                workers,
+                Duration::from_secs(60),
+                &|| false,
+                move |index, job: &DisplayJob| display_one(&display_for_workers, 1024, index, job),
+                &mut |item| {
+                    pending.push(item);
+                    if pending.len() >= ANALYSIS_CHUNK_SIZE {
+                        committed += flush_results(&conn, &mut pending, &apply)?;
+                    }
+                    Ok(())
+                },
+            )
+            .expect("run workers");
+            committed += flush_results(&conn, &mut pending, &apply).expect("final flush");
+            timings.push((workers, started.elapsed()));
+
+            assert_eq!(outcome.completed, expected);
+            assert_eq!(committed, expected, "全件が確定する");
+            let with_image: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM photos WHERE display_path IS NOT NULL AND display_edge=1024",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count");
+            assert_eq!(with_image as usize, total, "作れた全行に書かれ、壊れた 1 枚には印が無い");
+            for index in 0..total {
+                let bytes = fs::read(display_file(&display, &format!("photo-{index}"))).expect("read display");
+                let decoded = image::load_from_memory(&bytes).expect("decode display");
+                assert_eq!(decoded.width().max(decoded.height()), 1024);
+            }
+            assert!(!display_file(&display, "photo-broken").exists());
+        }
+        eprintln!("表示用画像 {} 枚（3000x2000）: {:?}", total, timings);
         fs::remove_dir_all(&directory).expect("remove test directory");
     }
 
