@@ -1323,7 +1323,9 @@ export function createCurator(desktop: PhotoBackend = useDesktop()) {
   async function toggleChoice(photoId: string) {
     const current = session.value
     const path = pathOf(photoId)
-    if (!current || !path) return
+    // 今の組に無い写真（組が進んだあとに届いた古い操作）は無視する。core の `advance` は組に無い
+    // 写真を黙って捨てるので、通すと新しい組が「選ばず」で丸ごと落ちる（W5）。
+    if (!current || !path || !current.core.current.includes(path)) return
     if (!current.multiSelect) {
       current.selectedInGroup = [path]
       await confirmChoices()
@@ -1373,6 +1375,9 @@ export function createCurator(desktop: PhotoBackend = useDesktop()) {
   async function decideSlide(kind: 'keep' | 'drop' | 'top', photoId: string) {
     const current = session.value
     if (!current) return
+    // 飛ばしている間に組が進んだ・戻された（Backspace）とき、古い写真への判断は捨てる（W5）。
+    const path = pathOf(photoId)
+    if (!path || !current.core.current.includes(path)) return
     current.multiSelect = false
     if (kind === 'keep') await toggleChoice(photoId)
     else if (kind === 'top') await confirmPhoto(photoId)
