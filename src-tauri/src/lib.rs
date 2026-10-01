@@ -1861,14 +1861,34 @@ fn is_hidden_entry(entry: &walkdir::DirEntry) -> bool {
     entry.depth() > 0 && entry.file_name().to_string_lossy().starts_with('.')
 }
 
-fn list_photo_files(folder: &str) -> Vec<PathBuf> {
-    WalkDir::new(folder)
+/// フォルダの列挙の結果。`unreadable` は、列挙の途中で読めなかった場所の数
+/// （権限・切断など）。1 件でもあれば、列挙は「全部は見えていない」。
+struct FolderListing {
+    files: Vec<PathBuf>,
+    unreadable: usize,
+}
+
+/// 走査の入口。フォルダ自体が開けなければ（NAS の切断・共有の取り外し・移動）、
+/// 空のフォルダとして通さずエラーにする。
+fn list_photo_files(folder: &str) -> Result<FolderListing, String> {
+    fs::read_dir(folder)
+        .map_err(|error| format!("フォルダに接続できませんでした（{folder}）: {error}"))?;
+    let mut files = Vec::new();
+    let mut unreadable = 0;
+    for entry in WalkDir::new(folder)
         .into_iter()
         .filter_entry(|entry| !is_hidden_entry(entry))
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file() && is_supported(entry.path()))
-        .map(|entry| entry.into_path())
-        .collect()
+    {
+        match entry {
+            Ok(entry) => {
+                if entry.file_type().is_file() && is_supported(entry.path()) {
+                    files.push(entry.into_path());
+                }
+            }
+            Err(_) => unreadable += 1,
+        }
+    }
+    Ok(FolderListing { files, unreadable })
 }
 
 fn photo_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Photo> {
@@ -1937,62 +1957,72 @@ fn project_folder(app: &AppHandle, project_id: &str) -> Result<String, String> {
         .map_err(|_| "Project was not found.".to_string())
 }
 
-fn run_scan(app: AppHandle, registry: &TaskRegistry, project_id: String) -> Result<(), String> {
-    // 出所で分ける。Amazon の共有リンクは、一覧を読むことが走査になる。
-    if let Some(source) = amazon_source_of(&connection(&app)?, &project_id)? {
-        return run_amazon_scan(app, registry, project_id, source);
-    }
-    let task_key = format!("scan:{project_id}");
-    let folder = project_folder(&app, &project_id)?;
-    let entries: Vec<PathBuf> = list_photo_files(&folder);
-    let total = entries.len();
-    progress(
-        &app,
-        &project_id,
-        "scan",
-        "indexing",
-        0,
-        total,
-        "Scanning photo files…",
-    );
+/// `scan_folder` の終わり方。
+enum ScanEnd {
+    Completed {
+        total: usize,
+        /// 走査後に画面へ出る写真の数。
+        #[cfg_attr(not(test), allow(dead_code))]
+        count: i64,
+        /// 列挙で読めなかった場所の数。0 でないとき、欠損の印は付け直していない。
+        unreadable: usize,
+    },
+    Cancelled {
+        processed: usize,
+        total: usize,
+    },
+}
 
-    let conn = connection(&app)?;
+/// フォルダの走査の本体（DB とフォルダだけを触る。アプリの窓には触れない）。
+///
+/// 「見つからなかった写真」への欠損の印（`is_missing=1`）は、写真の登録と同じ
+/// トランザクションに入れる。取り消し・失敗なら全部ロールバックされ、走査前の
+/// 状態のまま残る。また列挙で読めなかった場所が 1 件でもあれば、見えていない
+/// 写真を「無くなった」とは決められないので、印を付け直さない。
+fn scan_folder(
+    conn: &Connection,
+    project_id: &str,
+    folder: &str,
+    is_cancelled: &dyn Fn() -> bool,
+    on_progress: &mut dyn FnMut(&str, usize, usize, &str),
+) -> Result<ScanEnd, String> {
+    let listing = list_photo_files(folder)?;
+    let entries = listing.files;
+    let total = entries.len();
+    on_progress("indexing", 0, total, "Scanning photo files…");
+
     conn.execute(
         "UPDATE projects SET status='scanning', updated_at=?1 WHERE id=?2",
         params![now(), project_id],
-    )
-    .map_err(|error| error.to_string())?;
-    conn.execute(
-        "UPDATE photos SET is_missing=1 WHERE project_id=?1",
-        params![project_id],
     )
     .map_err(|error| error.to_string())?;
 
     let transaction = conn
         .unchecked_transaction()
         .map_err(|error| error.to_string())?;
+    if listing.unreadable == 0 {
+        transaction
+            .execute(
+                "UPDATE photos SET is_missing=1 WHERE project_id=?1",
+                params![project_id],
+            )
+            .map_err(|error| error.to_string())?;
+    }
     for (index, path) in entries.iter().enumerate() {
-        if registry.is_cancelled(&task_key) {
+        if is_cancelled() {
             transaction.rollback().map_err(|error| error.to_string())?;
-            connection(&app)?
-                .execute(
-                    "UPDATE projects SET status='ready', updated_at=?1 WHERE id=?2",
-                    params![now(), project_id],
-                )
-                .map_err(|error| error.to_string())?;
-            progress(
-                &app,
-                &project_id,
-                "scan",
-                "cancelled",
-                index,
+            conn.execute(
+                "UPDATE projects SET status='ready', updated_at=?1 WHERE id=?2",
+                params![now(), project_id],
+            )
+            .map_err(|error| error.to_string())?;
+            return Ok(ScanEnd::Cancelled {
+                processed: index,
                 total,
-                "Scanning was cancelled.",
-            );
-            return Ok(());
+            });
         }
         let relative = path
-            .strip_prefix(&folder)
+            .strip_prefix(folder)
             .unwrap_or(path)
             .to_string_lossy()
             .to_string();
@@ -2010,7 +2040,7 @@ fn run_scan(app: AppHandle, registry: &TaskRegistry, project_id: String) -> Resu
         };
         upsert_photo(
             &transaction,
-            &project_id,
+            project_id,
             &absolute,
             &relative,
             &name,
@@ -2018,15 +2048,7 @@ fn run_scan(app: AppHandle, registry: &TaskRegistry, project_id: String) -> Resu
             size,
         )?;
         if (index + 1) % 250 == 0 || index + 1 == total {
-            progress(
-                &app,
-                &project_id,
-                "scan",
-                "indexing",
-                index + 1,
-                total,
-                "Recording photo locations…",
-            );
+            on_progress("indexing", index + 1, total, "Recording photo locations…");
         }
     }
     transaction.commit().map_err(|error| error.to_string())?;
@@ -2042,6 +2064,59 @@ fn run_scan(app: AppHandle, registry: &TaskRegistry, project_id: String) -> Resu
         params![count, now(), project_id],
     )
     .map_err(|error| error.to_string())?;
+    Ok(ScanEnd::Completed {
+        total,
+        count,
+        unreadable: listing.unreadable,
+    })
+}
+
+fn run_scan(app: AppHandle, registry: &TaskRegistry, project_id: String) -> Result<(), String> {
+    // 出所で分ける。Amazon の共有リンクは、一覧を読むことが走査になる。
+    if let Some(source) = amazon_source_of(&connection(&app)?, &project_id)? {
+        return run_amazon_scan(app, registry, project_id, source);
+    }
+    let task_key = format!("scan:{project_id}");
+    let folder = project_folder(&app, &project_id)?;
+    let conn = connection(&app)?;
+    let ended = scan_folder(
+        &conn,
+        &project_id,
+        &folder,
+        &|| registry.is_cancelled(&task_key),
+        &mut |phase, processed, total, message| {
+            progress(&app, &project_id, "scan", phase, processed, total, message)
+        },
+    );
+    let (total, unreadable) = match ended {
+        Ok(ScanEnd::Completed {
+            total, unreadable, ..
+        }) => (total, unreadable),
+        Ok(ScanEnd::Cancelled { processed, total }) => {
+            progress(
+                &app,
+                &project_id,
+                "scan",
+                "cancelled",
+                processed,
+                total,
+                "Scanning was cancelled.",
+            );
+            return Ok(());
+        }
+        Err(message) => {
+            // 失敗で 'scanning' のまま残さない（写真があれば ready、なければ new）。
+            settle_project_status(&conn, &project_id);
+            return Err(message);
+        }
+    };
+    let complete_message = if unreadable > 0 {
+        format!(
+            "写真の読み込みが完了しました。ただし読めなかったフォルダが {unreadable} か所あったため、見つからなかった写真の整理はしていません。"
+        )
+    } else {
+        "写真の読み込みが完了しました。".to_string()
+    };
     progress(
         &app,
         &project_id,
@@ -2049,7 +2124,7 @@ fn run_scan(app: AppHandle, registry: &TaskRegistry, project_id: String) -> Resu
         "complete",
         total,
         total,
-        "写真の読み込みが完了しました。",
+        complete_message,
     );
     // ここから先はアイドル時の事前生成。利用者が設定画面を触っている間に
     // 撮影時刻・サムネイル・dHash を少しずつ作っておく。「選別を開始」を
@@ -2158,19 +2233,31 @@ fn run_amazon_scan(
         return Ok(());
     }
 
-    conn.execute("UPDATE photos SET is_missing=1 WHERE project_id=?1", params![project_id])
-        .map_err(|error| error.to_string())?;
-    let transaction = conn.unchecked_transaction().map_err(|error| error.to_string())?;
-    for (index, node) in nodes.iter().enumerate() {
-        upsert_amazon_photo(&transaction, &project_id, node)?;
-        if (index + 1) % 250 == 0 || index + 1 == total {
-            progress(&app, &project_id, "scan", "indexing", index + 1, total, "Recording photo locations…");
+    // 欠損の印は登録と同じトランザクションに入れる。途中で失敗しても走査前のまま残る。
+    // 失敗で 'scanning' のまま残さない。
+    let written = (|| -> Result<i64, String> {
+        let transaction = conn.unchecked_transaction().map_err(|error| error.to_string())?;
+        transaction
+            .execute("UPDATE photos SET is_missing=1 WHERE project_id=?1", params![project_id])
+            .map_err(|error| error.to_string())?;
+        for (index, node) in nodes.iter().enumerate() {
+            upsert_amazon_photo(&transaction, &project_id, node)?;
+            if (index + 1) % 250 == 0 || index + 1 == total {
+                progress(&app, &project_id, "scan", "indexing", index + 1, total, "Recording photo locations…");
+            }
         }
-    }
-    transaction.commit().map_err(|error| error.to_string())?;
-    // tempLink は node id で控える。拡大のたびに一覧をたどり直さないため。
-    amazon::save_links(&conn, &project_id, &amazon::links_of(&nodes))?;
-    let count = recount_photos(&conn, &project_id)?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        // tempLink は node id で控える。拡大のたびに一覧をたどり直さないため。
+        amazon::save_links(&conn, &project_id, &amazon::links_of(&nodes))?;
+        recount_photos(&conn, &project_id)
+    })();
+    let count = match written {
+        Ok(count) => count,
+        Err(message) => {
+            settle_project_status(&conn, &project_id);
+            return Err(message);
+        }
+    };
     conn.execute(
         "UPDATE projects SET status='ready',updated_at=?1 WHERE id=?2",
         params![now(), project_id],
@@ -7365,6 +7452,105 @@ mod tests {
         }
     }
 
+    /// 走査の試験の道具。プロジェクト 1 件（フォルダ付き）を持つ DB を作る。
+    fn scan_fixture(label: &str, names: &[&str]) -> (PathBuf, String, Connection) {
+        let directory = test_directory(label);
+        let root = directory.to_string_lossy().to_string();
+        for name in names {
+            fs::write(directory.join(name), b"photo bytes").unwrap();
+        }
+        let conn = open_database(&directory.join("scan.sqlite3")).expect("open database");
+        conn.execute(
+            "INSERT INTO projects (id,name,folder_path,photo_count,status,created_at,updated_at)
+             VALUES ('p1','p1',?1,0,'ready',1,1)",
+            params![root],
+        )
+        .expect("insert project");
+        (directory, root, conn)
+    }
+
+    fn scan_for_test(
+        conn: &Connection,
+        root: &str,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<ScanEnd, String> {
+        scan_folder(conn, "p1", root, is_cancelled, &mut |_, _, _, _| {})
+    }
+
+    fn missing_names(conn: &Connection) -> Vec<String> {
+        let mut statement = conn
+            .prepare("SELECT name FROM photos WHERE project_id='p1' AND is_missing=1 ORDER BY name")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect()
+    }
+
+    fn project_row(conn: &Connection) -> (i64, String) {
+        conn.query_row(
+            "SELECT photo_count,status FROM projects WHERE id='p1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    // 再走査を途中で取り消すと、以前は `is_missing=1` だけが commit されて残り、
+    // 件数は前のまま、一覧は 0 件になっていた（レビュー R11）。
+    #[test]
+    fn cancelling_a_rescan_leaves_the_missing_flags_as_they_were() {
+        let (directory, root, conn) = scan_fixture("scan-cancel", &["a.jpg", "b.jpg", "c.jpg"]);
+        let first = scan_for_test(&conn, &root, &|| false).expect("first scan");
+        assert!(matches!(first, ScanEnd::Completed { count: 3, .. }));
+        assert_eq!(project_row(&conn), (3, "ready".to_string()));
+
+        // 2 枚目の途中で取り消す。
+        let calls = std::cell::Cell::new(0);
+        let ended = scan_for_test(&conn, &root, &|| {
+            calls.set(calls.get() + 1);
+            calls.get() > 1
+        })
+        .expect("cancelled scan");
+        assert!(matches!(ended, ScanEnd::Cancelled { processed: 1, total: 3 }));
+        assert!(missing_names(&conn).is_empty(), "取り消しで欠損の印を残さない");
+        assert_eq!(project_row(&conn), (3, "ready".to_string()));
+
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    // 走査が最後まで成功したときだけ、見つからなかった写真に欠損の印が付く。
+    #[test]
+    fn a_completed_rescan_marks_only_the_photos_that_vanished() {
+        let (directory, root, conn) = scan_fixture("scan-vanish", &["a.jpg", "b.jpg"]);
+        scan_for_test(&conn, &root, &|| false).expect("first scan");
+        fs::remove_file(directory.join("b.jpg")).unwrap();
+        let ended = scan_for_test(&conn, &root, &|| false).expect("rescan");
+        assert!(matches!(ended, ScanEnd::Completed { count: 1, unreadable: 0, .. }));
+        assert_eq!(missing_names(&conn), vec!["b.jpg".to_string()]);
+        assert_eq!(project_row(&conn), (1, "ready".to_string()));
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    // NAS が落ちている・共有が外れている・フォルダを移動した場合に、以前は列挙が
+    // 空になって全写真が欠損、「0 枚で準備完了」になっていた（レビュー R12）。
+    #[test]
+    fn scanning_a_folder_that_cannot_be_opened_fails_and_keeps_the_photos() {
+        let (directory, root, conn) = scan_fixture("scan-gone", &["a.jpg", "b.jpg"]);
+        scan_for_test(&conn, &root, &|| false).expect("first scan");
+        // フォルダ自体が無くなる（DB は別の場所に置いてある）。
+        let gone = directory.join("moved-away").to_string_lossy().to_string();
+        let error = scan_for_test(&conn, &gone, &|| false).err().expect("must fail");
+        assert!(error.contains("接続できません"), "{error}");
+        assert!(missing_names(&conn).is_empty(), "つながらないとき写真を欠損にしない");
+        assert_eq!(project_row(&conn), (2, "ready".to_string()), "状態も前のまま");
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
     /// 隠しフォルダ・動画は数えず、中身が JPEG の `.cr2` は数え、中身がテキストの
     /// `.jpg` は数から外れる。
     #[test]
@@ -7382,7 +7568,7 @@ mod tests {
         // HEIC は先頭が `ftyp` だが画像。数から外さず、「読めなかった」に数える。
         fs::write(directory.join("photo.heic"), b"\0\0\0\x18ftypheic\0\0\0\0mif1heic").unwrap();
 
-        let files = list_photo_files(&root);
+        let files = list_photo_files(&root).expect("list").files;
         assert_eq!(
             relative_names(&directory, &files),
             vec!["broken.jpg", "fake.cr2", "ok.jpg", "photo.heic"]
