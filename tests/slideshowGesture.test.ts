@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
-  TAP_SLOP, decideThreshold, dragFeedback, fitContain, flyTarget, isTap, judgeDrag, slideKeyDecision, tapDecision
+  TAP_SLOP, decideThreshold, dragFeedback, fitContain, flyTarget, isTap, judgeDrag, slideKeyDecision, tapDecision,
+  isDoubleTap, CENTER_RATIO, DOUBLE_TAP_MS, DOUBLE_TAP_DISTANCE
 } from '~/utils/slideshowGesture'
 
 describe('decideThreshold', () => {
@@ -76,8 +77,8 @@ describe('tapDecision（枠 left=0, top=0, 幅 1000, 高さ 800 → 上の帯は
   const tap = (x: number, y: number) => tapDecision(x, y, 0, 0, 1000, 800)
   it('左半分は落とす、右半分は残す', () => {
     expect(tap(100, 400)).toBe('drop')
-    expect(tap(499, 400)).toBe('drop')
-    expect(tap(500, 400)).toBe('keep')
+    expect(tap(379, 400)).toBe('drop')
+    expect(tap(621, 400)).toBe('keep')
     expect(tap(900, 799)).toBe('keep')
   })
   it('上の帯（上から 25% 未満）は左右を問わず ★5', () => {
@@ -93,6 +94,67 @@ describe('tapDecision（枠 left=0, top=0, 幅 1000, 高さ 800 → 上の帯は
     expect(tapDecision(400, 150, 200, 100, 400, 400)).toBe('top')
     expect(tapDecision(400, 200, 200, 100, 400, 400)).toBe('keep')
     expect(tapDecision(399, 200, 200, 100, 400, 400)).toBe('drop')
+  })
+})
+
+describe('tapDecision の中心（枠 1000×800 → 中心 (500,400)、±120 × ±96、上の帯は y<200）', () => {
+  const tap = (x: number, y: number) => tapDecision(x, y, 0, 0, 1000, 800)
+  it('定数は 0.12', () => {
+    expect(CENTER_RATIO).toBe(0.12)
+  })
+  it('ほぼ中心は何もしない（center）', () => {
+    expect(tap(500, 400)).toBe('center')
+    expect(tap(450, 350)).toBe('center')
+    expect(tap(550, 450)).toBe('center')
+  })
+  it('境目（横 ±120・縦 ±96）は中心に含み、1px 外は左右で分ける', () => {
+    expect(tap(380, 400)).toBe('center')
+    expect(tap(620, 400)).toBe('center')
+    expect(tap(379, 400)).toBe('drop')
+    expect(tap(621, 400)).toBe('keep')
+    expect(tap(500, 304)).toBe('center')
+    expect(tap(500, 496)).toBe('center')
+    expect(tap(500, 497)).toBe('keep')
+    expect(tap(499, 497)).toBe('drop')
+    expect(tap(500, 303)).toBe('keep')
+    expect(tap(499, 303)).toBe('drop')
+  })
+  it('帯が優先（帯の中は常に top。中心の長方形は帯の外）', () => {
+    expect(tap(500, 199)).toBe('top')
+    expect(tap(500, 200)).toBe('keep')
+    // 低い枠では中心の長方形が帯にかかる。そのときも帯が先
+    expect(tapDecision(500, 9, 0, 0, 1000, 40)).toBe('top')
+    expect(tapDecision(500, 16, 0, 0, 1000, 40)).toBe('center')
+  })
+  it('枠がずれていても枠の中心を基準にする', () => {
+    expect(tapDecision(400, 300, 200, 100, 400, 400)).toBe('center')
+    expect(tapDecision(448, 300, 200, 100, 400, 400)).toBe('center')
+    expect(tapDecision(449, 300, 200, 100, 400, 400)).toBe('keep')
+  })
+})
+
+describe('isDoubleTap（300ms 以内・24px 以内）', () => {
+  const at = (time: number, x = 100, y = 100) => ({ time, x, y })
+  it('定数', () => {
+    expect(DOUBLE_TAP_MS).toBe(300)
+    expect(DOUBLE_TAP_DISTANCE).toBe(24)
+  })
+  it('記録が無ければ二度押しでない（中心以外のタップで記録が消えた後）', () => {
+    expect(isDoubleTap(null, at(0))).toBe(false)
+  })
+  it('時間の境目', () => {
+    expect(isDoubleTap(at(1000), at(1100))).toBe(true)
+    expect(isDoubleTap(at(1000), at(1300))).toBe(true)
+    expect(isDoubleTap(at(1000), at(1301))).toBe(false)
+  })
+  it('距離の境目', () => {
+    expect(isDoubleTap(at(0, 100, 100), at(100, 124, 100))).toBe(true)
+    expect(isDoubleTap(at(0, 100, 100), at(100, 125, 100))).toBe(false)
+    expect(isDoubleTap(at(0, 100, 100), at(100, 118, 118))).toBe(false)
+    expect(isDoubleTap(at(0, 100, 100), at(100, 116, 116))).toBe(true)
+  })
+  it('時刻が戻っていたら二度押しでない', () => {
+    expect(isDoubleTap(at(1000), at(999))).toBe(false)
   })
 })
 

@@ -3,7 +3,8 @@
  * ここでしない（決まった操作は core の `advance`・`keepAndTop` へ渡す）。
  *
  * 操作: 左＝落とす／右＝残す／上＝★5 で確定。下は使わない。
- * クリック（タップ）: 上の帯＝★5、それ以外は左半分＝落とす・右半分＝残す。
+ * クリック（タップ）: 上の帯＝★5、ほぼ中心＝何もしない（二度押しで拡大）、
+ * それ以外は左半分＝落とす・右半分＝残す。
  * キー: 1・←＝落とす／3・→＝残す／5・↑＝★5（↓・2・4 は何もしない）。
  * 数値・規則は Android の SlideshowGesture.kt と同じにする。
  */
@@ -56,15 +57,38 @@ export function dragFeedback(dx: number, dy: number, width: number): DragFeedbac
 /** 枠の上から、この割合までの帯のクリック（タップ）は「★5 で確定」。 */
 export const TOP_BAND_RATIO = 0.25
 
+/** 枠の中心から、横は幅の ±12%・縦は高さの ±12%（境目を含む）の長方形が「ほぼ中心」。 */
+export const CENTER_RATIO = 0.12
+
+/** クリック（タップ）の結果。'center' は何もしない（二度押しなら拡大）。 */
+export type TapResult = SlideDecision | 'center'
+
 /**
- * クリック（タップ）の判定。枠の上の帯（高さの上から 25% 未満）は「★5 で確定」、
- * それ以外は左半分が「落とす」・右半分が「残す」。
+ * クリック（タップ）の判定。枠の上の帯（高さの上から 25% 未満）は「★5 で確定」（帯が優先）、
+ * ほぼ中心は 'center'（何もしない）、それ以外は左半分が「落とす」・右半分が「残す」。
  */
 export function tapDecision(
   clientX: number, clientY: number, left: number, top: number, width: number, height: number
-): SlideDecision {
+): TapResult {
   if (clientY < top + height * TOP_BAND_RATIO) return 'top'
-  return clientX < left + width / 2 ? 'drop' : 'keep'
+  const cx = left + width / 2
+  const cy = top + height / 2
+  if (Math.abs(clientX - cx) <= width * CENTER_RATIO && Math.abs(clientY - cy) <= height * CENTER_RATIO) return 'center'
+  return clientX < cx ? 'drop' : 'keep'
+}
+
+/** 二度押しとみなす間隔（ms）と距離（px）。どちらも境目を含む。 */
+export const DOUBLE_TAP_MS = 300
+export const DOUBLE_TAP_DISTANCE = 24
+
+export interface TapRecord { time: number, x: number, y: number }
+
+/** 直前の中心タップ（なければ null）と今回の中心タップが、300ms 以内・24px 以内なら二度押し。 */
+export function isDoubleTap(prev: TapRecord | null, now: TapRecord): boolean {
+  if (!prev) return false
+  const dt = now.time - prev.time
+  if (!(dt >= 0 && dt <= DOUBLE_TAP_MS)) return false
+  return Math.hypot(now.x - prev.x, now.y - prev.y) <= DOUBLE_TAP_DISTANCE
 }
 
 export interface KeyLike {

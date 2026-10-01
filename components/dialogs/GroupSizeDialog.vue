@@ -44,7 +44,7 @@ function onArrowKey(event: KeyboardEvent) {
         <v-btn value="slideshow" prepend-icon="mdi-image-outline">スライドショー</v-btn>
       </v-btn-toggle>
       <p v-if="pendingSlideshow" class="text-caption text-medium-emphasis mb-0">
-        1 枚ずつ出して、残す（右）か落とす（左）かを決めます。上へのスワイプや、写真の上のほうのクリック・タップで★5 にして確定します。キーは 1・←＝落とす、3・→＝残す、5・↑＝★5 で確定です。
+        1 枚ずつ出して、残す（右）か落とす（左）かを決めます。上へのスワイプや、写真の上のほうのクリック・タップで★5 にして確定します。キーは 1・←＝落とす、3・→＝残す、5・↑＝★5 で確定です。写真のほぼ中心のクリック・タップは何もせず、二度押しで拡大します。
       </p>
       <template v-else>
       <div class="text-subtitle-2 mb-1">1グループの表示枚数</div>
