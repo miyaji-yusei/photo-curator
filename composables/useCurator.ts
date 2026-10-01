@@ -3,7 +3,7 @@ import type {
   SelectionResult, SelectionSummary, TournamentSettings
 } from '~/types/photo'
 import { MAX_RATING } from '~/types/photo'
-import type { DisplaySettings } from '~/composables/photoBackend'
+import type { DisplaySettings, PhotoBackend } from '~/composables/photoBackend'
 import { builtDisplayCount, displayEdgePlan } from '~/utils/displayEdge'
 import type { MoveSelection } from '~/utils/ratingMove'
 // `selectedCount` は選別画面側の computed と名前がぶつかるので別名にする。
@@ -20,6 +20,7 @@ import { buildBurstQuestions } from '~/utils/burstQuestions'
 import { burstNeighborhood } from '~/utils/burstNeighborhood'
 import { joinSpanOverrides, overridesFromShape } from '~/utils/burstShape'
 import { createSaveQueue } from '~/utils/saveQueue'
+import { createSerialQueue } from '~/utils/serialQueue'
 import {
   BURST_WINDOW_MS, D_HASH_VERSION, DEFAULT_BURST_DISTANCE,
   buildCoreInputs, maxNeighborDistance, toPhotoRef
@@ -42,8 +43,52 @@ import { registerAutoPush, useSidecarSync } from '~/composables/useSidecarSync'
 
 type View = 'home' | 'project' | 'method' | 'settings' | 'app-settings' | 'burst-threshold' | 'burst-preview' | 'tournament' | 'result' | 'results' | 'burst-review'
 
-function createCurator() {
-  const desktop = useDesktop()
+/**
+ * 行の星を**読む・消す・動かす**メソッド。選別の 1 タップは行の星の書き込みを待たずに次の組を出す（W1）ので、
+ * これらは入っている書き込みが終わってから走らせる（自分の書き込みを読み損ねない）。
+ * 行の星に触るメソッドを PhotoBackend に足したら、ここにも足すこと。`getPhotosByIds`・`saveSession` は
+ * 1 タップの道なので入れない。
+ */
+const ROW_RATING_METHODS = new Set<string>([
+  'getSelectionSummary', 'getCoreInputs', 'getProjectPhotoPage', 'getAnalysisBacklog',
+  'resetSelectionResults', 'moveRating', 'exportPhotos', 'exportAmazon', 'writeRatingsToPhotos',
+  'saveCsv', 'deleteProject'
+])
+
+function withRatingsBarrier(base: PhotoBackend, waitForWrites: () => Promise<void>): PhotoBackend {
+  return new Proxy(base, {
+    get(target, key, receiver) {
+      const value = Reflect.get(target, key, receiver)
+      if (typeof key !== 'string' || typeof value !== 'function' || !ROW_RATING_METHODS.has(key)) return value
+      return async (...args: unknown[]) => {
+        await waitForWrites()
+        return (value as (...a: unknown[]) => unknown).apply(target, args)
+      }
+    }
+  })
+}
+
+/** テストでは偽の `PhotoBackend` を渡す（既定は実行環境に合う実装）。 */
+export function createCurator(backend: PhotoBackend = useDesktop()) {
+  /**
+   * 行の星の書き込みの直列キュー（W1）。1 タップごとの書き込み・集計の完了を待たずに次の組を出す。
+   * 入れた順に 1 本ずつ書く（「1 つ戻す」が前の書き込みを追い越さない）。空になったら集計を 1 回だけ読み直す。
+   */
+  const ratingsQueue = createSerialQueue(
+    (cause) => { error.value = cause instanceof Error ? cause.message : '選別結果を保存できませんでした。' },
+    async () => {
+      const project = activeProject.value
+      if (!project) return
+      try {
+        // 自分の待ち行列の中なので、待たない素の backend を使う。
+        const summary = await backend.getSelectionSummary(project.id)
+        if (activeProject.value?.id === project.id) selectionSummary.value = summary
+      } catch {
+        selectionSummary.value = null
+      }
+    }
+  )
+  const desktop = withRatingsBarrier(backend, () => ratingsQueue.flush())
   const { notify } = useNotice()
   // サイドカー（写真のフォルダの `.photo-curator/catalog.json`）。4 通りの判断は core が行う。
   const sidecar = useSidecarSync(desktop)
@@ -85,6 +130,8 @@ function createCurator() {
   )
   /** 保存を書き終えてから、サイドカーに変更があれば書く（サイドカーは封筒も持つので順序が要る）。 */
   async function flushThenPush() {
+    // 行の星の書き込みが先（サイドカーの「変わった」印も、その書き込みのあとに付く）。
+    await ratingsQueue.flush()
     await saveQueue.flush()
     await sidecar.pushAuto(pushableProject())
   }
@@ -487,9 +534,13 @@ function createCurator() {
 
   const PREVIEW_PAGE = 120
   let previewMoreBusy = false
+  /** 読み直し（先頭から）の世代。新しい読み直しが始まったら、古い読み直し・続きの応答は捨てる（W7）。 */
+  let previewToken = 0
   /** 先頭から読み直す。すでにページ送りで読んだ分は、その数まで読み直す（準備の途中の更新でスクロールが戻らないように）。 */
   async function loadPreview(projectId: string) {
+    const token = ++previewToken
     const page = await desktop.getProjectPhotoPage(projectId, 0, Math.max(PREVIEW_PAGE, previewPhotos.value.length))
+    if (token !== previewToken) return
     if (activeProject.value && activeProject.value.id !== projectId) return
     previewPhotos.value = page.photos
     previewTotal.value = page.total
@@ -500,9 +551,10 @@ function createCurator() {
     const project = activeProject.value
     if (!project || previewMoreBusy || previewPhotos.value.length >= previewTotal.value) return
     previewMoreBusy = true
+    const token = previewToken
     try {
       const page = await desktop.getProjectPhotoPage(project.id, previewPhotos.value.length, PREVIEW_PAGE)
-      if (activeProject.value?.id !== project.id) return
+      if (activeProject.value?.id !== project.id || token !== previewToken) return
       previewPhotos.value = [...previewPhotos.value, ...page.photos]
       previewTotal.value = page.total
     } catch {
@@ -610,8 +662,12 @@ function createCurator() {
     if (projectId && projectId !== deletingProjectId) sidecar.markChanged(projectId)
   }
 
-  /** 前後の星を比べ、変わった写真の行だけ書く。`undo` も同じ。 */
-  async function writeRatings(changes: RatingChange[]) {
+  /**
+   * 前後の星を比べ、変わった写真の行だけ書く。`undo` も同じ。書き込みは直列キューに入れる。
+   * `wait` が true（既定）なら、書き込みと集計の読み直しが終わるまで待つ。選別の 1 タップ
+   * （`advanceWith`・`undoChoice`）だけ false で、待たずに次の組を出す。
+   */
+  async function writeRatings(changes: RatingChange[], wait = true) {
     const projectId = activeProject.value?.id
     if (!projectId || !changes.length) return
     const entries: SelectionResult[] = []
@@ -620,23 +676,21 @@ function createCurator() {
       if (id) entries.push({ id, rating: change.rating })
     }
     if (!entries.length) return
-    try {
-      await desktop.saveSelectionResults(projectId, entries)
+    ratingsQueue.enqueue(async () => {
+      await backend.saveSelectionResults(projectId, entries)
       noteJudgementChanged(projectId)
-      await loadSummary()
-    } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : '選別結果を保存できませんでした。'
-    }
+    })
+    if (wait) await ratingsQueue.flush()
   }
 
-  /** core の新しい Session を受け取り、星を行にも写す。 */
-  async function applyCore(next: Session) {
+  /** core の新しい Session を受け取り、星を行にも写す。`wait` は `writeRatings` と同じ。 */
+  async function applyCore(next: Session, wait = true) {
     const previous = session.value?.core ?? null
     setCore(next)
     // Session を先に待ち行列へ入れる。行の星の書き込みの途中で終了しても、Session は新しい組になる
     // （逆順だと、行の星だけ進んで Session が前の組のまま残り、次に開いて同じ組を確定すると +1 が重なる）。
     saveSession()
-    await writeRatings(syncRatings(previous, next))
+    await writeRatings(syncRatings(previous, next), wait)
   }
 
   /**
@@ -706,7 +760,11 @@ function createCurator() {
     if (activeProject.value) await sidecar.saveNow(activeProject.value)
   }
 
+  /** 開く処理の世代。新しい呼び出しが来たら古い呼び出しは、以降の結果を捨てて終わる（W6）。 */
+  let openToken = 0
   async function openProject(project: Project) {
+    const token = ++openToken
+    const stale = () => token !== openToken
     activeProject.value = project
     previewPhotos.value = []
     previewTotal.value = 0
@@ -720,6 +778,11 @@ function createCurator() {
     try {
       // 前に開いていたプロジェクトの書き途中を、読む前に書き終える。
       await saveQueue.flush()
+      if (stale()) return
+      // プレビュー格子は星を出さないのでサイドカーの結果に依存しない。確認と並べて読み始める（W9）。
+      // サイドカーが取り込んだときは reloadAfterSidecar がもう一度読むので、最後は新しい値になる。
+      const preview = loadPreview(project.id)
+      preview.catch(() => undefined) // 待つのは下。ここでは未処理の拒否にしない
       // 記録の取り込みは、選別の途中を読み込む前に済ませる（取り込んだ分が画面に出るように）。
       // 写真の行がまだ無いときは、走査のあとで確かめる（星を写す行が要る）。
       if (project.photoCount > 0) await runSidecarCheck(project)
@@ -727,14 +790,19 @@ function createCurator() {
         sidecarCheckPending = project.id
         await sidecar.refreshAccess(project.id)
       }
+      if (stale()) return
       await Promise.all([
-        loadPreview(project.id),
+        preview,
         desktop.loadSession(project.id).then(value => {
+          // 遅れて届いた前のプロジェクトの封筒で、今のプロジェクトの session を上書きしない。
+          if (stale()) return
           if (value) value.core = markRaw(value.core)
           session.value = value
         })
       ])
+      if (stale()) return
       await healRowRatings(project.id)
+      if (stale()) return
       // 開いた時点から少しずつ解析を進めておく。「選別を開始」で待たされないように。
       // ただし**やることが無いなら起動しない**。以前は無条件に呼んでいたため、
       // 解析済みのプロジェクトを開くたびに進捗イベントだけが飛び、解析中の帯が
@@ -757,20 +825,25 @@ function createCurator() {
         await loadSummary()
         return
       }
-      const backlog = await desktop.getAnalysisBacklog(project.id).catch(() => 0)
+      // 未解析数・表示用の状態・集計は互いに依存しないので、並べて読む（W9）。
+      const [backlog] = await Promise.all([
+        desktop.getAnalysisBacklog(project.id).catch(() => 0),
+        refreshDisplayState(),
+        loadSummary()
+      ])
+      if (stale()) return
       analysisBacklog.value = backlog
       if (backlog > 0) desktop.startBackgroundAnalysis(project.id).catch(() => undefined)
       // 表示用画像は走査とは別に溜める。**走査に混ぜると解析が桁で遅くなる**
       // （EXIF サムネイル経路 1.72ms/枚 に対しフルデコード 132ms/枚）。
-      await refreshDisplayState()
       if (displayBacklog.value > 0) {
         desktop.startDisplayGeneration(project.id).catch(() => undefined)
       }
-      await loadSummary()
     } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : 'プロジェクトを開けませんでした。'
+      if (!stale()) error.value = cause instanceof Error ? cause.message : 'プロジェクトを開けませんでした。'
     } finally {
-      loading.value = false
+      // 古い呼び出しが、新しい呼び出しの「読み込み中」を落とさない。
+      if (!stale()) loading.value = false
     }
   }
 
@@ -1305,7 +1378,9 @@ function createCurator() {
   async function toggleChoice(photoId: string) {
     const current = session.value
     const path = pathOf(photoId)
-    if (!current || !path) return
+    // 今の組に無い写真（組が進んだあとに届いた古い操作）は無視する。core の `advance` は組に無い
+    // 写真を黙って捨てるので、通すと新しい組が「選ばず」で丸ごと落ちる（W5）。
+    if (!current || !path || !current.core.current.includes(path)) return
     if (!current.multiSelect) {
       current.selectedInGroup = [path]
       await confirmChoices()
@@ -1336,8 +1411,10 @@ function createCurator() {
     current.selectedInGroup = []
     current.multiSelect = false
     if (next.finished) current.stage = 'result'
-    await applyCore(next)
+    // 行の星の書き込み・集計は待たずに次の組を出す（W1）。終わったときだけ、結果の数字のために待つ。
+    await applyCore(next, false)
     if (next.finished) {
+      await ratingsQueue.flush()
       view.value = 'result'
     } else {
       await loadCurrentPhotos()
@@ -1355,6 +1432,9 @@ function createCurator() {
   async function decideSlide(kind: 'keep' | 'drop' | 'top', photoId: string) {
     const current = session.value
     if (!current) return
+    // 飛ばしている間に組が進んだ・戻された（Backspace）とき、古い写真への判断は捨てる（W5）。
+    const path = pathOf(photoId)
+    if (!path || !current.core.current.includes(path)) return
     current.multiSelect = false
     if (kind === 'keep') await toggleChoice(photoId)
     else if (kind === 'top') await confirmPhoto(photoId)
@@ -1621,7 +1701,7 @@ function createCurator() {
     const current = session.value
     if (!current || !current.core.history.length) return
     // 戻した星（仲間の分も）は、前後の差で行にも戻る。
-    await applyCore(core.undo(current.core))
+    await applyCore(core.undo(current.core), false)
     current.selectedInGroup = []
     current.multiSelect = false
     current.stage = 'tournament'
@@ -1948,8 +2028,11 @@ function createCurator() {
     await loadResultsPage(true)
   }
 
+  /** 結果の読み直し（reset）の世代。reset が来たら、それ以前の読み込みの応答は捨てる（W7）。 */
+  let resultsToken = 0
   async function loadResultsPage(reset = false) {
     if (!activeProject.value) return
+    const token = reset ? ++resultsToken : resultsToken
     resultsBusy.value = true
     try {
       if (reset) {
@@ -1959,13 +2042,15 @@ function createCurator() {
       const page = await desktop.getProjectPhotoPage(
         activeProject.value.id, resultsOffset.value, 80, resultsRating.value, resultsSort.value
       )
+      if (token !== resultsToken) return
       resultsPhotos.value = [...resultsPhotos.value, ...page.photos]
       resultsTotal.value = page.total
       resultsOffset.value += page.photos.length
     } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : '選別結果を読み込めませんでした。'
+      if (token === resultsToken) error.value = cause instanceof Error ? cause.message : '選別結果を読み込めませんでした。'
     } finally {
-      resultsBusy.value = false
+      // 古い読み込みが、新しい読み込みの「読み込み中」を落とさない。
+      if (token === resultsToken) resultsBusy.value = false
     }
   }
 
@@ -2209,8 +2294,11 @@ function createCurator() {
     void loadMovePage(true)
   }
 
+  /** 移動の一覧の読み直し（reset）の世代（W7）。 */
+  let moveToken = 0
   async function loadMovePage(reset = false) {
     if (!activeProject.value) return
+    const token = reset ? ++moveToken : moveToken
     moveBusy.value = true
     try {
       if (reset) {
@@ -2220,13 +2308,14 @@ function createCurator() {
       const page = await desktop.getProjectPhotoPage(
         activeProject.value.id, moveOffset.value, 80, moveFrom.value, 'name'
       )
+      if (token !== moveToken) return
       movePhotos.value = [...movePhotos.value, ...page.photos]
       moveTotal.value = page.total
       moveOffset.value += page.photos.length
     } catch (cause) {
-      moveError.value = cause instanceof Error ? cause.message : '写真を読み込めませんでした。'
+      if (token === moveToken) moveError.value = cause instanceof Error ? cause.message : '写真を読み込めませんでした。'
     } finally {
-      moveBusy.value = false
+      if (token === moveToken) moveBusy.value = false
     }
   }
 
@@ -2595,7 +2684,11 @@ function createCurator() {
   watch(view, (next, previous) => {
     if (next === 'home' && previous !== 'home') void flushThenPush()
     // 選別のあとに戻ったとき、行の状態・点を今の値にする。
-    if ((next === 'home' || next === 'project') && previous !== next) void refreshProjectCards()
+    // ただし home -> project（プロジェクトを開く）は読み直さない。開く処理が同じ DB を使っている最中で、
+    // 点・見本は直前のホームの値のまま使える（W4）。
+    if ((next === 'home' || next === 'project') && previous !== next && !(previous === 'home' && next === 'project')) {
+      void refreshProjectCards()
+    }
   })
 
   async function mount() {
@@ -2664,7 +2757,10 @@ function createCurator() {
       error.value = cause instanceof Error ? cause.message : '進み具合を受け取れませんでした。'
     }
     // 背面へ回る・窓を閉じるときに書く。ホームへ戻るときは `view` の監視で書く。
-    stopAutoPush = registerAutoPush(() => sidecar.pushAuto(pushableProject()), () => saveQueue.flush())
+    stopAutoPush = registerAutoPush(
+      () => sidecar.pushAuto(pushableProject()),
+      async () => { await ratingsQueue.flush(); await saveQueue.flush() }
+    )
     // Tauri の窓を閉じるとき: 保存とサイドカーの書き込みを待ってから閉じる（待ちすぎないよう 5 秒で切る）。
     if (desktop.kind === 'tauri') {
       try {

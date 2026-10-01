@@ -134,4 +134,22 @@ describe('saveQueue', () => {
     await queue.drop('none')
     expect(queue.busy).toBe(false)
   })
+
+  // W8: 最後の 1 件を書き終えた直後の隙間に enqueue しても、その 1 件が書かれずに flush が返らない。
+  // 隙間は 1〜数マイクロタスクなので、enqueue するまでのマイクロタスク数を振って確かめる。
+  it('最後の書き込みの完了直後に enqueue しても取りこぼさない（flush も全部書いてから返る）', async () => {
+    for (let ticks = 0; ticks < 12; ticks += 1) {
+      const log: string[] = []
+      const queue = createSaveQueue<string>(async (_projectId, envelope) => { log.push(String(envelope)) }, () => {})
+      queue.enqueue('p', 'first')
+      for (let i = 0; i < ticks; i += 1) await Promise.resolve()
+      queue.enqueue('p', 'late')
+      await tick() // flush を呼ばなくても書かれる（次の enqueue まで置き去りにならない）
+      expect(log, `ticks=${ticks}`).toContain('late')
+      await queue.flush()
+      expect(log, `ticks=${ticks}`).toContain('late')
+      expect(log[log.length - 1], `ticks=${ticks}`).toBe('late')
+      expect(queue.busy).toBe(false)
+    }
+  })
 })

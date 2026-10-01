@@ -59,7 +59,10 @@ onMounted(() => {
   observer = new ResizeObserver(measure)
   observer.observe(stage.value)
 })
+/** 画面を離れたあとに、飛ばしている途中の判断が走らないようにする（W5）。 */
+let alive = true
 onBeforeUnmount(() => {
+  alive = false
   observer?.disconnect()
   window.removeEventListener('keydown', onKeydown)
 })
@@ -117,6 +120,7 @@ async function decide(kind: SlideDecision) {
     setFeedback(kind, 1)
     setMotion(fly.x, fly.y, fly.rotation, FLY_MS)
     await sleep(FLY_MS)
+    if (!alive) return
     await decideSlide(kind, current.id)
   } finally {
     motion.value = { photoId: '', x: 0, y: 0, rotation: 0, animate: 0 }

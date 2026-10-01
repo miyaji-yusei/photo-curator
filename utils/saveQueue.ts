@@ -43,11 +43,14 @@ export function createSaveQueue<T>(
       await done
       writing = null
     }
+    // 空と見たのと**同じ同期の区間**で running を外す。`.finally` に頼ると、
+    // 「空と見てから running が null になるまで」の隙間に入った enqueue が書かれない（W8）。
+    running = null
   }
 
   function start() {
     if (running) return
-    running = drain().finally(() => { running = null })
+    running = drain()
   }
 
   return {
@@ -57,7 +60,10 @@ export function createSaveQueue<T>(
     },
     async flush() {
       // 書いている間に足されたものも待つ。
-      while (running) await running
+      while (running || pending.size) {
+        if (!running) start()
+        await running
+      }
     },
     async drop(projectId) {
       pending.delete(projectId)
