@@ -43,7 +43,8 @@ object ProjectData {
         Learning.forget(context, projectId)
         Overrides.clear(context, projectId)
         Timing.clear(context, projectId)
-        // **やり直したことも判断。** 次にサイドカーへ渡す。
-        SyncState.touch(context, projectId)
+        // **やり直したことも判断。** 新しい世代にして、次にサイドカーへ渡す
+        // （ほかの端末は「最初からやり直された」と確認を出す。黙って空にしない）。
+        SyncState.restarted(context, projectId)
     }
 }

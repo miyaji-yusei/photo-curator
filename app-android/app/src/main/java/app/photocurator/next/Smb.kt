@@ -292,8 +292,76 @@ object Smb {
         path: String,
         bytes: ByteArray
     ): SmbResult<Unit> = connect(nas, password) { share ->
+        requireSidecar(path)
+        makeParent(share, path)
+        // **一時ファイルに書いてから置き換える。** 途中で切れても、前の中身が残る
+        // （直接書き換えると、壊れた catalog.json が残って両方の端末が同期できなくなる）。
+        val temporary = path + "." + java.util.UUID.randomUUID().toString().take(8) + ".writing"
+        try {
+            writeTo(share, temporary, bytes)
+            renameIn(share, temporary, path)
+        } finally {
+            if (share.fileExists(temporary)) share.rm(temporary)
+        }
+        Unit
+    }
+
+    /** そのまま書く（あれば置き換える）。**一時ファイルを書くとき用**（置き換えは [rename]）。 */
+    suspend fun writeDirect(nas: Nas, password: String, path: String, bytes: ByteArray): SmbResult<Unit> =
+        connect(nas, password) { share ->
+            requireSidecar(path)
+            makeParent(share, path)
+            writeTo(share, path, bytes)
+        }
+
+    /** 名前を変える。**先にあれば置き換える。** */
+    suspend fun rename(nas: Nas, password: String, from: String, to: String): SmbResult<Unit> =
+        connect(nas, password) { share ->
+            requireSidecar(from)
+            requireSidecar(to)
+            renameIn(share, from, to)
+        }
+
+    /** 無いときだけ作る（書く間のロック）。先にあれば false。 */
+    suspend fun createExclusive(nas: Nas, password: String, path: String, bytes: ByteArray): SmbResult<Boolean> =
+        connect(nas, password) { share ->
+            requireSidecar(path)
+            makeParent(share, path)
+            try {
+                share.openFile(
+                    path,
+                    EnumSet.of(AccessMask.GENERIC_WRITE),
+                    null,
+                    SMB2ShareAccess.ALL,
+                    // 無いときだけ作る。あれば失敗する（NAS の側で 1 つに決まる）。
+                    SMB2CreateDisposition.FILE_CREATE,
+                    null
+                ).use { file -> file.outputStream.use { it.write(bytes) } }
+                true
+            } catch (error: com.hierynomus.mssmb2.SMBApiException) {
+                if (error.status == com.hierynomus.mserref.NtStatus.STATUS_OBJECT_NAME_COLLISION) false
+                else throw error
+            }
+        }
+
+    /** 消す。**無くても失敗にしない。** サイドカーの下だけ。 */
+    suspend fun delete(nas: Nas, password: String, path: String): SmbResult<Unit> =
+        connect(nas, password) { share ->
+            requireSidecar(path)
+            if (share.fileExists(path)) share.rm(path)
+        }
+
+    /** 書いてよいのは `.photo-curator` の下だけ（設計 CON-3）。**原本には触らない。** */
+    private fun requireSidecar(path: String) {
+        require(path.split('\\', '/').contains(".photo-curator")) { "サイドカーの外には書かない: $path" }
+    }
+
+    private fun makeParent(share: DiskShare, path: String) {
         val parent = path.substringBeforeLast('\\', "")
         if (parent.isNotEmpty() && !share.folderExists(parent)) share.mkdir(parent)
+    }
+
+    private fun writeTo(share: DiskShare, path: String, bytes: ByteArray) {
         share.openFile(
             path,
             EnumSet.of(AccessMask.GENERIC_WRITE),
@@ -303,7 +371,17 @@ object Smb {
             SMB2CreateDisposition.FILE_OVERWRITE_IF,
             null
         ).use { file -> file.outputStream.use { it.write(bytes) } }
-        Unit
+    }
+
+    private fun renameIn(share: DiskShare, from: String, to: String) {
+        share.openFile(
+            from,
+            EnumSet.of(AccessMask.DELETE, AccessMask.GENERIC_READ),
+            null,
+            SMB2ShareAccess.ALL,
+            SMB2CreateDisposition.FILE_OPEN,
+            null
+        ).use { file -> file.rename(to, true) }
     }
 
     /** つながるかだけ試す。**設定画面の「接続を確認」。** */
