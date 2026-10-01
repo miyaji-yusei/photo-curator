@@ -264,9 +264,14 @@ fun ResultsScreen(
                 }
             } else {
                 IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, "戻る") }
-                Text("結果 · ${project.name}", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                // 長い名前はボタンを押しのけず、末尾を省略する（カバー画面）。
+                Text(
+                    "結果 · ${project.name}", fontSize = 16.sp, fontWeight = FontWeight.SemiBold,
+                    maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
             }
-            Spacer(Modifier.weight(1f))
+            if (selecting) Spacer(Modifier.weight(1f))
             Button(
                 onClick = { outputMenu = true },
                 enabled = !busy && targets.isNotEmpty(),
@@ -274,7 +279,7 @@ fun ResultsScreen(
             ) {
                 Icon(Icons.Filled.Output, null, Modifier.size(16.dp))
                 Spacer(Modifier.width(6.dp))
-                Text("$targetLabel を…", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                Text("$targetLabel を…", fontWeight = FontWeight.Bold, fontSize = 13.sp, maxLines = 1)
             }
         }
 

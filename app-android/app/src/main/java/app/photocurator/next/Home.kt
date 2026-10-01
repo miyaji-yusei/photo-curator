@@ -91,7 +91,11 @@ fun HomeScreen(
             Button(onClick = onCreate, shape = RoundedCornerShape(50)) {
                 Icon(Icons.Filled.Add, null, Modifier.size(18.dp))
                 Spacer(Modifier.width(6.dp))
-                Text("プロジェクトを作成", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                // カバー画面では「プロジェクトを作成」が入りきらず「作／成」と折れるので短くする。
+                Text(
+                    if (rememberNarrow()) "新規作成" else "プロジェクトを作成",
+                    fontWeight = FontWeight.Bold, fontSize = 14.sp, maxLines = 1
+                )
             }
         }
 

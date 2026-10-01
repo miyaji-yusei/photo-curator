@@ -87,7 +87,10 @@ internal fun SlideshowStage(
     var busy by remember(path) { mutableStateOf(false) }
     var look by remember(path) { mutableStateOf(SlideshowGesture.Feedback(null, 0f, 0f)) }
     val busyNow by rememberUpdatedState(busy)
+    // 直前の中心タップ（二度タップで拡大）。写真が変われば捨てる。
+    var lastCenterTap by remember(path) { mutableStateOf<SlideshowGesture.TapRecord?>(null) }
     val decideNow by rememberUpdatedState(onDecide)
+    val zoomNow by rememberUpdatedState(onZoom)
 
     val widthDp = frame.width / density
     val heightDp = frame.height / density
@@ -150,13 +153,30 @@ internal fun SlideshowStage(
                         val dy = (change.position.y - startY) / density
                         if (!change.pressed) {
                             if (!moved) {
-                                // タップ。左半分は落とす、右半分は残す（長押しの拡大はしない）。
-                                decide(
-                                    SlideshowGesture.tapDecision(
-                                        change.position.x, 0f, size.width.toFloat()
-                                    )
+                                // タップ。上の帯は★5、ほぼ中心は何もしない（二度タップで拡大）、
+                                // それ以外は左半分が落とす・右半分が残す（長押しの拡大はしない）。
+                                val result = SlideshowGesture.tapDecision(
+                                    change.position.x, change.position.y, 0f, 0f,
+                                    size.width.toFloat(), size.height.toFloat()
                                 )
+                                if (result != null) {
+                                    lastCenterTap = null
+                                    decide(result)
+                                } else {
+                                    // 1 回目は何もしない（遅らせない）。300ms・24dp 以内の 2 回目で拡大する。
+                                    val now = SlideshowGesture.TapRecord(
+                                        change.uptimeMillis,
+                                        change.position.x / density, change.position.y / density
+                                    )
+                                    if (SlideshowGesture.isDoubleTap(lastCenterTap, now)) {
+                                        lastCenterTap = null
+                                        zoomNow()
+                                    } else {
+                                        lastCenterTap = now
+                                    }
+                                }
                             } else {
+                                lastCenterTap = null
                                 val decision = SlideshowGesture.judgeDrag(dx, dy, widthNow)
                                 if (decision != null) decide(decision) else snapBack()
                             }

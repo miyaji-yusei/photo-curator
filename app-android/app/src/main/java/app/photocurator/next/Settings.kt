@@ -18,6 +18,8 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.filled.ChevronRight
 import kotlinx.coroutines.launch
 import androidx.compose.ui.text.font.FontWeight
@@ -30,6 +32,7 @@ import androidx.compose.ui.unit.sp
  * ここは「次に作るプロジェクトがどう始まるか」を決める場所。
  * いま動いている選別は変えない（選別中の変更は選別画面の `…` から）。
  */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun SettingsScreen(onBack: () -> Unit) {
     val context = LocalContext.current
@@ -62,11 +65,8 @@ fun SettingsScreen(onBack: () -> Unit) {
             Text("設定", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
         }
 
-        Row(
-            Modifier.fillMaxSize().padding(horizontal = 16.dp),
-            horizontalArrangement = Arrangement.spacedBy(16.dp)
-        ) {
-            Column(Modifier.weight(1f)) {
+        val narrow = rememberNarrow()
+        val nasPanel: @Composable () -> Unit = {
                 Panel {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text("NAS", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
@@ -154,9 +154,8 @@ fun SettingsScreen(onBack: () -> Unit) {
                         fontSize = 11.sp, color = Faint
                     )
                 }
-            }
-
-            Column(Modifier.weight(1f)) {
+        }
+        val prefsPanels: @Composable () -> Unit = {
                 Panel {
                     Text("表示用画像の既定", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                     Spacer(Modifier.height(4.dp))
@@ -166,7 +165,11 @@ fun SettingsScreen(onBack: () -> Unit) {
                         fontSize = 11.sp, color = Faint
                     )
                     Spacer(Modifier.height(8.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    // 狭い幅では折り返す（3 つ並べると 1 つが縦に潰れる）。
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
                         // 実測 1024px で 1 枚 約 80KB。2,000 枚で約 160MB。
                         EdgeChip("標準 1024px", estimate(1024), displayEdge == 1024) {
                             displayEdge = 1024; Prefs.setDisplayEdge(context, 1024)
@@ -192,34 +195,41 @@ fun SettingsScreen(onBack: () -> Unit) {
                     Text("選別の既定", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                     Spacer(Modifier.height(12.dp))
 
-                    Text("一度に見比べる枚数", fontSize = 13.sp)
+                    // 開始前シート・選別中の設定と同じ並び（方式 → トーナメントのときだけ枚数）。
+                    // ここは「既定」なので、押した時点で保存する。
+                    Text("選別の方式", fontSize = 13.sp)
                     Spacer(Modifier.height(6.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        for (size in 2..10) {
-                            SizeDot(size, size == groupSize) {
-                                groupSize = size; Prefs.setGroupSize(context, size)
+                    val slideshow = groupSize == Prefs.SLIDESHOW_SIZE
+                    MethodSegment(
+                        if (slideshow) Method.Slideshow else Method.Tournament,
+                        onChange = { method ->
+                            val next = if (method == Method.Slideshow) Prefs.SLIDESHOW_SIZE
+                            else Prefs.tournamentSize(context)
+                            groupSize = next; Prefs.setGroupSize(context, next)
+                        }
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    if (slideshow) {
+                        Text(SLIDESHOW_NOTE, fontSize = 11.sp, color = Faint)
+                    } else {
+                        Text("一度に見比べる枚数", fontSize = 13.sp)
+                        Spacer(Modifier.height(6.dp))
+                        FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            for (size in 2..10) {
+                                SizeDot(size, size == groupSize) {
+                                    groupSize = size; Prefs.setGroupSize(context, size)
+                                }
                             }
                         }
+                        Text(
+                            "4 枚がおすすめ。多いほど 1 回で絞れますが、1 枚が小さくなります",
+                            fontSize = 11.sp, color = Faint,
+                            modifier = Modifier.padding(top = 6.dp)
+                        )
                     }
-                    // 1 枚ずつ決める方式。**枚数ではなく方式**なので、丸とは別に置く。
-                    FilterChip(
-                        selected = groupSize == Prefs.SLIDESHOW_SIZE,
-                        onClick = {
-                            val next = if (groupSize == Prefs.SLIDESHOW_SIZE) Prefs.tournamentSize(context)
-                            else Prefs.SLIDESHOW_SIZE
-                            groupSize = next; Prefs.setGroupSize(context, next)
-                        },
-                        label = { Text("スライドショー（1 枚ずつ）", fontSize = 13.sp) },
-                        colors = FilterChipDefaults.filterChipColors(
-                            selectedContainerColor = Lime, selectedLabelColor = Color.Black
-                        ),
-                        modifier = Modifier.padding(top = 8.dp)
-                    )
-                    Text(
-                        "4 枚がおすすめ。多いほど 1 回で絞れますが、1 枚が小さくなります",
-                        fontSize = 11.sp, color = Faint,
-                        modifier = Modifier.padding(top = 6.dp)
-                    )
 
                     Spacer(Modifier.height(16.dp))
                     Toggle("連写を自動でまとめる", groupBursts) {
@@ -252,6 +262,24 @@ fun SettingsScreen(onBack: () -> Unit) {
                         modifier = Modifier.padding(top = 10.dp)
                     )
                 }
+        }
+        // 狭い幅（カバー画面）は 1 列で縦に流す。広い幅は左右 2 列（従来どおり）。
+        if (narrow) {
+            Column(
+                Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp)
+            ) {
+                nasPanel()
+                Spacer(Modifier.height(16.dp))
+                prefsPanels()
+                Spacer(Modifier.height(8.dp))
+            }
+        } else {
+            Row(
+                Modifier.fillMaxSize().padding(horizontal = 16.dp),
+                horizontalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) { nasPanel() }
+                Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) { prefsPanels() }
             }
         }
     }

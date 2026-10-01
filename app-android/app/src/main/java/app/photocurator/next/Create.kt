@@ -1,8 +1,13 @@
-@file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+@file:OptIn(
+    androidx.compose.material3.ExperimentalMaterial3Api::class,
+    androidx.compose.foundation.layout.ExperimentalLayoutApi::class
+)
 
 package app.photocurator.next
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
@@ -244,12 +249,23 @@ fun CreateScreen(
             Text("プロジェクトを作成", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
         }
         // 中身は残り全部を使う。**一覧が長いほど、送れる面積が要る。**
-        Column(Modifier.weight(1f)) {
+        //
+        // **狭い幅（カバー画面）では全体を縦に送れるようにする。** 左の一覧・右の確認を
+        // 縦に積み、一番下の「作成して準備を始める」まで届かせる。
+        // 広い幅は従来どおり左右 2 列で、一覧だけが送れる。
+        val narrow = rememberNarrow()
+        Column(
+            if (narrow) Modifier.weight(1f).verticalScroll(rememberScrollState())
+            else Modifier.weight(1f)
+        ) {
 
             // ---- 出所タブ ----
-            Row(
+            // **折り返す。** NAS が増えても Amazon Photos まで全部が見えて、1 タップで選べる。
+            // 横スクロールだと端の選択肢が隠れ、そこにあること自体が分からなくなる。
+            FlowRow(
                 Modifier.padding(top = 4.dp, bottom = 12.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
                 FilterChip(
                     selected = tab == "album",
@@ -264,7 +280,12 @@ fun CreateScreen(
                         selected = tab == nas.id,
                         onClick = { tab = nas.id },
                         // **人の言葉で。** 「home-nas · Share」
-                        label = { Text("${nas.label} · ${nas.share}", fontSize = 13.sp) },
+                        label = {
+                            Text(
+                                "${nas.label} · ${nas.share}", fontSize = 13.sp,
+                                maxLines = 1, overflow = TextOverflow.Ellipsis
+                            )
+                        },
                         colors = FilterChipDefaults.filterChipColors(
                             selectedContainerColor = Lime, selectedLabelColor = Color.Black
                         )
@@ -280,9 +301,8 @@ fun CreateScreen(
                 )
             }
 
-            Row(Modifier.weight(1f)) {
-                // ---- 左: フォルダ一覧（Amazon はリンクの欄）----
-                Column(Modifier.weight(1f)) {
+            // ---- 左: フォルダ一覧（Amazon はリンクの欄）----
+            val leftPane: @Composable () -> Unit = {
                   if (tab == "amazon") {
                     AmazonLinkPane(
                         text = linkText,
@@ -320,7 +340,8 @@ fun CreateScreen(
                             modifier = Modifier.padding(vertical = 24.dp)
                         )
                     }
-                    LazyColumn {
+                    // 狭い幅では全体が縦に送れる中に入るので、一覧の高さに上限を付ける。
+                    LazyColumn(if (narrow) Modifier.heightIn(max = 360.dp) else Modifier) {
                         items(folders, key = { it.path }) { folder ->
                             val chosenHere = chosenFolder?.path == folder.path
                             val nasId = tab
@@ -410,12 +431,10 @@ fun CreateScreen(
                         }
                     }
                   }
-                }
+            }
 
-                Spacer(Modifier.width(16.dp))
-
-                // ---- 右: 名前と出所の確認 ----
-                Column(Modifier.width(260.dp)) {
+            // ---- 右: 名前と出所の確認 ----
+            val rightPane: @Composable () -> Unit = {
                     OutlinedTextField(
                         value = name,
                         onValueChange = { name = it },
@@ -563,6 +582,18 @@ fun CreateScreen(
                             )
                         }
                     }
+            }
+            if (narrow) {
+                Column(Modifier.fillMaxWidth()) {
+                    leftPane()
+                    Spacer(Modifier.height(16.dp))
+                    rightPane()
+                }
+            } else {
+                Row(Modifier.weight(1f)) {
+                    Column(Modifier.weight(1f)) { leftPane() }
+                    Spacer(Modifier.width(16.dp))
+                    Column(Modifier.width(260.dp)) { rightPane() }
                 }
             }
 
