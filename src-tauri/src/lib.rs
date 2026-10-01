@@ -818,6 +818,10 @@ struct ParallelOutcome {
 ///   writer は止まらない**のがここでの要件。
 /// - そのため worker は join しない。join すると、まさに避けたかった
 ///   「遅い1枚に全体が引きずられる」状態に戻ってしまう。
+/// - timeout で見捨てた worker は戻ってこないかもしれないので、1 本見捨てるたびに
+///   代わりを 1 本足す（最大で `workers` 本まで。全体で `workers * 2` 本）。代わりも含めて
+///   全員が固まって上限に達したら、まだ取られていない写真を全部失敗として確定して戻る
+///   （永久に待たない）。正常なとき（timeout が起きないとき）は何も変わらない。
 fn run_in_parallel<T, F>(
     items: Arc<Vec<T>>,
     workers: usize,
@@ -842,12 +846,14 @@ where
     // 借りていて 'static にできないため、writer が毎ティック転記する。
     let stop = Arc::new(AtomicBool::new(false));
     let cursor = Arc::new(AtomicUsize::new(0));
+    // 見捨てた worker の代わりのぶんも含めて、枠を先に用意する。
+    let max_slots = workers * 2;
     let in_flight: Arc<Vec<Mutex<Option<(usize, Instant)>>>> =
-        Arc::new((0..workers).map(|_| Mutex::new(None)).collect());
+        Arc::new((0..max_slots).map(|_| Mutex::new(None)).collect());
     let work = Arc::new(work);
     let (sender, receiver) = mpsc::channel::<PhotoWork>();
 
-    for slot in 0..workers {
+    let spawn_worker = |slot: usize| {
         let items = items.clone();
         let cursor = cursor.clone();
         let in_flight = in_flight.clone();
@@ -872,9 +878,13 @@ where
                 }
             }
         });
+    };
+    for slot in 0..workers {
+        spawn_worker(slot);
     }
-    // writer 側の複製を落とす。全 worker が終わると recv が Disconnected になる。
-    drop(sender);
+    let mut spawned = workers;
+    // 見捨てて、代わりを足した枠。
+    let mut abandoned_slots = vec![false; max_slots];
 
     let mut reported = vec![false; total];
     let mut outcome = ParallelOutcome::default();
@@ -898,11 +908,20 @@ where
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
-        for cell in in_flight.iter() {
+        for (slot, cell) in in_flight.iter().enumerate() {
             let Some((index, started)) = cell.lock().ok().and_then(|cell| *cell) else {
                 continue;
             };
-            if reported[index] || started.elapsed() < timeout {
+            if started.elapsed() < timeout {
+                continue;
+            }
+            if reported[index] {
+                // 前の tick で timeout にした 1 枚。代わりをまだ足していなければ足す。
+                if !abandoned_slots[slot] && spawned < max_slots {
+                    abandoned_slots[slot] = true;
+                    spawn_worker(spawned);
+                    spawned += 1;
+                }
                 continue;
             }
             reported[index] = true;
@@ -915,6 +934,31 @@ where
                 timeout.as_secs()
             ));
             on_result(result)?;
+        }
+        // 代わりも含めて、動かせる worker が 1 本も残っていない（全員が timeout 済みの
+        // 1 枚から戻らず、足せる枠も無い）。まだ誰にも取られていない写真は、もう
+        // 処理されないので、失敗として確定して戻る。
+        let all_stuck = spawned == max_slots
+            && in_flight.iter().all(|cell| {
+                cell.lock()
+                    .ok()
+                    .and_then(|cell| *cell)
+                    .is_some_and(|(index, _)| reported[index])
+            });
+        if all_stuck && outcome.completed < total {
+            stop.store(true, Ordering::Relaxed);
+            for index in 0..total {
+                if reported[index] {
+                    continue;
+                }
+                reported[index] = true;
+                outcome.completed += 1;
+                outcome.timed_out += 1;
+                let mut result = PhotoWork::new(index, items[index].photo_id());
+                result.error = Some("読み込みが応答しないため、解析できませんでした。".into());
+                on_result(result)?;
+            }
+            return Ok(outcome);
         }
     }
     stop.store(true, Ordering::Relaxed);
@@ -6731,6 +6775,64 @@ mod tests {
         }
         // 遅くない 10 枚は成功として届く。
         assert_eq!(results.iter().filter(|r| r.error.is_none()).count(), 10);
+    }
+
+    /// 走らせて、`give_up_after` を過ぎても戻らなければ取り消しで抜ける（試験が
+    /// 永久に止まらないための安全弁）。`(outcome, results, 経過, 取り消しで抜けたか)`。
+    fn run_stuck_workers(
+        delays: &[(usize, u64)],
+        total: usize,
+        workers: usize,
+        give_up_after: Duration,
+    ) -> (ParallelOutcome, Vec<PhotoWork>, Duration) {
+        let mut jobs = fake_jobs(total);
+        for (index, seconds) in delays {
+            jobs[*index].delay = Duration::from_secs(*seconds);
+        }
+        let mut results: Vec<PhotoWork> = Vec::new();
+        let started = Instant::now();
+        let outcome = run_in_parallel(
+            Arc::new(jobs),
+            workers,
+            Duration::from_millis(300),
+            &|| started.elapsed() > give_up_after,
+            |index, job: &FakeJob| {
+                std::thread::sleep(job.delay);
+                PhotoWork::new(index, &job.id)
+            },
+            &mut |item| {
+                results.push(item);
+                Ok(())
+            },
+        )
+        .expect("run workers");
+        (outcome, results, started.elapsed())
+    }
+
+    // NAS が切れて worker が全員固まると、以前は未処理の写真を誰も取らず、
+    // 進捗が止まったまま永久に戻らなかった（レビュー R13）。固まった worker の
+    // 代わりを足して先へ進む。
+    #[test]
+    fn a_replacement_worker_takes_over_when_every_worker_is_stuck() {
+        // 2 本の worker が 0・1 枚目で固まる。残り 4 枚は代わりの worker が処理する。
+        let (outcome, results, elapsed) =
+            run_stuck_workers(&[(0, 30), (1, 30)], 6, 2, Duration::from_secs(8));
+        assert!(!outcome.cancelled, "戻らなかった: {elapsed:?}");
+        assert_eq!(outcome.completed, 6);
+        assert_eq!(outcome.timed_out, 2);
+        assert_eq!(results.iter().filter(|r| r.error.is_none()).count(), 4);
+    }
+
+    // 代わりの worker も固まり続けて上限に達したら、未処理の分を全部失敗として
+    // 確定して戻る（永久に待たない）。
+    #[test]
+    fn the_run_gives_up_when_the_replacements_get_stuck_too() {
+        let all: Vec<(usize, u64)> = (0..8).map(|index| (index, 30)).collect();
+        let (outcome, results, elapsed) = run_stuck_workers(&all, 8, 2, Duration::from_secs(8));
+        assert!(!outcome.cancelled, "戻らなかった: {elapsed:?}");
+        assert_eq!(outcome.completed, 8);
+        assert!(results.iter().all(|r| r.error.is_some()));
+        assert_eq!(results.len(), 8, "1 枚も二重に確定しない");
     }
 
     // 解析できなかった写真が DB に残り、その件数がそのまま UI へ渡ること。
