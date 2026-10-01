@@ -30,8 +30,6 @@ object Store {
      * 書けなかったことは記録する（黙って落とさない）。
      */
     suspend fun save(context: Context, projectId: String, session: Session) {
-        // **判断が変わった。** サイドカーへ渡すべきものが端末にできた印。
-        withContext(Dispatchers.IO) { SyncState.touch(context, projectId) }
         // **保存はアプリの列で 1 本ずつ。最後に頼んだ状態が必ず残る**（A2）。
         // 確定を連打しても、同じ一時ファイルを奪い合わず、古い状態が新しい状態を戻さない。
         val target = file(context, projectId)
@@ -369,8 +367,6 @@ object Overrides {
 
     suspend fun save(context: Context, projectId: String, list: List<PairOverride>) =
         Persist.latest("overrides:$projectId") {
-            // 手直しも判断。**サイドカーへ渡すもの。**
-            SyncState.touch(context, projectId)
             try {
                 val array = org.json.JSONArray()
                 for (item in list) {
@@ -588,15 +584,15 @@ object Device {
 }
 
 /**
- * サイドカーと端末の食い違いを見分けるための控え。
+ * サイドカーと端末の食い違いを見分けるための控え（U35 で core の `sidecarPlan` 用に置き換えた）。
  *
- * **時刻の大小で勝敗を決めない。** 端末ごとに時計はずれるので、
- * 「新しい方を採る」は狂った端末が常に勝つ。見るのは
- * 「**自分が最後に見た版と同じかどうか**」だけ。
+ * **時刻の大小で勝敗を決めない。** 見るのは「自分が最後に見た版（token）と同じか」と、
+ * 「その版の選別状況の比較キー（key）と、今の端末の比較キーが同じか」。
+ * 「変更があるか」は印（dirty）ではなく中身で決める（core）。印を立てる・消す操作が無いので、
+ * 書いている最中の判断の印を消す・キャンセルで印が落ちる、が起きない。
  *
- * `changed` が動くのは**判断が変わったときだけ**（星・まとまりの手直し・
- * 学習した基準・やり直し）。準備（指紋や表示用画像）では動かさない。
- * 動かすと、見ただけで食い違い扱いになる。
+ * 置き場所は SharedPreferences「sync」。キーは `<プロジェクト>-seenToken` など。
+ * 古い控え（`-seenAt`・`-seenBy`・`-dirty`）は、最初に読んだときに移す（設計書 §5 の PR-5）。
  */
 object SyncState {
     private const val FILE = "sync"
@@ -604,32 +600,65 @@ object SyncState {
     private fun prefs(context: Context) =
         context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
 
-    fun seenAt(context: Context, projectId: String): Long =
-        prefs(context).getLong("$projectId-seenAt", -1L)
-
-    fun seenBy(context: Context, projectId: String): String =
-        prefs(context).getString("$projectId-seenBy", "") ?: ""
-
-    /** 端末側に、まだ共有していない判断があるか。 */
-    fun changed(context: Context, projectId: String): Boolean =
-        prefs(context).getBoolean("$projectId-dirty", false)
-
-    /** 判断が変わった。**ここでしか印を付けない。** */
-    fun touch(context: Context, projectId: String) {
-        prefs(context).edit().putBoolean("$projectId-dirty", true).apply()
+    /** [SidecarSync] に渡す控えの置き場所。 */
+    fun store(context: Context): SeenStore {
+        val app = context.applicationContext
+        return object : SeenStore {
+            override fun load(projectId: String): SeenState = load(app, projectId)
+            override fun save(projectId: String, state: SeenState) = save(app, projectId, state)
+        }
     }
 
-    /** 読んだ／書いた版を控える。**書けたときだけ呼ぶ。** */
-    fun saw(context: Context, projectId: String, updatedAt: Long, updatedBy: String) {
+    fun load(context: Context, projectId: String): SeenState {
+        val store = prefs(context)
+        val token = store.getString("$projectId-seenToken", null)
+        if (token != null) {
+            return SeenState(
+                uniffi.photo_curator_core.SeenRecord(
+                    token,
+                    store.getString("$projectId-seenKey", "") ?: "",
+                    store.getString("$projectId-seenEpoch", null)
+                ),
+                detached = store.getBoolean("$projectId-detached", false)
+            )
+        }
+        // 古い控えからの移し替え。seenAt/seenBy は core の legacy の token と同じ形にする。
+        // dirty=true なら比較キーを空にして「変更あり」、false なら今の端末の比較キーで埋める。
+        val seenAt = store.getLong("$projectId-seenAt", -1L)
+        if (seenAt < 0) return SeenState(uniffi.photo_curator_core.SeenRecord("", "", null), detached = false)
+        val seenBy = store.getString("$projectId-seenBy", "") ?: ""
+        val dirty = store.getBoolean("$projectId-dirty", false)
+        return SeenState(
+            uniffi.photo_curator_core.SeenRecord("legacy:$seenAt:$seenBy", "", null),
+            detached = false,
+            keyFromLocal = !dirty
+        )
+    }
+
+    fun save(context: Context, projectId: String, state: SeenState) {
         prefs(context).edit()
-            .putLong("$projectId-seenAt", updatedAt)
-            .putString("$projectId-seenBy", updatedBy)
-            .putBoolean("$projectId-dirty", false)
-            .apply()
+            .putString("$projectId-seenToken", state.seen.token)
+            .putString("$projectId-seenKey", state.seen.key)
+            .putString("$projectId-seenEpoch", state.seen.epoch)
+            .putBoolean("$projectId-detached", state.detached)
+            // 古い控えは移したので消す（残すと、消したあとの移し替えで古い版に戻る）。
+            .remove("$projectId-seenAt")
+            .remove("$projectId-seenBy")
+            .remove("$projectId-dirty")
+            .commit()
     }
 
-    fun clean(context: Context, projectId: String) {
-        prefs(context).edit().putBoolean("$projectId-dirty", false).apply()
+    /** この端末のやり直しの世代。**やり直したことを、ほかの端末に伝えるため**（設計書 §6 の Q10）。 */
+    fun epoch(context: Context, projectId: String): String? =
+        prefs(context).getString("$projectId-epoch", null)
+
+    fun setEpoch(context: Context, projectId: String, epoch: String?) {
+        prefs(context).edit().putString("$projectId-epoch", epoch).commit()
+    }
+
+    /** やり直した。**新しい世代にする**（相手の進んだ分で黙って埋め戻されないように）。 */
+    fun restarted(context: Context, projectId: String) {
+        setEpoch(context, projectId, "e-" + java.util.UUID.randomUUID().toString().replace("-", "").take(16))
     }
 
     fun forget(context: Context, projectId: String) {

@@ -3,6 +3,20 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+/** core をこの PC 向けに組む（単体テスト用）。成果物は gitignore の core/target。 */
+val coreDir: File = rootProject.projectDir.resolve("../core")
+val hostCoreLibrary: File = coreDir.resolve(
+    "target/debug/" + when {
+        org.gradle.internal.os.OperatingSystem.current().isWindows -> "photo_curator_core.dll"
+        org.gradle.internal.os.OperatingSystem.current().isMacOsX -> "libphoto_curator_core.dylib"
+        else -> "libphoto_curator_core.so"
+    }
+)
+val hostCore: TaskProvider<Exec> = tasks.register<Exec>("hostCore") {
+    workingDir = coreDir
+    commandLine("cargo", "build", "--lib")
+}
+
 android {
     namespace = "app.photocurator.next"
     compileSdk = 36
@@ -45,6 +59,18 @@ android {
 
     // core の .so はビルド前に scripts/build-core.mjs が置く。
     sourceSets["main"].jniLibs.srcDirs("src/main/jniLibs")
+
+    // **JVM の単体テストでも本物の core を使う**（サイドカーの判断を Kotlin で真似しない）。
+    // Android の .so は JVM では読めないので、同じ core をこの PC 向けに組んだもの
+    // （core/target/debug の cdylib）を、UniFFI の libraryOverride で読ませる。
+    testOptions {
+        unitTests.all { test ->
+            test.dependsOn(hostCore)
+            test.systemProperty(
+                "uniffi.component.photo_curator_core.libraryOverride", hostCoreLibrary.absolutePath
+            )
+        }
+    }
 }
 
 dependencies {
@@ -81,4 +107,6 @@ dependencies {
 
     // 単体テスト（判定など、端末なしで確かめられるもの）。
     testImplementation("junit:junit:4.13.2")
+    // UniFFI の Kotlin を JVM で動かすための JNA（aar には PC 向けの本体が入っていない）。
+    testImplementation("net.java.dev.jna:jna:5.14.0")
 }
