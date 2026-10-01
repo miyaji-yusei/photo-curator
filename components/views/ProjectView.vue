@@ -38,7 +38,10 @@ const {
   sidecarBusy,
   sidecarClash,
   sidecarMessage,
+  sidecarNotice,
+  sidecarDetached,
   sidecarSavedAt,
+  writeSidecarToNas,
   session,
   startScan,
   view
@@ -87,12 +90,15 @@ const activeProject = nullableActiveProject as Ref<Project>
           <v-icon :color="sidecarAccess === 'readwrite' ? 'black' : undefined" :icon="sidecarAccess === 'readwrite' ? 'mdi-note-check-outline' : 'mdi-note-off-outline'" />
         </v-avatar>
         <div>
-          <div class="text-body-1">{{ sidecarAccess === 'readwrite' ? '写真のフォルダに記録しています' : 'この端末だけの結果' }}</div>
+          <div class="text-body-1">{{ sidecarDetached ? 'この端末だけの結果（NAS とは別）' : sidecarAccess === 'readwrite' ? '写真のフォルダに記録しています' : 'この端末だけの結果' }}</div>
+          <div v-if="sidecarDetached" class="text-caption text-medium-emphasis">NAS の記録とは切り離しています。自動では書き込みません。</div>
           <div v-if="sidecarSavedAt" class="text-caption text-medium-emphasis">最後に保存 {{ new Date(sidecarSavedAt).toLocaleTimeString('ja-JP') }}</div>
+          <div v-if="sidecarNotice" class="text-caption text-medium-emphasis">{{ sidecarNotice }}</div>
           <div v-if="sidecarMessage" class="text-caption text-error">{{ sidecarMessage }}</div>
         </div>
         <v-spacer />
-        <v-btn v-if="sidecarAccess === 'readwrite'" variant="outlined" prepend-icon="mdi-content-save-outline" :loading="sidecarBusy" :disabled="!!sidecarClash" @click="saveSidecarNow">今すぐ保存</v-btn>
+        <v-btn v-if="sidecarAccess === 'readwrite' && sidecarDetached" variant="outlined" prepend-icon="mdi-upload-outline" :loading="sidecarBusy" :disabled="!!sidecarClash" @click="writeSidecarToNas">NAS に書き込む</v-btn>
+        <v-btn v-else-if="sidecarAccess === 'readwrite'" variant="outlined" prepend-icon="mdi-content-save-outline" :loading="sidecarBusy" :disabled="!!sidecarClash" @click="saveSidecarNow">今すぐ保存</v-btn>
       </v-card-text>
     </v-card>
 
