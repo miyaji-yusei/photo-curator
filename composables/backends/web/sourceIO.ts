@@ -132,10 +132,21 @@ export async function requestHandlePermission(handle: FileSystemDirectoryHandle)
 export class HandleFolderIO implements SourceIO {
   constructor(private readonly root: FileSystemDirectoryHandle) {}
 
+  /** 辿ったディレクトリ handle（サブパス → handle）。読み込みのたびに根から辿り直さない。 */
+  private readonly dirs = new Map<string, FileSystemDirectoryHandle>()
+
   private async resolveDir(subPath: string): Promise<FileSystemDirectoryHandle> {
     let dir = this.root
+    let walked = ''
     for (const part of subPath.split('/').filter(Boolean)) {
+      walked = walked ? `${walked}/${part}` : part
+      const cached = this.dirs.get(walked)
+      if (cached) {
+        dir = cached
+        continue
+      }
       dir = await dir.getDirectoryHandle(part)
+      this.dirs.set(walked, dir)
     }
     return dir
   }
@@ -151,8 +162,9 @@ export class HandleFolderIO implements SourceIO {
       if (handle.kind === 'directory') {
         result.push({ name, isDirectory: true, size: 0, mtimeMs: 0 })
       } else {
-        const file = await (handle as FileSystemFileHandle).getFile()
-        result.push({ name, isDirectory: false, size: file.size, mtimeMs: file.lastModified })
+        // size・mtimeMs は走査の側で使わない。getFile() は 1 枚ごとにブラウザとファイルシステムの
+        // 往復になるので呼ばない（読み込み時の File.lastModified は本物なので、撮影時刻の手がかりは残る）。
+        result.push({ name, isDirectory: false, size: 0, mtimeMs: 0 })
       }
     }
     return result
