@@ -779,6 +779,10 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
       // 前に開いていたプロジェクトの書き途中を、読む前に書き終える。
       await saveQueue.flush()
       if (stale()) return
+      // プレビュー格子は星を出さないのでサイドカーの結果に依存しない。確認と並べて読み始める（W9）。
+      // サイドカーが取り込んだときは reloadAfterSidecar がもう一度読むので、最後は新しい値になる。
+      const preview = loadPreview(project.id)
+      preview.catch(() => undefined) // 待つのは下。ここでは未処理の拒否にしない
       // 記録の取り込みは、選別の途中を読み込む前に済ませる（取り込んだ分が画面に出るように）。
       // 写真の行がまだ無いときは、走査のあとで確かめる（星を写す行が要る）。
       if (project.photoCount > 0) await runSidecarCheck(project)
@@ -788,7 +792,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
       }
       if (stale()) return
       await Promise.all([
-        loadPreview(project.id),
+        preview,
         desktop.loadSession(project.id).then(value => {
           // 遅れて届いた前のプロジェクトの封筒で、今のプロジェクトの session を上書きしない。
           if (stale()) return
@@ -821,18 +825,20 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
         await loadSummary()
         return
       }
-      const backlog = await desktop.getAnalysisBacklog(project.id).catch(() => 0)
+      // 未解析数・表示用の状態・集計は互いに依存しないので、並べて読む（W9）。
+      const [backlog] = await Promise.all([
+        desktop.getAnalysisBacklog(project.id).catch(() => 0),
+        refreshDisplayState(),
+        loadSummary()
+      ])
       if (stale()) return
       analysisBacklog.value = backlog
       if (backlog > 0) desktop.startBackgroundAnalysis(project.id).catch(() => undefined)
       // 表示用画像は走査とは別に溜める。**走査に混ぜると解析が桁で遅くなる**
       // （EXIF サムネイル経路 1.72ms/枚 に対しフルデコード 132ms/枚）。
-      await refreshDisplayState()
-      if (stale()) return
       if (displayBacklog.value > 0) {
         desktop.startDisplayGeneration(project.id).catch(() => undefined)
       }
-      await loadSummary()
     } catch (cause) {
       if (!stale()) error.value = cause instanceof Error ? cause.message : 'プロジェクトを開けませんでした。'
     } finally {
@@ -2678,7 +2684,11 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   watch(view, (next, previous) => {
     if (next === 'home' && previous !== 'home') void flushThenPush()
     // 選別のあとに戻ったとき、行の状態・点を今の値にする。
-    if ((next === 'home' || next === 'project') && previous !== next) void refreshProjectCards()
+    // ただし home -> project（プロジェクトを開く）は読み直さない。開く処理が同じ DB を使っている最中で、
+    // 点・見本は直前のホームの値のまま使える（W4）。
+    if ((next === 'home' || next === 'project') && previous !== next && !(previous === 'home' && next === 'project')) {
+      void refreshProjectCards()
+    }
   })
 
   async function mount() {
