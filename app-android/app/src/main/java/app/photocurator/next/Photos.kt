@@ -173,6 +173,8 @@ object Photos {
      */
     suspend fun forSource(context: Context, source: Source): List<Photo> = try {
         list(context, source)
+    } catch (error: kotlinx.coroutines.CancellationException) {
+        throw error
     } catch (error: Exception) {
         // 画面から呼ばれる。**ここで落とさない。** 理由は準備の側（list）で残す。
         Log.w("Photos", "写真を読めなかった: ${source.kind}", error)

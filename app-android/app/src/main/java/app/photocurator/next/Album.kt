@@ -174,6 +174,8 @@ fun ProjectScreen(
                     else alive.reason
                 }
             }
+        } catch (error: kotlinx.coroutines.CancellationException) {
+            throw error
         } catch (error: Exception) {
             // **黙って落とさない。** 何が起きたかを 1 文にして、ホームにも残す。
             val said = Smb.describe(error)

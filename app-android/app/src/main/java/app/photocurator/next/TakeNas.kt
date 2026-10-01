@@ -104,6 +104,8 @@ object TakeNas {
                         null, null
                     )
                     done += 1
+                } catch (error: kotlinx.coroutines.CancellationException) {
+                    throw error
                 } catch (error: Exception) {
                     failed += 1
                     Log.w(TAG, "保存できなかった: ${photo.name}", error)
@@ -168,6 +170,8 @@ object TakeNas {
                     }
                     is SmbResult.Ok -> done += 1
                 }
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
             } catch (error: Exception) {
                 failed += 1
                 Log.w(TAG, "分けられなかった: ${photo.name}", error)
