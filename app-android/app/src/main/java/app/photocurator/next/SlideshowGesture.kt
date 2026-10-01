@@ -13,7 +13,8 @@ import kotlin.math.min
  * （Web の px と同じ大きさ）で受ける。画面の px は呼ぶ側が密度で割ってから渡す。
  *
  * 操作: 左＝落とす／右＝残す／上＝★5 で確定。下は使わない。
- * タップ: 上の帯＝★5、それ以外は左半分＝落とす・右半分＝残す。
+ * タップ: 上の帯＝★5、ほぼ中心＝何もしない（二度タップで拡大）、
+ * それ以外は左半分＝落とす・右半分＝残す。
  */
 enum class SlideDecision { Drop, Keep, Top }
 
@@ -67,15 +68,37 @@ object SlideshowGesture {
     /** 枠の上から、この割合までの帯のタップは「★5 で確定」。 */
     const val TOP_BAND_RATIO = 0.25f
 
+    /** 枠の中心から、横は幅の ±12%・縦は高さの ±12%（境目を含む）の長方形が「ほぼ中心」。 */
+    const val CENTER_RATIO = 0.12f
+
     /**
-     * タップの判定。枠の上の帯（高さの上から 25% 未満）は「★5 で確定」、
+     * タップの判定。枠の上の帯（高さの上から 25% 未満）は「★5 で確定」（帯が優先）、
+     * ほぼ中心は **null（何もしない。二度タップなら拡大）**、
      * それ以外は左半分が「落とす」・右半分が「残す」。
      */
     fun tapDecision(
         x: Float, y: Float, left: Float, top: Float, width: Float, height: Float
-    ): SlideDecision {
+    ): SlideDecision? {
         if (y < top + height * TOP_BAND_RATIO) return SlideDecision.Top
-        return if (x < left + width / 2) SlideDecision.Drop else SlideDecision.Keep
+        val cx = left + width / 2
+        val cy = top + height / 2
+        if (abs(x - cx) <= width * CENTER_RATIO && abs(y - cy) <= height * CENTER_RATIO) return null
+        return if (x < cx) SlideDecision.Drop else SlideDecision.Keep
+    }
+
+    /** 二度タップとみなす間隔（ms）と距離（dp）。どちらも境目を含む。 */
+    const val DOUBLE_TAP_MS = 300L
+    const val DOUBLE_TAP_DISTANCE = 24f
+
+    /** 中心タップの記録。時刻は ms、位置は dp。 */
+    data class TapRecord(val timeMs: Long, val x: Float, val y: Float)
+
+    /** 直前の中心タップ（なければ null）と今回の中心タップが、300ms 以内・24dp 以内なら二度タップ。 */
+    fun isDoubleTap(prev: TapRecord?, now: TapRecord): Boolean {
+        if (prev == null) return false
+        val dt = now.timeMs - prev.timeMs
+        if (dt < 0 || dt > DOUBLE_TAP_MS) return false
+        return hypot(now.x - prev.x, now.y - prev.y) <= DOUBLE_TAP_DISTANCE
     }
 
     /** 決定したとき、写真が飛んでいく先。 */

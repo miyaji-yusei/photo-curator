@@ -7,6 +7,8 @@ import app.photocurator.next.SlideshowGesture.decideThreshold
 import app.photocurator.next.SlideshowGesture.dragFeedback
 import app.photocurator.next.SlideshowGesture.fitContain
 import app.photocurator.next.SlideshowGesture.flyTarget
+import app.photocurator.next.SlideshowGesture.TapRecord
+import app.photocurator.next.SlideshowGesture.isDoubleTap
 import app.photocurator.next.SlideshowGesture.isTap
 import app.photocurator.next.SlideshowGesture.judgeDrag
 import app.photocurator.next.SlideshowGesture.tapDecision
@@ -94,9 +96,69 @@ class SlideshowGestureTest {
 
     @Test fun タップは左半分が落とす右半分が残す() {
         assertEquals(Drop, tap(100f, 400f))
-        assertEquals(Drop, tap(499f, 400f))
-        assertEquals(Keep, tap(500f, 400f))
+        assertEquals(Drop, tap(379f, 400f))
+        assertEquals(Keep, tap(621f, 400f))
         assertEquals(Keep, tap(900f, 799f))
+    }
+
+    // 枠 1000×800 → 中心 (500,400)、±120 × ±96、上の帯は y < 200（Web と同じ値）
+    @Test fun ほぼ中心は何もしない() {
+        assertEquals(0.12f, SlideshowGesture.CENTER_RATIO, eps)
+        assertNull(tap(500f, 400f))
+        assertNull(tap(450f, 350f))
+        assertNull(tap(550f, 450f))
+    }
+
+    @Test fun 中心の境目は含み1px外は左右で分ける() {
+        assertNull(tap(380f, 400f))
+        assertNull(tap(620f, 400f))
+        assertEquals(Drop, tap(379f, 400f))
+        assertEquals(Keep, tap(621f, 400f))
+        assertNull(tap(500f, 304f))
+        assertNull(tap(500f, 496f))
+        assertEquals(Keep, tap(500f, 497f))
+        assertEquals(Drop, tap(499f, 497f))
+        assertEquals(Keep, tap(500f, 303f))
+        assertEquals(Drop, tap(499f, 303f))
+    }
+
+    @Test fun 帯が優先で中心の長方形は帯の外() {
+        assertEquals(Top, tap(500f, 199f))
+        assertEquals(Keep, tap(500f, 200f))
+        // 低い枠では中心の長方形が帯にかかる。そのときも帯が先
+        assertEquals(Top, tapDecision(500f, 9f, 0f, 0f, 1000f, 40f))
+        assertNull(tapDecision(500f, 16f, 0f, 0f, 1000f, 40f))
+    }
+
+    @Test fun 中心は枠がずれていても枠の中心を基準にする() {
+        assertNull(tapDecision(400f, 300f, 200f, 100f, 400f, 400f))
+        assertNull(tapDecision(448f, 300f, 200f, 100f, 400f, 400f))
+        assertEquals(Keep, tapDecision(449f, 300f, 200f, 100f, 400f, 400f))
+    }
+
+    private fun at(time: Long, x: Float = 100f, y: Float = 100f) = TapRecord(time, x, y)
+
+    @Test fun 二度タップの定数() {
+        assertEquals(300L, SlideshowGesture.DOUBLE_TAP_MS)
+        assertEquals(24f, SlideshowGesture.DOUBLE_TAP_DISTANCE, eps)
+    }
+
+    @Test fun 記録が無ければ二度タップでない() {
+        assertTrue(!isDoubleTap(null, at(0)))
+    }
+
+    @Test fun 二度タップの時間の境目() {
+        assertTrue(isDoubleTap(at(1000), at(1100)))
+        assertTrue(isDoubleTap(at(1000), at(1300)))
+        assertTrue(!isDoubleTap(at(1000), at(1301)))
+        assertTrue(!isDoubleTap(at(1000), at(999)))
+    }
+
+    @Test fun 二度タップの距離の境目() {
+        assertTrue(isDoubleTap(at(0, 100f, 100f), at(100, 124f, 100f)))
+        assertTrue(!isDoubleTap(at(0, 100f, 100f), at(100, 125f, 100f)))
+        assertTrue(!isDoubleTap(at(0, 100f, 100f), at(100, 118f, 118f)))
+        assertTrue(isDoubleTap(at(0, 100f, 100f), at(100, 116f, 116f)))
     }
 
     @Test fun 上の帯は左右を問わず星5() {

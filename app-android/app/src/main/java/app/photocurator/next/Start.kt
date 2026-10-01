@@ -114,7 +114,7 @@ fun StartSheet(
                     Text(
                         (if (groupSize == Prefs.SLIDESHOW_SIZE)
                             "スライドショー: 1 枚ずつ出して、残す（右）か落とす（左）かを決めます。" +
-                                "上のほうのタップは ★5 で確定。" +
+                                "上のほうのタップは ★5 で確定、中心の二度タップで拡大。" +
                                 "約 $rounds 回で ROUND 1 が終わります。"
                         else "$groupSize 枚なら約 $rounds 回で ROUND 1 が終わります。") +
                             "選別中に … から変えられます",
