@@ -105,5 +105,55 @@
   "expected_restarted": { "plan": "Clash", "reason": "TheirsRestarted" },
   "seen_token": "w-a1",
   "expected_key": "j1:941dbb20dcd00558ac8e1e7eadbd7f1e16c18ed88dfb86dfd5e3d00a2714735d",
-  "expected_plan": { "Push": { "expected": "w-p1", "aside_theirs": true, "reason": "TheirsUntouched" } }
+  "expected_plan": { "Push": { "expected": "w-p1", "aside_theirs": true, "reason": "TheirsUntouched" } },
+  "merge_mid_round": {
+    "about": "U45: 同じ ROUND 1 の途中どうしを混ぜても、どちらも見ていない写真（e・f）は queue に残り、続きから選別できる",
+    "group_size": 2,
+    "mine": {
+      "group_size": 2,
+      "target_star": 0,
+      "round": 1,
+      "queue": [],
+      "current": ["e.jpg", "f.jpg"],
+      "survivors": ["a.jpg", "sub/c.jpg", "d.jpg"],
+      "ratings": { "a.jpg": 1, "b.jpg": 0, "sub/c.jpg": 1, "d.jpg": 1, "e.jpg": 0, "f.jpg": 0 },
+      "members": {},
+      "history": [
+        { "group": ["a.jpg", "b.jpg"], "chosen": ["a.jpg"], "topped": null, "before": { "a.jpg": 0 } },
+        { "group": ["sub/c.jpg", "d.jpg"], "chosen": ["sub/c.jpg", "d.jpg"], "topped": null, "before": { "sub/c.jpg": 0, "d.jpg": 0 } }
+      ],
+      "finished": false
+    },
+    "theirs": {
+      "group_size": 2,
+      "target_star": 0,
+      "round": 1,
+      "queue": ["e.jpg", "f.jpg"],
+      "current": ["sub/c.jpg", "d.jpg"],
+      "survivors": ["b.jpg"],
+      "ratings": { "a.jpg": 0, "b.jpg": 1, "sub/c.jpg": 0, "d.jpg": 0, "e.jpg": 0, "f.jpg": 0 },
+      "members": {},
+      "history": [
+        { "group": ["a.jpg", "b.jpg"], "chosen": ["b.jpg"], "topped": null, "before": { "b.jpg": 0 } }
+      ],
+      "finished": false
+    },
+    "expected_preview": { "undecided": 2, "mid_round": true, "mergeable": true },
+    "expected_union": {
+      "finished": false,
+      "current": ["e.jpg", "f.jpg"],
+      "queue": [],
+      "survivors": ["a.jpg", "b.jpg", "d.jpg", "sub/c.jpg"],
+      "ratings": { "a.jpg": 1, "b.jpg": 1, "d.jpg": 1, "sub/c.jpg": 1 },
+      "undecided": 2
+    },
+    "expected_intersection": {
+      "finished": false,
+      "current": ["e.jpg", "f.jpg"],
+      "queue": [],
+      "survivors": ["d.jpg", "sub/c.jpg"],
+      "ratings": { "d.jpg": 1, "sub/c.jpg": 1 },
+      "undecided": 2
+    }
+  }
 }

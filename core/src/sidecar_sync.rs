@@ -263,10 +263,14 @@ pub struct MergePreview {
     pub theirs_starred: u32,
     pub intersection_starred: u32,
     pub union_starred: u32,
-    /// どちらかの途中の ROUND で、まだ見ていない写真の数（混ぜると今の★のままになる）。
+    /// 混ぜたあとも残る、**どちらの端末もまだ見ていない**写真の数（連写の仲間も数える）。
+    /// 混ぜたセッションの続き（queue）で選別する（U45）。混ぜられないときは 0。
     pub undecided: u32,
     /// どちらかが ROUND の途中か。
     pub mid_round: bool,
+    /// 混ぜられるか（U45）。どちらかが ROUND の途中なのに、2 つの ROUND か対象の★が違うと
+    /// false（どちらの判断で続きを選別すればよいか決められないので、D・E を出さない）。
+    pub mergeable: bool,
 }
 
 /// 開き方の判断（設計書 §4.3）。
@@ -296,7 +300,8 @@ pub enum SidecarPlan {
 /// D・E で混ぜた結果。端末をこの状態にしてから、NAS にも書く（両方を同じにする）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MergeResult {
-    /// 「混ぜた星の完了状態」のセッション（1 つ戻すはできない）。
+    /// 混ぜたセッション（1 つ戻すはできない）。どちらの端末もまだ見ていない写真が残るなら
+    /// 未完了で、その写真が queue に残る（続きから選別する。U45）。残りが無ければ完了状態。
     pub session: Session,
     /// 混ぜた★（★1 以上だけ。載っていない写真は★0）。
     pub ratings: HashMap<String, i32>,
@@ -304,7 +309,7 @@ pub struct MergeResult {
     pub burst_distance: Option<u32>,
     pub epoch: Option<String>,
     pub starred: u32,
-    /// 途中の ROUND で、まだ見ていなかった写真の数。
+    /// 混ぜたあとも残る、どちらの端末もまだ見ていない写真の数（`session` の続きで選別する）。
     pub undecided: u32,
 }
 
@@ -844,10 +849,7 @@ fn pending_of(judgement: &Judgement) -> Option<HashSet<String>> {
 /// 未判定か: 途中のセッションでまだ見ていない、セッションが無く★も 0、
 /// または**その端末の記録に無い**（D3。PC だけが対象にする RAW・HEIC など）。
 fn undecided(judgement: &Judgement, pending: &Option<HashSet<String>>, path: &str, star: i32) -> bool {
-    let recorded = judgement
-        .known
-        .as_ref()
-        .is_none_or(|known| known.binary_search_by(|id| id.as_str().cmp(path)).is_ok());
+    let recorded = recorded(judgement, path);
     match (&judgement.session, pending) {
         (None, _) => star == 0,
         (Some(_), Some(pending)) => !recorded || pending.contains(path),
@@ -908,6 +910,9 @@ pub fn merge_overrides(mine: Vec<PairOverride>, theirs: Vec<PairOverride>) -> Ve
 /// `finished = true`・`queue`／`current`／`history` は空（1 つ戻すはできない）。
 /// `survivors` は★が `target_star` を超え、★5 未満の写真（★5 は以降のラウンドに出さない）。
 /// 続きは結果画面の「もう一度選別する（★n から）」（`round_for`）で始める。
+///
+/// **選別の残りが無いときだけ使う**（D・E で両方とも見終わっているとき、星だけの記録を取り込む
+/// とき）。途中の ROUND をこれで閉じると、まだ見ていない写真を飛ばしてしまう（U45）。
 pub fn session_from_ratings(
     ratings: HashMap<String, i32>,
     round: u32,
@@ -937,17 +942,15 @@ pub fn session_from_ratings(
 }
 
 fn preview_of(mine: &Judgement, theirs: &Judgement) -> MergePreview {
-    let (mine_pending, theirs_pending) = (pending_of(mine), pending_of(theirs));
-    let mut open: HashSet<String> = HashSet::new();
-    open.extend(mine_pending.iter().flatten().cloned());
-    open.extend(theirs_pending.iter().flatten().cloned());
+    let shape = merge_shape(mine, theirs);
     MergePreview {
         mine_starred: mine.stars.len() as u32,
         theirs_starred: theirs.stars.len() as u32,
         intersection_starred: merged_stars(mine, theirs, MergeMode::Intersection).len() as u32,
         union_starred: merged_stars(mine, theirs, MergeMode::Union).len() as u32,
-        undecided: open.len() as u32,
-        mid_round: mine_pending.is_some() || theirs_pending.is_some(),
+        undecided: shape.open_count(),
+        mid_round: pending_of(mine).is_some() || pending_of(theirs).is_some(),
+        mergeable: !matches!(shape, MergeShape::Blocked),
     }
 }
 
@@ -956,11 +959,343 @@ pub fn merge_preview(mine: Judgement, theirs: Judgement) -> MergePreview {
     preview_of(&mine, &theirs)
 }
 
+// ---------------------------------------------------------------------------
+// 途中の ROUND を混ぜる（U45）
+//
+// 以前は D・E を選ぶと、途中の ROUND でも「混ぜた星の完了状態」にしていた。そのため、
+// **どちらの端末もまだ見ていない写真が、選別されないまま ROUND の終わりに飛ばされた**
+// （実機の報告: 残り 444 枚が未選別のまま ROUND 1 が終わった）。
+// 今は、どちらの端末も見ていない写真を queue に残し、続きから選別できるようにする。
+// ---------------------------------------------------------------------------
+
+/// 連写のまとまり（代表 → 仲間）。
+fn groups_of(session: &JudgementSession) -> HashMap<&str, &Vec<String>> {
+    session
+        .members
+        .iter()
+        .map(|group| (group.representative.as_str(), &group.members))
+        .collect()
+}
+
+/// その端末がこの ROUND で判定した写真（`history` に出た組と、その連写の仲間）。
+fn judged_in_round(session: &JudgementSession) -> HashSet<String> {
+    let groups = groups_of(session);
+    let mut judged = HashSet::new();
+    for decision in &session.history {
+        for id in &decision.group {
+            judged.insert(id.clone());
+            if let Some(mates) = groups.get(id.as_str()) {
+                judged.extend(mates.iter().cloned());
+            }
+        }
+    }
+    judged
+}
+
+/// その端末の記録（セッションの ratings・photos）にある写真か。分からなければ「ある」。
+fn recorded(judgement: &Judgement, path: &str) -> bool {
+    judgement
+        .known
+        .as_ref()
+        .is_none_or(|known| known.binary_search_by(|id| id.as_str().cmp(path)).is_ok())
+}
+
+/// 片方の端末の、混ぜるための控え。
+struct MergeSide<'a> {
+    judgement: &'a Judgement,
+    /// この ROUND で判定した写真（途中のセッションのときだけ使う）。
+    judged: HashSet<String>,
+    /// この ROUND を通った写真（`survivors` と、その連写の仲間）。
+    kept: HashSet<String>,
+}
+
+impl<'a> MergeSide<'a> {
+    fn new(judgement: &'a Judgement) -> Self {
+        let (judged, kept) = match &judgement.session {
+            Some(session) => {
+                let groups = groups_of(session);
+                let mut kept: HashSet<String> = HashSet::new();
+                for id in &session.survivors {
+                    kept.insert(id.clone());
+                    if let Some(mates) = groups.get(id.as_str()) {
+                        kept.extend(mates.iter().cloned());
+                    }
+                }
+                (judged_in_round(session), kept)
+            }
+            None => (HashSet::new(), HashSet::new()),
+        };
+        MergeSide { judgement, judged, kept }
+    }
+
+    /// この ROUND で、この端末が判定した写真か。
+    ///
+    /// - 終わったセッション: 記録にある写真は全部判定済み（記録に無い RAW などは未判定。D3）
+    /// - 途中のセッション: `history` に出た組（連写の仲間まで）
+    /// - セッションが無い（★だけの古い記録）: **判定済みにしない**（★は混ぜるが、
+    ///   選別の続きからは外さない。外すと、その写真を見ないまま飛ばすことになる）
+    fn has_judged(&self, path: &str) -> bool {
+        match &self.judgement.session {
+            None => false,
+            Some(session) if session.finished => recorded(self.judgement, path),
+            Some(_) => self.judged.contains(path),
+        }
+    }
+
+    /// まだ見ていない代表の並び（途中のセッションだけ）。
+    fn remaining(&self) -> &[String] {
+        match &self.judgement.session {
+            Some(session) if !session.finished => &session.remaining,
+            _ => &[],
+        }
+    }
+}
+
+/// 混ぜたときに、まだ選別する写真があるか。
+enum MergeShape {
+    /// どちらかが途中なのに、2 つの ROUND か対象の★が違う。混ぜない。
+    Blocked,
+    /// 選別の残りが無い。混ぜた星の完了状態にする（今までどおり）。
+    Finished,
+    /// どちらの端末もまだ見ていない写真（連写の仲間も）が残る。ROUND・対象の★はそろっている。
+    Continue { open: HashSet<String>, round: u32, target_star: i32 },
+}
+
+impl MergeShape {
+    fn open_count(&self) -> u32 {
+        match self {
+            MergeShape::Continue { open, .. } => open.len() as u32,
+            _ => 0,
+        }
+    }
+}
+
+fn merge_shape(mine: &Judgement, theirs: &Judgement) -> MergeShape {
+    let (mine_pending, theirs_pending) = (pending_of(mine), pending_of(theirs));
+    if mine_pending.is_none() && theirs_pending.is_none() {
+        return MergeShape::Finished;
+    }
+    // 途中のセッションが 1 つはあるので、セッションは 1 つ以上ある。
+    let sessions: Vec<&JudgementSession> = mine.session.iter().chain(theirs.session.iter()).collect();
+    let Some(first) = sessions.first() else {
+        return MergeShape::Finished;
+    };
+    if sessions
+        .iter()
+        .any(|session| session.round != first.round || session.target_star != first.target_star)
+    {
+        return MergeShape::Blocked;
+    }
+    let (mine_side, theirs_side) = (MergeSide::new(mine), MergeSide::new(theirs));
+    let open: HashSet<String> = mine_pending
+        .into_iter()
+        .flatten()
+        .chain(theirs_pending.into_iter().flatten())
+        .filter(|path| !mine_side.has_judged(path) && !theirs_side.has_judged(path))
+        .collect();
+    if open.is_empty() {
+        return MergeShape::Finished;
+    }
+    MergeShape::Continue { open, round: first.round, target_star: first.target_star }
+}
+
+/// 2 つの並びを、どちらの順も崩さずに 1 つにする（`second` にだけあるものは、
+/// `second` の中で直前にあるものの次に入れる）。
+fn merged_order(first: &[String], second: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(first.len() + second.len());
+    let mut seen: HashSet<String> = HashSet::new();
+    for id in first {
+        if seen.insert(id.clone()) {
+            out.push(id.clone());
+        }
+    }
+    let mut anchor: Option<usize> = None;
+    for id in second {
+        if seen.contains(id) {
+            anchor = out.iter().position(|item| item == id);
+            continue;
+        }
+        let at = anchor.map_or(0, |position| position + 1);
+        out.insert(at, id.clone());
+        seen.insert(id.clone());
+        anchor = Some(at);
+    }
+    out
+}
+
+/// まとまりの表（代表 → 仲間）。端末の分を優先し、NAS の分は端末のまとまりと重ならないものだけ。
+fn merged_members(mine: &Judgement, theirs: &Judgement) -> HashMap<String, Vec<String>> {
+    let groups = |judgement: &Judgement| -> Vec<MemberGroup> {
+        judgement.session.as_ref().map(|session| session.members.clone()).unwrap_or_default()
+    };
+    let (mine_groups, theirs_groups) = (groups(mine), groups(theirs));
+    let taken: HashSet<&String> = mine_groups.iter().flat_map(|group| group.members.iter()).collect();
+    let mut members: HashMap<String, Vec<String>> = HashMap::new();
+    for group in &theirs_groups {
+        if !taken.contains(&group.representative) && group.members.iter().all(|id| !taken.contains(id)) {
+            members.insert(group.representative.clone(), group.members.clone());
+        }
+    }
+    for group in &mine_groups {
+        members.insert(group.representative.clone(), group.members.clone());
+    }
+    members
+}
+
+/// 混ぜた星を、セッションの ratings にする（記録にある写真は★0 も持つ。次に混ぜるとき、
+/// 「記録に無い＝その端末では未判定」と読み違えないように。D3）。
+fn session_ratings(
+    stars: &BTreeMap<String, i32>,
+    sides: &[&Judgement],
+    open: &HashSet<String>,
+) -> HashMap<String, i32> {
+    let mut ratings: HashMap<String, i32> = HashMap::new();
+    for judgement in sides {
+        for path in judgement.known.iter().flatten() {
+            ratings.insert(path.clone(), 0);
+        }
+    }
+    for path in open {
+        ratings.insert(path.clone(), 0);
+    }
+    for (path, star) in stars {
+        ratings.insert(path.clone(), *star);
+    }
+    ratings
+}
+
+/// 途中の ROUND を混ぜたセッション（未完了。続きから選別できる）。
+#[allow(clippy::too_many_arguments)]
+fn continued_session(
+    mine: &Judgement,
+    theirs: &Judgement,
+    mode: MergeMode,
+    stars: &BTreeMap<String, i32>,
+    open: &HashSet<String>,
+    round: u32,
+    target_star: i32,
+    group_size: u32,
+) -> Session {
+    let (mine_side, theirs_side) = (MergeSide::new(mine), MergeSide::new(theirs));
+    let mine_remaining: HashSet<&String> = mine_side.remaining().iter().collect();
+    let mine_groups = mine.session.as_ref().map(groups_of).unwrap_or_default();
+    let theirs_groups = theirs.session.as_ref().map(groups_of).unwrap_or_default();
+    let mut members = merged_members(mine, theirs);
+
+    // queue: どちらの端末もまだ見ていない写真だけ。元の並び順を保つ。
+    // 代表の仲間のうち、ほかの端末で判定済みのもの（まとまりの組み方が違った）は外す
+    // （続きで代表を選んだときに、判定済みの仲間の★まで動かさない）。
+    let mut queue: Vec<String> = Vec::new();
+    let mut covered: HashSet<String> = HashSet::new();
+    for rep in merged_order(mine_side.remaining(), theirs_side.remaining()) {
+        let own = if mine_remaining.contains(&rep) { mine_groups.get(rep.as_str()) } else { None };
+        let group: Vec<String> = own
+            .or_else(|| theirs_groups.get(rep.as_str()))
+            .map(|mates| (*mates).clone())
+            .unwrap_or_else(|| vec![rep.clone()]);
+        let fresh: Vec<String> = group
+            .into_iter()
+            .filter(|id| open.contains(id) && !covered.contains(id))
+            .collect();
+        if fresh.is_empty() {
+            continue;
+        }
+        covered.extend(fresh.iter().cloned());
+        if fresh.contains(&rep) {
+            if fresh.len() > 1 {
+                members.insert(rep.clone(), fresh);
+            } else {
+                members.remove(&rep);
+            }
+            queue.push(rep);
+        } else {
+            // 代表は判定済みで、仲間だけが残った。1 枚ずつ出す。
+            for id in fresh {
+                members.remove(&id);
+                queue.push(id);
+            }
+        }
+    }
+    // 念のため: 並びに出てこなかった未判定の写真も、飛ばさずに最後に出す。
+    let mut left: Vec<String> = open.iter().filter(|id| !covered.contains(*id)).cloned().collect();
+    left.sort();
+    for id in left {
+        members.remove(&id);
+        queue.push(id);
+    }
+
+    // survivors（この ROUND を通ったもの）: 和集合は両方の分。積集合は、判定した端末が
+    // すべて通したものだけ（片方だけが判定した写真は、判定した側の判断）。
+    let candidates: BTreeSet<String> = mine
+        .session
+        .iter()
+        .chain(theirs.session.iter())
+        .flat_map(|session| session.survivors.iter().cloned())
+        .collect();
+    let survivors: Vec<String> = candidates
+        .into_iter()
+        .filter(|id| !covered.contains(id))
+        .filter(|id| match mode {
+            MergeMode::Union => true,
+            MergeMode::Intersection => [&mine_side, &theirs_side]
+                .iter()
+                .all(|side| !side.has_judged(id) || side.kept.contains(id)),
+        })
+        .collect();
+
+    let mut session = Session {
+        group_size: group_size.max(1),
+        target_star,
+        round: round.max(1),
+        queue,
+        current: Vec::new(),
+        survivors,
+        ratings: session_ratings(stars, &[mine, theirs], open),
+        members,
+        history: Vec::new(),
+        finished: false,
+    };
+    crate::fill(&mut session);
+    session
+}
+
+/// 混ぜられないときに返す、この端末の分そのまま（1 つ戻すの控えだけは持たない）。
+fn session_of(judgement: &Judgement, group_size: u32) -> Option<Session> {
+    let canonical = judgement.session.as_ref()?;
+    let stars: BTreeMap<String, i32> = stars_map(judgement);
+    let mut session = Session {
+        group_size: group_size.max(1),
+        target_star: canonical.target_star,
+        round: canonical.round.max(1),
+        queue: canonical.remaining.clone(),
+        current: Vec::new(),
+        survivors: canonical.survivors.clone(),
+        ratings: session_ratings(&stars, &[judgement], &HashSet::new()),
+        members: canonical
+            .members
+            .iter()
+            .map(|group| (group.representative.clone(), group.members.clone()))
+            .collect(),
+        history: Vec::new(),
+        finished: canonical.finished,
+    };
+    crate::fill(&mut session);
+    Some(session)
+}
+
 /// D・E: 両方の選別状況から新しい 1 つを作る。
 ///
 /// - 星: `merge_stars`
-/// - セッション: 混ぜられないので「混ぜた星の完了状態」（`session_from_ratings`）。ROUND と
-///   対象の★は両方の大きい方。連写のまとまりは端末の分（無ければ NAS の分）
+/// - セッション（U45）:
+///   - **どちらの端末もまだ見ていない写真が残るなら、未完了のまま続きから選別できる形**。
+///     queue はその写真だけ（元の並び順。連写は代表だけ）。どちらかの端末で判定済みの写真は
+///     queue に出さず、判定は混ぜた★と `survivors` に入れる（和集合は両方の分、積集合は
+///     判定した端末がすべて通したものだけ。片方だけが判定した写真は判定した側）。`history` は
+///     空（1 つ戻すはできない）。ROUND・対象の★はそのまま（2 つでそろっているときだけ混ぜる）
+///   - 残りが無ければ、今までどおり「混ぜた星の完了状態」（`session_from_ratings`。ROUND と
+///     対象の★は両方の大きい方）
+///   - どちらかが途中なのに ROUND か対象の★が違えば混ぜない（`merge_preview` の
+///     `mergeable = false`）。呼ばれたら**この端末の分をそのまま返す**（写真を飛ばさない）
 /// - 手直し: 和集合（食い違えば端末）。境目: 端末にあれば端末、無ければ NAS
 /// - やり直しの世代: 同じならそのまま、違えば `fresh_epoch`（呼ぶ側が作った乱数）
 pub fn merge_judgements(
@@ -970,26 +1305,51 @@ pub fn merge_judgements(
     group_size: u32,
     fresh_epoch: String,
 ) -> MergeResult {
-    let ratings: HashMap<String, i32> = merged_stars(&mine, &theirs, mode).into_iter().collect();
-    let sessions = || mine.session.iter().chain(theirs.session.iter());
-    let round = sessions().map(|session| session.round).max().unwrap_or(1);
-    let target_star = sessions().map(|session| session.target_star).max().unwrap_or(0);
-    let members: HashMap<String, Vec<String>> = mine
-        .session
-        .as_ref()
-        .or(theirs.session.as_ref())
-        .map(|session| {
-            session
-                .members
-                .iter()
-                .map(|group| (group.representative.clone(), group.members.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let undecided = preview_of(&mine, &theirs).undecided;
+    let shape = merge_shape(&mine, &theirs);
+    if let MergeShape::Blocked = shape {
+        if let Some(session) = session_of(&mine, group_size) {
+            let ratings: HashMap<String, i32> = stars_map(&mine).into_iter().collect();
+            let undecided = pending_of(&mine).map_or(0, |pending| pending.len() as u32);
+            return MergeResult {
+                session,
+                starred: ratings.len() as u32,
+                ratings,
+                overrides: mine.overrides.clone(),
+                burst_distance: mine.burst_distance,
+                epoch: mine.epoch.clone(),
+                undecided,
+            };
+        }
+    }
+    let stars = merged_stars(&mine, &theirs, mode);
+    let ratings: HashMap<String, i32> = stars.clone().into_iter().collect();
+    let undecided = shape.open_count();
+    let session = match &shape {
+        MergeShape::Continue { open, round, target_star } => {
+            continued_session(&mine, &theirs, mode, &stars, open, *round, *target_star, group_size)
+        }
+        _ => {
+            let sessions = || mine.session.iter().chain(theirs.session.iter());
+            let round = sessions().map(|session| session.round).max().unwrap_or(1);
+            let target_star = sessions().map(|session| session.target_star).max().unwrap_or(0);
+            let members: HashMap<String, Vec<String>> = mine
+                .session
+                .as_ref()
+                .or(theirs.session.as_ref())
+                .map(|session| {
+                    session
+                        .members
+                        .iter()
+                        .map(|group| (group.representative.clone(), group.members.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            session_from_ratings(ratings.clone(), round, target_star, group_size, members)
+        }
+    };
     let starred = ratings.len() as u32;
     MergeResult {
-        session: session_from_ratings(ratings.clone(), round, target_star, group_size, members),
+        session,
         ratings,
         overrides: merge_overrides(mine.overrides.clone(), theirs.overrides.clone()),
         burst_distance: mine.burst_distance.or(theirs.burst_distance),
