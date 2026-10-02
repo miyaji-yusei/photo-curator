@@ -342,17 +342,55 @@ object Prepare {
         Skip,
 
         /** 前は写真があったのに空で返ってきた。**前の控えを残し、失敗として扱う。** */
-        KeepPrevious
+        KeepPrevious,
+
+        /**
+         * 一覧が欠けている（読めなかったフォルダがある・上限で止めた。U50・D8）。
+         * **控えもハッシュ値も触らず（前の控えを残し）、失敗として扱う。**
+         */
+        Incomplete
     }
 
     /**
-     * 取り直した顔ぶれを控えに書いてよいか。**空で上書きしない。**
-     * 失敗が空に見える形（網の途切れなど）で、ハッシュ値まで失うのを防ぐ。
+     * 取り直した顔ぶれを控えに書いてよいか。**空で上書きしない。欠けた一覧で上書きしない。**
+     * 失敗が空・欠けに見える形（網の途切れなど）で、写真とハッシュ値を失うのを防ぐ。
+     *
+     * 前の控えが無くても、欠けた一覧は控えにしない。控えると次からそれが「前の一覧」になり、
+     * 欠けたまま選別が始まってしまう（端末だけでなく NAS の相手にも、写真が無いように見える）。
      */
-    fun decideListing(previous: List<Photo>?, fresh: List<Photo>): ListingDecision = when {
+    fun decideListing(previous: List<Photo>?, fresh: List<Photo>, complete: Boolean = true): ListingDecision = when {
+        !complete -> ListingDecision.Incomplete
         fresh.isNotEmpty() -> ListingDecision.Replace
         !previous.isNullOrEmpty() -> ListingDecision.KeepPrevious
         else -> ListingDecision.Skip
+    }
+
+    /** 欠けた一覧を使わなかったときの言い方（「止まっています」に出る）。 */
+    fun incompleteReason(listed: Listed, hadPrevious: Boolean): String {
+        val what = if (listed.incomplete > 0) "一部のフォルダを読めませんでした"
+        else "写真が多すぎるか、フォルダが深すぎて、全部を数えられませんでした"
+        return what + if (hadPrevious) "。前の一覧のままです" else "。読めるようにしてから再試行してください"
+    }
+
+    /**
+     * 取り直した一覧を控えに書き、使う一覧を返す。**欠けていれば書かずに理由を投げる**
+     * （このあとのハッシュ値の刈り込みまで進ませない）。[save] は控えへの書き込み。
+     */
+    suspend fun settleListing(
+        previous: List<Photo>?,
+        listed: Listed,
+        save: suspend (List<Photo>) -> Unit
+    ): List<Photo> {
+        val fresh = listed.photos
+        when (decideListing(previous, fresh, listed.complete)) {
+            ListingDecision.Replace -> save(fresh)
+            ListingDecision.Skip -> Unit
+            ListingDecision.KeepPrevious ->
+                throw IllegalStateException("写真の一覧を取れませんでした（前の状態は残してあります）")
+            ListingDecision.Incomplete ->
+                throw IllegalStateException(incompleteReason(listed, hadPrevious = !previous.isNullOrEmpty()))
+        }
+        return fresh
     }
 
     /** ハッシュ値を作り直す写真があるか。**無ければ NAS へつながない**（U43）。 */
@@ -371,14 +409,9 @@ object Prepare {
         val previous = Listing.load(context, project.source.key)
         val listed = if (!rescan && previous != null) previous else {
             // U49: 組の RAW を外すかはプロジェクトの設定。変えたら「写真を再読み込み」で反映。
-            val fresh = Photos.list(context, project.source, Prefs.pairRawJpeg(context, project.id))
-            when (decideListing(previous, fresh)) {
-                ListingDecision.Replace -> Listing.save(context, project.source.key, fresh)
-                ListingDecision.Skip -> Unit
-                ListingDecision.KeepPrevious ->
-                    throw IllegalStateException("写真の一覧を取れませんでした（前の状態は残してあります）")
-            }
-            fresh
+            // U50: 欠けた一覧（読めなかったフォルダ・上限）なら、控えもハッシュ値も触らずに止まる。
+            val fresh = Photos.listing(context, project.source, Prefs.pairRawJpeg(context, project.id))
+            settleListing(previous, fresh) { Listing.save(context, project.source.key, it) }
         }
         val photos = inShootingOrder(listed)
         val cached = Fingerprints.load(context, project.source.key)
