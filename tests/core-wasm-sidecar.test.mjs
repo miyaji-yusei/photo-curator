@@ -68,6 +68,11 @@ describe('core-wasm のサイドカー同期（U33）', () => {
     const seen = { token: fixture.seen_token, key: androidKey, epoch: null }
     const plan = wasm.sidecarPlan(seen, wasm.sidecarJudgement(android), untouched, true, false)
     expect(plan).toEqual(fixture.expected_plan)
+
+    // U42: 端末は見た版のままでも、ほかの端末がやり直した版（早送りの関係）は確認する。
+    const restarted = read(fixture.restarted, fixture.pc_folder)
+    const again = wasm.sidecarPlan(seen, wasm.sidecarJudgement(android), restarted, true, false)
+    expect(again[fixture.expected_restarted.plan]?.reason).toBe(fixture.expected_restarted.reason)
   })
 
   it('意味が同じなら、並び・空白・updatedAt が違っても何もしない（警告なし）', () => {

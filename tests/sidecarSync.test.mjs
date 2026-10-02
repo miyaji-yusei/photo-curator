@@ -875,4 +875,30 @@ describe('やり直し（epoch）', () => {
     expect(outcome.clash.reason).toBe('TheirsRestarted')
     expect(ratingsOf(android)).toEqual([1, 0, 0, 1, 0, 0])
   })
+
+  it('U42: Android が書いたあと何も変えていなくても、PC がやり直した版は確認なしに取り込まない', async () => {
+    const nas = sharedNas()
+    const pc = fakeBackend({ nas, identity: PC })
+    const android = fakeBackend({ nas, identity: ANDROID })
+    const pcSync = createSidecarSync(pc, nextClock)
+    const androidSync = createSidecarSync(android, nextClock)
+    play(android, [['IMG_0.JPG']])
+    await androidSync.pushIfChanged(project)
+    await pcSync.checkOnOpen(project) // PC は取り込む
+    // Android はその後も進め、書いた（共有していない判断は無い）。
+    play(android, [['IMG_0.JPG'], ['IMG_3.JPG']])
+    expect(await androidSync.pushIfChanged(project)).toBe(true)
+    // PC で「最初からやり直す」。PC は Android の版を見ないまま、その上に書く（早送りの関係）。
+    await pcSync.checkOnOpen(project)
+    for (const row of pc.rows) row.rating = 0
+    pc.session = null
+    await pcSync.markRestarted('p1')
+    expect(await pcSync.pushIfChanged(project)).toBe(true)
+    expect(nasCatalog(pc).epoch).toMatch(/^e-/)
+    // Android は見た版のまま。以前は早送りになり、確認なしに空になっていた。
+    const outcome = await androidSync.checkOnOpen(project)
+    expect(outcome.kind).toBe('clash')
+    expect(outcome.clash.reason).toBe('TheirsRestarted')
+    expect(ratingsOf(android)).toEqual([1, 0, 0, 1, 0, 0])
+  })
 })
