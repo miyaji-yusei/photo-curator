@@ -26,6 +26,27 @@ class StoredFileTest {
         assertEquals(Stored.Ok(42), file.readStored(-1, parse = parse))
     }
 
+    @Test fun 端末の書きかけはそのプロジェクトの古いものだけ片付ける() {
+        val folder = dir()
+        val now = 1_790_000_000_000L
+        val old = now - 2 * 60 * 60 * 1000L
+        fun make(name: String, at: Long) = File(folder, name).apply { writeText("x"); setLastModified(at) }
+        make("session-p.json.12.writing", old)
+        make("overrides-p.json.13.writing", old)
+        make("session-p.json.14.writing", now - 1_000)
+        make("session-q.json.15.writing", old)
+        make("session-p.json", old)
+        make("thumb.jpg.16.writing", old)
+
+        val gone = cleanWriting(folder, listOf("session-p.json.", "overrides-p.json."), now)
+
+        assertEquals(setOf("session-p.json.12.writing", "overrides-p.json.13.writing"), gone.map { it.name }.toSet())
+        assertEquals(
+            setOf("session-p.json.14.writing", "session-q.json.15.writing", "session-p.json", "thumb.jpg.16.writing"),
+            folder.listFiles()!!.map { it.name }.toSet()
+        )
+    }
+
     @Test fun 読めなければ空にせず元のファイルを残し写しを1つだけ作る() {
         val folder = dir()
         val file = File(folder, "session-p.json").apply { writeText("v2:{\"new\":true}") }

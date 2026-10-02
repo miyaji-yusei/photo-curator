@@ -343,8 +343,35 @@ class SidecarSync(
         return filled
     }
 
+    /** 片付けを済ませたプロジェクト（アプリの起動ごとに 1 回）。 */
+    private val tidied = HashSet<String>()
+
+    /**
+     * 書く・置き換える途中で落ちたときの残りかすを片付ける（U44 D11）。**開いたときに 1 回だけ。**
+     * 古いもの（[LEFTOVER_AGE_MS] より前）だけ消す。ロックがあれば（ほかの端末が書いている）何もしない。
+     * 失敗しても同期は止めない。
+     */
+    private suspend fun tidyOnce(target: SyncTarget) {
+        if (synchronized(tidied) { target.projectId in tidied }) return
+        try {
+            val folder = dir(target.folder)
+            val entries = when (val listed = target.io.list(folder)) {
+                is SmbResult.Failed -> return
+                is SmbResult.Ok -> listed.value
+            }
+            if (entries.any { it.name == LOCK_NAME }) return
+            for (name in leftoversToClean(entries, now())) target.io.delete("$folder\\$name")
+            synchronized(tidied) { tidied += target.projectId }
+        } catch (error: kotlinx.coroutines.CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            log("書きかけの残りかすを片付けられなかった", error)
+        }
+    }
+
     private suspend fun sync(target: SyncTarget, mode: SyncMode): SyncOutcome {
         target.local.flush()
+        if (mode == SyncMode.Open) tidyOnce(target)
         var attempts = 0
         while (true) {
             val remote = when (val read = readRemote(target)) {
@@ -778,6 +805,20 @@ class SidecarSync(
         fun catalogPath(folder: String) = dir(folder) + "\\catalog.json"
         private const val LOCK_NAME = "catalog.lock"
         fun lockPath(folder: String) = dir(folder) + "\\" + LOCK_NAME
+        /** 書きかけの残りかすと見なす古さ（U44 D11）。書き込みはロックの 60 秒より長くはかからない。 */
+        const val LEFTOVER_AGE_MS = 60 * 60 * 1000L
+
+        private val LEFTOVER = Regex("^\\.?catalog\\..+\\.tmp$")
+
+        /**
+         * 片付けてよい残りかす（U44 D11）: 一時ファイル（Android の `.catalog.<writeId>.tmp`・PC の
+         * `.catalog.json.<uuid>.tmp`・`catalog.*.tmp`）と `*.writing` のうち、更新時刻が [age] より古いもの。
+         * catalog.json・ロック・退避・壊れたファイルの写しは対象にしない。
+         */
+        fun leftoversToClean(entries: List<CatalogEntry>, now: Long, age: Long = LEFTOVER_AGE_MS): List<String> =
+            entries.filter { (LEFTOVER.matches(it.name) || it.name.endsWith(".writing")) && now - it.modifiedAt > age }
+                .map { it.name }
+
         /** `.photo-curator` のフォルダ（共有の根から `\` 区切り）。 */
         fun sidecarDir(folder: String) = dir(folder)
 

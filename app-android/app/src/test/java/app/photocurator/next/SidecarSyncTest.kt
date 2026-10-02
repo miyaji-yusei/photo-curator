@@ -881,6 +881,77 @@ class SidecarSyncTest {
         assertEquals(SyncOutcome.Settled(null), syncFor(android, c.seen).check(target(c.local, c.nas)))
     }
 
+    // ---- U44 D11: 書きかけの残りかすを、開いたときに古いものだけ片付ける ----
+
+    private fun leftoverNas(): Pair<FakeNas, Sidecar> {
+        val nas = FakeNas()
+        val a1 = written(mineAdvanced(), android, "a1")
+        put(nas, a1)
+        val head = SidecarSync.sidecarDir(folder) + "\\"
+        val old = clock - 2 * 60 * 60 * 1000L
+        for (name in listOf(".catalog.w9old.tmp", ".catalog.json.0f3a.tmp", "catalog.json.1a2b3c4d.writing", "catalog.x.tmp")) {
+            nas.files[head + name] = "half".toByteArray()
+            nas.mtimes[head + name] = old
+        }
+        nas.files[head + ".catalog.w9new.tmp"] = "writing now".toByteArray()
+        nas.mtimes[head + ".catalog.w9new.tmp"] = clock - 10_000
+        nas.files[head + "catalog.pc-desktop-1.20261001000000.json"] = "aside".toByteArray()
+        nas.mtimes[head + "catalog.pc-desktop-1.20261001000000.json"] = old
+        nas.mtimes[catalog] = old
+        nas.nasNow = clock
+        return nas to a1
+    }
+
+    @Test fun 開いたときに古い書きかけだけ片付ける() = run {
+        val (nas, a1) = leftoverNas()
+        val head = SidecarSync.sidecarDir(folder) + "\\"
+        val seen = FakeSeen().apply { save("project-1", seenAt(a1)) }
+
+        val answer = syncFor(android, seen).check(target(FakeLocal(snapshot(mineAdvanced())), nas))
+
+        assertTrue("$answer", answer is SyncOutcome.Settled)
+        assertEquals(
+            "残るのは catalog.json・退避・進行中の一時ファイル",
+            setOf(catalog, head + ".catalog.w9new.tmp", head + "catalog.pc-desktop-1.20261001000000.json"),
+            nas.files.keys.toSet()
+        )
+    }
+
+    @Test fun ほかの端末が書いている間と背面では片付けない() = run {
+        val (nas, a1) = leftoverNas()
+        val seen = FakeSeen().apply { save("project-1", seenAt(a1)) }
+        val before = nas.files.keys.toSet()
+        val local = FakeLocal(snapshot(mineAdvanced()))
+        val sync = syncFor(android, seen)
+
+        assertTrue(sync.pushIfChanged(target(local, nas)).await() is SyncOutcome.Settled)
+        assertEquals("背面では片付けない", before, nas.files.keys.toSet())
+
+        nas.files[lock] = "{\"holder\":\"pc\",\"at\":${clock}}".toByteArray()
+        nas.mtimes[lock] = clock
+        sync.check(target(local, nas))
+        assertEquals("ロックがあれば片付けない", before + lock, nas.files.keys.toSet())
+    }
+
+    @Test fun 片付ける名前は書きかけだけ() {
+        val now = 10_000_000_000L
+        val old = now - 2 * 60 * 60 * 1000L
+        val entries = listOf(
+            CatalogEntry(".catalog.abc.tmp", old),
+            CatalogEntry(".catalog.json.0f3a.tmp", old),
+            CatalogEntry("catalog.json.1a2b3c4d.writing", old),
+            CatalogEntry("catalog.json", old),
+            CatalogEntry("catalog.lock", old),
+            CatalogEntry("catalog.pc.20261001000000.json", old),
+            CatalogEntry("catalog.json.broken-20261001000000.json", old),
+            CatalogEntry(".catalog.fresh.tmp", now - 60_000)
+        )
+        assertEquals(
+            listOf(".catalog.abc.tmp", ".catalog.json.0f3a.tmp", "catalog.json.1a2b3c4d.writing"),
+            SidecarSync.leftoversToClean(entries, now)
+        )
+    }
+
     @Test fun 文言はPCと同じ形() {
         assertEquals("NAS の記録と、この端末の記録が違います", SidecarSync.CLASH_TITLE)
         assertEquals("この端末（Pixel 8）", SidecarSync.mineLabel("Pixel 8"))

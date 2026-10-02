@@ -64,7 +64,25 @@ object Sidecar {
      */
     suspend fun check(context: Context, project: Project, mode: SyncMode = SyncMode.Open): SyncOutcome {
         if (!supports(project)) return SyncOutcome.Settled()
+        if (mode == SyncMode.Open) tidyLocalOnce(context, project.id)
         return engine(context).check(target(context, project), mode)
+    }
+
+    /** 端末の書きかけを片付けたプロジェクト（アプリの起動ごとに 1 回）。 */
+    private val tidiedLocal = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /**
+     * 端末の保存が途中で落ちて残した `.writing` を片付ける（U44 D11）。このプロジェクトの
+     * 選別の途中・手直し・退避のうち、1 時間より古いものだけ。失敗しても止めない。
+     */
+    private suspend fun tidyLocalOnce(context: Context, id: String) {
+        if (!tidiedLocal.add(id)) return
+        withContext(Dispatchers.IO) {
+            val now = System.currentTimeMillis()
+            val gone = cleanWriting(context.filesDir, listOf("session-$id.json.", "overrides-$id.json."), now) +
+                cleanWriting(File(context.filesDir, "aside"), listOf("$id-"), now)
+            if (gone.isNotEmpty()) Log.i(TAG, "書きかけを片付けた: " + gone.joinToString { it.name })
+        }
     }
 
     /**

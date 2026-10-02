@@ -63,6 +63,20 @@ private fun File.keepBroken(bytes: ByteArray, now: Long): File? = try {
     null
 }
 
+/**
+ * [writeAtomically] が途中で落ちて残した `<名前>.<番号>.writing` を片付ける（U44 D11）。
+ * [prefixes] で始まる名前（例 `session-<id>.json.`）のうち、更新時刻が [age] より古いものだけ消す
+ * （書いている最中のものは消さない）。消したファイルを返す。失敗しても止めない。
+ */
+fun cleanWriting(dir: File, prefixes: List<String>, now: Long, age: Long = 60 * 60 * 1000L): List<File> = try {
+    dir.listFiles { file ->
+        file.isFile && file.name.endsWith(".writing") && prefixes.any { file.name.startsWith(it) } &&
+            file.lastModified() > 0 && now - file.lastModified() > age
+    }.orEmpty().filter { it.delete() }
+} catch (error: Exception) {
+    emptyList()
+}
+
 fun File.writeAtomically(write: (File) -> Unit) {
     val temporary = File(parentFile, "$name.${temporaryCounter.incrementAndGet()}.writing")
     try {
