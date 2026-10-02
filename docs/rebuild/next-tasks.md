@@ -41,8 +41,28 @@
 | U16 | 拡大のぐるぐるを、右上でなく写真の真ん中に重ねる（Android と同じ）。U10 の見直し | S | `app.vue`（`zoom-overlay__photo`）・`assets/main.css` 254〜255 行 | 済（#33） |
 | U17 | アプリの設定の画面を足し、表示用画像の既定の大きさを変えられるようにする（Android の設定と同じ） | S〜M | 新規 `components/views/AppSettingsView.vue`・`AppNav.vue`・`useCurator.ts`（`view`）・`displayEdge` まわり | 済（#34。PC の実機は未確認） |
 | U18 | 選別の並べ方で、3 枚のときだけ 1×3 に固定する（4〜10 枚は U7 のまま）。縦長の 3 枚が 2×2 になっていた（2026-09-30 #32 の目視で。縦横比を測る案は見送り） | S | `utils/gridFor.ts`・`tests/gridFor.test.ts` | 済（#39。3 枚だけ 1×3 固定） |
-| U19 | スライドショー選別（1 枚ずつ、左＝落とす・右＝残す）。トーナメントと切り替え可 | L | `TournamentView.vue`・`useCurator.ts`・core（グループ 1 枚）・Android | PC・Web・Android とも実装済み（`feat/mb-slideshow`。ユーザーの目視待ち。Android はエミュレーターで確認、実機は未確認）。core は下限 1 に変更（Android の .so は作り直し済み。`scripts/build-core.mjs`） |
+| U19 | スライドショー選別（1 枚ずつ、左＝落とす・右＝残す）。トーナメントと切り替え可 | L | `TournamentView.vue`・`useCurator.ts`・core（グループ 1 枚）・Android | 済（#41。PC・Web・Android とも実装済み（`feat/mb-slideshow`。ユーザーの目視待ち。Android はエミュレーターで確認、実機は未確認）。core は下限 1 に変更（Android の .so は作り直し済み。`scripts/build-core.mjs`）） |
 | U20 | 表示用画像の px の不具合（1536 で作られない・作成ダイアログの値がアプリの既定に負ける）と、詳細の ⋮ から px を変える機能 | M | `useCurator.ts`・`ProjectView.vue`・新規 `DisplayEdgeDialog.vue`・`utils/displayEdge.ts`・`lib.rs`（`get_display_settings`）・`backends/local.ts` | 済（#42。PC 実機は確認待ち） |
+| U21 | スライドショー選別の操作の直し（上の帯のクリック・タップで ★5。方式の並び） | M | `utils/slideshowGesture`・`SlideshowView.vue`・`app-android/`（`Slideshow.kt`） | 済（#44。PC・Web 側は #41 の先に取り込み済み） |
+| U22 | Android の Amazon の並列を 4 → 8（PC の U14 (b') にそろえる。ユーザー決定） | S | `app-android/`（`Amazon.PARALLEL`） | 済（#43） |
+| U23 | スライドショーの中心のクリック・タップは何もせず、二度押し（タップ）で拡大 | S〜M | `SlideshowView.vue`・`app-android/`（`SlideshowGesture`） | 済（#44） |
+| U24 | 選別画面のヘルプ「？」ボタンとテンキー | S〜M | `SelectionHelpButton.vue`・`app-android/`（`CullBar`・`SelectionHelpDialog`） | 済（#44） |
+| U25 | 折りたたみ端末を閉じた幅（約 411dp）での設定・作成・上バーの表示崩れ（Android） | S | `app-android/` | 済（#44） |
+| U26 | Android の選別中の画像の出方のもたつき（先読み・サムネイルの先出し） | M | `app-android/` | 済（#45 に含む） |
+| U27 | PC Rust のレビュー R1〜R14 のうち、挙動を変えずにできる改善 | M | `src-tauri/` | 済（#45 に含む。残りは U37） |
+| U28 | Web・PC 共通の画面コードのレビュー W1〜W24 の速さ・不具合の直し | M〜L | `composables/`・`components/` | 済（#45 に含む） |
+| U29 | Android: スライドショーの中央タップが振り分けになる実機報告の調査（件 1）と、準備を撮影時刻の昇順にする（件 2） | S〜M | `app-android/` | 済（#45 に含む） |
+| U30 | Android のレビュー A1〜A36 の速さと不具合の直し | L | `app-android/` | 済（#45 に含む） |
+| U31 | （10章 §7・PR #45 の概要・コミット履歴に見当たらない） | — | — | 要確認 |
+| U32 | スライドショー選別のタップの領域の変更（上 30% ＝★5・左 30% ＝落とす・右 30% ＝残す・中央の縦帯は無反応。ユーザー決定） | S〜M | `utils/slideshowGesture`・`app-android/`（`SlideshowGesture`） | 済（#45 に含む） |
+| U33 | サイドカー同期の core（正規化・比較キー・未着手・`sidecar_plan`・混ぜ方・鍵の変換・catalog.json v2）。下の「U33」の節 | L | `core/src/sidecar_sync.rs`・UDL・`core-wasm/` | 済（#45 に含む） |
+| U34 | PC・Web のサイドカー同期を `sidecar_plan` と楽観ロックに切り替える。下の「U34」の節 | L | `composables/useSidecarSync.ts`・`src-tauri/src/sidecar.rs` | 済（#45 に含む） |
+| U35 | Android のサイドカー同期を `sidecarPlan` に切り替える。下の「U35」の節 | L | `app-android/`（`Sidecar.kt`） | 済（#45 に含む。実機は未確認） |
+| U36 | Web の準備（解析）の順序と軽い改善（W10〜W18 など） | M | `composables/`・`utils/analysisOrder.ts` | 済（#45 に含む） |
+| U37 | PC Rust の走査（取り消し・失敗・NAS 不通で欠損の印を確定しない。R4・R5・R11〜R14・R3） | M | `src-tauri/` | 済（#45 に含む） |
+| U38 | core のレビュー R15〜R17（次のラウンドで仲間の星が追従する・`advance` の検証・手直しの重複は先勝ち） | S〜M | `core/src/lib.rs` | 済（#46） |
+| U39 | 「指紋」を「ハッシュ値」に言い換える（docs・文言。識別子は変えない） | S | docs・画面の文言 | 済（#47） |
+| U40 | Android のホームのカードが「…」のまま固まる件 | S | `app-android/` | 済（#48） |
 
 ---
 
@@ -239,9 +259,9 @@
 
 | 段 | 中身 | ブランチ | 状態 |
 | --- | --- | --- | --- |
-| U33 | core: 正規化・比較キー・未着手・`sidecar_plan`・混ぜ方（D・E）・鍵の変換・catalog.json v2 の項目。UDL と core-wasm に公開 | `fix/mb-u33-core-sidecar` | 済（push・PR はまだ。10章 §7 の U33） |
-| U34 | PC・Web: `useSidecarSync` を `sidecar_plan` と楽観ロック（lock → 読む → 確かめる → 一時ファイル → rename → 読み戻し）に切り替える。`sidecar_state` に `seen_token`・`seen_key`・`seen_epoch`・`detached`（移行: 古い seen_at/seen_by から `legacy:` の token、localChanged=true なら key を空に）。5 択のダイアログ・B の帯と「NAS に書き込む」・取り込みの「元に戻す」。`lib/core.ts` に新しい関数の型を足す。鍵は書くとき `sidecarKeysToFolder(…, '')`、読んだ直後に `sidecarNormalizeKeys(…, 選んだフォルダ)`、取り込むとき `sidecarKeysFromFolder(…, '', '\\')`（Windows） | `fix/mb-u34-pcweb-sidecar` | 済（push・PR はまだ。10章 §7 の U34・下の「U34」） |
-| U35 | Android: `Sidecar.kt` の判断を core の `sidecarPlan` に置き換える（`SyncState` を token・key・epoch・detached に）。鍵は prefix＝共有の根からのフォルダで変換。プロジェクトごとに 1 本の列・一時ファイル → rename・ON_STOP は開いているプロジェクトだけ・最初の確認が終わるまで「選別を開始」を押せない・5 択のダイアログ。**先に `node scripts/build-core.mjs` で `.so` と Kotlin の束ねを作り直す（ユーザー）** | `fix/mb-u35-android-sidecar` | 済（push・PR はまだ。下の「U35」の節。実機は未確認） |
+| U33 | core: 正規化・比較キー・未着手・`sidecar_plan`・混ぜ方（D・E）・鍵の変換・catalog.json v2 の項目。UDL と core-wasm に公開 | `fix/mb-u33-core-sidecar` | 済（#45 に含む。10章 §7 の U33） |
+| U34 | PC・Web: `useSidecarSync` を `sidecar_plan` と楽観ロック（lock → 読む → 確かめる → 一時ファイル → rename → 読み戻し）に切り替える。`sidecar_state` に `seen_token`・`seen_key`・`seen_epoch`・`detached`（移行: 古い seen_at/seen_by から `legacy:` の token、localChanged=true なら key を空に）。5 択のダイアログ・B の帯と「NAS に書き込む」・取り込みの「元に戻す」。`lib/core.ts` に新しい関数の型を足す。鍵は書くとき `sidecarKeysToFolder(…, '')`、読んだ直後に `sidecarNormalizeKeys(…, 選んだフォルダ)`、取り込むとき `sidecarKeysFromFolder(…, '', '\\')`（Windows） | `fix/mb-u34-pcweb-sidecar` | 済（#45 に含む。10章 §7 の U34・下の「U34」） |
+| U35 | Android: `Sidecar.kt` の判断を core の `sidecarPlan` に置き換える（`SyncState` を token・key・epoch・detached に）。鍵は prefix＝共有の根からのフォルダで変換。プロジェクトごとに 1 本の列・一時ファイル → rename・ON_STOP は開いているプロジェクトだけ・最初の確認が終わるまで「選別を開始」を押せない・5 択のダイアログ。**先に `node scripts/build-core.mjs` で `.so` と Kotlin の束ねを作り直す（ユーザー）** | `fix/mb-u35-android-sidecar` | 済（#45 に含む。下の「U35」の節。実機は未確認） |
 
 ### U33 で足した core の公開 API（`core/src/sidecar_sync.rs`。UDL・core-wasm にも同名／camelCase）
 - 正規化・比較: `normalize_key`・`canonical_judgement`・`sidecar_judgement`・`judgement_equivalent`・`judgement_key`
