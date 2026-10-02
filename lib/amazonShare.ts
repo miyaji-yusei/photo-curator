@@ -66,7 +66,7 @@ export function viewBoxUrl(tempLink: string, edge: number): string {
 
 /**
  * 自分のサーバー（server/api/amazon/image.get.ts）を経由した URL。
- * バイトが要る（指紋・ZIP）ときだけ使う。静的配信（GitHub Pages）には
+ * バイトが要る（ハッシュ値・ZIP）ときだけ使う。静的配信（GitHub Pages）には
  * この経路が無いので、失敗は `fetchAmazonBytes` 側で飲み込む。
  */
 function relayUrl(tempLink: string, edge?: number): string {

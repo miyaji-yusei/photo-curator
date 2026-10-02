@@ -94,7 +94,7 @@ object Preparations {
                         }
                         // EXIF に縮小画像が無かった写真を、落とした表示用画像から
                         // 埋める。**網へは行かない。**
-                        // Amazon は縮小画像から指紋を作るので要らない。
+                        // Amazon は縮小画像からハッシュ値を作るので要らない。
                         if (kind == SourceKind.Nas) Prepare.fillFromRenders(app, project, ready.first, displayEdge)
                     }
                     Trouble.clear(app, project.source.key)

@@ -326,7 +326,7 @@ fn db_path(app: &AppHandle) -> Result<PathBuf, String> {
         .app_data_dir()
         .map_err(|error| error.to_string())?;
     fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
-    // 指紋の計算式を core に替えたので、古い指紋が混ざらないよう別のファイルにする。
+    // ハッシュ値の計算式を core に替えたので、古いハッシュ値が混ざらないよう別のファイルにする。
     // 旧 `photo-curator.sqlite3` は読まない・消さない。
     Ok(dir.join("photo-curator-v2.sqlite3"))
 }
@@ -1560,7 +1560,7 @@ fn encode_thumbnail(image: &DynamicImage) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-/// 指紋。**必ず core を通す**（Android・Web と同じ計算式にするため）。
+/// ハッシュ値。**必ず core を通す**（Android・Web と同じ計算式にするため）。
 /// 大きい画像のまま平均を取ると遅いので、先に軽く縮めてから渡す。
 /// 作れないとき（極端に小さい画像など）は None で、0 を入れない。
 fn d_hash_of(image: &DynamicImage) -> Option<String> {
@@ -2472,7 +2472,7 @@ fn hash_one(thumbnails: &Path, index: usize, record: &HashRecord) -> PhotoWork {
     result
 }
 
-/// `hash_one` の Amazon 版。`viewBox=160` の画像を取り、旧版と同じサムネイルと指紋にする。
+/// `hash_one` の Amazon 版。`viewBox=160` の画像を取り、旧版と同じサムネイルとハッシュ値にする。
 /// サムネイルが残っていて版も合えば、網を使わない。**DB には触れない。**
 fn hash_one_amazon(
     book: &amazon::LinkBook,
@@ -2526,7 +2526,7 @@ fn hash_one_amazon(
     result
 }
 
-/// Amazon に縮小させるときの長辺（サムネイルと指紋のもと）。
+/// Amazon に縮小させるときの長辺（サムネイルとハッシュ値のもと）。
 const AMAZON_THUMBNAIL_EDGE: u32 = 160;
 
 /// 解析できなかった写真の件数。UI へそのまま渡す。
@@ -2561,7 +2561,7 @@ fn run_burst_analysis(
     // ネットワークのフォルダは worker 数を抑えるので、フォルダの場所を先に知る。
     let folder = project_folder(&app, &project_id)?;
     // Amazon の共有リンクは、撮影時刻を一覧の contentDate から走査で入れてあり、
-    // サムネイル・指紋は viewBox=160 の画像から作る。並列は WORKERS（8）。
+    // サムネイル・ハッシュ値は viewBox=160 の画像から作る。並列は WORKERS（8）。
     let amazon_book = amazon_book_of(&app, &project_id)?;
     let workers = if amazon_book.is_some() {
         amazon::WORKERS
@@ -3186,8 +3186,8 @@ fn get_analysis_backlog(app: AppHandle, project_id: String) -> Result<i64, Strin
 
 /// 「解析の対象なのに未処理」の枚数。
 ///
-/// 指紋・サムネイルを作る対象は、解析（`select_burst_candidates`）が選んだ連写の候補だけ
-/// （Amazon は全部）。対象でない写真は指紋もサムネイルも空のままなので、数えない。
+/// ハッシュ値・サムネイルを作る対象は、解析（`select_burst_candidates`）が選んだ連写の候補だけ
+/// （Amazon は全部）。対象でない写真はハッシュ値もサムネイルも空のままなので、数えない。
 /// 数えると、候補でない写真の分だけ backlog が 0 にならず、ホームがずっと「準備中」になる。
 /// 撮影時刻が未読の写真は、対象が決まる前なので常に数える。
 fn analysis_backlog(conn: &Connection, project_id: &str, is_amazon: bool) -> Result<i64, String> {
@@ -7566,9 +7566,9 @@ mod tests {
         fs::remove_dir_all(&directory).expect("remove test directory");
     }
 
-    // ---- 指紋（core）・DB のファイル ------------------------------------
+    // ---- ハッシュ値（core）・DB のファイル ------------------------------------
 
-    /// 同じ絵を JPEG で作り直しても、指紋はほとんど動かない（core と同じ基準）。
+    /// 同じ絵を JPEG で作り直しても、ハッシュ値はほとんど動かない（core と同じ基準）。
     #[test]
     fn the_fingerprint_survives_a_jpeg_round_trip() {
         let original = synthetic_image(640, 480, 3);
@@ -8444,7 +8444,7 @@ mod tests {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })
             .unwrap();
-        // 星は残り、絵と指紋は作り直しになる。
+        // 星は残り、絵とハッシュ値は作り直しになる。
         assert_eq!((rating, hash, thumb, display), (3, None, None, None));
         fs::remove_dir_all(&directory).ok();
     }
@@ -8481,7 +8481,7 @@ mod tests {
         assert!(reused.error.is_none() && reused.hash_reused);
         assert_eq!(reused.d_hash, expected);
 
-        // 版が古い指紋は、サムネイルから作り直す（網は使わない）。
+        // 版が古いハッシュ値は、サムネイルから作り直す（網は使わない）。
         let mut old = record.clone();
         old.cached.d_hash_version = Some(D_HASH_VERSION - 1);
         let rebuilt = hash_one_amazon(&book, &thumbnails, 0, &old);

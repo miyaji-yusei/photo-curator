@@ -12,7 +12,7 @@ import kotlinx.coroutines.withContext
 import uniffi.photo_curator_core.dHashFromGray
 
 /**
- * 連写のまとめに使う指紋（dHash）を作る。
+ * 連写のまとめに使うハッシュ値（dHash）を作る。
  *
  * **デコードと縮小は Android に任せる。** `loadThumbnail` は OS が持っている
  * 縮小画像を返すので、**原本を読まない**（実測 1 枚 3.5ms）。
@@ -43,10 +43,10 @@ object Analyse {
     }
 
     /**
-     * NAS の 1 枚。**先頭 64KB だけ読んで、指紋と撮影時刻を同時に取る。**
+     * NAS の 1 枚。**先頭 64KB だけ読んで、ハッシュ値と撮影時刻を同時に取る。**
      *
      * 原本 6MB を網越しに引くと 2,000 枚で 12GB になる。EXIF は先頭にあり、
-     * その中の縮小画像（160x120 程度）で指紋は十分に作れる。
+     * その中の縮小画像（160x120 程度）でハッシュ値は十分に作れる。
      */
     fun hashOverNetwork(
         context: Context,
@@ -57,13 +57,13 @@ object Analyse {
         val path = photo.smb?.path ?: return null
         val head = reader.head(path, SmbExifReader.HEAD_BYTES) ?: return null
         val exif = SmbExifReader.parse(head, fallbackAt)
-        // 縮小画像が無い写真は指紋を作らない。**原本を引きに行かない。**
+        // 縮小画像が無い写真はハッシュ値を作らない。**原本を引きに行かない。**
         // 連写のまとめに入らないだけで、選別には出る。
         val bytes = exif.thumbnail ?: return Fingerprint(VERSION, photo.size, "", exif.takenAt)
         return try {
             val decoded = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
                 ?: return Fingerprint(VERSION, photo.size, "", exif.takenAt)
-            // **向きを当ててから指紋を作る。** 回ったままだと、同じ連写でも
+            // **向きを当ててからハッシュ値を作る。** 回ったままだと、同じ連写でも
             // 縦横が混ざって距離が開き、まとまらなくなる。
             val bitmap = SmbExifReader.applyOrientation(decoded, exif.orientation)
             // **一度読んだ絵は捨てない。** 一覧を出すたびに網へ行かせない。
@@ -72,13 +72,13 @@ object Analyse {
             bitmap.recycle()
             Fingerprint(VERSION, photo.size, made ?: "", exif.takenAt)
         } catch (error: Exception) {
-            Log.w(TAG, "NAS の指紋を作れなかった: ${photo.name}", error)
+            Log.w(TAG, "NAS のハッシュ値を作れなかった: ${photo.name}", error)
             Fingerprint(VERSION, photo.size, "", exif.takenAt)
         }
     }
 
     /**
-     * Amazon の写真の指紋。**縮小して返してもらったサムネイルから作る。**
+     * Amazon の写真のハッシュ値。**縮小して返してもらったサムネイルから作る。**
      * 撮影時刻は一覧に入っていたものをそのまま控える（EXIF を読まない）。
      *
      * リンクが消えていたら**準備ごと止める**（つまずきとして出すため）。
@@ -103,7 +103,7 @@ object Analyse {
         return Fingerprint(VERSION, photo.size, made ?: "", photo.takenAt)
     }
 
-    /** 絵から指紋を作る。**元の Bitmap は片付けない**（呼んだ側の持ち物）。 */
+    /** 絵からハッシュ値を作る。**元の Bitmap は片付けない**（呼んだ側の持ち物）。 */
     fun hashOf(source: Bitmap): String? {
         // **縮小は core に任せる。** ここで createScaledBitmap を使うと、
         // 縮小率が大きいときに 2x2 しか読まず、同じ絵でも値が揃わない
@@ -124,13 +124,13 @@ object Analyse {
     }
 
     /**
-     * 指紋そのものが効いているかを確かめる。**まとまらない理由を切り分ける。**
+     * ハッシュ値そのものが効いているかを確かめる。**まとまらない理由を切り分ける。**
      *
-     * 「まとまらない」は「写真が本当に違う」でも起きるし「指紋が壊れている」でも
+     * 「まとまらない」は「写真が本当に違う」でも起きるし「ハッシュ値が壊れている」でも
      * 起きる。区別がつかないまま閾値をいじると、いつまでも直らない。
      *
      * 同じ絵を JPEG で作り直したものと比べる。中身は同じなので、
-     * **距離が 0 に近ければ指紋は効いている**。32 前後なら値が乱数と変わらない。
+     * **距離が 0 に近ければハッシュ値は効いている**。32 前後なら値が乱数と変わらない。
      */
     fun selfCheck(context: Context, photo: Photo) {
         val source = Photos.thumbnail(context, photo, edge = 64) ?: run {
@@ -146,14 +146,14 @@ object Analyse {
             val again = copy?.let { hashOf(it) }
             copy?.recycle()
             if (original == null || again == null) {
-                Log.w(TAG, "自己確認: 指紋を作れなかった")
+                Log.w(TAG, "自己確認: ハッシュ値を作れなかった")
                 return
             }
             Log.i(
                 TAG,
                 "自己確認: ${source.width}x${source.height} / $original vs $again / " +
                     "距離 ${uniffi.photo_curator_core.hashDistance(original, again)}" +
-                    "（0 に近ければ指紋は効いている）"
+                    "（0 に近ければハッシュ値は効いている）"
             )
         } catch (error: Exception) {
             Log.w(TAG, "自己確認に失敗", error)
@@ -199,7 +199,7 @@ object Analyse {
         nasAccess: Pair<Nas, String>? = null
     ): Map<String, Fingerprint> = withContext(Dispatchers.IO) {
         // **既に分かっている分から始める。** 途中で止まったときにここを空から
-        // 始めていると、まだ見ていない写真の指紋まで消してしまう。
+        // 始めていると、まだ見ていない写真のハッシュ値まで消してしまう。
         val out = HashMap(cached)
 
         fun needsWork(photo: Photo): Boolean = !upToDate(cached[photo.relativePath], photo)
@@ -248,7 +248,7 @@ object Analyse {
         }
 
         /**
-         * Amazon は縮小を向こうに頼む。**サムネを取って、そのまま指紋にする。**
+         * Amazon は縮小を向こうに頼む。**サムネを取って、そのままハッシュ値にする。**
          * 取ったサムネは一覧でも使うので置いておく（二度取らない）。
          */
         suspend fun sweepAmazon() = coroutineScope {
@@ -292,7 +292,7 @@ object Analyse {
 
 object Prepare {
     /**
-     * 準備（指紋・サムネイル・表示用画像）を進める順。**選別と同じ、撮影時刻の昇順
+     * 準備（ハッシュ値・サムネイル・表示用画像）を進める順。**選別と同じ、撮影時刻の昇順
      * （同時刻は相対パス）。** 先の写真から使えるようになるので、選別が始まる順に
      * 用意する。NAS の一覧は名前順、Amazon は日付の昇順（同時刻の並びは不定）で
      * 来るので、そのまま使わずここで並べる。並びだけで、中身は変えない。
@@ -414,10 +414,10 @@ object Prepare {
     ): Pair<List<Photo>, List<uniffi.photo_curator_core.PhotoRef>> {
         // **撮影時刻は EXIF のものを使う。**
         // NAS の更新時刻はコピーしたときに変わるので、撮影順にならない。
-        // 指紋と同じ読みで取れているので、ここで差し替えて並べ直す。
+        // ハッシュ値と同じ読みで取れているので、ここで差し替えて並べ直す。
         val dated = photos
             .map { photo ->
-                // Amazon は一覧の時刻が正（EXIF を読んでいない）。指紋に控えた古い値で
+                // Amazon は一覧の時刻が正（EXIF を読んでいない）。ハッシュ値に控えた古い値で
                 // 上書きすると、読み方を直しても直らない。
                 val takenAt = if (photo.amazon != null) null else prints[photo.relativePath]?.takenAt
                 if (takenAt != null && takenAt > 0) photo.copy(takenAt = takenAt) else photo
@@ -560,15 +560,15 @@ object Prepare {
      * EXIF に縮小画像が無かった写真を、**表示用画像から**埋める。
      *
      * 書き出し方によっては EXIF に縮小画像が入らない（実機の NAS にあった
-     * 「倉坂くるる」の 17 枚がそうで、指紋が全部空だった）。すると
+     * 「倉坂くるる」の 17 枚がそうで、ハッシュ値が全部空だった）。すると
      *
-     *   * 連写がまとまらない（指紋が無いので比べようがない）
+     *   * 連写がまとまらない（ハッシュ値が無いので比べようがない）
      *   * カバーが出ない（端末に小さい絵が 1 枚も無い）
      *
      * の 2 つが、何も言わずに起きる。表示用画像は準備で**もう落としてある**
      * ので、そこから作れば網へは行かない。
      *
-     * 指紋の元が EXIF の縮小画像か表示用画像かで、同じ写真でも値は少しずれる。
+     * ハッシュ値の元が EXIF の縮小画像か表示用画像かで、同じ写真でも値は少しずれる。
      * まとまりの判定は距離で見ているので、そこは吸収できる範囲に収まる。
      */
     suspend fun fillFromRenders(
@@ -589,7 +589,7 @@ object Prepare {
             val file = Renders.file(context, nasId, path, edge)
             if (!file.exists() || file.length() == 0L) continue
             try {
-                // **指紋に要るのは形だけ。** 大きいまま読むと 17 枚でも重い。
+                // **ハッシュ値に要るのは形だけ。** 大きいまま読むと 17 枚でも重い。
                 val options = android.graphics.BitmapFactory.Options().apply { inSampleSize = 4 }
                 val bitmap = android.graphics.BitmapFactory.decodeFile(file.path, options)
                     ?: continue
@@ -610,7 +610,7 @@ object Prepare {
 /**
  * 連写がまとまらなかったときに、**どちらの条件で落ちたのか**を残す。
  *
- * 「まとまらない」には理由が 3 つある（指紋が無い・時間が離れている・
+ * 「まとまらない」には理由が 3 つある（ハッシュ値が無い・時間が離れている・
  * 見た目が違う）。区別できないと、直しようがない推測が始まる。
  */
 object Neighbours {
@@ -644,7 +644,7 @@ object Neighbours {
         }
         Log.i(
             TAG,
-            "隣どうし ${refs.size - 1} 組 / 両方に指紋 $bothHashed / " +
+            "隣どうし ${refs.size - 1} 組 / 両方にハッシュ値 $bothHashed / " +
                 "時間が近い $nearInTime / 見た目が近い $nearInLook / 両方 $both"
         )
         // **閾値を勘で決めないための材料。** 時間が近いペアだけの距離の散らばり。

@@ -370,7 +370,7 @@ fun sourceIcon(kind: SourceKind): androidx.compose.ui.graphics.vector.ImageVecto
  *
  * ここで網へ行かない。ホームは一覧が出るまでの時間がすべてなので、
  * 「開いたら NAS を待つ」は作らない。準備の進みは端末に置いたもの
- * （顔ぶれ・指紋・表示用画像）を数えれば分かる。
+ * （顔ぶれ・ハッシュ値・表示用画像）を数えれば分かる。
  */
 internal suspend fun standingOf(
     context: Context,
