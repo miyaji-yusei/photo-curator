@@ -56,6 +56,26 @@ const canMerge = computed(() => {
   const preview = sidecarClash.value?.preview
   return canWrite.value && !!preview && preview.mine_starred > 0 && preview.theirs_starred > 0
 })
+/**
+ * 混ぜられないとき（途中の ROUND があるのに ROUND か対象の★が違う。U45）は、D・E を押せなくして理由を出す。
+ * どちらの判断で続きを選別すればよいか決められず、混ぜるとまだ見ていない写真を飛ばしかねないため。
+ */
+const mergeBlocked = computed(() => sidecarClash.value?.preview.mergeable === false)
+/** D・E の下の注意書き（U45: どちらも見ていない写真は、混ぜたあと続きから選別する）。 */
+const mergeNote = computed(() => {
+  const preview = sidecarClash.value?.preview
+  if (!preview) return ''
+  if (preview.mergeable === false) {
+    return 'この端末とほかの端末で ROUND か対象の★が違うので、混ぜられません（まだ見ていない写真を飛ばさないため）。上の 3 つから選んでください。'
+  }
+  if (preview.undecided > 0) {
+    return `どちらの端末でもまだ見ていない ${preview.undecided.toLocaleString()} 枚は、混ぜたあとも残ります。選別画面で続きから選別できます。混ぜたあとは「1 つ戻す」はできません。`
+  }
+  if (preview.mid_round) {
+    return 'まだ見ていない写真は、どれもどちらかの端末で判定済みなので、混ぜるとこの ROUND は完了します。続きは結果画面の「もう一度選別する」から始めます。混ぜたあとは「1 つ戻す」はできません。'
+  }
+  return ''
+})
 </script>
 
 <template>
@@ -95,18 +115,16 @@ const canMerge = computed(() => {
         </div>
         <template v-if="canMerge">
           <div>
-            <v-btn block variant="outlined" :disabled="sidecarBusy" @click="resolveSidecarClash('intersection')">両方で残した写真のみにする</v-btn>
+            <v-btn block variant="outlined" :disabled="sidecarBusy || mergeBlocked" @click="resolveSidecarClash('intersection')">両方で残した写真のみにする</v-btn>
             <div class="text-caption text-medium-emphasis mt-1">
               ★1 以上が {{ sidecarClash.preview.intersection_starred.toLocaleString() }} 枚になります（この端末 {{ sidecarClash.preview.mine_starred.toLocaleString() }}・NAS {{ sidecarClash.preview.theirs_starred.toLocaleString() }}）。片方でまだ見ていない写真は、見た側の★を使います。
             </div>
           </div>
           <div>
-            <v-btn block variant="outlined" :disabled="sidecarBusy" @click="resolveSidecarClash('union')">どちらかで残した写真をすべて残す</v-btn>
+            <v-btn block variant="outlined" :disabled="sidecarBusy || mergeBlocked" @click="resolveSidecarClash('union')">どちらかで残した写真をすべて残す</v-btn>
             <div class="text-caption text-medium-emphasis mt-1">★1 以上が {{ sidecarClash.preview.union_starred.toLocaleString() }} 枚になります。</div>
           </div>
-          <p v-if="sidecarClash.preview.mid_round" class="text-caption text-medium-emphasis mb-0">
-            混ぜる 2 つは、途中の ROUND を終わりにします。まだ見ていない {{ sidecarClash.preview.undecided.toLocaleString() }} 枚は今の★のままになります。続きは結果画面の「もう一度選別する」から始めます。
-          </p>
+          <p v-if="mergeNote" class="text-caption text-medium-emphasis mb-0">{{ mergeNote }}</p>
         </template>
       </div>
 

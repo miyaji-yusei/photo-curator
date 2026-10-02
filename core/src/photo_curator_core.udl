@@ -359,6 +359,8 @@ dictionary MergePreview {
     u32 union_starred;
     u32 undecided;
     boolean mid_round;
+    // U45: 途中の ROUND があるのに ROUND か対象の★が違えば false（D・E を出さない）。
+    boolean mergeable;
 };
 
 dictionary MergeResult {

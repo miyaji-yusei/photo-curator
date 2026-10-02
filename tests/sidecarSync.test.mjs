@@ -731,7 +731,7 @@ describe('食い違いの 5 択', () => {
     ['intersection', 'Intersection', null],
     ['union', 'Union', [1, 1, 1, 0, 0, 0]]
   ]) {
-    it(`${choice === 'intersection' ? 'D 積集合' : 'E 和集合'}: 混ぜた星の完了状態にし、両方を退避して NAS にも書く`, async () => {
+    it(`${choice === 'intersection' ? 'D 積集合' : 'E 和集合'}: まだどちらも見ていない写真は続きから選別できる形にし、両方を退避して NAS にも書く（U45）`, async () => {
       const { pc, android, pcSync, androidSync, clash } = await clashed()
       const mineJ = core.sidecarJudgement(core.sidecarKeysToFolder(await pcSync.buildSidecar(project, 1), ''))
       const theirsJ = core.sidecarJudgement(clash.theirs)
@@ -741,11 +741,14 @@ describe('食い違いの 5 択', () => {
       expect((await pcSync.resolveClash(project, clash, choice)).kind).toBe('done')
       expect(pc.writes).toEqual([asideFileName(PC.id), asideFileName(ANDROID.id), 'catalog.json'])
       expect(ratingsOf(pc)).toEqual(want)
-      expect(pc.session.core.finished).toBe(true)
+      // U45: 両方とも IMG_4・IMG_5 をまだ見ていない → 完了にせず、選別画面で続きから出す（以前は完了・結果画面）。
+      expect(pc.session.core.finished).toBe(false)
+      expect([...pc.session.core.current, ...pc.session.core.queue]).toEqual(['IMG_4.JPG', 'IMG_5.JPG'])
       expect(pc.session.core.history).toEqual([])
-      expect(pc.session.stage).toBe('result')
+      expect(pc.session.stage).toBe('tournament')
       const written = nasCatalog(pc)
-      expect(written.sessions.tournament.finished).toBe(true)
+      expect(written.sessions.tournament.finished).toBe(false)
+      expect(written.sessions.tournament.current).toEqual(['IMG_4.JPG', 'IMG_5.JPG'])
       // Android は確認なしに混ぜた結果を取り込む（早送り）。
       expect((await androidSync.checkOnOpen(project)).kind).toBe('pulled')
       expect(ratingsOf(android)).toEqual(want)
@@ -753,6 +756,19 @@ describe('食い違いの 5 択', () => {
       expect((await pcSync.checkOnOpen(project)).kind).toBe('settled')
     })
   }
+
+  it('U45: ROUND が違えば D・E は押せない扱いで、選ばれても何も変えずに理由を返す', async () => {
+    const { pc, pcSync, clash } = await clashed()
+    // PC だけ ROUND 2（★1 から）の途中にいることにする。
+    pc.session = envelope({ ...pc.session.core, round: 2, target_star: 1 })
+    const before = pc.files.get('catalog.json')
+    const result = await pcSync.resolveClash(project, clash, 'union')
+    expect(result.kind).toBe('failed')
+    expect(result.reason).toContain('混ぜられません')
+    expect(pc.writes).toEqual([])
+    expect(pc.files.get('catalog.json')).toBe(before)
+    expect(pc.session.core.round).toBe(2)
+  })
 
   it('積集合: 片方で未判定の写真は判定済みの側の★を採る（Android で未判定の IMG_4 は PC の★）', async () => {
     const { pc, pcSync, clash } = await clashed()

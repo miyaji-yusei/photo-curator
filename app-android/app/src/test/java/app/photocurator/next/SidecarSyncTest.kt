@@ -22,6 +22,7 @@ import uniffi.photo_curator_core.Session
 import uniffi.photo_curator_core.Sidecar
 import uniffi.photo_curator_core.SidecarPhoto
 import uniffi.photo_curator_core.SidecarSessions
+import uniffi.photo_curator_core.advance
 import uniffi.photo_curator_core.judgementEquivalent
 import uniffi.photo_curator_core.judgementKey
 import uniffi.photo_curator_core.sidecarFromJson
@@ -501,10 +502,14 @@ class SidecarSyncTest {
 
         assertTrue("$answer", answer is SyncOutcome.Pushed)
         val session = c.local.snapshot.session!!
-        assertTrue("混ぜた星の完了した状態", session.finished)
+        // U45: 9〜12 枚目はどちらの端末もまだ見ていない → 完了にせず、続きから選別する（以前は完了状態）。
+        assertFalse("未判定が残るので完了にしない", session.finished)
+        assertEquals(photos.drop(8), session.current + session.queue)
+        assertTrue(session.history.isEmpty())
         // ★1・2 は相手（判定済み）で落ちた。★3 はこの端末（判定済み）で落ちた。
         // ★5 は相手ではまだ見ていない → この端末の★を採る。
         assertEquals(mapOf(p(5) to 1), session.ratings.filterValues { it > 0 })
+        assertEquals(listOf(p(5)), session.survivors)
         assertTrue(sameJudgement(c.local, remote(c.nas)))
         assertNotNull(aside(c.nas, SidecarSync.tag(fold.id)))
         assertNotNull(aside(c.nas, SidecarSync.tag(android.id)))
@@ -517,11 +522,50 @@ class SidecarSyncTest {
 
         assertTrue("$answer", answer is SyncOutcome.Pushed)
         val session = c.local.snapshot.session!!
-        assertTrue(session.finished)
+        // U45: どちらの端末もまだ見ていない 9〜12 枚目を飛ばさない（以前は完了状態で、飛ばしていた）。
+        assertFalse(session.finished)
+        assertEquals(photos.drop(8), session.current)
         assertEquals(setOf(p(1), p(2), p(3), p(5)), session.ratings.filterValues { it > 0 }.keys)
         assertTrue(sameJudgement(c.local, remote(c.nas)))
         assertNotNull(aside(c.nas, SidecarSync.tag(fold.id)))
         assertNotNull(aside(c.nas, SidecarSync.tag(android.id)))
+        // 続きから選別できる（本物の core の advance）。
+        val next = advance(session, listOf(p(10)))
+        assertEquals(1, next.ratings[p(10)])
+        assertTrue(next.finished)
+    }
+
+    @Test fun 混ぜるときの見込みと注意書き_U45() = run {
+        val c = clashed()
+        assertTrue(c.clash.preview.mergeable)
+        assertEquals(4u, c.clash.preview.undecided)
+        assertEquals(
+            "どちらの端末でもまだ見ていない 4 枚は、混ぜたあとも残ります。" +
+                "選別画面で続きから選別できます。混ぜたあとは「1 つ戻す」はできません。",
+            SidecarSync.mergeNote(c.clash.preview)
+        )
+    }
+
+    @Test fun ROUNDが違えば混ぜず_選ばれてもNASも端末も変えない_U45() = run {
+        val nas = FakeNas()
+        val theirsBytes = put(nas, written(theirsAdvanced(), fold, "f1"))
+        val seen = FakeSeen()
+        // この端末だけ ROUND 2（★1 から）の途中。
+        val late = mineAdvanced().copy(round = 2u, targetStar = 1)
+        val local = FakeLocal(snapshot(late))
+        val sync = syncFor(android, seen)
+        val answer = sync.check(target(local, nas))
+        assertTrue("$answer", answer is SyncOutcome.Asking)
+        val clash = (answer as SyncOutcome.Asking).clash
+        assertFalse(clash.preview.mergeable)
+        assertTrue(SidecarSync.mergeNote(clash.preview)!!.contains("混ぜられません"))
+
+        val resolved = sync.resolve(target(local, nas), clash, ClashChoice.Union)
+        assertEquals(SyncOutcome.Blocked(SidecarSync.MERGE_BLOCKED_REASON), resolved)
+        assertArrayEquals("NAS の catalog.json はそのまま", theirsBytes, nas.files[catalog])
+        assertEquals("退避もしない", setOf(catalog), nas.files.keys.toSet())
+        assertEquals(late, local.snapshot.session)
+        assertTrue(local.asides.isEmpty())
     }
 
     @Test fun ダイアログのあとでNASが変わっていたら実行せず聞き直す() = run {

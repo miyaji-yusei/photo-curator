@@ -160,8 +160,10 @@ describe('core-wasm のサイドカー同期（U33）', () => {
       theirs_starred: 2,
       intersection_starred: 2,
       union_starred: 4,
-      undecided: 1,
-      mid_round: true
+      // U45: 混ぜたあとも残る、どちらも見ていない写真の数。端末は完了しているので 0（以前の期待は 1）。
+      undecided: 0,
+      mid_round: true,
+      mergeable: true
     })
 
     const result = wasm.mergeJudgements(mine, theirs, 'Intersection', 2, 'e-new')
@@ -188,6 +190,27 @@ describe('core-wasm のサイドカー同期（U33）', () => {
         [{ left: 'a.jpg', right: 'b.jpg', decision: 'join' }]
       )
     ).toEqual([{ left: 'a.jpg', right: 'b.jpg', decision: 'split' }])
+  })
+
+  it('U45: 途中の ROUND どうしを混ぜても、どちらも見ていない写真は queue に残り続きから選別できる（フィクスチャ）', () => {
+    const merge = fixture.merge_mid_round
+    const mine = judge(merge.mine)
+    const theirs = judge(merge.theirs)
+    expect(wasm.mergePreview(mine, theirs)).toMatchObject(merge.expected_preview)
+    for (const [mode, expected] of [['Union', merge.expected_union], ['Intersection', merge.expected_intersection]]) {
+      const result = wasm.mergeJudgements(mine, theirs, mode, merge.group_size, 'e')
+      expect(result.session.finished, mode).toBe(expected.finished)
+      expect(result.session.current, mode).toEqual(expected.current)
+      expect(result.session.queue, mode).toEqual(expected.queue)
+      expect(result.session.survivors, mode).toEqual(expected.survivors)
+      expect(result.ratings, mode).toEqual(expected.ratings)
+      expect(result.undecided, mode).toBe(expected.undecided)
+      expect(result.session.history, mode).toEqual([])
+      // 続きから選別できる。
+      expect(advance(result.session, ['e.jpg']).ratings['e.jpg'], mode).toBe(1)
+    }
+    // ROUND が違えば混ぜない。
+    expect(wasm.mergePreview(judge({ ...merge.mine, round: 2, target_star: 1 }), theirs).mergeable).toBe(false)
   })
 
   it('写真の鍵: Android 形式とフォルダ形式を行き来し、一致率を数える', () => {

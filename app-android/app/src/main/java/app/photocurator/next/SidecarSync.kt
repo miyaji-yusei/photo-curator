@@ -21,6 +21,7 @@ import uniffi.photo_curator_core.SidecarSessions
 import uniffi.photo_curator_core.isUntouched
 import uniffi.photo_curator_core.judgementKey
 import uniffi.photo_curator_core.mergeJudgements
+import uniffi.photo_curator_core.mergePreview
 import uniffi.photo_curator_core.sessionFromRatings
 import uniffi.photo_curator_core.sidecarFromJson
 import uniffi.photo_curator_core.sidecarJudgement
@@ -722,6 +723,10 @@ class SidecarSync(
 
             ClashChoice.Intersection, ClashChoice.Union -> {
                 val mode = if (choice == ClashChoice.Union) MergeMode.UNION else MergeMode.INTERSECTION
+                // ROUND か対象の★が違うと混ぜない（ダイアログでも押せない。U45）。何も変えずに理由を出す。
+                if (!mergePreview(judgement, sidecarJudgement(current)).mergeable) {
+                    return SyncOutcome.Blocked(MERGE_BLOCKED_REASON)
+                }
                 // 元の 2 つは両方退避する（端末の分は端末と NAS、NAS の分は書くときに NAS）。
                 val json = sidecarToJson(mine)
                 target.local.aside(json)
@@ -926,9 +931,26 @@ class SidecarSync(
 
         fun unionLine(preview: MergePreview) = "★1 以上が ${preview.unionStarred} 枚になります"
 
-        /** 混ぜるとセッションが終わることの注意（途中のときだけ）。 */
-        fun midRoundLine(preview: MergePreview): String? = if (!preview.midRound) null else
-            "途中の ROUND は終わりにします。まだ見ていない ${preview.undecided} 枚は今の★のままになります。" +
-                "続きは結果画面の『もう一度選別する』から"
+        /** 混ぜられないとき（D・E を押せなくする）の理由。PC・Web と同じ文。 */
+        const val MERGE_BLOCKED_REASON = "ROUND か対象の★がほかの端末と違うので、混ぜられません"
+
+        /**
+         * D・E の下の注意書き（U45）。PC・Web の `SidecarConflictDialog.vue` と同じ文。
+         * - 混ぜられない（途中の ROUND があるのに ROUND か対象の★が違う）→ 理由
+         * - どちらの端末もまだ見ていない写真が残る → 続きから選別できる
+         * - 途中だが、残りはどちらかの端末で判定済み → この ROUND は完了する
+         */
+        fun mergeNote(preview: MergePreview): String? = when {
+            !preview.mergeable ->
+                "この端末とほかの端末で ROUND か対象の★が違うので、混ぜられません（まだ見ていない写真を飛ばさないため）。" +
+                    "上の 3 つから選んでください。"
+            preview.undecided > 0u ->
+                "どちらの端末でもまだ見ていない ${preview.undecided} 枚は、混ぜたあとも残ります。" +
+                    "選別画面で続きから選別できます。混ぜたあとは「1 つ戻す」はできません。"
+            preview.midRound ->
+                "まだ見ていない写真は、どれもどちらかの端末で判定済みなので、混ぜるとこの ROUND は完了します。" +
+                    "続きは結果画面の「もう一度選別する」から始めます。混ぜたあとは「1 つ戻す」はできません。"
+            else -> null
+        }
     }
 }

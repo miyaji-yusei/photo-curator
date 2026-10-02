@@ -159,8 +159,11 @@ export interface MergePreview {
   theirs_starred: number
   intersection_starred: number
   union_starred: number
+  /** 混ぜたあとも残る、どちらの端末もまだ見ていない写真の数（続きから選別する。U45）。 */
   undecided: number
   mid_round: boolean
+  /** 混ぜられるか。途中の ROUND があるのに ROUND か対象の★が違えば false（U45）。 */
+  mergeable: boolean
 }
 
 export interface MergeResult {

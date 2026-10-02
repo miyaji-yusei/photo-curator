@@ -913,7 +913,9 @@ fn 混ぜ方_セッションは混ぜた星の完了状態になり続きを始�
     assert_eq!(result.session.round, 1);
     assert_eq!(result.session.group_size, 3);
     assert_eq!(result.starred, 2);
-    assert_eq!(result.undecided, 1);
+    // U45: undecided は「混ぜたあとも残る、どちらも見ていない写真」。d は相手がまだ見ていないが、
+    // この端末は完了（判定済み）なので残りは 0 → 完了状態のまま（以前の期待は 1）。
+    assert_eq!(result.undecided, 0);
     assert_eq!(result.ratings, stars(&[("a.jpg", 1), ("d.jpg", 1)]));
     assert_eq!(result.session.ratings, result.ratings);
     // ★1 の 2 枚でもう一度選別できる。
@@ -989,8 +991,10 @@ fn 混ぜ方_見込みの枚数() {
     assert_eq!(preview.theirs_starred, 2);
     assert_eq!(preview.intersection_starred, 2);
     assert_eq!(preview.union_starred, 4);
-    assert_eq!(preview.undecided, 1);
+    // U45: 端末は完了しているので、どちらも見ていない写真は無い（以前の期待は 1）。
+    assert_eq!(preview.undecided, 0);
     assert!(preview.mid_round);
+    assert!(preview.mergeable);
     let union = merge_judgements(mine, theirs, MergeMode::Union, 2, "e".into());
     assert_eq!(union.starred, preview.union_starred);
 }
@@ -1036,6 +1040,216 @@ fn 混ぜ方_d3でも記録の比べ方は意味が同じかの判断に影響�
     let android = judge(Some(done(&[("a.jpg", 1)])));
     assert!(judgement_equivalent(pc.clone(), android.clone()));
     assert_eq!(judgement_key(pc), judgement_key(android));
+}
+
+// ---------------------------------------------------------------------------
+// U45: 混ぜても、どちらの端末もまだ見ていない写真をスキップしない
+// ---------------------------------------------------------------------------
+
+fn many(count: usize) -> Vec<String> {
+    (0..count).map(|index| format!("p{index:04}.jpg")).collect()
+}
+
+fn refs_named(list: &[String]) -> Vec<PhotoRef> {
+    list.iter()
+        .enumerate()
+        .map(|(index, name)| PhotoRef {
+            relative_path: name.clone(),
+            captured_at: Some(index as i64 * 100_000),
+            d_hash: Some("0000000000000000".into()),
+            d_hash_version: 2,
+        })
+        .collect()
+}
+
+/// `groups` 組を決める。各組の `pick` 番目を選ぶ。
+fn judge_groups(mut session: Session, groups: usize, pick: usize) -> Session {
+    for _ in 0..groups {
+        let chosen = session.current[pick].clone();
+        session = advance(session, vec![chosen]);
+    }
+    session
+}
+
+fn remaining_of(session: &Session) -> Vec<String> {
+    session.current.iter().chain(&session.queue).cloned().collect()
+}
+
+/// 報告（L:\20260927_NANIWA_SPLASH_Day2\Saya）の形。844 枚・4 枚ずつ。
+/// A（この端末）は ROUND 1 で 100 組（400 枚）を決め、残り 444 枚。
+/// B（NAS）は同じ ROUND 1 で 80 組（320 枚）を決め、残り 524 枚（A の残り 444 枚を含む）。
+fn reported_case() -> (Vec<String>, Session, Session) {
+    let all = many(844);
+    let start = start_round(refs_named(&all), 4, 0, false, thr(), vec![]);
+    let a = judge_groups(start.clone(), 100, 0);
+    let b = judge_groups(start, 80, 1);
+    assert_eq!(remaining_of(&a).len(), 444);
+    assert_eq!(remaining_of(&b).len(), 524);
+    (all, a, b)
+}
+
+#[test]
+fn 混ぜ方_u45_和集合でもどちらも見ていない444枚はスキップせず続きから選別できる() {
+    let (all, a, b) = reported_case();
+    let unseen: Vec<String> = all[400..].to_vec();
+    let preview = merge_preview(judge(Some(a.clone())), judge(Some(b.clone())));
+    assert!(preview.mergeable, "同じ ROUND・同じ対象★なら混ぜられる");
+    assert!(preview.mid_round);
+    assert_eq!(preview.undecided, 444, "混ぜたあとも残る、どちらも見ていない写真の数");
+
+    let result = merge_judgements(judge(Some(a)), judge(Some(b)), MergeMode::Union, 4, "e".into());
+    let session = result.session.clone();
+    assert!(!session.finished, "未判定の写真が残るので完了にしない");
+    assert_eq!(remaining_of(&session), unseen, "両方が見ていない写真が、元の並び順のまま全部残る");
+    assert_eq!(session.current.len(), 4, "先頭の 1 組を出している");
+    assert!(session.history.is_empty(), "1 つ戻すはできない");
+    assert_eq!((session.round, session.target_star, session.group_size), (1, 0, 4));
+    assert_eq!(result.undecided, 444);
+    // ★: A が選んだ 100 枚と B が選んだ 80 枚（和集合）。
+    let expected: HashMap<String, i32> = (0..100)
+        .map(|k| (all[4 * k].clone(), 1))
+        .chain((0..80).map(|k| (all[4 * k + 1].clone(), 1)))
+        .collect();
+    assert_eq!(result.ratings, expected);
+    assert_eq!(result.starred, 180);
+    // survivors（次のラウンドの対象）も和集合。
+    let mut survivors: Vec<String> = expected.keys().cloned().collect();
+    survivors.sort();
+    assert_eq!(session.survivors, survivors);
+    // 判定済みの写真は queue に出ない。
+    assert!(all[..400].iter().all(|id| !remaining_of(&session).contains(id)));
+
+    // 続きから選別できる（先頭から出て、選べば★が上がり、最後まで進める）。
+    let next = advance(session, vec![all[400].clone()]);
+    assert_eq!(next.ratings.get(&all[400]).copied(), Some(1));
+    assert_eq!(next.current, all[404..408].to_vec());
+    let mut rest = next;
+    let mut groups = 1;
+    while !rest.finished {
+        rest = advance(rest, vec![]);
+        groups += 1;
+    }
+    assert_eq!(groups, 111, "444 枚を 4 枚ずつ全部見る");
+    assert!(rest.survivors.contains(&all[400]));
+}
+
+#[test]
+fn 混ぜ方_u45_積集合でも残りは続きから_片方だけが判定した写真はその側の判断() {
+    let (all, a, b) = reported_case();
+    let result = merge_judgements(judge(Some(a)), judge(Some(b)), MergeMode::Intersection, 4, "e".into());
+    assert!(!result.session.finished);
+    assert_eq!(remaining_of(&result.session), all[400..].to_vec());
+    // 先頭 80 組は両方が判定し、選んだ写真が違う → どちらも★0。
+    // 81〜100 組目は A だけが判定 → A の判断（各組の先頭が★1）。
+    let expected: HashMap<String, i32> = (80..100).map(|k| (all[4 * k].clone(), 1)).collect();
+    assert_eq!(result.ratings, expected);
+    let mut survivors: Vec<String> = expected.keys().cloned().collect();
+    survivors.sort();
+    assert_eq!(result.session.survivors, survivors);
+}
+
+#[test]
+fn 混ぜ方_u45_片方だけが判定した写真はその側の判断で_残りは両方の未判定だけ() {
+    // A: [a,b] で a を選んだ（残り sub/c・d・e・f）。
+    // B: [a,b] はどれも選ばず、[sub/c,d] で d を選んだ（残り e・f）。
+    let a = advance(fresh(), names(&["a.jpg"]));
+    let b = advance(advance(fresh(), names(&[])), names(&["d.jpg"]));
+    // 積集合: a は両方が判定（B は選ばず）→ 0。d は B だけが判定 → 1。sub/c も B だけ → 0。
+    let result = merge_judgements(judge(Some(a.clone())), judge(Some(b.clone())), MergeMode::Intersection, 2, "e".into());
+    assert!(!result.session.finished);
+    assert_eq!(remaining_of(&result.session), names(&["e.jpg", "f.jpg"]));
+    assert_eq!(result.ratings, stars(&[("d.jpg", 1)]));
+    assert_eq!(result.session.survivors, names(&["d.jpg"]));
+    // 和集合: a（A で選んだ）と d（B で選んだ）。
+    let result = merge_judgements(judge(Some(a)), judge(Some(b)), MergeMode::Union, 2, "e".into());
+    assert_eq!(remaining_of(&result.session), names(&["e.jpg", "f.jpg"]));
+    assert_eq!(result.ratings, stars(&[("a.jpg", 1), ("d.jpg", 1)]));
+    assert_eq!(result.session.survivors, names(&["a.jpg", "d.jpg"]));
+    // 判定していない写真の★0 も記録に残す（次に混ぜるとき「記録に無い＝未判定」にならない）。
+    assert_eq!(result.session.ratings.get("e.jpg").copied(), Some(0));
+}
+
+/// 連写のまとまり: 代表 a に b、代表 e に f。代表だけが並ぶ（a・sub/c・d・e）。
+fn burst_start() -> Session {
+    let mut session = fresh();
+    session.members = HashMap::from([
+        ("a.jpg".to_string(), names(&["a.jpg", "b.jpg"])),
+        ("e.jpg".to_string(), names(&["e.jpg", "f.jpg"])),
+    ]);
+    session.current = names(&["a.jpg", "sub/c.jpg"]);
+    session.queue = names(&["d.jpg", "e.jpg"]);
+    session
+}
+
+#[test]
+fn 混ぜ方_u45_連写の仲間も判定済みとして扱い_残りのまとまりは仲間ごと続きから() {
+    let a = advance(burst_start(), names(&["a.jpg"]));
+    let b = advance(burst_start(), names(&[]));
+    let preview = merge_preview(judge(Some(a.clone())), judge(Some(b.clone())));
+    assert_eq!(preview.undecided, 3, "d と、まとまり e（e・f）");
+
+    let result = merge_judgements(judge(Some(a)), judge(Some(b)), MergeMode::Union, 2, "e".into());
+    assert!(!result.session.finished);
+    // b は a の仲間として判定済み → 出さない。e のまとまりは代表だけが出る。
+    assert_eq!(remaining_of(&result.session), names(&["d.jpg", "e.jpg"]));
+    assert_eq!(result.session.members.get("e.jpg"), Some(&names(&["e.jpg", "f.jpg"])));
+    assert_eq!(result.ratings, stars(&[("a.jpg", 1), ("b.jpg", 1)]));
+    // 続きで e を選ぶと、仲間の f にも★が配られる。
+    let next = advance(result.session, names(&["e.jpg"]));
+    assert_eq!(next.ratings.get("f.jpg").copied(), Some(1));
+    assert!(next.finished);
+}
+
+#[test]
+fn 混ぜ方_u45_roundか対象の星が違えば混ぜられず_呼ばれても端末の分を変えない() {
+    // この端末: ROUND 2（★1 から）の途中。NAS: ROUND 1 の途中。
+    let mut late = fresh();
+    late.round = 2;
+    late.target_star = 1;
+    late.ratings = session_ratings(&[("a.jpg", 1), ("b.jpg", 1), ("d.jpg", 2)]);
+    late.current = names(&["a.jpg", "b.jpg"]);
+    late.queue = vec![];
+    late.history = vec![crate::Decision {
+        group: names(&["d.jpg", "e.jpg"]),
+        chosen: names(&["d.jpg"]),
+        topped: None,
+        before: HashMap::new(),
+    }];
+    late.survivors = names(&["d.jpg"]);
+    let mine = judge(Some(late));
+    let theirs = judge(Some(other_progress()));
+
+    let preview = merge_preview(mine.clone(), theirs.clone());
+    assert!(!preview.mergeable, "途中の ROUND があり、ROUND が違う");
+    // 呼ばれても（画面が古いなど）、この端末の分をそのまま返す（スキップしない）。
+    let result = merge_judgements(mine.clone(), theirs.clone(), MergeMode::Union, 2, "e".into());
+    assert!(!result.session.finished);
+    assert_eq!(remaining_of(&result.session), names(&["a.jpg", "b.jpg"]));
+    assert_eq!((result.session.round, result.session.target_star), (2, 1));
+    assert_eq!(result.ratings, stars(&[("a.jpg", 1), ("b.jpg", 1), ("d.jpg", 2)]));
+    assert_eq!(result.session.survivors, names(&["d.jpg"]));
+
+    // 片方が完了していても、もう片方が途中で ROUND が違えば混ぜない。
+    let mut finished_late = done(&[("a.jpg", 2)]);
+    finished_late.round = 2;
+    finished_late.target_star = 1;
+    assert!(!merge_preview(judge(Some(finished_late)), theirs).mergeable);
+}
+
+#[test]
+fn 混ぜ方_u45_両方完了なら今までどおり完了状態で見込みの未判定は0() {
+    let mut late = done(&[("a.jpg", 3), ("b.jpg", 2)]);
+    late.round = 3;
+    late.target_star = 2;
+    let mine = judge(Some(late));
+    let theirs = judge(Some(done(&[("a.jpg", 1)])));
+    let preview = merge_preview(mine.clone(), theirs.clone());
+    assert!(preview.mergeable, "未判定が無いので、ROUND が違っても混ぜられる");
+    assert!(!preview.mid_round);
+    assert_eq!(preview.undecided, 0);
+    let result = merge_judgements(mine, theirs, MergeMode::Union, 2, "e".into());
+    assert!(result.session.finished);
+    assert_eq!(result.undecided, 0);
 }
 
 // ---------------------------------------------------------------------------

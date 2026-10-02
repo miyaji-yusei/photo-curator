@@ -128,6 +128,18 @@ struct SidecarSyncFixture {
     seen_token: String,
     expected_key: String,
     expected_plan: serde_json::Value,
+    /// U45: 途中の ROUND どうしを混ぜても、どちらも見ていない写真は queue に残る。
+    merge_mid_round: MergeMidRoundFixture,
+}
+
+#[derive(Deserialize)]
+struct MergeMidRoundFixture {
+    group_size: u32,
+    mine: Session,
+    theirs: Session,
+    expected_preview: serde_json::Value,
+    expected_union: serde_json::Value,
+    expected_intersection: serde_json::Value,
 }
 
 /// サイドカー同期（U33）: Android の古い形と PC の形の同じ選別状況が、鍵をそろえると
@@ -160,4 +172,26 @@ fn sidecar_sync_はフィクスチャの期待値と一致する() {
     let plan = serde_json::to_value(sidecar_plan(seen, sidecar_judgement(android), Some(restarted), true, false)).unwrap();
     let kind = fixture.expected_restarted["plan"].as_str().expect("plan");
     assert_eq!(plan[kind]["reason"], fixture.expected_restarted["reason"], "やり直した版: {plan}");
+
+    // U45: D・E で混ぜても、どちらの端末もまだ見ていない写真を飛ばさない。
+    use photo_curator_core::{canonical_judgement, merge_judgements, merge_preview, MergeMode};
+    use std::collections::HashMap;
+    let merge = fixture.merge_mid_round;
+    let judge = |session: &Session| canonical_judgement(Some(session.clone()), HashMap::new(), vec![], None, None);
+    let preview = serde_json::to_value(merge_preview(judge(&merge.mine), judge(&merge.theirs))).unwrap();
+    for (field, value) in merge.expected_preview.as_object().expect("expected_preview") {
+        assert_eq!(&preview[field], value, "見込みの {field}");
+    }
+    for (mode, expected) in [(MergeMode::Union, &merge.expected_union), (MergeMode::Intersection, &merge.expected_intersection)] {
+        let result = merge_judgements(judge(&merge.mine), judge(&merge.theirs), mode, merge.group_size, "e".into());
+        let session = serde_json::to_value(&result.session).unwrap();
+        for field in ["finished", "current", "queue", "survivors"] {
+            assert_eq!(session[field], expected[field], "{mode:?} の {field}");
+        }
+        assert_eq!(serde_json::to_value(&result.ratings).unwrap(), expected["ratings"], "{mode:?} の★");
+        assert_eq!(serde_json::json!(result.undecided), expected["undecided"], "{mode:?} の残り");
+        // 続きから選別できる。
+        let next = advance(result.session, vec!["e.jpg".into()]);
+        assert_eq!(next.ratings.get("e.jpg").copied(), Some(1), "{mode:?} の続き");
+    }
 }
