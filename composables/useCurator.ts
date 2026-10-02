@@ -2450,19 +2450,32 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     moveError.value = ''
     const { includeIds, excludeIds } = toMoveArgs(moveSelection.value)
     try {
+      // セッションに無い写真（あとから増えた写真など）で移す対象（U52 D10）。移す前の星で選ぶ。
+      // セッションに入れないと比較キーに映らず同期されないうえ、次の取り込みで行の星が 0 に戻される。
+      let outside: string[] = []
+      if (session.value) {
+        const ratings = session.value.core.ratings
+        const include = includeIds ? new Set(includeIds) : null
+        const exclude = new Set(excludeIds)
+        outside = (await desktop.getCoreInputs(activeProject.value.id))
+          .filter(row => !(row.relativePath in ratings) && row.rating === moveFrom.value
+            && (include ? include.has(row.id) : !exclude.has(row.id)))
+          .map(row => row.relativePath)
+      }
       const moved = await desktop.moveRating(
         activeProject.value.id, moveFrom.value, moveTo.value, includeIds, excludeIds
       )
       noteJudgementChanged()
       // 進行中のセッションが持つ星も合わせる。人が星を決める手直しなので `ratingEdit` で。
-      // Session に無い写真は飛ばす。行への書き込みは上の `moveRating` が済ませている。
+      // Session に無い写真は、上で選んだ `outside` として足す。行への書き込みは上の `moveRating` が済ませている。
       if (session.value) {
         await ensureCoreInputs()
         const excluded = new Set(excludeIds.map(pathOf))
         const paths = includeIds
           ? includeIds.map(pathOf).filter((path): path is string => path !== null)
           : pathsWithRating(session.value.core, moveFrom.value).filter(path => !excluded.has(path))
-        setCore(moveRatings(session.value.core, paths, moveTo.value))
+        const added = Object.fromEntries(outside.map(path => [path, moveTo.value]))
+        setCore(applyChanges(moveRatings(session.value.core, paths, moveTo.value), added))
         await saveSession()
       }
       moveDialog.value = false

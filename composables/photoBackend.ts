@@ -63,6 +63,11 @@ export interface PhotoBackend {
    * サムネイルなどの URL は持たない（写真そのものの表示は `getPhotosByIds`）。
    */
   getCoreInputs: (projectId: string) => Promise<Photo[]>
+  /**
+   * 欠損の印の写真のうち、星が 1 以上のもの（U52 D13）。サイドカーに載せて、一時的に見えないだけの写真の星を
+   * NAS から消さないために使う。
+   */
+  getMissingRatings: (projectId: string) => Promise<{ relativePath: string, rating: number }[]>
 
   /** 判定したグループぶんだけを書く。全件を毎回送らない。 */
   saveSelectionResults: (projectId: string, entries: SelectionResult[]) => Promise<void>
@@ -129,14 +134,28 @@ export interface PhotoBackend {
   sidecarSupported: (projectId: string) => Promise<SidecarAccess>
   /** サイドカーの JSON の文字列。無ければ null。 */
   readSidecar: (projectId: string) => Promise<string | null>
-  /** 原子的に書く（一時ファイル → rename）。退避（`catalog.<id>.json`）に使う。 */
+  /** 原子的に書く（一時ファイル → rename）。U52 から同期は使わない（退避は `asideSidecar`）。 */
   writeSidecar: (projectId: string, json: string, fileName?: string) => Promise<void>
   /**
+   * NAS に退避する（U52 D4。Android の U44 と同じ形）: `catalog.<tag>.<UTC yyyyMMddHHmmss>.json` を
+   * **無いときだけ作る**（同じ秒なら `-2` 以降）。書けたら同じ `tag` の時刻つきの退避を新しい 5 つだけ残す
+   * （時刻の無い古い名前・ほかの印の退避は消さない）。書けなければ投げる。返すのは書いた名前。
+   */
+  asideSidecar: (projectId: string, json: string, tag: string) => Promise<string>
+  /**
+   * 端末の中に退避する（U52 D4。PC はアプリのデータフォルダの `aside/`、Web は IndexedDB。プロジェクトごとに
+   * 最新 5 つ）。置き換える前の端末の選別状況を控える。書けなければ投げる（呼ぶ側は置き換えない）。
+   */
+  asideLocal: (projectId: string, json: string) => Promise<void>
+  /**
    * `catalog.json` を楽観ロックで書く（設計書 §4.4）: ロック → 読んで `expected`（判断に使った中身。
-   * 無かったなら null）と同じか確かめる → 一時ファイル → 置き換え → 読み戻して確かめる → ロックを放す。
+   * 無かったなら null）と同じか確かめる → （`asideTag` があり、置き換える版があれば）その版を `asideSidecar` と
+   * 同じ形で退避する（書けなければ書かずに投げる）→ 一時ファイル → 置き換え → 読み戻して確かめる → ロックを放す。
    * 見た版と違えば書かずに `changed`、ほかの端末が書いている最中なら `locked`。
    */
-  writeSidecarChecked: (projectId: string, json: string, expected: string | null) => Promise<SidecarWriteResult>
+  writeSidecarChecked: (
+    projectId: string, json: string, expected: string | null, asideTag?: string | null
+  ) => Promise<SidecarWriteResult>
   /** 端末が覚える、最後に読んだ／書いたサイドカーの印と、判断が変わったか。 */
   loadSidecarState: (projectId: string) => Promise<SidecarState>
   saveSidecarState: (projectId: string, state: SidecarState) => Promise<void>

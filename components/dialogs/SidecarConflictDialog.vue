@@ -129,7 +129,7 @@ const mergeNote = computed(() => {
       </div>
 
       <p class="text-caption text-medium-emphasis mt-4 mb-0">
-        どれを選んでも、元の記録は消しません。置き換える前の記録は、写真のフォルダの <code>.photo-curator/</code> に <code>catalog.＜端末の id の先頭 12 文字＞.json</code> として残します。
+        どれを選んでも、元の記録は消しません。置き換える前の記録は、写真のフォルダの <code>.photo-curator/</code> に <code>catalog.＜端末＞.＜時刻＞.json</code> として残し（端末ごとに新しい 5 つ）、取り込む前のこの端末の記録はこの端末の中にも控えます。
       </p>
       <v-alert v-if="sidecarMessage" type="error" variant="tonal" density="comfortable" class="mt-4">{{ sidecarMessage }}</v-alert>
       <v-progress-linear v-if="sidecarBusy" indeterminate class="mt-4" />

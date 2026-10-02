@@ -712,6 +712,11 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
       return rows.filter(row => !row.isMissing).map(row => toPhoto(row, null, null, null))
     },
 
+    getMissingRatings: async (projectId: string) =>
+      (await store.photosOfProject(projectId))
+        .filter(row => row.isMissing && row.rating >= 1)
+        .map(row => ({ relativePath: row.relativePath, rating: row.rating })),
+
     saveSelectionResults: (projectId: string, entries: SelectionResult[]) =>
       store.saveSelectionResults(projectId, entries),
 
@@ -820,13 +825,21 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
       }
       await io.writeSidecar(json, fileName)
     },
-    writeSidecarChecked: async (projectId: string, json: string, expected: string | null) => {
+    writeSidecarChecked: async (projectId: string, json: string, expected: string | null, asideTag?: string | null) => {
       const io = await sidecarIO(projectId)
       if (!io || (await io.sidecarAccess()) !== 'readwrite') {
         throw new Error('この出所にはサイドカーを書けません。フォルダへのアクセスを許可してください。')
       }
-      return io.writeSidecarChecked(json, expected)
+      return io.writeSidecarChecked(json, expected, asideTag)
     },
+    asideSidecar: async (projectId: string, json: string, tag: string) => {
+      const io = await sidecarIO(projectId)
+      if (!io || (await io.sidecarAccess()) !== 'readwrite') {
+        throw new Error('この出所にはサイドカーを書けません。フォルダへのアクセスを許可してください。')
+      }
+      return io.asideSidecar(json, tag)
+    },
+    asideLocal: (projectId: string, json: string) => store.writeLocalAside(projectId, json),
     loadSidecarState: (projectId: string): Promise<SidecarState> => store.readSidecarState(projectId),
     saveSidecarState: (projectId: string, state: SidecarState) => store.writeSidecarState(projectId, state),
     deviceIdentity: async (): Promise<DeviceIdentity> => ({ id: await store.deviceId(), name: 'ブラウザ' }),
