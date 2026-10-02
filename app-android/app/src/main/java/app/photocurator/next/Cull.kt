@@ -256,7 +256,7 @@ fun CullScreen(
         selected = emptySet()
         // **複数モードは切らない。** 複数で選ぶ人はずっと複数で選ぶので、
         // 毎回押し直させるのは 1 グループにつき 1 タップ増えるのと同じ。
-        scope.launch { Store.save(context, project.id, next) }
+        Store.queue(context, project.id, next)
     }
 
     /**
@@ -270,14 +270,14 @@ fun CullScreen(
         val next = keepAndTop(live, selected.toList(), path)
         session = next
         selected = emptySet()
-        scope.launch { Store.save(context, project.id, next) }
+        Store.queue(context, project.id, next)
     }
 
     fun stepBack() {
         val next = undo(live)
         session = next
         selected = emptySet()
-        scope.launch { Store.save(context, project.id, next) }
+        Store.queue(context, project.id, next)
     }
 
     /**
@@ -293,10 +293,9 @@ fun CullScreen(
         val next = regroup(live, refs, groupBursts, threshold, merged)
         session = next
         selected = emptySet()
-        scope.launch {
-            Overrides.save(context, project.id, merged)
-            Store.save(context, project.id, next)
-        }
+        // 呼んだその場で積む（画面の scope で起動しない。U50・D14）。順に積むので、同期の flush は両方を待つ。
+        Overrides.queue(context, project.id, merged)
+        Store.queue(context, project.id, next)
     }
 
     /**
@@ -329,10 +328,9 @@ fun CullScreen(
 
         session = next
         selected = emptySet()
-        scope.launch {
-            Overrides.save(context, project.id, merged)
-            Store.save(context, project.id, next)
-        }
+        // 呼んだその場で積む（画面の scope で起動しない。U50・D14）。順に積むので、同期の flush は両方を待つ。
+        Overrides.queue(context, project.id, merged)
+        Store.queue(context, project.id, next)
     }
 
     /** まとまりの中の隣どうしを全部切る。 */
@@ -392,7 +390,7 @@ fun CullScreen(
                 if (size == Prefs.SLIDESHOW_SIZE) multi = false
                 // 画面から外れた写真の印は落とす。**残っていると数が合わない。**
                 selected = selected.filter { it in next.current }.toSet()
-                scope.launch { Store.save(context, project.id, next) }
+                Store.queue(context, project.id, next)
             },
             onGroupBursts = { on ->
                 groupBursts = on
@@ -400,7 +398,7 @@ fun CullScreen(
                 val next = regroup(live, refs, on, threshold, overrides)
                 session = next
                 selected = emptySet()
-                scope.launch { Store.save(context, project.id, next) }
+                Store.queue(context, project.id, next)
             },
             onDisplayEdge = { value ->
                 edge = value
@@ -483,7 +481,7 @@ fun CullScreen(
                     val next = advance(base, listOf(head))
                     session = next
                     selected = emptySet()
-                    scope.launch { Store.save(context, project.id, next) }
+                    Store.queue(context, project.id, next)
                 }
             },
             onClose = { zooming = null }
@@ -535,7 +533,7 @@ fun CullScreen(
                 onNext = { next ->
                     session = next
                     selected = emptySet()
-                    scope.launch { Store.save(context, project.id, next) }
+                    Store.queue(context, project.id, next)
                 },
                 onResults = onResults,
                 onBack = onBack

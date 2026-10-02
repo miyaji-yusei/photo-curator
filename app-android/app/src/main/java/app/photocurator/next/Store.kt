@@ -30,10 +30,18 @@ object Store {
      * 書けなかったことは記録する（黙って落とさない）。
      */
     suspend fun save(context: Context, projectId: String, session: Session) {
+        queue(context, projectId, session).await()
+    }
+
+    /**
+     * 保存を**その場でアプリの列に積む**（待たない）。画面から呼ぶときはこちら（U50・D14）。
+     * 画面の scope で `launch { save() }` すると、すぐ戻ったときに最後の 1 組が消えうる。
+     */
+    fun queue(context: Context, projectId: String, session: Session): kotlinx.coroutines.Deferred<Unit> {
         // **保存はアプリの列で 1 本ずつ。最後に頼んだ状態が必ず残る**（A2）。
         // 確定を連打しても、同じ一時ファイルを奪い合わず、古い状態が新しい状態を戻さない。
         val target = file(context, projectId)
-        Persist.latest("session:$projectId") {
+        return Persist.submit("session:$projectId") {
             try {
                 // 途中で落ちても壊れた JSON を残さないよう、書いてから差し替える。
                 // rename が使えない環境ではコピーで置き換える。
@@ -421,7 +429,11 @@ object Overrides {
     }
 
     suspend fun save(context: Context, projectId: String, list: List<PairOverride>) =
-        Persist.latest("overrides:$projectId") {
+        queue(context, projectId, list).await()
+
+    /** その場でアプリの列に積む（待たない）。画面から呼ぶときはこちら（U50・D14。[Store.queue] と同じ）。 */
+    fun queue(context: Context, projectId: String, list: List<PairOverride>): kotlinx.coroutines.Deferred<Unit> =
+        Persist.submit("overrides:$projectId") {
             try {
                 val array = org.json.JSONArray()
                 for (item in list) {

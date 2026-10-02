@@ -233,7 +233,7 @@ fun ResultsScreen(
                         val moved = current.copy(ratings = current.ratings + next)
                         session = moved
                         ratings = moved.ratings
-                        scope.launch { Store.save(context, project.id, moved) }
+                        Store.queue(context, project.id, moved)
                     }
                     reviewing = null
                 },
@@ -776,6 +776,6 @@ private fun shiftStars(
     }
     if (count == 0) return
     val moved = live.copy(ratings = changed)
-    scope.launch { Store.save(context, project.id, moved) }
+    Store.queue(context, project.id, moved)
     onDone(moved, count)
 }
