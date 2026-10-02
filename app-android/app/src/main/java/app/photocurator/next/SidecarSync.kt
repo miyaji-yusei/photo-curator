@@ -409,7 +409,7 @@ class SidecarSync(
     }
 
     private sealed interface Pushed {
-        data class Done(val note: String) : Pushed
+        data class Done(val note: String, val writeId: String = "", val epoch: String? = null) : Pushed
         data class Failed(val reason: String) : Pushed
         data object Retry : Pushed
     }
@@ -494,7 +494,9 @@ class SidecarSync(
         mine: Sidecar,
         judgement: Judgement,
         expected: String?,
-        asideTheirs: Boolean
+        asideTheirs: Boolean,
+        /** false なら控え（seen）を保存しない（呼ぶ側が端末に入れてから保存する。D・E）。 */
+        saveSeen: Boolean = true
     ): Pushed {
         val held = when (val taken = lock(target)) {
             is Lock.Failed -> return Pushed.Failed(taken.reason)
@@ -546,13 +548,17 @@ class SidecarSync(
             val back = readRemote(target)
             if (back !is Remote.Read || back.sidecar?.writeId != writeId) return Pushed.Retry
 
-            store.save(
-                target.projectId,
-                SeenState(SeenRecord(writeId, judgementKey(judgement), stamped.epoch), detached = false)
-            )
+            if (saveSeen) {
+                store.save(
+                    target.projectId,
+                    SeenState(SeenRecord(writeId, judgementKey(judgement), stamped.epoch), detached = false)
+                )
+            }
             return Pushed.Done(
                 "この端末の結果を NAS に保存しました" +
-                    (aside?.let { "（NAS にあった記録は $it に残しました）" } ?: "")
+                    (aside?.let { "（NAS にあった記録は $it に残しました）" } ?: ""),
+                writeId,
+                stamped.epoch
             )
         } finally {
             unlock(target, held)
@@ -707,16 +713,27 @@ class SidecarSync(
                     keyBase = "folder"
                 )
                 val device = sidecarKeysFromFolder(folderShape, target.prefix, "/")
-                target.local.apply(
-                    LocalSnapshot(
-                        session = device.sessions.tournament,
-                        overrides = device.burstOverrides,
-                        burstDistance = device.burstDistance?.toInt(),
-                        epoch = device.epoch
-                    )
+                val mergedLocal = LocalSnapshot(
+                    session = device.sessions.tournament,
+                    overrides = device.burstOverrides,
+                    burstDistance = device.burstDistance?.toInt(),
+                    epoch = device.epoch
                 )
-                val after = folderSidecar(target, readLocal(target))
-                outcomeOf(push(target, after, sidecarJudgement(after), clash.token, asideTheirs = true))
+                // **NAS に書けてから端末に入れる**（U44 D7。PC と同じ順）。書けなければ端末は元のまま。
+                // 控えは端末に入れたあとで保存する（入れる前に落ちても、控えが混ぜた版を指さない）。
+                val after = folderSidecar(target, mergedLocal)
+                when (val pushed = push(target, after, sidecarJudgement(after), clash.token, asideTheirs = true, saveSeen = false)) {
+                    is Pushed.Done -> {
+                        target.local.apply(mergedLocal)
+                        val applied = sidecarJudgement(folderSidecar(target, readLocal(target)))
+                        store.save(
+                            target.projectId,
+                            SeenState(SeenRecord(pushed.writeId, judgementKey(applied), pushed.epoch), detached = false)
+                        )
+                        SyncOutcome.Pushed(pushed.note)
+                    }
+                    else -> outcomeOf(pushed)
+                }
             }
         }
     }

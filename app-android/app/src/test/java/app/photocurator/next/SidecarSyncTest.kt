@@ -840,6 +840,47 @@ class SidecarSyncTest {
         assertTrue("$seenLock", seenLock!!.contains("\"holder\":\"${android.id}\"") && Regex("\"at\":\\d+").containsMatchIn(seenLock!!))
     }
 
+    // ---- U44 D7: 混ぜた版は NAS に書けてから端末に入れる ----
+
+    @Test fun 混ぜた版をNASに書けなければ端末は元のまま() = run {
+        val c = clashed()
+        // ほかの端末が書いている（新しいロック）。
+        c.nas.files[lock] = "{\"holder\":\"pc\",\"at\":${clock}}".toByteArray()
+        c.nas.mtimes[lock] = clock
+        c.nas.nasNow = clock
+
+        val answer = syncFor(android, c.seen).resolve(target(c.local, c.nas), c.clash, ClashChoice.Intersection)
+
+        assertTrue("$answer", answer is SyncOutcome.Blocked)
+        assertEquals("端末は混ぜないまま", mineAdvanced(), c.local.snapshot.session)
+        assertArrayEquals("NAS もそのまま", c.theirsBytes, c.nas.files[catalog])
+        assertEquals("控えは進めない", "", c.seen.load("project-1").seen.token)
+        assertEquals("退避は済んでいる", 1, c.local.asides.size)
+    }
+
+    @Test fun 混ぜた版を書いている途中で切れても端末は元のまま() = run {
+        val c = clashed()
+        c.nas.breakWrite = { it.endsWith(".tmp") }
+
+        val answer = syncFor(android, c.seen).resolve(target(c.local, c.nas), c.clash, ClashChoice.Union)
+
+        assertTrue("$answer", answer is SyncOutcome.Blocked)
+        assertEquals(mineAdvanced(), c.local.snapshot.session)
+        assertArrayEquals(c.theirsBytes, c.nas.files[catalog])
+    }
+
+    @Test fun 混ぜた版を書けたら端末に入れて控えを書いた版にする() = run {
+        val c = clashed()
+        val answer = syncFor(android, c.seen).resolve(target(c.local, c.nas), c.clash, ClashChoice.Union)
+
+        assertTrue("$answer", answer is SyncOutcome.Pushed)
+        val state = c.seen.load("project-1")
+        assertEquals(remote(c.nas).writeId, state.seen.token)
+        assertEquals("控えの比較キーは端末に入れたあとの値", judgementKey(sidecarJudgement(localSidecar(c.local))), state.seen.key)
+        // もう一度開いても何もしない（混ぜた版で落ち着く）。
+        assertEquals(SyncOutcome.Settled(null), syncFor(android, c.seen).check(target(c.local, c.nas)))
+    }
+
     @Test fun 文言はPCと同じ形() {
         assertEquals("NAS の記録と、この端末の記録が違います", SidecarSync.CLASH_TITLE)
         assertEquals("この端末（Pixel 8）", SidecarSync.mineLabel("Pixel 8"))
