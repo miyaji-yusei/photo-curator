@@ -391,12 +391,26 @@ fn write_checked_with(
     ttl: Duration,
     aside_tag: Option<&str>,
 ) -> Result<CheckedWrite, String> {
+    write_checked_core(folder, json, expected, holder, ttl, aside_tag, &|folder| read(folder))
+}
+
+/// [`write_checked_with`] の中身。`read_before` は「ロックを取ったあとの確かめ」の読み方（テストで、
+/// Windows の SMB クライアントの「無い」のキャッシュ（D12）を真似るために差し替える）。
+fn write_checked_core(
+    folder: &Path,
+    json: &str,
+    expected: Option<&str>,
+    holder: &str,
+    ttl: Duration,
+    aside_tag: Option<&str>,
+    read_before: &dyn Fn(&Path) -> Result<Option<String>, String>,
+) -> Result<CheckedWrite, String> {
     let dir = sidecar_dir(folder);
     fs::create_dir_all(&dir).map_err(|error| format!("サイドカーのフォルダを作れませんでした: {error}"))?;
     let Some(_lock) = acquire_lock(&dir, holder, ttl)? else {
         return Ok(CheckedWrite::Locked);
     };
-    let current = read(folder)?;
+    let current = read_before(folder)?;
     if current.as_deref() != expected {
         return Ok(CheckedWrite::Changed);
     }
@@ -404,12 +418,57 @@ fn write_checked_with(
         // **退避に失敗したら上書きしない。** 消してしまうより、次に持ち越す。
         write_aside(folder, tag, replaced)?;
     }
-    write(folder, SIDECAR_FILE, json)?;
+    if current.is_none() {
+        // 最初の版を作る（D12）。「無い」と読めても、Windows の SMB クライアントの「無い」のキャッシュで
+        // 実は相手の最初の版がありうる。置き換えを許さずに作り、先にあれば書かずに判定し直す。
+        if !write_new(folder, json, NEGATIVE_CACHE_SETTLE)? {
+            return Ok(CheckedWrite::Changed);
+        }
+    } else {
+        write(folder, SIDECAR_FILE, json)?;
+    }
     // 古い版のアプリはロックを見ない。読み戻して、自分の書いたものが残っているかを確かめる。
     if read(folder)?.as_deref() != Some(json) {
         return Ok(CheckedWrite::Changed);
     }
     Ok(CheckedWrite::Written)
+}
+
+/// Windows の SMB クライアントが「ファイルが無い」を覚えている時間（FileNotFoundCacheLifetime、既定 5 秒）より
+/// 少し長く。ハードリンクを作れない共有で、最初の版を作る前に待つ（D12）。
+const NEGATIVE_CACHE_SETTLE: Duration = Duration::from_secs(6);
+
+/// `catalog.json` が無いときだけ作る（U52 D12）。作れたら true、先にあれば false（何も変えない）。
+///
+/// 一時ファイルに書いてから**ハードリンク**で名前を付ける。ハードリンクは同じ名前があればサーバーが断るので、
+/// クライアントの「無い」のキャッシュに騙されても、相手の版を置き換えない（`fs::rename` は Windows では
+/// 置き換えを許す）。ハードリンクを作れない共有（FAT 系など）では、キャッシュが切れるまで待って読み直し、
+/// まだ無ければ置き換えを許す移動で仕上げる（このときは確証が無い。実機で確かめる必要がある）。
+fn write_new(folder: &Path, json: &str, settle: Duration) -> Result<bool, String> {
+    let dir = sidecar_dir(folder);
+    let temp = dir.join(format!(".{SIDECAR_FILE}.{}.tmp", Uuid::new_v4().simple()));
+    fs::write(&temp, json.as_bytes()).map_err(|error| {
+        let _ = fs::remove_file(&temp);
+        format!("サイドカーを書けませんでした: {error}")
+    })?;
+    let target = dir.join(SIDECAR_FILE);
+    let result = match fs::hard_link(&temp, &target) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(_) => {
+            std::thread::sleep(settle);
+            match read(folder) {
+                Ok(Some(_)) => Ok(false),
+                Ok(None) => fs::rename(&temp, &target)
+                    .map(|()| true)
+                    .map_err(|error| format!("サイドカーを書けませんでした: {error}")),
+                Err(error) => Err(error),
+            }
+        }
+    };
+    // ハードリンクのあと・失敗したときに一時ファイルを消す（rename したあとは、もう無い）。
+    let _ = fs::remove_file(&temp);
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -815,6 +874,27 @@ mod tests {
         assert_eq!(read(&folder).unwrap().as_deref(), Some("v2"));
         assert!(!lock_path(&folder).exists());
         let _ = fs::remove_dir_all(&folder);
+    }
+
+    /// U52 D12: 「無い」と読んだ（Windows の SMB クライアントの「無い」のキャッシュで、実は相手の最初の版が
+    /// ある）ときは、置き換えを許さずに作る。先にあれば書かずに Changed（相手の版を消さない）。
+    #[test]
+    fn creating_the_first_catalog_never_replaces_one_that_appeared_meanwhile() {
+        let folder = temp_dir("first-create");
+        write(&folder, SIDECAR_FILE, "android-first").unwrap();
+        // ロックを取ったあとの確かめが「無い」と読んだ（キャッシュ）。
+        let stale_read = |_: &Path| -> Result<Option<String>, String> { Ok(None) };
+        let result = write_checked_core(&folder, "pc-first", None, "pc", LOCK_TTL, None, &stale_read).unwrap();
+        assert_eq!(result, CheckedWrite::Changed);
+        assert_eq!(read(&folder).unwrap().as_deref(), Some("android-first"));
+        assert_eq!(leftovers(&folder), vec![SIDECAR_FILE.to_string()], "一時ファイルもロックも残さない");
+        // 本当に無ければ作れる。
+        let empty = temp_dir("first-create-empty");
+        assert_eq!(write_checked(&empty, "pc-first", None, "pc").unwrap(), CheckedWrite::Written);
+        assert_eq!(read(&empty).unwrap().as_deref(), Some("pc-first"));
+        assert_eq!(leftovers(&empty), vec![SIDECAR_FILE.to_string()]);
+        let _ = fs::remove_dir_all(&folder);
+        let _ = fs::remove_dir_all(&empty);
     }
 
     fn now_ms() -> u128 {
