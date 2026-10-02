@@ -129,6 +129,10 @@ fun ProjectScreen(
     var displayEdge by remember { mutableStateOf(Prefs.projectEdge(context, project.id)) }
     // 「…」から大きさを選んでいるか。
     var choosingEdge by remember { mutableStateOf(false) }
+    // U49: 同名の JPEG がある RAW を外すか（プロジェクトごと、既定オン）。
+    var pairRaw by remember(project.id) { mutableStateOf(Prefs.pairRawJpeg(context, project.id)) }
+    // 切り替えたら「再読み込みで反映」を出す。**再読み込みしたら消す。**
+    var pairRawChanged by remember(project.id) { mutableStateOf(false) }
     // 一覧の列数。**0 は「おまかせ」**（幅から決める）。
     var columns by remember { mutableStateOf(Prefs.gridColumns(context)) }
 
@@ -154,7 +158,8 @@ fun ProjectScreen(
         // **転んだままなら、まずそれを出す。** 準備をやり直すのは押されたとき。
         val noted = Trouble.load(context, project.source.key)
         photos = Listing.load(context, project.source.key)
-            ?: if (noted != null) emptyList() else Photos.forSource(context, project.source)
+            ?: if (noted != null) emptyList()
+            else Photos.forSource(context, project.source, Prefs.pairRawJpeg(context, project.id))
         scanned = true
         try {
             // 準備は**アプリが持つ**（Preparations）。画面を離れても止まらないので、
@@ -532,7 +537,7 @@ fun ProjectScreen(
                                     zooming = shown to shown.indexOf(photo)
                                 }
                         ) {
-                            EmptyTile(state, format)
+                            EmptyTile(state, format, raw = photo.isRaw)
                             if (state != Preview.Unsupported) {
                                 AsyncImage(
                                     model = ImageRequest.Builder(LocalContext.current)
@@ -617,8 +622,26 @@ fun ProjectScreen(
         // ところが白く残り、一番下のボタンに被る。
         contentWindowInsets = { WindowInsets(0) }
     ) {
-            Column(Modifier.padding(horizontal = 8.dp).padding(bottom = 24.dp)) {
-                DetailMenuRow("写真を再読み込み") { menu = false; rescan = true; reloads += 1 }
+            Column(
+                Modifier.verticalScroll(rememberScrollState())
+                    .padding(horizontal = 8.dp).padding(bottom = 24.dp)
+            ) {
+                DetailMenuRow("写真を再読み込み") {
+                    menu = false; rescan = true; reloads += 1; pairRawChanged = false
+                }
+                // U49: 組の RAW を外すか。**自動では取り直さない**（PC と同じ。押されたときだけ網へ行く）。
+                if (project.source.kind != SourceKind.Amazon) {
+                    PairRawSwitch(
+                        checked = pairRaw,
+                        onChange = { on ->
+                            pairRaw = on
+                            Prefs.setPairRawJpeg(context, project.id, on)
+                            pairRawChanged = true
+                        },
+                        note = if (pairRawChanged) "「写真を再読み込み」で反映します" else null,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                    )
+                }
                 if (project.source.remote) {
                     DetailMenuRow("表示用画像の大きさ（${displayEdge}px）") {
                         menu = false; choosingEdge = true

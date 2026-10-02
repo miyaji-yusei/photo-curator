@@ -59,8 +59,11 @@ sealed interface SmbResult<out T> {
 object Smb {
     private const val TAG = "Smb"
 
-    /** このアプリが扱う形式。MediaStore 側と揃える。 */
-    private val EXTENSIONS = setOf("jpg", "jpeg", "png", "webp")
+    /**
+     * このアプリが扱う形式。MediaStore 側と揃える。U49 で RAW（PC と同じ 10 種）を足した。
+     * 組の JPEG がある RAW を外すかどうかは、一覧を取ったあとにプロジェクトの設定で決める。
+     */
+    private val EXTENSIONS = setOf("jpg", "jpeg", "png", "webp") + RawFiles.EXTENSIONS
 
     /** ディレクトリの印（SMB のファイル属性）。 */
     private const val DIRECTORY = 0x10L
@@ -201,7 +204,48 @@ object Smb {
             Log.w(TAG, "原本を読めなかった: $path", error)
             null
         }
+
+        /**
+         * 開いて、要る範囲だけを読む（U49: RAW のプレビュー）。**25MB を丸ごと引かない。**
+         * 読めなければ null（1 枚で全体を止めない）。
+         */
+        fun <T> ranged(path: String, work: (ByteSource) -> T): T? = try {
+            openRead(share, path).use { file -> work(BlockCache(FileRange(file))) }
+        } catch (error: Exception) {
+            Log.w(TAG, "範囲を読めなかった: $path", error)
+            null
+        }
     }
+
+    private fun openRead(share: DiskShare, path: String) = share.openFile(
+        path,
+        EnumSet.of(AccessMask.GENERIC_READ),
+        null,
+        SMB2ShareAccess.ALL,
+        SMB2CreateDisposition.FILE_OPEN,
+        null
+    )
+
+    /** 開いたファイルの決めた範囲。**1 回の読みの上限は smbj が交渉した大きさで切られる**ので、埋まるまで回す。 */
+    private class FileRange(private val file: com.hierynomus.smbj.share.File) : ByteSource {
+        override fun read(offset: Long, length: Int): ByteArray? {
+            if (offset < 0 || length <= 0) return null
+            val buffer = ByteArray(length)
+            var filled = 0
+            while (filled < length) {
+                val read = file.read(buffer, offset + filled, filled, length - filled)
+                if (read <= 0) break
+                filled += read
+            }
+            return if (filled == 0) null else buffer.copyOf(filled)
+        }
+    }
+
+    /** 1 枚だけ、要る範囲を読む（U49: RAW のプレビュー）。まとめて読むところは [Reader.ranged]。 */
+    suspend fun <T> ranged(nas: Nas, password: String, path: String, work: (ByteSource) -> T): SmbResult<T> =
+        connect(nas, password) { share ->
+            openRead(share, path).use { file -> work(BlockCache(FileRange(file))) }
+        }
 
     /** 例外を人の言葉にする。**次に何をすればいいかが分かる言い方で。** */
     /**

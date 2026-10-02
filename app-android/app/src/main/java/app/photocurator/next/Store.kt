@@ -246,6 +246,45 @@ object Prefs {
             .edit().putInt("display_edge_" + projectId, edge.coerceIn(768, 1920)).apply()
     }
 
+    /**
+     * 「ファイル名が同じ JPEG と RAW を 1 枚の写真として扱う」（U49。PC の `pair_raw_jpeg` と同じ）。
+     * **プロジェクトごと、既定はオン。** 反映は次の走査（「写真を再読み込み」）から。
+     *
+     * 切り替えた時刻（`changedAt`、epoch ミリ秒）も持つ。**0 は「一度も切り替えていない（既定のまま）」。**
+     * 次の段で、サイドカーの設定の同期（新しい方を採る）に使う。いまはまだ読み書きをつないでいない。
+     */
+    data class PairRawSetting(val enabled: Boolean, val changedAt: Long)
+
+    private fun pairRawKey(projectId: String) = "pair_raw_jpeg_$projectId"
+    private fun pairRawAtKey(projectId: String) = "pair_raw_jpeg_at_$projectId"
+
+    fun pairRawSetting(context: Context, projectId: String): PairRawSetting {
+        val preferences = context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+        return PairRawSetting(
+            enabled = preferences.getBoolean(pairRawKey(projectId), true),
+            changedAt = preferences.getLong(pairRawAtKey(projectId), 0L)
+        )
+    }
+
+    fun pairRawJpeg(context: Context, projectId: String): Boolean =
+        pairRawSetting(context, projectId).enabled
+
+    /**
+     * 変える。`at` は切り替えた時刻。サイドカーから取り込むときは**相手の時刻をそのまま**渡す
+     * （ここで今の時刻にすると、取り込んだだけで自分の方が新しく見える）。
+     */
+    fun setPairRawJpeg(
+        context: Context,
+        projectId: String,
+        enabled: Boolean,
+        at: Long = System.currentTimeMillis()
+    ) {
+        context.getSharedPreferences(FILE, Context.MODE_PRIVATE).edit()
+            .putBoolean(pairRawKey(projectId), enabled)
+            .putLong(pairRawAtKey(projectId), at)
+            .apply()
+    }
+
     /** 表示用画像の大きさの選択肢。**画面ごとに書き直さない。** */
     val EDGES = listOf(768, 1024, 1280, 1536, 1920)
 
@@ -333,7 +372,9 @@ object Prefs {
     /** プロジェクトを消すときに、そのプロジェクトだけの設定を片付ける。 */
     fun forgetProject(context: Context, projectId: String) {
         context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
-            .edit().remove("display_edge_" + projectId).apply()
+            .edit().remove("display_edge_" + projectId)
+            .remove(pairRawKey(projectId)).remove(pairRawAtKey(projectId))
+            .apply()
     }
 }
 

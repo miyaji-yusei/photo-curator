@@ -78,11 +78,20 @@ data class Photo(
     val uri get() = ContentUris.withAppendedId(COLLECTION, id)
 
     /**
+     * RAW か（U49）。**Amazon は除く**（名前が .cr2 でも中身は JPEG で、縮小も向こうがする）。
+     * RAW の絵は、中のプレビュー JPEG を取り出して出す（[RawImage]）。
+     */
+    val isRaw: Boolean get() = remote !is AmazonRef && RawFiles.isRaw(name)
+
+    private fun raw(size: ImageSize, edge: Int = 1024): RawImage? = if (!isRaw) null else
+        RawImage(if (remote == null) uri else null, remote as? SmbRef, size, edge)
+
+    /**
      * 小さく並べるときの絵。**EXIF の縮小画像（160x120）。**
      * 詳細の一覧と、まとまりの確認だけ。選別には使わない。
      */
     val thumbModel: Any
-        get() = when (val r = remote) {
+        get() = raw(ImageSize.Thumb) ?: when (val r = remote) {
             is SmbRef -> SmbImage(r.nasId, r.path, ImageSize.Thumb)
             is AmazonRef -> AmazonImage(r, ImageSize.Thumb)
             null -> uri
@@ -95,7 +104,7 @@ data class Photo(
      * 要求した大きさでデコードすれば足りる。NAS は網越しなので、
      * 準備のときに作って置いたものを使う。
      */
-    fun displayModel(edge: Int): Any = when (val r = remote) {
+    fun displayModel(edge: Int): Any = raw(ImageSize.Display, edge) ?: when (val r = remote) {
         is SmbRef -> SmbImage(r.nasId, r.path, ImageSize.Display, edge)
         is AmazonRef -> AmazonImage(r, ImageSize.Display, edge)
         null -> uri
@@ -103,7 +112,7 @@ data class Photo(
 
     /** 拡大して見るときの絵。原本。 */
     val fullModel: Any
-        get() = when (val r = remote) {
+        get() = raw(ImageSize.Full) ?: when (val r = remote) {
             is SmbRef -> SmbImage(r.nasId, r.path, ImageSize.Full)
             is AmazonRef -> AmazonImage(r, ImageSize.Full)
             null -> uri
@@ -122,12 +131,25 @@ private val COLLECTION = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
     MediaStore.Images.Media.EXTERNAL_CONTENT_URI
 }
 
-/** このアプリが扱う形式。 */
-private val MIME_TYPES = arrayOf("image/jpeg", "image/png", "image/webp")
+/**
+ * このアプリが扱う形式。U49 で RAW を足した（PC と同じ 10 種）。
+ * 組の JPEG がある RAW を外すかどうかはプロジェクトの設定で、一覧を取ったあとに決める。
+ */
+private val MIME_TYPES = arrayOf("image/jpeg", "image/png", "image/webp") +
+    RawFiles.MIME_TYPES.values.toTypedArray()
 
+/**
+ * MIME で選び、**RAW は拡張子でも拾う。** MediaStore は RAW を
+ * application/octet-stream のような型で持っていることがある。
+ */
 private fun mimeSelection(): Pair<String, Array<String>> {
     val placeholders = MIME_TYPES.joinToString(",") { "?" }
-    return "${MediaStore.Images.Media.MIME_TYPE} IN ($placeholders)" to MIME_TYPES
+    val byName = RawFiles.EXTENSIONS.joinToString(" OR ") {
+        "LOWER(${MediaStore.Images.Media.DISPLAY_NAME}) LIKE ?"
+    }
+    val names = RawFiles.EXTENSIONS.map { "%.$it" }.toTypedArray()
+    return "(${MediaStore.Images.Media.MIME_TYPE} IN ($placeholders) OR $byName)" to
+        (MIME_TYPES + names)
 }
 
 object Photos {
@@ -171,8 +193,8 @@ object Photos {
      * 出所から写真を引く。**プロジェクトはここだけを通る。**
      * 出所の種類が増えても、上の画面はこの 1 か所しか知らなくてよい。
      */
-    suspend fun forSource(context: Context, source: Source): List<Photo> = try {
-        list(context, source)
+    suspend fun forSource(context: Context, source: Source, pairRaw: Boolean = true): List<Photo> = try {
+        list(context, source, pairRaw)
     } catch (error: kotlinx.coroutines.CancellationException) {
         throw error
     } catch (error: Exception) {
@@ -185,11 +207,14 @@ object Photos {
      * 読めなかったら**理由を投げる**。準備はこちらを使う（つまずきとして残すため）。
      * Amazon の「リンクが消えた」をここで拾えないと、空のプロジェクトに見える。
      */
-    suspend fun list(context: Context, source: Source): List<Photo> = when (source.kind) {
-        SourceKind.Album -> photos(context, source.key)
-        SourceKind.Nas -> fromNas(context, source.key)
-        SourceKind.Amazon -> fromAmazon(source.key)
-    }
+    suspend fun list(context: Context, source: Source, pairRaw: Boolean = true): List<Photo> =
+        when (source.kind) {
+            // **組の RAW を外すのは端末と NAS だけ**（U49。PC の U46 と同じ規則）。
+            // Amazon は中身の種類で選んでいて、RAW の扱いは従来どおり。
+            SourceKind.Album -> RawFiles.skipPairedRaw(photos(context, source.key), pairRaw) { it.relativePath }
+            SourceKind.Nas -> RawFiles.skipPairedRaw(fromNas(context, source.key), pairRaw) { it.relativePath }
+            SourceKind.Amazon -> fromAmazon(source.key)
+        }
 
     /** Amazon の共有リンクの写真。**撮影時刻の昇順で来る。** */
     private suspend fun fromAmazon(key: String): List<Photo> =
