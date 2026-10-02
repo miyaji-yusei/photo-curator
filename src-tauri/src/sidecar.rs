@@ -268,41 +268,87 @@ pub fn write(folder: &Path, file_name: &str, json: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 取ったロック。手放すとき（drop）にファイルを消す。
+/// 取ったロック。手放すとき（drop）に、**まだ自分が書いた中身のときだけ**ファイルを消す（U52 D5。
+/// ほかの端末が古いと見なして取り直していたら、そのロックは残す。Android の U44 と同じ）。
 struct LockGuard {
     path: PathBuf,
+    body: Vec<u8>,
 }
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        if fs::read(&self.path).is_ok_and(|current| current == self.body) {
+            let _ = fs::remove_file(&self.path);
+        }
     }
+}
+
+fn now_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or(0)
 }
 
 fn try_create_lock(path: &Path, holder: &str) -> std::io::Result<LockGuard> {
     let mut file = fs::OpenOptions::new().write(true).create_new(true).open(path)?;
-    let at = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|value| value.as_millis())
-        .unwrap_or(0);
-    // 中身は人が見て分かるためだけ（判定には更新時刻だけを使う）。
-    let _ = write!(file, "{{\"holder\":{},\"at\":{at}}}", serde_json::Value::String(holder.to_string()));
-    Ok(LockGuard { path: path.to_path_buf() })
+    // 形は Android と同じ `{"holder","at"}`（at は書いた端末の時計の ms）。nonce は放すときの見分け。
+    let body = format!(
+        "{{\"holder\":{},\"at\":{},\"nonce\":\"{}\"}}",
+        serde_json::Value::String(holder.to_string()),
+        now_millis(),
+        Uuid::new_v4().simple()
+    )
+    .into_bytes();
+    let _ = file.write_all(&body);
+    Ok(LockGuard { path: path.to_path_buf(), body })
 }
 
-/// 排他のロックを取る。あれば、`ttl` より古いものだけ壊して取り直す。取れなければ None。
+/// ロックの中身の `at`（ms）。無い・読めなければ None。
+fn lock_at(body: &[u8]) -> Option<u128> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    value.get("at")?.as_u64().map(u128::from)
+}
+
+/// 古いロックか（U52 D5。Android の U44 と同じ判断）:
+/// - 中身に `at` がある: `at`（書いた端末の時計）と更新時刻（NAS の時計）の**両方**が `ttl` より古い
+/// - 中身が空・読めない（作った直後でまだ書いていない、など）: 更新時刻が古い
+/// - 更新時刻が分からなければ古いと見なさない
+fn lock_stale(path: &Path, body: &[u8], ttl: Duration) -> bool {
+    let Some(age) = fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+    else {
+        return false;
+    };
+    if age <= ttl {
+        return false;
+    }
+    match lock_at(body) {
+        Some(at) => now_millis().saturating_sub(at) > ttl.as_millis(),
+        None => true,
+    }
+}
+
+/// 排他のロックを取る。あれば、古いもの（[`lock_stale`]）だけ壊して取り直す。取れなければ None。
+/// **壊す前にもう一度読み、中身が変わっていれば（ほかの端末が取り直した）壊さない。**
 fn acquire_lock(dir: &Path, holder: &str, ttl: Duration) -> Result<Option<LockGuard>, String> {
     let path = dir.join(LOCK_FILE);
     for _ in 0..2 {
         match try_create_lock(&path, holder) {
             Ok(guard) => return Ok(Some(guard)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let stale = fs::metadata(&path)
-                    .and_then(|meta| meta.modified())
-                    .ok()
-                    .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-                    .is_some_and(|age| age > ttl);
-                if !stale {
+                let first = match fs::read(&path) {
+                    Ok(body) => body,
+                    // 読む前に消えた → 取り直す。
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(_) => return Ok(None),
+                };
+                if !lock_stale(&path, &first, ttl) {
+                    return Ok(None);
+                }
+                if !fs::read(&path).is_ok_and(|again| again == first) {
                     return Ok(None);
                 }
                 // 書いた端末が途中で止まった。壊して取り直す（同時に壊した端末があれば、どちらかが負ける）。
@@ -767,6 +813,76 @@ mod tests {
         fs::File::options().write(true).open(lock_path(&folder)).unwrap().set_modified(old).unwrap();
         assert_eq!(write_checked(&folder, "v2", Some("v1"), "pc").unwrap(), CheckedWrite::Written);
         assert_eq!(read(&folder).unwrap().as_deref(), Some("v2"));
+        assert!(!lock_path(&folder).exists());
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    fn now_ms() -> u128 {
+        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis()
+    }
+
+    fn age_lock(folder: &Path, secs: u64) {
+        let old = SystemTime::now() - Duration::from_secs(secs);
+        fs::File::options().write(true).open(lock_path(folder)).unwrap().set_modified(old).unwrap();
+    }
+
+    /// U52 D5（Android の U44 と同じ判断）: 中身の `at` が新しければ、更新時刻が古くても壊さない
+    /// （NAS の時計と PC の時計がずれていても、生きているロックを壊さない）。
+    #[test]
+    fn lock_with_a_fresh_at_is_not_broken_even_if_its_modified_time_is_old() {
+        let folder = temp_dir("lock-fresh-at");
+        write(&folder, SIDECAR_FILE, "v1").unwrap();
+        fs::write(lock_path(&folder), format!("{{\"holder\":\"android\",\"at\":{}}}", now_ms())).unwrap();
+        age_lock(&folder, 120);
+        assert_eq!(write_checked(&folder, "v2", Some("v1"), "pc").unwrap(), CheckedWrite::Locked);
+        assert_eq!(read(&folder).unwrap().as_deref(), Some("v1"));
+        assert!(lock_path(&folder).exists());
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    /// U52 D5: `at` と更新時刻の両方が古ければ壊す。`at` が古くても更新時刻が新しければ壊さない。
+    #[test]
+    fn lock_is_broken_only_when_both_at_and_modified_time_are_old() {
+        let folder = temp_dir("lock-both-old");
+        write(&folder, SIDECAR_FILE, "v1").unwrap();
+        let old_at = now_ms() - 120_000;
+        fs::write(lock_path(&folder), format!("{{\"holder\":\"android\",\"at\":{old_at}}}")).unwrap();
+        assert_eq!(write_checked(&folder, "v2", Some("v1"), "pc").unwrap(), CheckedWrite::Locked);
+        age_lock(&folder, 120);
+        assert_eq!(write_checked(&folder, "v2", Some("v1"), "pc").unwrap(), CheckedWrite::Written);
+        assert!(!lock_path(&folder).exists());
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    /// U52 D5: 中身が空（作った直後でまだ書いていない）なら、更新時刻が古いときだけ壊す。
+    #[test]
+    fn empty_lock_is_broken_only_when_its_modified_time_is_old() {
+        let folder = temp_dir("lock-empty");
+        write(&folder, SIDECAR_FILE, "v1").unwrap();
+        fs::write(lock_path(&folder), "").unwrap();
+        assert_eq!(write_checked(&folder, "v2", Some("v1"), "pc").unwrap(), CheckedWrite::Locked);
+        age_lock(&folder, 120);
+        assert_eq!(write_checked(&folder, "v2", Some("v1"), "pc").unwrap(), CheckedWrite::Written);
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    /// U52 D5: 放すのは自分が書いた中身のときだけ（ほかの端末が古いと見なして取り直したロックは残す）。
+    #[test]
+    fn releasing_leaves_a_lock_that_someone_else_took_over() {
+        let folder = temp_dir("lock-release");
+        let dir = folder.join(SIDECAR_DIR);
+        fs::create_dir_all(&dir).unwrap();
+        let guard = acquire_lock(&dir, "pc", LOCK_TTL).unwrap().expect("取れる");
+        let mine = fs::read_to_string(lock_path(&folder)).unwrap();
+        assert!(mine.contains("\"holder\":\"pc\"") && mine.contains("\"at\":"), "{mine}");
+        // ほかの端末が取り直した。
+        fs::write(lock_path(&folder), "{\"holder\":\"android\",\"at\":1}").unwrap();
+        drop(guard);
+        assert_eq!(fs::read_to_string(lock_path(&folder)).unwrap(), "{\"holder\":\"android\",\"at\":1}");
+        // 自分のロックなら放す。
+        fs::remove_file(lock_path(&folder)).unwrap();
+        let guard = acquire_lock(&dir, "pc", LOCK_TTL).unwrap().expect("取れる");
+        drop(guard);
         assert!(!lock_path(&folder).exists());
         let _ = fs::remove_dir_all(&folder);
     }

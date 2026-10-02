@@ -56,6 +56,24 @@ export const SIDECAR_LOCK_TTL_MS = 60_000
 export const isSidecarFileName = (name: string) =>
   name === SIDECAR_FILE || /^catalog\.[A-Za-z0-9-]{1,64}\.json$/.test(name)
 
+/**
+ * 古いロックか（U52 D5。Android の U44・PC の Rust と同じ判断）:
+ * - 中身に `at` がある: `at`（書いた端末の時計）と更新時刻の**両方**が TTL より古い
+ * - 中身が空・読めない（作った直後でまだ書いていない、など）: 更新時刻が古い
+ * - 更新時刻が分からなければ古いと見なさない
+ */
+export function lockIsStale(text: string, lastModified: number | null | undefined, now: number): boolean {
+  if (typeof lastModified !== 'number' || !Number.isFinite(lastModified) || lastModified <= 0) return false
+  if (now - lastModified <= SIDECAR_LOCK_TTL_MS) return false
+  let at: unknown
+  try {
+    at = (JSON.parse(text) as { at?: unknown } | null)?.at
+  } catch {
+    at = undefined
+  }
+  return typeof at === 'number' ? now - at > SIDECAR_LOCK_TTL_MS : true
+}
+
 export const joinPath = (base: string, name: string) => (base ? `${base}/${name}` : name)
 
 // ---------------------------------------------------------------------------
@@ -242,12 +260,25 @@ export class HandleFolderIO implements SourceIO {
    */
   async writeSidecarChecked(json: string, expected: string | null, asideTag?: string | null): Promise<SidecarWriteOutcome> {
     const dir = await this.root.getDirectoryHandle(SIDECAR_DIR, { create: true })
-    const mark = `${Date.now()}-${Math.random().toString(36).slice(2)}`
-    try {
-      const existing = await (await dir.getFileHandle(SIDECAR_LOCK)).getFile()
-      if (Date.now() - existing.lastModified < SIDECAR_LOCK_TTL_MS) return 'locked'
-    } catch (cause) {
-      if (!(cause instanceof DOMException && cause.name === 'NotFoundError')) throw cause
+    // 形は Android・PC と同じ `{"holder","at"}`（at は書いた端末の時計の ms）。nonce は放すときの見分け。
+    const mark = JSON.stringify({
+      holder: 'ブラウザ', at: Date.now(), nonce: Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2)
+    })
+    const readLock = async (): Promise<{ text: string, lastModified: number } | null> => {
+      try {
+        const file = await (await dir.getFileHandle(SIDECAR_LOCK)).getFile()
+        return { text: await file.text(), lastModified: file.lastModified }
+      } catch (cause) {
+        if (cause instanceof DOMException && cause.name === 'NotFoundError') return null
+        throw cause
+      }
+    }
+    const first = await readLock()
+    if (first) {
+      if (!lockIsStale(first.text, first.lastModified, Date.now())) return 'locked'
+      // 壊す前にもう一度読み、中身が変わっていれば（ほかの端末が取り直した）壊さない（U52 D5）。
+      const again = await readLock()
+      if (again && again.text !== first.text) return 'locked'
     }
     const lock = await dir.getFileHandle(SIDECAR_LOCK, { create: true })
     const lockWriter = await lock.createWritable()
