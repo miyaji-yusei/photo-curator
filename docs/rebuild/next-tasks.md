@@ -427,7 +427,7 @@ core の `core/src/sidecar_sync/tests.rs` に、関数名の末尾「_3のn」�
 サイドカー（NAS のフォルダの `.photo-curator/catalog.json`。NAS 以外のプロジェクトは端末）にも記録して同期する。
 PC と Android で違う値にしたときは**新しく切り替えた方**を採る（確認ダイアログは出さない。選別状況の食い違いとは別扱い）。
 
-core・PC・Web は `fix/mb-u48-settings-sync` で済み（10章 §7 の U48 の行）。**Android の配線はこの節の依頼**。
+core・PC・Web は `fix/mb-u48-settings-sync` で済み（10章 §7 の U48 の行）。**Android の配線も U51 で済み**（`fix/mb-u51-android-settings-sync`。10章 §7 の U51 の行）。
 
 ### 形（catalog.json v2 に足した省略可能な項目）
 
@@ -451,7 +451,10 @@ core・PC・Web は `fix/mb-u48-settings-sync` で済み（10章 §7 の U48 の
 - `sidecarPlan` の #7b: 版の見分けは違うが NAS の選別状況の比較キーが見た版のもの（ほかの端末が設定だけを書き直した版）なら、
   #3 と同じく端末の変更を確認せずに書く（Push LocalChanged）。Android は呼ぶだけで効く
 
-### Android への依頼（U49 の写真の一覧・RAW・トグルの画面のあと）
+### Android への依頼（U49 の写真の一覧・RAW・トグルの画面のあと）— **U51 で済み**
+
+1〜5 はすべて U51 で済み（2026-10-03）。違いは 2 点: 取り込むのは Open に加えて Explicit（「NAS に保存」。判断が Open と同じ）でも行う。
+書けない共有で設定だけを書けなかったときは、黙らず Blocked で理由を出す（NAS は変えない）。以下は依頼の元の文（記録として残す）。
 
 1. **設定の置き場**: プロジェクトごとに `pairRawJpeg`（既定 true）と `pairRawJpegAt`（既定 0）を持つ（U49 でトグルを足すときに一緒に）。
    画面で切り替えたら `at = 今の時刻`。作成時に既定のままなら 0

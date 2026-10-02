@@ -251,7 +251,7 @@ object Prefs {
      * **プロジェクトごと、既定はオン。** 反映は次の走査（「写真を再読み込み」）から。
      *
      * 切り替えた時刻（`changedAt`、epoch ミリ秒）も持つ。**0 は「一度も切り替えていない（既定のまま）」。**
-     * 次の段で、サイドカーの設定の同期（新しい方を採る）に使う。いまはまだ読み書きをつないでいない。
+     * NAS のプロジェクトは、サイドカーの `settings.pairRawJpeg` と同期する（U51。新しく切り替えた方を採る。`SidecarSync`）。
      */
     data class PairRawSetting(val enabled: Boolean, val changedAt: Long)
 

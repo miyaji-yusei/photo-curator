@@ -41,7 +41,8 @@ object Sidecar {
                 store = SyncState.store(app),
                 me = { Me(Device.id(app), Device.name()) },
                 scope = scope,
-                log = { message, error -> Log.w(TAG, message, error) }
+                log = { message, error -> Log.w(TAG, message, error) },
+                settings = settingsStore(app)
             ).also { engine = it }
         }
     }
@@ -114,16 +115,30 @@ object Sidecar {
     fun detached(context: Context, project: Project): Boolean =
         supports(project) && engine(context).detached(project.id)
 
-    /** 結果を 1 行にする。**黙って書かない、黙って失敗しない。** 何もしなかったときは null。 */
-    fun note(outcome: SyncOutcome): String? = when (outcome) {
-        is SyncOutcome.Settled -> outcome.note
-        is SyncOutcome.Pushed -> outcome.note
-        is SyncOutcome.Pulled -> outcome.note
-        is SyncOutcome.Blocked -> outcome.reason
-        is SyncOutcome.Asking, SyncOutcome.Deferred -> null
+    /**
+     * 結果を 1 行にする。**黙って書かない、黙って失敗しない。** 何もしなかったときは null。
+     * ほかの端末の設定を取り込んだら（U51）、そのお知らせを後ろに足す（確認のダイアログのときも出す）。
+     */
+    fun note(outcome: SyncOutcome): String? {
+        val base = when (outcome) {
+            is SyncOutcome.Settled -> outcome.note
+            is SyncOutcome.Pushed -> outcome.note
+            is SyncOutcome.Pulled -> outcome.note
+            is SyncOutcome.Blocked -> outcome.reason
+            is SyncOutcome.Asking, SyncOutcome.Deferred -> null
+        }
+        val adopted = outcome.settingsAdopted?.let { SidecarSync.settingsAdoptedNotice(it) } ?: return base
+        return if (base == null) adopted else "$base。$adopted"
     }
 
     // ---- つなぎ ----
+
+    /** プロジェクトの設定（U51）。`Prefs` の「同名の JPEG と RAW を 1 枚として扱う」と、切り替えた時刻。 */
+    private fun settingsStore(context: Context): SettingsStore = object : SettingsStore {
+        override fun pairRaw(projectId: String) = Prefs.pairRawSetting(context, projectId)
+        override fun setPairRaw(projectId: String, enabled: Boolean, at: Long) =
+            Prefs.setPairRawJpeg(context, projectId, enabled, at)
+    }
 
     /** NAS（SMB）。**接続の情報は使うときに読む**（列に積むのはその場で、待たずに済ませるため）。 */
     private class SmbCatalogIO(private val context: Context, private val nasId: String) : CatalogIO {

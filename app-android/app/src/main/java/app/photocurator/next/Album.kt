@@ -91,12 +91,22 @@ fun ProjectScreen(
     // 「この端末の状況を残す」を選んだあと（NAS から切り離し、自動で書かない）。
     var detached by remember { mutableStateOf(Sidecar.detached(context, project)) }
 
+    // U49: 同名の JPEG がある RAW を外すか（プロジェクトごと、既定オン）。
+    var pairRaw by remember(project.id) { mutableStateOf(Prefs.pairRawJpeg(context, project.id)) }
+    // 切り替えたら「再読み込みで反映」を出す。**再読み込みしたら消す。**
+    var pairRawChanged by remember(project.id) { mutableStateOf(false) }
+
     /** 同期の結果を画面に映す。取り込んだら読み直す。 */
     suspend fun show(outcome: SyncOutcome) {
         when (outcome) {
             is SyncOutcome.Asking -> clash = outcome.clash
             is SyncOutcome.Pulled -> session = Store.load(context, project.id)
             else -> Unit
+        }
+        // U51: ほかの端末の設定を取り込んだ。スイッチを合わせ、再読み込みを促す（自動では取り直さない）。
+        outcome.settingsAdopted?.let {
+            pairRaw = it
+            pairRawChanged = true
         }
         Sidecar.note(outcome)?.let {
             syncNote = it
@@ -129,10 +139,6 @@ fun ProjectScreen(
     var displayEdge by remember { mutableStateOf(Prefs.projectEdge(context, project.id)) }
     // 「…」から大きさを選んでいるか。
     var choosingEdge by remember { mutableStateOf(false) }
-    // U49: 同名の JPEG がある RAW を外すか（プロジェクトごと、既定オン）。
-    var pairRaw by remember(project.id) { mutableStateOf(Prefs.pairRawJpeg(context, project.id)) }
-    // 切り替えたら「再読み込みで反映」を出す。**再読み込みしたら消す。**
-    var pairRawChanged by remember(project.id) { mutableStateOf(false) }
     // 一覧の列数。**0 は「おまかせ」**（幅から決める）。
     var columns by remember { mutableStateOf(Prefs.gridColumns(context)) }
 
@@ -637,6 +643,9 @@ fun ProjectScreen(
                             pairRaw = on
                             Prefs.setPairRawJpeg(context, project.id, on)
                             pairRawChanged = true
+                            // U51: NAS のプロジェクトはサイドカーにも書く（いつもの区切りの書き込みと同じ列。
+                            // 選別状況が同じでも、切り替えた設定が NAS より新しければ書く）。NAS 以外は何もしない。
+                            Sidecar.pushIfChanged(context, project)
                         },
                         note = if (pairRawChanged) "「写真を再読み込み」で反映します" else null,
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
@@ -656,7 +665,9 @@ fun ProjectScreen(
                             // **開いたときと同じ判断で書く**（NAS の中身を確かめずに上書きしない）。
                             val outcome = Sidecar.save(context, project)
                             show(outcome)
-                            if (outcome is SyncOutcome.Settled && outcome.note == null) {
+                            if (outcome is SyncOutcome.Settled && outcome.settingsPushed && outcome.settingsAdopted == null) {
+                                syncNote = "プロジェクトの設定を NAS に書き込みました"
+                            } else if (outcome is SyncOutcome.Settled && outcome.note == null && outcome.settingsAdopted == null) {
                                 syncNote = "書く必要はありません（NAS の記録と同じか、まだ選別していません）"
                             }
                         }

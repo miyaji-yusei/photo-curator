@@ -19,6 +19,8 @@ import uniffi.photo_curator_core.ClashReason
 import uniffi.photo_curator_core.Decision
 import uniffi.photo_curator_core.SeenRecord
 import uniffi.photo_curator_core.Session
+import uniffi.photo_curator_core.SettingValueBool
+import uniffi.photo_curator_core.SettingsRecord
 import uniffi.photo_curator_core.Sidecar
 import uniffi.photo_curator_core.SidecarPhoto
 import uniffi.photo_curator_core.SidecarSessions
@@ -1024,5 +1026,274 @@ class SidecarSyncTest {
     @Test fun 文言はPCと同じ形() {
         assertEquals("NAS の記録と、この端末の記録が違います", SidecarSync.CLASH_TITLE)
         assertEquals("この端末（Pixel 8）", SidecarSync.mineLabel("Pixel 8"))
+    }
+
+    // ---- U51: 「同名の JPEG と RAW を 1 枚として扱う」の設定の同期（U48 の Android の配線） ----
+
+    /** 端末のプロジェクトの設定（`Prefs.pairRawSetting`／`setPairRawJpeg` の偽物）。 */
+    class FakeSettings(var setting: Prefs.PairRawSetting = Prefs.PairRawSetting(true, 0L)) : SettingsStore {
+        val saved = ArrayList<Prefs.PairRawSetting>()
+        override fun pairRaw(projectId: String) = setting
+        override fun setPairRaw(projectId: String, enabled: Boolean, at: Long) {
+            setting = Prefs.PairRawSetting(enabled, at)
+            saved += setting
+        }
+    }
+
+    private val pc = Me("pc-desktop-1", "DESKTOP-ABC")
+    private val older = 1_789_500_000_000L
+    private val newer = 1_789_600_000_000L
+
+    private fun syncWith(who: Me, seen: FakeSeen, settings: FakeSettings) = SidecarSync(
+        store = seen,
+        me = { who },
+        scope = scope,
+        now = { clock++ },
+        newId = { "w" + ids.incrementAndGet() + who.id.take(4) },
+        settings = settings
+    )
+
+    private fun Sidecar.withPair(value: Boolean, at: Long) =
+        copy(settings = SettingsRecord(SettingValueBool(value, at), emptyMap()))
+
+    private fun pairOf(nas: FakeNas): SettingValueBool? = remote(nas).settings?.pairRawJpeg
+
+    @Test fun 設定_PCが切り替えた版を開くと取り込みお知らせを出す() = run {
+        val nas = FakeNas()
+        val theirs = written(mineAdvanced(), pc, "p1").withPair(false, newer)
+        val bytes = put(nas, theirs)
+        val seen = FakeSeen().apply { save("project-1", seenAt(theirs)) }
+        val settings = FakeSettings(Prefs.PairRawSetting(true, 0L))
+        val local = FakeLocal(snapshot(mineAdvanced()))
+
+        val answer = syncWith(android, seen, settings).check(target(local, nas))
+
+        assertTrue("確認も書き込みもしない: $answer", answer is SyncOutcome.Settled)
+        assertEquals("取り込んだ値をお知らせに出す", false, answer.settingsAdopted)
+        assertEquals("NAS の値・NAS の時刻（今に変えない）", Prefs.PairRawSetting(false, newer), settings.setting)
+        assertArrayEquals("NAS は書かない", bytes, nas.files[catalog])
+        assertEquals(
+            "ほかの端末の設定に合わせて「同名の JPEG と RAW を 1 枚として扱う」をオフにしました。" +
+                "写真を反映するには「写真を再読み込み」を押してください。",
+            SidecarSync.settingsAdoptedNotice(false)
+        )
+        assertTrue(SidecarSync.settingsAdoptedNotice(true).contains("をオンにしました。"))
+        // もう一度開いても、もう取り込まない（お知らせも出ない）。
+        val again = syncWith(android, seen, settings).check(target(local, nas))
+        assertEquals(SyncOutcome.Settled(null), again)
+        assertEquals(1, settings.saved.size)
+    }
+
+    @Test fun 設定_背面への書き込みでは端末の設定を変えない() = run {
+        val nas = FakeNas()
+        val theirs = written(mineAdvanced(), pc, "p1").withPair(false, newer)
+        val bytes = put(nas, theirs)
+        val seen = FakeSeen().apply { save("project-1", seenAt(theirs)) }
+        val settings = FakeSettings(Prefs.PairRawSetting(true, older))
+        val local = FakeLocal(snapshot(mineAdvanced()))
+
+        val answer = syncWith(android, seen, settings).pushIfChanged(target(local, nas)).await()
+
+        assertTrue("$answer", answer is SyncOutcome.Settled)
+        assertNull(answer.settingsAdopted)
+        assertEquals(Prefs.PairRawSetting(true, older), settings.setting)
+        assertArrayEquals("古い端末の値で書かない", bytes, nas.files[catalog])
+    }
+
+    @Test fun 設定_Androidで新しく切り替えたらNASに書く() = run {
+        val nas = FakeNas()
+        val theirs = written(mineAdvanced(), pc, "p1").withPair(true, older)
+        put(nas, theirs)
+        val seen = FakeSeen().apply { save("project-1", seenAt(theirs)) }
+        val settings = FakeSettings(Prefs.PairRawSetting(false, newer))
+        val local = FakeLocal(snapshot(mineAdvanced()))
+
+        // トグルを切り替えたときの経路（区切りの書き込み）。
+        val answer = syncWith(android, seen, settings).pushIfChanged(target(local, nas)).await()
+
+        assertTrue("選別状況は同じなので Settled のまま: $answer", answer is SyncOutcome.Settled)
+        assertTrue("設定のために書いた", (answer as SyncOutcome.Settled).settingsPushed)
+        assertEquals(SettingValueBool(false, newer), pairOf(nas))
+        assertTrue("選別状況は変えない", sameJudgement(local, remote(nas)))
+        assertEquals("控えは書いた版", remote(nas).writeId, seen.load("project-1").seen.token)
+        assertNull("ロックは放す", nas.files[SidecarSync.lockPath(folder)])
+        // 書いたあとは落ち着く。
+        val again = syncWith(android, seen, settings).check(target(local, nas))
+        assertEquals(SyncOutcome.Settled(null), again)
+    }
+
+    @Test fun 設定_新しい方が勝ち古いatのNASは取り込まない() = run {
+        val nas = FakeNas()
+        val theirs = written(mineAdvanced(), pc, "p1").withPair(true, older)
+        put(nas, theirs)
+        val seen = FakeSeen().apply { save("project-1", seenAt(theirs)) }
+        val settings = FakeSettings(Prefs.PairRawSetting(false, newer))
+        val local = FakeLocal(snapshot(mineAdvanced()))
+
+        val answer = syncWith(android, seen, settings).check(target(local, nas))
+
+        assertNull("取り込まない: $answer", answer.settingsAdopted)
+        assertEquals(Prefs.PairRawSetting(false, newer), settings.setting)
+        assertTrue(settings.saved.isEmpty())
+        assertEquals("端末の新しい値を書く", SettingValueBool(false, newer), pairOf(nas))
+    }
+
+    @Test fun 設定_同じ値なら何もしない() = run {
+        val nas = FakeNas()
+        val theirs = written(mineAdvanced(), pc, "p1").withPair(false, older)
+        val bytes = put(nas, theirs)
+        val seen = FakeSeen().apply { save("project-1", seenAt(theirs)) }
+        val settings = FakeSettings(Prefs.PairRawSetting(false, newer))
+        val local = FakeLocal(snapshot(mineAdvanced()))
+
+        val answer = syncWith(android, seen, settings).check(target(local, nas))
+        val background = syncWith(android, seen, settings).pushIfChanged(target(local, nas)).await()
+
+        assertEquals(SyncOutcome.Settled(null), answer)
+        assertEquals(SyncOutcome.Settled(null), background)
+        assertTrue(settings.saved.isEmpty())
+        assertArrayEquals("at が違っても値が同じなら書かない", bytes, nas.files[catalog])
+    }
+
+    @Test fun 設定_settingsの無い古い版は壊れず書き戻しても他は変わらない() = run {
+        val nas = FakeNas()
+        val theirs = written(mineAdvanced(), pc, "p1").copy(burstDistance = 7u)
+        put(nas, theirs)
+        assertNull(theirs.settings)
+        val seen = FakeSeen().apply { save("project-1", seenAt(theirs)) }
+        val settings = FakeSettings(Prefs.PairRawSetting(false, newer))
+        val local = FakeLocal(LocalSnapshot(mineAdvanced(), emptyList(), 7, null))
+
+        val answer = syncWith(android, seen, settings).check(target(local, nas))
+
+        assertTrue("$answer", answer is SyncOutcome.Settled && answer.settingsPushed)
+        val after = remote(nas)
+        assertEquals(SettingValueBool(false, newer), after.settings?.pairRawJpeg)
+        assertEquals("選別状況の比較キーは同じ", judgementKey(sidecarJudgement(theirs)), judgementKey(sidecarJudgement(after)))
+        assertEquals(theirs.photos.filterValues { it.rating > 0 }, after.photos.filterValues { it.rating > 0 })
+        assertEquals(theirs.sessions, after.sessions)
+        assertEquals(theirs.burstOverrides, after.burstOverrides)
+        assertEquals(theirs.burstDistance, after.burstDistance)
+        assertEquals(Prefs.PairRawSetting(false, newer), settings.setting)
+
+        // 古い Android の形（版の見分けなし・v1）も読めて、一度も切り替えていなければ書かない。
+        val legacyNas = FakeNas()
+        val legacy = written(mineAdvanced(), pc, null)
+        val legacyBytes = put(legacyNas, legacy)
+        val legacyAnswer = syncWith(android, FakeSeen().apply { save("project-1", seenAt(legacy)) }, FakeSettings())
+            .check(target(FakeLocal(snapshot(mineAdvanced())), legacyNas))
+        assertTrue("$legacyAnswer", legacyAnswer is SyncOutcome.Settled)
+        assertArrayEquals(legacyBytes, legacyNas.files[catalog])
+    }
+
+    @Test fun 設定の違いだけでは確認も変更ありも出ない() = run {
+        // 端末は a1 を書いて見たあと、さらに 1 組進めた（まだ共有していない）。
+        val nas = FakeNas()
+        val a1 = written(mineAdvanced(), android, "a1").withPair(true, 0L)
+        val seen = FakeSeen().apply { save("project-1", seenAt(a1)) }
+        // その間に PC が設定だけを切り替えて書き直した（選別状況は a1 のまま、版の見分けは別）。
+        put(nas, written(mineAdvanced(), pc, "p2", basedOn = "a1").withPair(false, newer))
+        val settings = FakeSettings(Prefs.PairRawSetting(true, 0L))
+        val local = FakeLocal(snapshot(mineFurther()))
+
+        val answer = syncWith(android, seen, settings).check(target(local, nas))
+
+        assertTrue("確認ではなく書く（#7b）: $answer", answer is SyncOutcome.Pushed)
+        assertEquals(false, answer.settingsAdopted)
+        assertEquals(Prefs.PairRawSetting(false, newer), settings.setting)
+        assertTrue("端末の選別状況を書いた", sameJudgement(local, remote(nas)))
+        assertEquals("NAS の新しい設定を引き継ぐ", SettingValueBool(false, newer), pairOf(nas))
+
+        // 選別状況が同じで設定だけ違う → 確認も書き込みもしない。
+        val nas2 = FakeNas()
+        val same = written(mineAdvanced(), pc, "p3").withPair(true, newer)
+        val bytes2 = put(nas2, same)
+        val seen2 = FakeSeen().apply { save("project-1", seenAt(same)) }
+        val settings2 = FakeSettings(Prefs.PairRawSetting(false, older))
+        val local2 = FakeLocal(snapshot(mineAdvanced()))
+        val answer2 = syncWith(android, seen2, settings2).check(target(local2, nas2))
+        assertTrue("$answer2", answer2 is SyncOutcome.Settled)
+        assertArrayEquals(bytes2, nas2.files[catalog])
+        // 取り込んだあと、区切りの書き込みでも「変更あり」として書かない。
+        assertEquals(SyncOutcome.Settled(null), syncWith(android, seen2, settings2).pushIfChanged(target(local2, nas2)).await())
+        assertArrayEquals(bytes2, nas2.files[catalog])
+    }
+
+    @Test fun 設定_書けない共有と切り離し中は書かない() = run {
+        // 書けない（ロックも一時ファイルも作れない）。
+        val nas = FakeNas()
+        val theirs = written(mineAdvanced(), pc, "p1").withPair(true, older)
+        val bytes = put(nas, theirs)
+        nas.refuse = { true }
+        val seen = FakeSeen().apply { save("project-1", seenAt(theirs)) }
+        val settings = FakeSettings(Prefs.PairRawSetting(false, newer))
+        val answer = syncWith(android, seen, settings).check(target(FakeLocal(snapshot(mineAdvanced())), nas))
+        assertTrue("書けなかったことを伝える: $answer", answer is SyncOutcome.Blocked)
+        assertArrayEquals(bytes, nas.files[catalog])
+        assertEquals(setOf(catalog), nas.files.keys.toSet())
+
+        // 切り離し中（この端末の状況を残す、を選んだあと）。
+        val nas2 = FakeNas()
+        val bytes2 = put(nas2, theirs)
+        val seen2 = FakeSeen().apply { save("project-1", seenAt(theirs).copy(detached = true)) }
+        val local2 = FakeLocal(snapshot(mineFurther()))
+        val sync2 = syncWith(android, seen2, FakeSettings(Prefs.PairRawSetting(false, newer)))
+        assertTrue(sync2.check(target(local2, nas2)) is SyncOutcome.Settled)
+        assertTrue(sync2.pushIfChanged(target(local2, nas2)).await() is SyncOutcome.Settled)
+        assertArrayEquals("書かない", bytes2, nas2.files[catalog])
+    }
+
+    @Test fun 設定_選別状況を書く版にNASの新しい設定を引き継ぐ() = run {
+        // Push（背面。端末の設定は変えない）。
+        kotlin.run {
+            val nas = FakeNas()
+            val a1 = written(mineAdvanced(), android, "a1")
+            put(nas, written(mineAdvanced(), pc, "p2", basedOn = "a1").withPair(false, newer))
+            val seen = FakeSeen().apply { save("project-1", seenAt(a1)) }
+            val settings = FakeSettings(Prefs.PairRawSetting(true, older))
+            val local = FakeLocal(snapshot(mineFurther()))
+            val answer = syncWith(android, seen, settings).pushIfChanged(target(local, nas)).await()
+            assertTrue("$answer", answer is SyncOutcome.Pushed)
+            assertEquals(Prefs.PairRawSetting(true, older), settings.setting)
+            assertEquals(SettingValueBool(false, newer), pairOf(nas))
+        }
+        // C・D・E（ダイアログの答え）。
+        for (choice in listOf(ClashChoice.WriteMine, ClashChoice.Intersection, ClashChoice.Union)) {
+            val nas = FakeNas()
+            put(nas, written(theirsAdvanced(), fold, "f1").withPair(false, newer))
+            val seen = FakeSeen()
+            val settings = FakeSettings(Prefs.PairRawSetting(true, older))
+            val local = FakeLocal(snapshot(mineAdvanced()))
+            val t = target(local, nas)
+            // 背面では確認しないので、開いたときの判断を使う（ここで設定は取り込まれる）。
+            val asked = syncWith(android, seen, settings).check(t)
+            assertTrue("$choice: $asked", asked is SyncOutcome.Asking)
+            assertEquals(false, asked.settingsAdopted)
+            // 取り込んだあとで端末の値が古いままでも（ほかの経路で戻った場合）、書く版は NAS の値。
+            settings.setting = Prefs.PairRawSetting(true, older)
+            val answer = syncWith(android, seen, settings).resolve(t, (asked as SyncOutcome.Asking).clash, choice)
+            assertTrue("$choice: $answer", answer is SyncOutcome.Pushed)
+            assertEquals("$choice", SettingValueBool(false, newer), pairOf(nas))
+        }
+    }
+
+    @Test fun 設定_一度も切り替えていない端末は設定のためだけに書かない() = run {
+        val nas = FakeNas()
+        val theirs = written(mineAdvanced(), pc, "p1")
+        val bytes = put(nas, theirs)
+        val seen = FakeSeen().apply { save("project-1", seenAt(theirs)) }
+        val settings = FakeSettings(Prefs.PairRawSetting(false, 0L))
+        val local = FakeLocal(snapshot(mineAdvanced()))
+
+        val open = syncWith(android, seen, settings).check(target(local, nas))
+        val background = syncWith(android, seen, settings).pushIfChanged(target(local, nas)).await()
+
+        assertEquals(SyncOutcome.Settled(null), open)
+        assertEquals(SyncOutcome.Settled(null), background)
+        assertArrayEquals(bytes, nas.files[catalog])
+        // 選別状況を書くときは、at が 0 でも値は書く。
+        local.snapshot = snapshot(mineFurther())
+        assertTrue(syncWith(android, seen, settings).check(target(local, nas)) is SyncOutcome.Pushed)
+        assertEquals(SettingValueBool(false, 0L), pairOf(nas))
     }
 }
