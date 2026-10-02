@@ -96,14 +96,22 @@ object Persist {
     private val writers = java.util.concurrent.ConcurrentHashMap<String, LatestWriter<() -> Unit>>()
 
     suspend fun latest(key: String, job: () -> Unit) {
+        submit(key, job).await()
+    }
+
+    /**
+     * **呼んだその場で列に積む**（待たない。U50・D14）。画面の scope で `launch { save() }` すると、
+     * 起動が次のフレームまで遅れ、その前に戻ると画面の scope ごと取り消されて最後の 1 組が消える。
+     * 積んだ分は、画面が無くなってもアプリの列で書かれ、[settle] はそれを待つ。
+     */
+    fun submit(key: String, job: () -> Unit): kotlinx.coroutines.Deferred<Unit> =
         writers.computeIfAbsent(key) {
             LatestWriter(
                 scope,
                 write = { it() },
                 onError = { android.util.Log.w("Persist", "保存に失敗した: $key", it) }
             )
-        }.submit(job).await()
-    }
+        }.submit(job)
 
     /** その書き込み先の列が空になるまで待つ。**値は足さない**（頼まれた最後の保存を消さない）。 */
     suspend fun settle(key: String) {

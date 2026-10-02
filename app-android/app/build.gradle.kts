@@ -109,4 +109,6 @@ dependencies {
     testImplementation("junit:junit:4.13.2")
     // UniFFI の Kotlin を JVM で動かすための JNA（aar には PC 向けの本体が入っていない）。
     testImplementation("net.java.dev.jna:jna:5.14.0")
+    // android.jar の org.json は JVM のテストでは中身が無い。保存形式の読み書きを確かめるため（U50・A17）。
+    testImplementation("org.json:json:20250107")
 }

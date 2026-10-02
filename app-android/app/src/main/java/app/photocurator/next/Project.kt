@@ -86,15 +86,22 @@ object Projects {
 
     private fun file(context: Context) = File(context.filesDir, FILE)
 
-    suspend fun all(context: Context): List<Project> = withContext(Dispatchers.IO) {
-        val target = file(context)
-        if (!target.exists()) return@withContext emptyList()
-        try {
-            val array = org.json.JSONArray(target.readText())
-            val read = (0 until array.length()).map { at ->
+    /** 読んだ結果。[unknown] は読めなかった 1 件ずつの JSON（書き戻すときに落とさない）。 */
+    internal data class Parsed(val projects: List<Project>, val unknown: List<String>)
+
+    /**
+     * 読む。**1 件ずつ読み、読めない 1 件で全体を空にしない**（U50・A17 (a)）。
+     * 全体が JSON の配列として読めなければ例外（呼ぶ側が写しを残す）。
+     */
+    internal fun parse(text: String): Parsed {
+        val array = org.json.JSONArray(text)
+        val projects = ArrayList<Project>()
+        val unknown = ArrayList<String>()
+        for (at in 0 until array.length()) {
+            try {
                 val entry = array.getJSONObject(at)
                 val source = entry.getJSONObject("source")
-                Project(
+                projects += Project(
                     id = entry.getString("id"),
                     name = entry.getString("name"),
                     source = Source(
@@ -105,36 +112,84 @@ object Projects {
                     createdAt = entry.getLong("created"),
                     updatedAt = entry.getLong("updated")
                 )
-            // **更新順。** 2 回目以降は続きから始めることの方が多い。
-            }.sortedByDescending { it.updatedAt }
-            lastSeen = read
-            read
-        } catch (error: Exception) {
-            Log.w(TAG, "プロジェクトを読めなかった", error)
-            emptyList()
+            } catch (error: Exception) {
+                // 新しい版が書いた種類・欠けた 1 件。**捨てずに中身のまま持っておく。**
+                unknown += array.get(at).toString()
+            }
+        }
+        // **更新順。** 2 回目以降は続きから始めることの方が多い。
+        return Parsed(projects.sortedByDescending { it.updatedAt }, unknown)
+    }
+
+    /** 書く形。[unknown]（読めなかった 1 件）は、そのまま後ろに付ける。 */
+    internal fun serialize(projects: List<Project>, unknown: List<String>): String {
+        val array = org.json.JSONArray()
+        for (project in projects) {
+            array.put(
+                org.json.JSONObject()
+                    .put("id", project.id)
+                    .put("name", project.name)
+                    .put("created", project.createdAt)
+                    .put("updated", project.updatedAt)
+                    .put(
+                        "source",
+                        org.json.JSONObject()
+                            .put("kind", project.source.kind.id)
+                            .put("label", project.source.label)
+                            .put("key", project.source.key)
+                    )
+            )
+        }
+        for (raw in unknown) {
+            try {
+                array.put(org.json.JSONTokener(raw).nextValue())
+            } catch (error: Exception) {
+                array.put(raw)
+            }
+        }
+        return array.toString()
+    }
+
+    /** 最後に読んだときの、読めなかった 1 件ずつ。[save] で書き戻す。 */
+    @Volatile
+    private var unknownSeen: List<String> = emptyList()
+
+    suspend fun all(context: Context): List<Project> = withContext(Dispatchers.IO) {
+        // **全体が読めなければ、元のファイルの写しを `projects.broken-<時刻>.json` に残す**（D2 と同じ）。
+        // 空の一覧に新しい 1 件を足して保存しても、前の中身は写しに残る。
+        when (val read = file(context).readStored(Parsed(emptyList(), emptyList())) { parse(it) }) {
+            is Stored.Ok -> {
+                if (read.value.unknown.isNotEmpty()) {
+                    Log.w(TAG, "読めないプロジェクトが ${read.value.unknown.size} 件（書き戻すときも残す）")
+                }
+                unknownSeen = read.value.unknown
+                unsafeToWrite = false
+                lastSeen = read.value.projects
+                read.value.projects
+            }
+            is Stored.Broken -> {
+                Log.w(TAG, "プロジェクトを読めなかった: ${read.reason}。控え: ${read.keptAs?.name}")
+                unknownSeen = emptyList()
+                // 写しを残せなかった（読み込みそのものの失敗など）なら、**上書きしない**。
+                // 空の一覧に 1 件足して書くと、前の中身がどこにも残らない。
+                unsafeToWrite = read.keptAs == null && file(context).exists()
+                emptyList()
+            }
         }
     }
 
+    /** 前の中身をどこにも残せていないので、書くと失う。次に読めるまで書かない。 */
+    @Volatile
+    private var unsafeToWrite = false
+
     suspend fun save(context: Context, projects: List<Project>) = withContext(Dispatchers.IO) {
+        if (unsafeToWrite) {
+            Log.w(TAG, "プロジェクトの一覧を読めていないので、上書きしない")
+            return@withContext
+        }
         try {
-            val array = org.json.JSONArray()
-            for (project in projects) {
-                array.put(
-                    org.json.JSONObject()
-                        .put("id", project.id)
-                        .put("name", project.name)
-                        .put("created", project.createdAt)
-                        .put("updated", project.updatedAt)
-                        .put(
-                            "source",
-                            org.json.JSONObject()
-                                .put("kind", project.source.kind.id)
-                                .put("label", project.source.label)
-                                .put("key", project.source.key)
-                        )
-                )
-            }
-            file(context).writeAtomically { it.writeText(array.toString()) }
+            val text = serialize(projects, unknownSeen)
+            file(context).writeAtomically { it.writeText(text) }
         } catch (error: Exception) {
             Log.w(TAG, "プロジェクトを保存できなかった", error)
         }

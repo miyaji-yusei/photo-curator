@@ -119,6 +119,20 @@ data class Photo(
         }
 }
 
+/**
+ * 取り直した一覧と、**欠けていないか**（U50・レビュー D8）。
+ * NAS の入れ子で読めなかったフォルダがある・上限で止めたとき、欠けた一覧で控えを置き換えない。
+ */
+data class Listed(
+    val photos: List<Photo>,
+    /** 読めなかったフォルダの数。 */
+    val incomplete: Int = 0,
+    /** 深さか枚数の上限で、たどり切れなかったか。 */
+    val truncated: Boolean = false
+) {
+    val complete: Boolean get() = incomplete == 0 && !truncated
+}
+
 /** `photo.smb?.path` のような書き方を残すための計算プロパティ。**保持はしない。** */
 val Photo.smb: SmbRef? get() = remote as? SmbRef
 
@@ -207,13 +221,24 @@ object Photos {
      * 読めなかったら**理由を投げる**。準備はこちらを使う（つまずきとして残すため）。
      * Amazon の「リンクが消えた」をここで拾えないと、空のプロジェクトに見える。
      */
-    suspend fun list(context: Context, source: Source, pairRaw: Boolean = true): List<Photo> =
+    suspend fun list(context: Context, source: Source, pairRaw: Boolean = true): List<Photo> {
+        val listed = listing(context, source, pairRaw)
+        // **欠けた一覧を、欠けていない顔で渡さない**（U50・D8）。理由を投げる。
+        if (!listed.complete) throw IllegalStateException(Prepare.incompleteReason(listed, hadPrevious = false))
+        return listed.photos
+    }
+
+    /**
+     * 一覧と、**欠けていないか**（U50・D8）。準備（[Prepare.run]）はこちらを使い、欠けていれば
+     * 前の控えを残す。端末と Amazon は欠けることがない（読めなければ例外）。
+     */
+    suspend fun listing(context: Context, source: Source, pairRaw: Boolean = true): Listed =
         when (source.kind) {
             // **組の RAW を外すのは端末と NAS だけ**（U49。PC の U46 と同じ規則）。
             // Amazon は中身の種類で選んでいて、RAW の扱いは従来どおり。
-            SourceKind.Album -> RawFiles.skipPairedRaw(photos(context, source.key), pairRaw) { it.relativePath }
-            SourceKind.Nas -> RawFiles.skipPairedRaw(fromNas(context, source.key), pairRaw) { it.relativePath }
-            SourceKind.Amazon -> fromAmazon(source.key)
+            SourceKind.Album -> Listed(RawFiles.skipPairedRaw(photos(context, source.key), pairRaw) { it.relativePath })
+            SourceKind.Nas -> fromNas(context, source.key, pairRaw)
+            SourceKind.Amazon -> Listed(fromAmazon(source.key))
         }
 
     /** Amazon の共有リンクの写真。**撮影時刻の昇順で来る。** */
@@ -244,7 +269,7 @@ object Photos {
      * EXIF は原本の先頭 64KB に入っているので、そこだけ読む。
      * 読めたぶんはハッシュ値と一緒に控えるので、2 回目以降は網に行かない。
      */
-    private suspend fun fromNas(context: Context, key: String): List<Photo> {
+    private suspend fun fromNas(context: Context, key: String, pairRaw: Boolean): Listed {
         val nasId = key.substringBefore("|")
         val deep = key.endsWith("|**")
         val folder = key.removeSuffix("|**").substringAfter("|")
@@ -255,11 +280,23 @@ object Photos {
         val password = NasPasswords.password(context, nas)
             ?: throw IllegalStateException("NAS のパスワードが要ります")
         // **「以下ぜんぶ」なら入れ子もたどる。** 印は鍵の末尾に付いている。
+        // 1 階層だけのときは、読めなければ全体が失敗になる（欠けることはない）。
         val listed = if (deep) Smb.photosDeep(nas, password, folder)
-        else Smb.photos(nas, password, folder)
+        else when (val flat = Smb.photos(nas, password, folder)) {
+            is SmbResult.Failed -> flat
+            is SmbResult.Ok -> SmbResult.Ok(Smb.Scan(flat.value, emptyList(), truncated = false))
+        }
         if (listed is SmbResult.Failed) throw IllegalStateException(listed.reason)
         listed as SmbResult.Ok
-        return listed.value.map { entry ->
+        return fromScan(nasId, listed.value, pairRaw)
+    }
+
+    /**
+     * NAS をたどった結果を写真に（U50: 欠けていたかを一緒に運ぶ）。組の RAW を外す規則（U49）は
+     * ここで当てる。**網には行かない**（テストで確かめられるように分けた）。
+     */
+    internal fun fromScan(nasId: String, scan: Smb.Scan, pairRaw: Boolean): Listed {
+        val photos = scan.photos.map { entry ->
             Photo(
                 // MediaStore の id は無いので、道筋から作る。**同じ道筋なら同じ値。**
                 id = entry.path.hashCode().toLong() and 0xffffffffL,
@@ -271,6 +308,11 @@ object Photos {
                 remote = SmbRef(nasId, entry.path)
             )
         }
+        return Listed(
+            RawFiles.skipPairedRaw(photos, pairRaw) { it.relativePath },
+            incomplete = scan.unreadable.size,
+            truncated = scan.truncated
+        )
     }
 
     /** あるアルバムの写真。**撮影時刻の昇順**で返す。 */

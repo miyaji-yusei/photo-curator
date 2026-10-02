@@ -144,7 +144,9 @@ fun ProjectScreen(
 
     // 準備の進みを見る。**持ち主はアプリなので、画面はただ映すだけ。**
     val prepared by Preparations.watch().collectAsState()
-    LaunchedEffect(prepared, project.id) {
+    // **このプロジェクトの進みだけを鍵にする**（A12）。全体の Map を鍵にすると、他のプロジェクトの
+    // 準備が 10 枚進むたびに、止まっているこちらの控え（一覧・ハッシュ値）を全部読み直していた。
+    LaunchedEffect(prepared[project.id], project.id) {
         val mine = prepared[project.id] ?: return@LaunchedEffect
         preparing = mine.meta
         rendering = mine.display
@@ -228,7 +230,9 @@ fun ProjectScreen(
 
     val live = session
     val ratings = live?.ratings ?: emptyMap()
-    val starred = photos.count { (ratings[it.relativePath] ?: 0) > 0 }
+    // 準備の進み（10 枚ごと）で組み直されても、全写真を数え直さない（A12）。
+    val starred = remember(photos, ratings) { photos.count { (ratings[it.relativePath] ?: 0) > 0 } }
+    val photoSpan = remember(photos) { span(photos) }
     val bursts = live?.members?.size ?: 0
 
     // 拡大は画面を覆う。**開いているあいだ下は組まない。**
@@ -298,7 +302,7 @@ fun ProjectScreen(
                     Text(
                         // **いつ撮ったものかを 1 行で。** 同じ名前のフォルダが
                         // 並んだとき、枚数だけでは見分けがつかない。
-                        "${photos.size} 枚" + span(photos)?.let { " · $it" }.orEmpty(),
+                        "${photos.size} 枚" + photoSpan?.let { " · $it" }.orEmpty(),
                         fontSize = 12.sp, color = Faint,
                         modifier = Modifier.padding(top = 6.dp)
                     )

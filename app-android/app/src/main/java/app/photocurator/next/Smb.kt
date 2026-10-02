@@ -526,38 +526,93 @@ object Smb {
     suspend fun photosDeep(
         nas: Nas,
         password: String,
+        folder: String
+    ): SmbResult<Scan> = connect(nas, password) { share ->
+        val scan = scanDeep(folder, { path ->
+            share.list(path).map { entry ->
+                Entry(
+                    name = entry.fileName,
+                    folder = isFolder(entry),
+                    size = entry.endOfFile,
+                    modifiedAt = entry.lastWriteTime.toEpochMillis()
+                )
+            }
+        })
+        for (path in scan.unreadable) Log.w(TAG, "たどれなかった: $path")
+        if (scan.truncated) Log.w(TAG, "上限（深さ $DEEP_MAX_DEPTH・$DEEP_LIMIT 枚）で数えきれなかった: $folder")
+        scan
+    }
+
+    /** 一覧の 1 件。**smbj の型に頼らない形**にして、たどり方を偽の NAS で確かめられるようにする（U50）。 */
+    data class Entry(val name: String, val folder: Boolean, val size: Long, val modifiedAt: Long)
+
+    /**
+     * 入れ子をたどった結果。**読めなかったフォルダと、上限で止めたことを隠さない**（U50・レビュー D8）。
+     * 欠けた一覧で控えを置き換えると、写真が一覧から抜け、ハッシュ値の控えも消える。
+     */
+    data class Scan(
+        val photos: List<SmbPhoto>,
+        /** 読めなかったフォルダの道筋。 */
+        val unreadable: List<String>,
+        /** 深さか枚数の上限で、たどり切れなかったか。 */
+        val truncated: Boolean
+    ) {
+        val complete: Boolean get() = unreadable.isEmpty() && !truncated
+    }
+
+    /**
+     * たどる深さの上限。**事故（共有の根を選んだ等）で網を延々と歩かないため。**
+     * U50 で 4 から広げた（超えたら黙って切らず「不完全」になるので、普通の置き方で当たらない値に）。
+     */
+    const val DEEP_MAX_DEPTH = 8
+
+    /** 集める枚数の上限。U50 で 20,000 から広げた（超えたら「不完全」）。 */
+    const val DEEP_LIMIT = 50_000
+
+    /**
+     * フォルダの下を全部たどる（中身は [list] で読む。テストでは偽物を渡す）。
+     *
+     * **選んだフォルダそのものが読めなければ例外**（空の一覧にしない）。途中のフォルダが
+     * 読めなければ [Scan.unreadable] に残して続ける。上限に当たったら [Scan.truncated]。
+     */
+    internal fun scanDeep(
         folder: String,
-        limit: Int = 20000
-    ): SmbResult<List<SmbPhoto>> = connect(nas, password) { share ->
+        list: (String) -> List<Entry>,
+        maxDepth: Int = DEEP_MAX_DEPTH,
+        limit: Int = DEEP_LIMIT
+    ): Scan {
         val found = ArrayList<SmbPhoto>()
+        val unreadable = ArrayList<String>()
+        var truncated = false
         fun walk(path: String, depth: Int) {
-            if (depth > 4 || found.size >= limit) return
-            val entries = try {
-                share.list(path)
+            val entries = if (depth == 0) list(path) else try {
+                list(path)
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
             } catch (error: Exception) {
-                Log.w(TAG, "たどれなかった: " + path, error)
+                unreadable += path
                 return
             }
             for (entry in entries) {
-                val name = entry.fileName
+                if (truncated) return
+                val name = entry.name
                 if (name == "." || name == ".." || name.startsWith(".")) continue
                 val child = if (path.isEmpty()) name else path + "\\" + name
                 if (isPhoto(name)) {
-                    found += SmbPhoto(
-                        name = name,
-                        path = child,
-                        size = entry.endOfFile,
-                        modifiedAt = entry.lastWriteTime.toEpochMillis()
-                    )
-                    if (found.size >= limit) return
-                } else if (isFolder(entry)) {
-                    walk(child, depth + 1)
+                    if (found.size >= limit) {
+                        truncated = true
+                        return
+                    }
+                    found += SmbPhoto(name = name, path = child, size = entry.size, modifiedAt = entry.modifiedAt)
+                } else if (entry.folder) {
+                    if (depth + 1 > maxDepth) truncated = true
+                    else walk(child, depth + 1)
                 }
             }
         }
         walk(folder, 0)
         // **使う値そのもので並べる。** 同時刻は道筋で決める（毎回同じ順）。
-        found.sortedWith(compareBy({ it.modifiedAt }, { it.path }))
+        return Scan(found.sortedWith(compareBy({ it.modifiedAt }, { it.path })), unreadable, truncated)
     }
 
     /**
