@@ -83,14 +83,16 @@ fun SidecarClashDialog(
                     Choice(SidecarSync.CHOICE_KEEP_MINE) { onChoose(ClashChoice.KeepMine) }
                     Choice(SidecarSync.CHOICE_WRITE_MINE) { onChoose(ClashChoice.WriteMine) }
                 }
+                // ROUND か対象の★が違えば、混ぜる 2 つは押せなくして理由を出す（U45）。
+                val mergeable = clash.preview.mergeable
                 val mixed: @Composable ColumnScope.() -> Unit = {
-                    Choice(SidecarSync.CHOICE_INTERSECTION, SidecarSync.intersectionLine(clash.preview)) {
+                    Choice(SidecarSync.CHOICE_INTERSECTION, SidecarSync.intersectionLine(clash.preview), mergeable) {
                         onChoose(ClashChoice.Intersection)
                     }
-                    Choice(SidecarSync.CHOICE_UNION, SidecarSync.unionLine(clash.preview)) {
+                    Choice(SidecarSync.CHOICE_UNION, SidecarSync.unionLine(clash.preview), mergeable) {
                         onChoose(ClashChoice.Union)
                     }
-                    SidecarSync.midRoundLine(clash.preview)?.let {
+                    SidecarSync.mergeNote(clash.preview)?.let {
                         Text(it, fontSize = 11.sp, color = Warn, modifier = Modifier.padding(top = 2.dp))
                     }
                 }
@@ -129,10 +131,11 @@ private fun Side(label: String, line: String, ahead: Boolean, tint: Color) {
 
 /** 選択肢 1 つ。**どれも同じ見た目**（既定のボタンを作らない）。 */
 @Composable
-private fun Choice(text: String, hint: String? = null, onClick: () -> Unit) {
+private fun Choice(text: String, hint: String? = null, enabled: Boolean = true, onClick: () -> Unit) {
     Column(Modifier.fillMaxWidth()) {
         OutlinedButton(
             onClick = onClick,
+            enabled = enabled,
             shape = RoundedCornerShape(12.dp),
             modifier = Modifier.fillMaxWidth()
         ) {
