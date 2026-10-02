@@ -41,3 +41,19 @@ export function asidesToDrop(names: string[], tag: string, keep: number = ASIDE_
     .slice(keep)
     .map(entry => entry.name)
 }
+
+/**
+ * 同じ印・同じ秒の退避に付ける番号の始まり（今ある番号の最大 + 1。無ければ 1）。片付けで消えた番号を
+ * 使い直すと、新しい退避が番号の小さい（古い）扱いになって、すぐ片付けられてしまうため。
+ */
+export function nextAsideNumber(names: string[], tag: string, stamp: string): number {
+  const prefix = `catalog.${tag}.${stamp}`
+  let max = 0
+  for (const name of names) {
+    if (!name.startsWith(prefix) || !name.endsWith('.json')) continue
+    const rest = name.slice(prefix.length, -'.json'.length)
+    const n = rest === '' ? 1 : /^-\d+$/.test(rest) ? Number(rest.slice(1)) : 0
+    if (n > max) max = n
+  }
+  return max + 1
+}

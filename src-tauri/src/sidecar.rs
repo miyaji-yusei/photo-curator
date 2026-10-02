@@ -437,8 +437,21 @@ pub fn write_aside_at(folder: &Path, tag: &str, json: &str, now: SystemTime) -> 
     let dir = sidecar_dir(folder);
     fs::create_dir_all(&dir).map_err(|error| format!("サイドカーのフォルダを作れませんでした: {error}"))?;
     let stamp = utc_stamp(now);
+    // 同じ秒の退避より後ろの番号から（片付けで消えた番号を使い直すと、新しい退避が古い扱いで消える）。
+    let first = fs::read_dir(&dir)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .filter_map(|entry| parse_aside(&entry.file_name().to_string_lossy(), tag))
+                .filter(|(found, _)| *found == stamp)
+                .map(|(_, n)| n)
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0)
+        + 1;
     let mut written = None;
-    for n in 1..=9 {
+    for n in first..first + 9 {
         let name = aside_name(tag, &stamp, n);
         match fs::OpenOptions::new().write(true).create_new(true).open(dir.join(&name)) {
             Ok(mut file) => {
@@ -634,6 +647,14 @@ mod tests {
         let second = write_aside_at(&folder, "abc", "v2", at_utc(base)).unwrap();
         assert_eq!(second, "catalog.abc.20261003040506-2.json");
         assert_eq!(fs::read_to_string(dir.join(&first)).unwrap(), "v1");
+        // 同じ秒に 7 つ書いても、どれも別の名前で、片付けで消えるのは古い番号から。
+        let mut same: Vec<String> = Vec::new();
+        for index in 0..7 {
+            same.push(write_aside_at(&folder, "burst", &format!("b{index}"), at_utc(base)).unwrap());
+        }
+        let unique: std::collections::HashSet<&String> = same.iter().collect();
+        assert_eq!(unique.len(), 7);
+        assert!(dir.join(same.last().unwrap()).exists(), "いちばん新しい退避は残る");
         for offset in 1..=5 {
             write_aside_at(&folder, "abc", "later", at_utc(base + offset)).unwrap();
         }

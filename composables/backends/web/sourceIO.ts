@@ -9,7 +9,7 @@
  * 将来 Swift の殻に包むときは、`SourceIO` を実装した橋をここへ差し込む。
  */
 
-import { ASIDE_KEEP, asideName, asideStamp, asidesToDrop } from '~/utils/sidecarAside'
+import { ASIDE_KEEP, asideName, asideStamp, asidesToDrop, nextAsideNumber } from '~/utils/sidecarAside'
 
 export interface SourceEntry {
   name: string
@@ -276,8 +276,17 @@ export class HandleFolderIO implements SourceIO {
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(tag)) throw new Error('退避のファイル名が正しくありません。')
     const dir = await this.root.getDirectoryHandle(SIDECAR_DIR, { create: true })
     const stamp = asideStamp(Date.now())
+    const listNames = async () => {
+      const names: string[] = []
+      for await (const [entry] of (dir as unknown as { entries(): AsyncIterable<[string, unknown]> }).entries()) {
+        names.push(entry)
+      }
+      return names
+    }
+    // 同じ秒の退避より後ろの番号から（片付けで消えた番号を使い直すと、新しい退避が古い扱いで消える）。
+    const first = nextAsideNumber(await listNames().catch(() => []), tag, stamp)
     let name: string | null = null
-    for (let n = 1; n <= 9 && !name; n++) {
+    for (let n = first; n < first + 9 && !name; n++) {
       const candidate = asideName(tag, stamp, n)
       try {
         await dir.getFileHandle(candidate)
@@ -298,11 +307,7 @@ export class HandleFolderIO implements SourceIO {
     }
     // 同じ印の時刻つきの退避は、新しい 5 つだけ残す（片付けの失敗は止めない）。
     try {
-      const names: string[] = []
-      for await (const [entry] of (dir as unknown as { entries(): AsyncIterable<[string, unknown]> }).entries()) {
-        names.push(entry)
-      }
-      for (const old of asidesToDrop(names, tag, ASIDE_KEEP)) await dir.removeEntry(old).catch(() => undefined)
+      for (const old of asidesToDrop(await listNames(), tag, ASIDE_KEEP)) await dir.removeEntry(old).catch(() => undefined)
     } catch {
       // 片付けられなくても、退避は書けている。
     }
