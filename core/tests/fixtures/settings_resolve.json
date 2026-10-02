@@ -1,0 +1,37 @@
+{
+  "_comment": "U48: catalog.json の settings（pairRawJpeg）の同期。cargo test（core/tests/fixtures_match.rs）と wasm（tests/core-wasm-sidecar.test.mjs）が同じ答えを出すこと。local は端末の設定、remote は NAS の catalog.json の settings（null は無い）。",
+  "cases": [
+    { "name": "両方に無い", "local": null, "remote": null, "expected": "Keep" },
+    { "name": "NAS だけにある", "local": null, "remote": { "pairRawJpeg": { "value": false, "at": 5 } }, "expected": { "AdoptRemote": { "value": false, "at": 5 } } },
+    { "name": "端末だけにある", "local": { "pairRawJpeg": { "value": true, "at": 0 } }, "remote": null, "expected": "PushLocal" },
+    { "name": "NAS の settings に pairRawJpeg が無い（未知の設定だけ）", "local": { "pairRawJpeg": { "value": true, "at": 0 } }, "remote": { "futureThing": { "value": 1 } }, "expected": "PushLocal" },
+    { "name": "値が同じなら時刻が違っても何もしない", "local": { "pairRawJpeg": { "value": true, "at": 0 } }, "remote": { "pairRawJpeg": { "value": true, "at": 1790955613101 } }, "expected": "Keep" },
+    { "name": "端末の方が新しく切り替えた", "local": { "pairRawJpeg": { "value": false, "at": 1790955613200 } }, "remote": { "pairRawJpeg": { "value": true, "at": 1790955613101 } }, "expected": "PushLocal" },
+    { "name": "NAS の方が新しく切り替えた", "local": { "pairRawJpeg": { "value": true, "at": 0 } }, "remote": { "pairRawJpeg": { "value": false, "at": 1790955613101 } }, "expected": { "AdoptRemote": { "value": false, "at": 1790955613101 } } },
+    { "name": "同じ時刻で値が違えば NAS", "local": { "pairRawJpeg": { "value": true, "at": 7 } }, "remote": { "pairRawJpeg": { "value": false, "at": 7 } }, "expected": { "AdoptRemote": { "value": false, "at": 7 } } }
+  ],
+  "catalog_without_settings": {
+    "version": 2,
+    "updatedAt": 5,
+    "updatedBy": "android-id",
+    "updatedByName": "Pixel 8",
+    "photos": { "a.jpg": { "rating": 1 } },
+    "burstOverrides": [],
+    "sessions": {},
+    "writeId": "w-1",
+    "keyBase": "folder"
+  },
+  "catalog_with_settings": {
+    "version": 2,
+    "updatedAt": 6,
+    "updatedBy": "pc-id",
+    "updatedByName": "DESKTOP-ABC",
+    "photos": { "a.jpg": { "rating": 1 } },
+    "burstOverrides": [],
+    "sessions": {},
+    "writeId": "w-2",
+    "basedOn": "w-1",
+    "keyBase": "folder",
+    "settings": { "pairRawJpeg": { "value": false, "at": 1790955613101 }, "futureThing": { "value": 3 } }
+  }
+}

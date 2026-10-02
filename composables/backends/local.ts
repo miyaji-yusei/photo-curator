@@ -146,6 +146,7 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
       burstThresholdLearnedAt: row.burstThresholdLearnedAt,
       sourceKind: source.kind === 'amazon' ? 'amazon' : 'folder',
       pairRawJpeg: row.pairRawJpeg !== false,
+      pairRawJpegAt: row.pairRawJpegAt ?? 0,
       source: source.kind,
       ...(folderAccess ? { folderAccess } : {})
     }
@@ -872,8 +873,9 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
       if (edge !== null) await store.patchProject(projectId, { displayEdge: nearestDisplayEdge(edge) })
       return displayEdgeOf(projectId)
     },
-    saveProjectPairRaw: async (projectId: string, enabled: boolean) => {
-      await store.patchProject(projectId, { pairRawJpeg: enabled })
+    saveProjectPairRaw: async (projectId: string, enabled: boolean, at?: number) => {
+      // 切り替えた時刻も残す（サイドカーで新しく切り替えた方を採るため。U48）。
+      await store.patchProject(projectId, { pairRawJpeg: enabled, pairRawJpegAt: at ?? Date.now() })
       return enabled
     },
     // 準備と同時に作っているので、あとから溜まる分は無い。

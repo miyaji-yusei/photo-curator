@@ -246,4 +246,25 @@ describe('core-wasm のサイドカー同期（U33）', () => {
     delete legacy.keyBase
     expect(sidecarToJson(legacy)).not.toMatch(/writeId|basedOn|lineage|epoch|keyBase|progress/)
   })
+
+  it('U48: 設定（settings.pairRawJpeg）の判断がフィクスチャ（cargo test と同じ）と一致し、比較キーに入らない', () => {
+    const settings = JSON.parse(
+      readFileSync(join(root, '..', 'core', 'tests', 'fixtures', 'settings_resolve.json'), 'utf-8')
+    )
+    for (const item of settings.cases) {
+      expect(wasm.settingsResolve(item.local, item.remote), item.name).toEqual(item.expected)
+    }
+    const without = sidecarFromJson(JSON.stringify(settings.catalog_without_settings))
+    const withSettings = sidecarFromJson(JSON.stringify(settings.catalog_with_settings))
+    expect(withSettings.settings).toEqual(settings.catalog_with_settings.settings)
+    expect(wasm.judgementKey(wasm.sidecarJudgement(withSettings)))
+      .toBe(wasm.judgementKey(wasm.sidecarJudgement(without)))
+    // 書き戻しても未知の設定を保つ。settings の無い版には足さない。
+    expect(JSON.parse(sidecarToJson(withSettings)).settings).toEqual(settings.catalog_with_settings.settings)
+    expect(JSON.parse(sidecarToJson(without))).toEqual(settings.catalog_without_settings)
+    // 書く前の刻印は、置き換える版の未知の設定を引き継ぐ（端末の値は端末のまま）。
+    const mine = { ...without, settings: { pairRawJpeg: { value: true, at: 0 } } }
+    const stamped = wasm.sidecarStamp(mine, 'w-3', withSettings)
+    expect(stamped.settings).toEqual({ pairRawJpeg: { value: true, at: 0 }, futureThing: { value: 3 } })
+  })
 })

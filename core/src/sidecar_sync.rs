@@ -580,11 +580,15 @@ pub fn sidecar_seen(sidecar: Sidecar) -> SeenRecord {
 /// 書く直前に、v2 の印を入れる: `version`・`writeId`（呼ぶ側が作った乱数）・
 /// `basedOn`／`lineage`（いま NAS にある、置き換える版。無ければ None）・`keyBase`・`progress`。
 ///
+/// 設定（`settings`）は、`base` にあって `sidecar` に無いものを引き継ぐ（未知の設定を消さない。U48）。
+///
 /// 鍵は先にフォルダ形式（`sidecar_keys_to_folder`）にしておく。
 pub fn sidecar_stamp(sidecar: Sidecar, write_id: String, base: Option<Sidecar>) -> Sidecar {
     let mut out = sidecar;
     out.version = SIDECAR_VERSION;
     out.write_id = Some(write_id);
+    // 設定は、置き換える版にあって端末に無いもの（未知の設定など）を引き継ぐ（U48）。
+    out.settings = carried_settings(out.settings.take(), base.as_ref().and_then(|base| base.settings.as_ref()));
     match base {
         Some(base) => {
             let token = token_of(&base);
@@ -608,6 +612,122 @@ pub fn sidecar_stamp(sidecar: Sidecar, write_id: String, base: Option<Sidecar>) 
     progress.total = Some(total as u32);
     out.progress = Some(progress);
     out
+}
+
+// ---------------------------------------------------------------------------
+// プロジェクトの設定（U48。catalog.json の `settings`）
+// ---------------------------------------------------------------------------
+//
+// ユーザー決定（2026-10-03）: 「同名の JPEG と RAW を 1 枚の写真として扱う」（pairRawJpeg）の
+// ON・OFF もサイドカーに書いて同期する。端末どうしで違えば**新しく切り替えた方**を採る
+// （確認ダイアログは出さない。選別状況の食い違いとは別扱い）。
+//
+// **設定は選別状況ではない。** 正規形（Judgement）・比較キー・`judgement_equivalent`・
+// `sidecar_seen` には入れない（設定を変えただけで「端末が変わった」や確認にならない）。
+
+/// 真偽の設定 1 つ（値と、切り替えた時刻 ms）。`at` が 0 なら「作ったまま一度も切り替えていない」。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SettingValueBool {
+    pub value: bool,
+    #[serde(default)]
+    pub at: i64,
+}
+
+/// catalog.json の `settings`。知っている設定は型つきで、**知らない設定は JSON の文字列のまま**
+/// `other` に持って書き戻す（新しい版のアプリが足した設定を、古い版が消さない）。
+///
+/// JSON では `other` の中身が `settings` の直下に並ぶ（`{"pairRawJpeg":{…},"未知の名前":…}`）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SettingsRecord {
+    /// 同名の JPEG と RAW を 1 枚の写真として扱う（U46）。
+    pub pair_raw_jpeg: Option<SettingValueBool>,
+    /// 知らない設定（名前 → その値の JSON 文字列）。
+    pub other: HashMap<String, String>,
+}
+
+const SETTING_PAIR_RAW_JPEG: &str = "pairRawJpeg";
+
+impl serde::Serialize for SettingsRecord {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        // 並びを決まった順にする（同じ中身なら同じ文字列）。
+        let mut others: Vec<(&String, &String)> =
+            self.other.iter().filter(|(name, _)| name.as_str() != SETTING_PAIR_RAW_JPEG || self.pair_raw_jpeg.is_none()).collect();
+        others.sort();
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(value) = &self.pair_raw_jpeg {
+            map.serialize_entry(SETTING_PAIR_RAW_JPEG, value)?;
+        }
+        for (name, raw) in others {
+            // 読めない文字列（手で入れたなど）は、文字列の値として残す。
+            let value: serde_json::Value =
+                serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.clone()));
+            map.serialize_entry(name, &value)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SettingsRecord {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut entries: BTreeMap<String, serde_json::Value> = serde::Deserialize::deserialize(deserializer)?;
+        // 型が違う pairRawJpeg は読み捨てる（全体を読めないことにはしない）。
+        let pair_raw_jpeg = entries
+            .remove(SETTING_PAIR_RAW_JPEG)
+            .and_then(|value| serde_json::from_value::<SettingValueBool>(value).ok());
+        let other = entries
+            .into_iter()
+            .map(|(name, value)| (name, serde_json::to_string(&value).unwrap_or_default()))
+            .collect();
+        Ok(SettingsRecord { pair_raw_jpeg, other })
+    }
+}
+
+/// 設定をどうするか（`settings_resolve`）。今は pairRawJpeg だけを見る。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SettingsPlan {
+    /// 何もしない（両方に無い・値が同じ）。
+    Keep,
+    /// NAS の値を端末に取り込む（端末の設定を `value` にし、切り替えた時刻を `at` にする）。
+    AdoptRemote { value: bool, at: i64 },
+    /// 端末の値を NAS に書く（NAS に無い・端末の方が新しく切り替えた）。
+    PushLocal,
+}
+
+/// 端末の設定（`local`）と、NAS の catalog.json の `settings`（`remote`）から、どうするか。
+///
+/// 1. どちらかが無ければ、ある方（NAS だけ → 取り込む、端末だけ → 書く、両方無い → 何もしない）
+/// 2. 両方あって値が同じ → 何もしない（時刻が違っても）
+/// 3. 値が違えば、切り替えた時刻（`at`）が新しい方。時刻が同じなら NAS
+///
+/// **時刻を比べるのは設定だけ。** 選別状況は時刻の大小では決めない（`sidecar_plan`）。
+pub fn settings_resolve(local: Option<SettingsRecord>, remote: Option<SettingsRecord>) -> SettingsPlan {
+    let mine = local.and_then(|record| record.pair_raw_jpeg);
+    let theirs = remote.and_then(|record| record.pair_raw_jpeg);
+    match (mine, theirs) {
+        (None, None) => SettingsPlan::Keep,
+        (None, Some(theirs)) => SettingsPlan::AdoptRemote { value: theirs.value, at: theirs.at },
+        (Some(_), None) => SettingsPlan::PushLocal,
+        (Some(mine), Some(theirs)) if mine.value == theirs.value => SettingsPlan::Keep,
+        (Some(mine), Some(theirs)) if mine.at > theirs.at => SettingsPlan::PushLocal,
+        (Some(_), Some(theirs)) => SettingsPlan::AdoptRemote { value: theirs.value, at: theirs.at },
+    }
+}
+
+/// 書く版の設定に、置き換える版（`base`）の設定のうち端末に無いものを足す
+/// （未知の設定・端末が持っていない設定を消さない）。
+fn carried_settings(mine: Option<SettingsRecord>, base: Option<&SettingsRecord>) -> Option<SettingsRecord> {
+    let Some(base) = base else {
+        return mine;
+    };
+    let mut out = mine.unwrap_or_default();
+    if out.pair_raw_jpeg.is_none() {
+        out.pair_raw_jpeg = base.pair_raw_jpeg;
+    }
+    for (name, raw) in &base.other {
+        out.other.entry(name.clone()).or_insert_with(|| raw.clone());
+    }
+    Some(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -671,6 +791,8 @@ fn total_of(sidecar: &Sidecar) -> u32 {
 /// 6. 早送り（NAS の版の系統に、端末が見た版がある。端末は変わっていない）→ 確認なしに取り込む。
 ///    ただし NAS の側がやり直した版（epoch が違う）は早送りにせず、#9 で確認する（U42）
 /// 7. 星とセッションが同じで、手直し・境目が片方にだけある → 持っている方に合わせる
+/// 7b. 版の見分けは違うが NAS の選別状況の比較キーが見た版のもの（ほかの端末が設定だけを書き直した版。
+///    U48）→ #3 と同じく、端末が変わっていれば確認せずに書く
 /// 8. 書けない共有 → 何もしない（この端末だけの結果）
 /// 9. やり直しが絡む → 確認
 /// 10. それ以外（両方着手済みで違う）→ 確認
@@ -804,6 +926,19 @@ pub fn sidecar_plan(
             }
             Extras::Conflict => return clash(ClashReason::ExtrasConflict),
         }
+    }
+
+    // 7b. 版の見分けは違うが、NAS の選別状況は見た版のまま（比較キーが見た版のものと同じ）。
+    //     ほかの端末が**設定だけ**を書き直した版（U48）。端末の変更は #3 と同じく確認せずに書く。
+    if !never_seen && !seen.key.is_empty() && remote_key == seen.key {
+        if !can_write {
+            return settled(blocked);
+        }
+        if detached {
+            return settled(SettledReason::Detached);
+        }
+        let aside_theirs = untouched(&local) && !untouched(&remote_judgement);
+        return SidecarPlan::Push { expected: Some(token), aside_theirs, reason: PushReason::LocalChanged };
     }
 
     // 8. 書けない共有。端末の分はそのまま。

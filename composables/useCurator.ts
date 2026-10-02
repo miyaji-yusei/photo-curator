@@ -93,7 +93,16 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   const desktop = withRatingsBarrier(backend, () => ratingsQueue.flush())
   const { notify } = useNotice()
   // サイドカー（写真のフォルダの `.photo-curator/catalog.json`）。開き方の判断は core の sidecarPlan が行う。
-  const sidecar = useSidecarSync(desktop)
+  // ほかの端末で切り替えた「同名の JPEG と RAW を 1 枚として扱う」を取り込んだら（U48）、画面のプロジェクトを
+  // 読み直す（お知らせは useSidecarSync が出す。写真への反映は「写真を再読み込み」で、自動では走査しない）。
+  const sidecar = useSidecarSync(desktop, {
+    onSettingsAdopted: async (projectId) => {
+      await refreshProjects()
+      if (activeProject.value?.id === projectId) {
+        activeProject.value = projects.value.find(item => item.id === projectId) ?? activeProject.value
+      }
+    }
+  })
   const {
     access: sidecarAccess, clash: sidecarClash, busy: sidecarBusy,
     message: sidecarMessage, notice: sidecarNotice, detached: sidecarDetached, savedAt: sidecarSavedAt
@@ -1078,6 +1087,8 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   /**
    * このプロジェクトの「同名の JPEG と RAW を 1 枚の写真として扱う」を切り替える。
    * 反映は次の走査から。変えたらその旨を知らせる（自動では走査しない）。
+   * 切り替えた時刻も保存し（backend）、ほかの端末へ届くようサイドカーにも書く（U48。いつもの自動の書き込み
+   * ＝区切りで書くのと同じ経路。選別状況が同じなら設定だけを書く。書けなければ次の区切りで書く）。
    */
   async function setPairRawJpeg(enabled: boolean) {
     const project = activeProject.value
@@ -1087,6 +1098,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
       await refreshProjects()
       activeProject.value = projects.value.find(item => item.id === project.id) ?? activeProject.value
       notify('設定を変えました。写真に反映するには「写真を再読み込み」を押してください。')
+      void flushThenPush().catch(() => undefined)
     } catch (cause) {
       error.value = cause instanceof Error ? cause.message : '設定を保存できませんでした。'
     }

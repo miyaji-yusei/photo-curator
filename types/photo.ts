@@ -91,6 +91,11 @@ export interface Project {
    */
   pairRawJpeg: boolean
   /**
+   * `pairRawJpeg` を切り替えた時刻（ms）。0・省略は「作ったまま一度も切り替えていない」。
+   * サイドカーで端末どうしの設定が違うとき、新しく切り替えた方を採るのに使う（U48）。
+   */
+  pairRawJpegAt?: number
+  /**
    * 写真の出所（ブラウザだけ）。省略はデスクトップ（フォルダ参照）。
    * `picker` は写真ピッカー、`folder` は File System Access のフォルダ、`dev` は開発用の HTTP。
    */

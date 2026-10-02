@@ -420,3 +420,55 @@ core の `core/src/sidecar_sync/tests.rs` に、関数名の末尾「_3のn」�
 ### 未確認
 - Tauri の実機（ロック・rename・NAS 越しの読み戻し）、Web の書き込み（File System Access。偽物でだけ確かめた）、ダイアログの実画面（書ける 2 台を用意できなかった）
 - Android は U35（今の Android は旧い判断のまま。PC が U34 で書いた v2 の catalog.json を読んでも壊れないことは U33 のテストで固定済み）
+
+## U48 「同名の JPEG と RAW を 1 枚として扱う」をサイドカーで同期する（2026-10-03）
+
+ユーザー決定（2026-10-03）: U46 のプロジェクト設定（PC・Web `pair_raw_jpeg`／`pairRawJpeg`、既定オン）の ON・OFF を、
+サイドカー（NAS のフォルダの `.photo-curator/catalog.json`。NAS 以外のプロジェクトは端末）にも記録して同期する。
+PC と Android で違う値にしたときは**新しく切り替えた方**を採る（確認ダイアログは出さない。選別状況の食い違いとは別扱い）。
+
+core・PC・Web は `fix/mb-u48-settings-sync` で済み（10章 §7 の U48 の行）。**Android の配線はこの節の依頼**。
+
+### 形（catalog.json v2 に足した省略可能な項目）
+
+```json
+"settings": { "pairRawJpeg": { "value": true, "at": 1790955613101 } }
+```
+
+- `at` は切り替えた時刻（ms）。0 は「作ったまま一度も切り替えていない」（NAS に値があれば NAS を採る）
+- 設定は**選別状況ではない**。比較キー・`judgementEquivalent`・`sidecarSeen` には入らない
+- 知らない設定は core が読んで書き戻す（`SettingsRecord.other`）。`sidecarStamp(mine, writeId, base)` は、
+  `base`（置き換える NAS の版）にあって `mine` に無い設定を引き継ぐ
+
+### core の API（UDL・Kotlin。`node scripts/build-core.mjs` で作り直すこと）
+
+- `Sidecar.settings: SettingsRecord?`（既定 null。今の Kotlin はそのままコンパイルできる）
+- `SettingsRecord(pairRawJpeg: SettingValueBool?, other: Map<String, String>)`（`other` は必須。新しく作るときは `emptyMap()`）
+- `SettingValueBool(value: Boolean, at: Long)`
+- `settingsResolve(local: SettingsRecord?, remote: SettingsRecord?): SettingsPlan`
+  - `SettingsPlan.Keep`／`SettingsPlan.AdoptRemote(value, at)`／`SettingsPlan.PushLocal`
+  - 規則: どちらかが無ければある方、両方あって値が同じなら Keep（at が違っても）、違えば at が新しい方、同じ at なら NAS
+- `sidecarPlan` の #7b: 版の見分けは違うが NAS の選別状況の比較キーが見た版のもの（ほかの端末が設定だけを書き直した版）なら、
+  #3 と同じく端末の変更を確認せずに書く（Push LocalChanged）。Android は呼ぶだけで効く
+
+### Android への依頼（U49 の写真の一覧・RAW・トグルの画面のあと）
+
+1. **設定の置き場**: プロジェクトごとに `pairRawJpeg`（既定 true）と `pairRawJpegAt`（既定 0）を持つ（U49 でトグルを足すときに一緒に）。
+   画面で切り替えたら `at = 今の時刻`。作成時に既定のままなら 0
+2. **書くとき**（`SidecarSync.folderSidecar`）: `settings = SettingsRecord(SettingValueBool(value, at), emptyMap())` を入れる（at が 0 でも値は書く）
+3. **読んだとき**（`sync` の中、`readRemote` のあと・`sidecarPlan` の前）: `settingsResolve(mine.settings, remote.settings)` を呼ぶ
+   - `AdoptRemote(value, at)`: 開いたとき（`SyncMode.Open`）はプロジェクトの設定を `value`・`at` にし、
+     「ほかの端末の設定に合わせて「同名の JPEG と RAW を 1 枚として扱う」を{オン/オフ}にしました。写真を反映するには「写真を再読み込み」を押してください。」を出す（自動では再走査しない）。
+     どのモードでも、この回に書く版（Push・C・D・E・退避）の `settings.pairRawJpeg` は NAS の値にする（古い端末の値で上書きしない）
+   - `PushLocal`: 書く版に端末の値を入れる（2 のとおり）
+4. **設定だけが変わったときに書く契機**: `sidecarPlan` が `Settled`（理由 `Same`・`NoChange`・`Nothing`）で、`PushLocal` かつ端末の `at > 0`、
+   書ける共有なら、既存の楽観ロックの書き込み（`push` と同じ経路・ロック・読み戻し）で書く。`Detached`・`ReadOnly`・`NewerVersion` では書かない。
+   一度も切り替えていない既定値のためだけには書かない。トグルを切り替えたら、いつもの区切りの書き込み（`pushIfChanged`）を呼ぶ
+5. **テスト**（JVM の `SidecarSyncTest` の偽物で、先に赤）: PC が切り替えた版を取り込む・新しい方が勝つ・同じなら何もしない・
+   settings なしの古い版・設定の違いだけでは確認も「変更あり」も出ない（PC 側は `tests/sidecarSync.test.mjs` の U48 の節と同じ場面）
+
+### 迷った点（PC・Web で決めたこと。Android も合わせる）
+
+- 自動の書き込み（背面へ回る・ラウンドの終わりなど）では端末の設定を変えない（お知らせを出せないため）。書く版にだけ NAS の値を入れ、
+  端末は次に開いたときに取り込む
+- 写真 0 枚で作った直後は走査が先に走るので、NAS の設定を取り込むのは走査のあと（お知らせで再読み込みを促す）

@@ -261,6 +261,9 @@ struct Project {
     source_kind: String,
     /// 同名の JPEG と RAW を 1 枚の写真として扱い、組の RAW を対象から外す（U46）。既定は true。
     pair_raw_jpeg: bool,
+    /// `pair_raw_jpeg` を切り替えた時刻（ms）。0 は「作ったまま一度も切り替えていない」。
+    /// サイドカーで端末どうしの設定が違うとき、新しく切り替えた方を採るのに使う（U48）。
+    pair_raw_jpeg_at: i64,
 }
 
 #[derive(Serialize)]
@@ -554,6 +557,8 @@ fn open_database(path: &Path) -> Result<Connection, String> {
     add_column_if_missing(&conn, "projects", "source_key", "TEXT")?;
     // 同名の JPEG と RAW を 1 枚の写真として扱う（U46）。既存のプロジェクトも既定の 1（オン）。
     add_column_if_missing(&conn, "projects", "pair_raw_jpeg", "INTEGER NOT NULL DEFAULT 1")?;
+    // その設定を切り替えた時刻（U48）。既存のプロジェクトは 0（一度も切り替えていない）。
+    add_column_if_missing(&conn, "projects", "pair_raw_jpeg_at", "INTEGER NOT NULL DEFAULT 0")?;
     // d_hash の算出方式。旧ビルドの行は NULL になり、キャッシュとして使われない。
     // 古い方式のハッシュと新しい方式のハッシュが混ざると連写判定が壊れるため、
     // 値を消さずに「使わない」ことで移行する。
@@ -2984,7 +2989,7 @@ fn run_burst_analysis(
 fn list_projects(app: AppHandle) -> Result<Vec<Project>, String> {
     let conn = connection(&app)?;
     let mut statement = conn
-        .prepare("SELECT id,name,folder_path,photo_count,status,created_at,updated_at,burst_threshold,burst_threshold_learned_at,source_kind,pair_raw_jpeg FROM projects ORDER BY updated_at DESC")
+        .prepare("SELECT id,name,folder_path,photo_count,status,created_at,updated_at,burst_threshold,burst_threshold_learned_at,source_kind,pair_raw_jpeg,pair_raw_jpeg_at FROM projects ORDER BY updated_at DESC")
         .map_err(|error| error.to_string())?;
     let rows = statement
         .query_map([], |row| {
@@ -3000,6 +3005,7 @@ fn list_projects(app: AppHandle) -> Result<Vec<Project>, String> {
                 burst_threshold_learned_at: row.get(8)?,
                 source_kind: row.get(9)?,
                 pair_raw_jpeg: row.get::<_, i64>(10)? != 0,
+                pair_raw_jpeg_at: row.get(11)?,
             })
         })
         .map_err(|error| error.to_string())?;
@@ -3026,6 +3032,7 @@ fn create_project(app: AppHandle, name: String, folder_path: String) -> Result<P
         burst_threshold_learned_at: None,
         source_kind: SOURCE_FOLDER.into(),
         pair_raw_jpeg: true,
+        pair_raw_jpeg_at: 0,
     };
     connection(&app)?
         .execute(
@@ -3151,6 +3158,7 @@ fn create_amazon_project_blocking(app: AppHandle, name: String, share_url: Strin
         burst_threshold_learned_at: None,
         source_kind: SOURCE_AMAZON.into(),
         pair_raw_jpeg: true,
+        pair_raw_jpeg_at: 0,
     };
     connection(&app)?
         .execute(
@@ -4722,16 +4730,33 @@ fn project_pair_raw(conn: &Connection, project_id: &str) -> bool {
     .unwrap_or(true)
 }
 
-/// 設定を保存する。反映は次の走査（「写真を再読み込み」）から。
-#[tauri::command]
-fn save_project_pair_raw(app: AppHandle, project_id: String, enabled: bool) -> Result<bool, String> {
-    let conn = connection(&app)?;
+/// 設定と、切り替えた時刻を保存する（U48）。`at` が None なら今の時刻（画面で切り替えたとき）、
+/// Some ならその時刻（ほかの端末の設定をサイドカーから取り込んだとき）。
+fn store_project_pair_raw(
+    conn: &Connection,
+    project_id: &str,
+    enabled: bool,
+    at: Option<i64>,
+) -> Result<bool, String> {
+    let stamp = now();
     conn.execute(
-        "UPDATE projects SET pair_raw_jpeg=?1, updated_at=?2 WHERE id=?3",
-        params![enabled as i64, now(), project_id],
+        "UPDATE projects SET pair_raw_jpeg=?1, pair_raw_jpeg_at=?2, updated_at=?3 WHERE id=?4",
+        params![enabled as i64, at.unwrap_or(stamp), stamp, project_id],
     )
     .map_err(|error| error.to_string())?;
-    Ok(project_pair_raw(&conn, &project_id))
+    Ok(project_pair_raw(conn, project_id))
+}
+
+/// 設定を保存する。反映は次の走査（「写真を再読み込み」）から。
+#[tauri::command]
+fn save_project_pair_raw(
+    app: AppHandle,
+    project_id: String,
+    enabled: bool,
+    at: Option<i64>,
+) -> Result<bool, String> {
+    let conn = connection(&app)?;
+    store_project_pair_raw(&conn, &project_id, enabled, at)
 }
 
 /// プロジェクト単位の上書き。`None` を渡すと全体の設定に戻す。
@@ -8457,6 +8482,52 @@ mod tests {
         // 冪等で、保存した値を既定に戻さない。
         let conn = open_database(&database).expect("reopen");
         assert!(!project_pair_raw(&conn, "p1"));
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    /// U48: 切り替えた時刻の列は既存のプロジェクトを壊さずに 0 で足され、保存で値と時刻が入る。
+    #[test]
+    fn pair_raw_jpeg_at_column_migrates_to_zero_and_stores_the_switch_time() {
+        let directory = test_directory("pair-raw-at-migrate");
+        let database = directory.join("legacy.sqlite3");
+        {
+            let legacy = Connection::open(&database).expect("open legacy");
+            legacy
+                .execute_batch(
+                    "CREATE TABLE projects (
+                       id TEXT PRIMARY KEY, name TEXT NOT NULL, folder_path TEXT NOT NULL,
+                       photo_count INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'new',
+                       created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                       pair_raw_jpeg INTEGER NOT NULL DEFAULT 1
+                     );
+                     INSERT INTO projects (id,name,folder_path,photo_count,status,created_at,updated_at,pair_raw_jpeg)
+                     VALUES ('p1','U46 のプロジェクト','C:/photos',10,'ready',100,200,0);",
+                )
+                .expect("create legacy projects");
+        }
+        let conn = open_database(&database).expect("migrate");
+        let read = |conn: &Connection| -> (i64, i64) {
+            conn.query_row("SELECT pair_raw_jpeg,pair_raw_jpeg_at FROM projects WHERE id='p1'", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .expect("read project")
+        };
+        // U46 で保存したオフはそのまま、時刻は 0（一度も切り替えていない扱い）。
+        assert_eq!(read(&conn), (0, 0));
+        // サイドカーから取り込んだときは、その時刻を残す。
+        assert!(store_project_pair_raw(&conn, "p1", true, Some(1_790_955_613_101)).expect("store"));
+        assert_eq!(read(&conn), (1, 1_790_955_613_101));
+        // 画面で切り替えたときは今の時刻。
+        let before = now();
+        assert!(!store_project_pair_raw(&conn, "p1", false, None).expect("store"));
+        let (value, at) = read(&conn);
+        assert_eq!(value, 0);
+        assert!(at >= before, "切り替えた時刻: {at}");
+        drop(conn);
+        // 冪等で、時刻を 0 に戻さない。
+        let conn = open_database(&database).expect("reopen");
+        assert_eq!(read(&conn).1, at);
         drop(conn);
         fs::remove_dir_all(&directory).expect("remove test directory");
     }
