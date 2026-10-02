@@ -121,6 +121,10 @@ struct SidecarSyncFixture {
     pc_folder: String,
     pc: serde_json::Value,
     untouched: serde_json::Value,
+    /// U42: ほかの端末がやり直した版（未着手・別の epoch・見た版の上に書いた＝早送りの関係）。
+    restarted: serde_json::Value,
+    /// `{ "plan": "Clash", "reason": "TheirsRestarted" }`（Clash の中身は大きいので、種類と理由だけ比べる）。
+    expected_restarted: serde_json::Value,
     seen_token: String,
     expected_key: String,
     expected_plan: serde_json::Value,
@@ -148,6 +152,12 @@ fn sidecar_sync_はフィクスチャの期待値と一致する() {
     assert_eq!(judgement_key(sidecar_judgement(pc)), fixture.expected_key, "PC の形");
 
     let seen = SeenRecord { token: fixture.seen_token, key: android_key, epoch: None };
-    let plan = sidecar_plan(seen, sidecar_judgement(android), Some(untouched), true, false);
+    let plan = sidecar_plan(seen.clone(), sidecar_judgement(android.clone()), Some(untouched), true, false);
     assert_eq!(serde_json::to_value(&plan).unwrap(), fixture.expected_plan);
+
+    // U42: 端末は見た版のまま（変えていない）でも、ほかの端末がやり直した版は確認する。
+    let restarted = read(&fixture.restarted, &fixture.pc_folder);
+    let plan = serde_json::to_value(sidecar_plan(seen, sidecar_judgement(android), Some(restarted), true, false)).unwrap();
+    let kind = fixture.expected_restarted["plan"].as_str().expect("plan");
+    assert_eq!(plan[kind]["reason"], fixture.expected_restarted["reason"], "やり直した版: {plan}");
 }

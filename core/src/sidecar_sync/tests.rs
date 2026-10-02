@@ -582,6 +582,105 @@ fn 計画_相手がやり直していれば確認_9_3の13() {
     }
 }
 
+/// U42（ユーザー決定 2026-10-02）: ほかの端末がやり直した版は、この端末が見た版のあと
+/// 何も変えていなくても（早送りの関係でも）、着手済みなら確認してから取り込む。
+/// 以前は早送り（#6）が先に当たり、確認なしに端末の星と選別の途中が消えていた。
+#[test]
+fn 計画_相手がやり直した版は早送りの関係でも端末が着手済みなら確認_u42() {
+    let mut a1 = sidecar(Some(progressed()), Some("w-a1"), "android", 10);
+    a1.epoch = Some("e1".into());
+    // 端末は a1 を書いたあと何も変えていない。
+    let local = canonical_judgement(Some(progressed()), HashMap::new(), vec![], None, Some("e1".into()));
+    assert_eq!(judgement_key(local.clone()), seen_of(&a1).key, "端末は変わっていない");
+
+    // PC で最初からやり直した（未着手・新しい epoch・a1 の上に書いた）。
+    let mut restarted = sidecar(Some(fresh()), Some("w-r"), "pc", 20);
+    restarted.epoch = Some("e2".into());
+    restarted.based_on = Some("w-a1".into());
+    restarted.lineage = Some(vec!["w-a1".into()]);
+    match sidecar_plan(seen_of(&a1), local.clone(), Some(restarted.clone()), true, false) {
+        SidecarPlan::Clash { reason: ClashReason::TheirsRestarted, .. } => {}
+        other => panic!("やり直しは早送りでも確認するはず: {other:?}"),
+    }
+    // 切り離し中でも同じ（自動では取り込まない）。
+    assert!(matches!(
+        sidecar_plan(seen_of(&a1), local.clone(), Some(restarted.clone()), true, true),
+        SidecarPlan::Clash { reason: ClashReason::TheirsRestarted, .. }
+    ));
+
+    // やり直したあと PC が少し進めて書いた版でも同じ。
+    let mut progressed_after = sidecar(Some(other_progress()), Some("w-r2"), "pc", 30);
+    progressed_after.epoch = Some("e2".into());
+    progressed_after.based_on = Some("w-r".into());
+    progressed_after.lineage = Some(vec!["w-r".into(), "w-a1".into()]);
+    assert!(matches!(
+        sidecar_plan(seen_of(&a1), local.clone(), Some(progressed_after), true, false),
+        SidecarPlan::Clash { reason: ClashReason::TheirsRestarted, .. }
+    ));
+
+    // 書けない共有では取り込まず、端末の分をそのまま（この端末だけの結果）。消さない側に倒す。
+    assert!(matches!(
+        sidecar_plan(seen_of(&a1), local, Some(restarted), false, false),
+        SidecarPlan::Settled { seen: None, reason: SettledReason::ReadOnly }
+    ));
+}
+
+/// U42 の副作用（安全側。意図して確かめる）: 世代の違う版の上に「書き込む」（C）を選ぶと、
+/// NAS の epoch が変わるので、ほかの端末（着手済み・変えていない）からも早送りではなく確認になる。
+/// epoch の違いだけでは「やり直し」と「世代をまたいだ書き込み」を見分けられないため。
+#[test]
+fn 計画_世代の違う版の上に書き込んだ版は相手から早送りでなく確認になる_u42() {
+    // PC はやり直して（e2）少し進め、書いた。
+    let mut p2 = sidecar(Some(other_progress()), Some("w-p2"), "pc", 20);
+    p2.epoch = Some("e2".into());
+    // Android はそれを見て「この端末の状況をサイドカーに書き込む」（e1 のまま）。
+    let mut mine = sidecar(Some(progressed()), None, "android", 30);
+    mine.epoch = Some("e1".into());
+    let written = sidecar_stamp(mine, "w-c".into(), Some(p2.clone()));
+    let pc_local = canonical_judgement(Some(other_progress()), HashMap::new(), vec![], None, Some("e2".into()));
+    assert!(matches!(
+        sidecar_plan(seen_of(&p2), pc_local, Some(written.clone()), true, false),
+        SidecarPlan::Clash { reason: ClashReason::TheirsRestarted, .. }
+    ));
+    // PC が未着手（やり直した直後のまま）なら、今までどおり確認なしに取り込む。
+    let pc_fresh = canonical_judgement(Some(fresh()), HashMap::new(), vec![], None, Some("e2".into()));
+    let mut p1 = sidecar(Some(fresh()), Some("w-p1"), "pc", 20);
+    p1.epoch = Some("e2".into());
+    let mut mine = sidecar(Some(progressed()), None, "android", 30);
+    mine.epoch = Some("e1".into());
+    let written = sidecar_stamp(mine, "w-c2".into(), Some(p1.clone()));
+    assert!(matches!(
+        sidecar_plan(seen_of(&p1), pc_fresh, Some(written), true, false),
+        SidecarPlan::Pull { reason: PullReason::LocalUntouched, .. }
+    ));
+}
+
+/// U42 で変えないこと: 端末が未着手なら、やり直された版も確認なしに取り込む。
+/// 意味が同じなら何も出さない。同じ世代の早送りは今までどおり確認なし。
+#[test]
+fn 計画_やり直された版でも端末が未着手か意味が同じなら確認しない_u42() {
+    let mut a1 = sidecar(Some(fresh()), Some("w-a1"), "android", 10);
+    a1.epoch = Some("e1".into());
+    let mut restarted = sidecar(Some(other_progress()), Some("w-r"), "pc", 20);
+    restarted.epoch = Some("e2".into());
+    restarted.based_on = Some("w-a1".into());
+    restarted.lineage = Some(vec!["w-a1".into()]);
+
+    // 端末は未着手 → 取り込む（捨てるものが無い）。
+    let untouched_local = canonical_judgement(Some(fresh()), HashMap::new(), vec![], None, Some("e1".into()));
+    assert!(matches!(
+        sidecar_plan(seen_of(&a1), untouched_local, Some(restarted.clone()), true, false),
+        SidecarPlan::Pull { reason: PullReason::LocalUntouched, aside_mine: false, .. }
+    ));
+
+    // 端末がすでに同じ状態（同じ世代・同じ星）→ 何もしない。
+    let same = sidecar_judgement(restarted.clone());
+    assert!(matches!(
+        sidecar_plan(seen_of(&a1), same, Some(restarted), true, false),
+        SidecarPlan::Settled { reason: SettledReason::Same, .. }
+    ));
+}
+
 #[test]
 fn 計画_この端末がやり直した後に相手が進んでいれば取り込まず確認_3の13() {
     let mut a1 = sidecar(Some(progressed()), Some("w-a1"), "android", 10);

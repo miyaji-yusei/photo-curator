@@ -619,7 +619,8 @@ fn total_of(sidecar: &Sidecar) -> u32 {
 /// 3. 見た版のまま → 端末が変わっていれば書く
 /// 4. 端末が未着手 → 確認なしに取り込む
 /// 5. NAS が未着手（端末は着手済み）→ 確認なしに書く（NAS の版は退避）
-/// 6. 早送り（NAS の版の系統に、端末が見た版がある。端末は変わっていない）→ 確認なしに取り込む
+/// 6. 早送り（NAS の版の系統に、端末が見た版がある。端末は変わっていない）→ 確認なしに取り込む。
+///    ただし NAS の側がやり直した版（epoch が違う）は早送りにせず、#9 で確認する（U42）
 /// 7. 星とセッションが同じで、手直し・境目が片方にだけある → 持っている方に合わせる
 /// 8. 書けない共有 → 何もしない（この端末だけの結果）
 /// 9. やり直しが絡む → 確認
@@ -723,10 +724,12 @@ pub fn sidecar_plan(
     }
 
     // 6. 早送り。系統（basedOn・lineage）に端末が見た版がある。古い形（writeId 無し）は見なさない。
+    //    **NAS の側がやり直した版（epoch が違う）は早送りにしない**（U42。ユーザー決定 2026-10-02）。
+    //    端末が着手済みなら #9 で確認する（未着手なら #4 で取り込み済み、同じなら #2 で済み）。
     let descends = theirs.write_id.as_deref().is_some_and(|id| !id.is_empty())
         && (theirs.based_on.as_deref() == Some(seen.token.as_str())
             || theirs.lineage.as_ref().is_some_and(|lineage| lineage.iter().any(|id| *id == seen.token)));
-    if !never_seen && !local_changed && descends {
+    if !never_seen && !local_changed && !remote_restarted && descends {
         return pull(true, PullReason::FastForward);
     }
 
