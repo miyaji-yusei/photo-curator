@@ -4574,6 +4574,37 @@ fn get_core_inputs_blocking(app: AppHandle, project_id: String) -> Result<Vec<Ph
         .map_err(|error| error.to_string())
 }
 
+/// 欠損の印の写真のうち、星が 1 以上のもの（U52 D13）。サイドカーに載せて、一時的に見えないだけの写真の
+/// 星を NAS から消さないために使う。
+#[derive(Clone, Serialize, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase")]
+struct MissingRating {
+    relative_path: String,
+    rating: i64,
+}
+
+fn missing_ratings(conn: &Connection, project_id: &str) -> Result<Vec<MissingRating>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT relative_path, rating FROM photos WHERE project_id=?1 AND is_missing=1 AND rating>=1
+             ORDER BY relative_path",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params![project_id], |row| {
+            Ok(MissingRating { relative_path: row.get(0)?, rating: row.get(1)? })
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn get_missing_ratings(app: AppHandle, project_id: String) -> Result<Vec<MissingRating>, String> {
+    tauri::async_runtime::spawn_blocking(move || missing_ratings(&connection(&app)?, &project_id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// 手で直した連写の例外（core の `PairOverride`）。鍵は relativePath。
 #[derive(Clone, Serialize, serde::Deserialize)]
 struct PairOverrideRow {
@@ -5520,6 +5551,7 @@ pub fn run() {
             read_sidecar,
             write_sidecar,
             write_sidecar_checked,
+            get_missing_ratings,
             aside_sidecar,
             aside_local,
             load_sidecar_state,
@@ -5877,6 +5909,29 @@ mod tests {
 
     // 接続の使い回し（U27 R1）: 初回だけ整備し、2 回目以降は整備なしで同じデータが見える。
     // Amazon の行は backfill の対象外（fingerprint が NULL のまま、stat も走らない）。
+    #[test]
+    fn missing_ratings_lists_only_missing_rows_with_stars() {
+        let directory = test_directory("missing-ratings");
+        let conn = open_connection(&directory.join("m.sqlite3")).expect("open");
+        conn.execute(
+            "INSERT INTO projects (id,name,folder_path,created_at,updated_at,source_kind) VALUES ('p','p','/x',1,1,'folder')",
+            [],
+        )
+        .unwrap();
+        for (id, path, rating, missing) in [("a", "a.jpg", 2, 1), ("b", "b.jpg", 0, 1), ("c", "c.jpg", 3, 0)] {
+            conn.execute(
+                "INSERT INTO photos (id,project_id,path,relative_path,name,rating,is_missing) VALUES (?1,'p',?2,?2,?2,?3,?4)",
+                params![id, path, rating, missing],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            missing_ratings(&conn, "p").unwrap(),
+            vec![MissingRating { relative_path: "a.jpg".into(), rating: 2 }]
+        );
+        assert!(missing_ratings(&conn, "other").unwrap().is_empty());
+    }
+
     #[test]
     fn open_connection_migrates_once_and_keeps_data_visible() {
         let directory = test_directory("open-connection");

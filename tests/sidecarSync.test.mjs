@@ -125,7 +125,12 @@ function fakeBackend(options = {}) {
     loadSidecarState: async () => ({ ...backend.state }),
     saveSidecarState: async (_projectId, state) => { backend.state = { ...state } },
     deviceIdentity: async () => backend.identity,
-    getCoreInputs: async () => backend.rows.map(row => ({ ...row })),
+    // 行は欠損（isMissing）を除いて読む（PC・Web の getCoreInputs と同じ）。
+    getCoreInputs: async () => backend.rows.filter(row => !row.isMissing).map(row => ({ ...row })),
+    // U52 D13: 欠損の行のうち星が 1 以上のもの。
+    getMissingRatings: async () => backend.rows
+      .filter(row => row.isMissing && row.rating >= 1)
+      .map(row => ({ relativePath: row.relativePath, rating: row.rating })),
     saveSelectionResults: async (_projectId, entries) => {
       for (const entry of entries) {
         const row = backend.rows.find(item => item.id === entry.id)
@@ -1232,5 +1237,36 @@ describe('U52 D4: 退避に成功してから変える（PC・Web。Android の 
     const asides = [...nas.files.keys()].filter(name => asideRe(ANDROID.id).test(name))
     expect(asides).toHaveLength(5)
     expect(nas.files.get('catalog.zzzzzzzz-111.json')).toBe('old')
+  })
+})
+
+describe('U52 D13: 一時的に欠けた写真の星を、セッションの無い端末が NAS から消さない', () => {
+  it('セッションの無い PC で写真が欠損になっても、星は NAS に残り、書き直しもしない', async () => {
+    const backend = fakeBackend()
+    const sync = createSidecarSync(backend, nextClock)
+    backend.rows[1].rating = 2
+    backend.rows[3].rating = 1
+    expect(await sync.pushIfChanged(project)).toBe(true)
+    expect(nasCatalog(backend).photos['IMG_3.JPG']).toEqual({ rating: 1 })
+    const writes = backend.writes.length
+    // サブフォルダが一時的に見えず、IMG_3 が欠損の印になった（行の星は残っている）。
+    backend.rows[3].isMissing = true
+    expect(await sync.pushIfChanged(project)).toBe(false)
+    expect(backend.writes.length).toBe(writes)
+    expect(nasCatalog(backend).photos['IMG_3.JPG']).toEqual({ rating: 1 })
+    // 別の判断で書くときも、欠損の写真の星を載せる。
+    backend.rows[0].rating = 3
+    expect(await sync.pushIfChanged(project)).toBe(true)
+    expect(nasCatalog(backend).photos['IMG_3.JPG']).toEqual({ rating: 1 })
+    expect(nasCatalog(backend).photos['IMG_0.JPG']).toEqual({ rating: 3 })
+  })
+
+  it('全部の行が欠損なら、星があっても書かない（空に近い記録で共有を上書きしない）', async () => {
+    const backend = fakeBackend()
+    const sync = createSidecarSync(backend, nextClock)
+    backend.rows[1].rating = 2
+    for (const row of backend.rows) row.isMissing = true
+    expect((await sync.pushAuto(project)).kind).not.toBe('pushed')
+    expect(backend.writes).toEqual([])
   })
 })

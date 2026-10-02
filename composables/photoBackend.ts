@@ -63,6 +63,11 @@ export interface PhotoBackend {
    * サムネイルなどの URL は持たない（写真そのものの表示は `getPhotosByIds`）。
    */
   getCoreInputs: (projectId: string) => Promise<Photo[]>
+  /**
+   * 欠損の印の写真のうち、星が 1 以上のもの（U52 D13）。サイドカーに載せて、一時的に見えないだけの写真の星を
+   * NAS から消さないために使う。
+   */
+  getMissingRatings: (projectId: string) => Promise<{ relativePath: string, rating: number }[]>
 
   /** 判定したグループぶんだけを書く。全件を毎回送らない。 */
   saveSelectionResults: (projectId: string, entries: SelectionResult[]) => Promise<void>

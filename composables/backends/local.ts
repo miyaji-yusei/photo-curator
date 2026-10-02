@@ -712,6 +712,11 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
       return rows.filter(row => !row.isMissing).map(row => toPhoto(row, null, null, null))
     },
 
+    getMissingRatings: async (projectId: string) =>
+      (await store.photosOfProject(projectId))
+        .filter(row => row.isMissing && row.rating >= 1)
+        .map(row => ({ relativePath: row.relativePath, rating: row.rating })),
+
     saveSelectionResults: (projectId: string, entries: SelectionResult[]) =>
       store.saveSelectionResults(projectId, entries),
 

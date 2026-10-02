@@ -42,6 +42,8 @@ export type SidecarBackend = Pick<PhotoBackend,
   | 'saveSidecarState' | 'deviceIdentity' | 'getCoreInputs' | 'saveSelectionResults' | 'getPairOverrides'
   | 'savePairOverrides' | 'loadSession' | 'saveSession' | 'listProjects' | 'saveBurstThreshold'
   | 'clearBurstThreshold' | 'saveProjectPairRaw'>
+  // 欠損の行の星（U52 D13）。無い backend（古い偽物）では欠損の星を載せない（従来どおり）。
+  & Partial<Pick<PhotoBackend, 'getMissingRatings'>>
 
 /** 古い要約（表示用。今は使っていないが、外から使えるよう残す）。 */
 export interface SidecarSummary {
@@ -185,6 +187,8 @@ interface Snapshot {
   separator: string
   /** 端末の写真の鍵（フォルダ形式）。 */
   photoKeys: string[]
+  /** 載せる写真のうち、欠損でない行の数（0 なら書かない）。 */
+  liveRows: number
   identity: { id: string, name: string }
   /**
    * 設定（U48）をどうするか。`AdoptRemote` のときは `mine` の設定をもう NAS の値にしてある
@@ -257,6 +261,13 @@ export function createSidecarSync(backend: SidecarBackend, now: () => number = D
     // 星は写真の行が持っている（結果・移動・書き出しが読む）。全部載せる。
     const photos: Sidecar['photos'] = {}
     for (const row of rows) photos[row.relativePath] = { rating: row.rating }
+    // 一時的に見えない（欠損の印の）写真の星も載せる（U52 D13）。「見えない」は「星を 0 にした」ではない。
+    // 載せないと、セッションの無いプロジェクトでは比較キーが変わって書き、NAS と相手の端末から星が消える。
+    const listed = backend.getMissingRatings ? await backend.getMissingRatings(project.id) : null
+    const missing = Array.isArray(listed) ? listed : []
+    for (const row of missing) {
+      if (row.rating >= 1 && !(row.relativePath in photos)) photos[row.relativePath] = { rating: row.rating }
+    }
     const info = projects.find(item => item.id === project.id)
     const distance = info?.burstThreshold
     const sidecar: Sidecar = {
@@ -320,6 +331,7 @@ export function createSidecarSync(backend: SidecarBackend, now: () => number = D
       seen: seenOf(built.state, localKey),
       separator: built.separator,
       photoKeys: Object.keys(mine.photos),
+      liveRows: built.rows.length,
       identity: built.identity
     }
   }
@@ -348,8 +360,8 @@ export function createSidecarSync(backend: SidecarBackend, now: () => number = D
   async function writeMine(
     project: ProjectRef, snap: Snapshot, aside: boolean
   ): Promise<'written' | 'changed' | 'locked' | 'empty'> {
-    // 載せる行が 0 件（例: 全部が欠損扱いの間）なら書かない。空の記録で共有を上書きしない。
-    if (snap.photoKeys.length === 0) return 'empty'
+    // 欠損でない行が 0 件（例: 全部が欠損扱いの間）なら書かない。空に近い記録で共有を上書きしない。
+    if (snap.liveRows === 0) return 'empty'
     const asideOwner = aside && snap.text !== null && snap.remote ? asideTag(snap.remote.updatedBy) : null
     const writeId = randomId()
     const stamped = core.sidecarStamp(snap.mine, writeId, snap.remote)

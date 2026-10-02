@@ -70,6 +70,8 @@ export function createTauriBackend(): PhotoBackend {
     getSelectionSummary: (projectId: string) => invokeDesktop<SelectionSummary>('get_selection_summary', { projectId }),
     getPhotosByIds: (projectId: string, photoIds: string[]) => invokeDesktop<Photo[]>('get_photos_by_ids', { projectId, photoIds }),
     getCoreInputs: (projectId: string) => invokeDesktop<Photo[]>('get_core_inputs', { projectId }),
+    getMissingRatings: (projectId: string) =>
+      invokeDesktop<{ relativePath: string, rating: number }[]>('get_missing_ratings', { projectId }),
     exportPhotos: (projectId: string, destination: string, photoIds: string[], moveFiles: boolean) =>
       invokeDesktop<ExportReport>('export_photos', { projectId, destination, photoIds, moveFiles }),
     writeRatingsToPhotos: (projectId: string, photoIds: string[]) =>
