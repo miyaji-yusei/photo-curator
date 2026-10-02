@@ -582,6 +582,105 @@ fn 計画_相手がやり直していれば確認_9_3の13() {
     }
 }
 
+/// U42（ユーザー決定 2026-10-02）: ほかの端末がやり直した版は、この端末が見た版のあと
+/// 何も変えていなくても（早送りの関係でも）、着手済みなら確認してから取り込む。
+/// 以前は早送り（#6）が先に当たり、確認なしに端末の星と選別の途中が消えていた。
+#[test]
+fn 計画_相手がやり直した版は早送りの関係でも端末が着手済みなら確認_u42() {
+    let mut a1 = sidecar(Some(progressed()), Some("w-a1"), "android", 10);
+    a1.epoch = Some("e1".into());
+    // 端末は a1 を書いたあと何も変えていない。
+    let local = canonical_judgement(Some(progressed()), HashMap::new(), vec![], None, Some("e1".into()));
+    assert_eq!(judgement_key(local.clone()), seen_of(&a1).key, "端末は変わっていない");
+
+    // PC で最初からやり直した（未着手・新しい epoch・a1 の上に書いた）。
+    let mut restarted = sidecar(Some(fresh()), Some("w-r"), "pc", 20);
+    restarted.epoch = Some("e2".into());
+    restarted.based_on = Some("w-a1".into());
+    restarted.lineage = Some(vec!["w-a1".into()]);
+    match sidecar_plan(seen_of(&a1), local.clone(), Some(restarted.clone()), true, false) {
+        SidecarPlan::Clash { reason: ClashReason::TheirsRestarted, .. } => {}
+        other => panic!("やり直しは早送りでも確認するはず: {other:?}"),
+    }
+    // 切り離し中でも同じ（自動では取り込まない）。
+    assert!(matches!(
+        sidecar_plan(seen_of(&a1), local.clone(), Some(restarted.clone()), true, true),
+        SidecarPlan::Clash { reason: ClashReason::TheirsRestarted, .. }
+    ));
+
+    // やり直したあと PC が少し進めて書いた版でも同じ。
+    let mut progressed_after = sidecar(Some(other_progress()), Some("w-r2"), "pc", 30);
+    progressed_after.epoch = Some("e2".into());
+    progressed_after.based_on = Some("w-r".into());
+    progressed_after.lineage = Some(vec!["w-r".into(), "w-a1".into()]);
+    assert!(matches!(
+        sidecar_plan(seen_of(&a1), local.clone(), Some(progressed_after), true, false),
+        SidecarPlan::Clash { reason: ClashReason::TheirsRestarted, .. }
+    ));
+
+    // 書けない共有では取り込まず、端末の分をそのまま（この端末だけの結果）。消さない側に倒す。
+    assert!(matches!(
+        sidecar_plan(seen_of(&a1), local, Some(restarted), false, false),
+        SidecarPlan::Settled { seen: None, reason: SettledReason::ReadOnly }
+    ));
+}
+
+/// U42 の副作用（安全側。意図して確かめる）: 世代の違う版の上に「書き込む」（C）を選ぶと、
+/// NAS の epoch が変わるので、ほかの端末（着手済み・変えていない）からも早送りではなく確認になる。
+/// epoch の違いだけでは「やり直し」と「世代をまたいだ書き込み」を見分けられないため。
+#[test]
+fn 計画_世代の違う版の上に書き込んだ版は相手から早送りでなく確認になる_u42() {
+    // PC はやり直して（e2）少し進め、書いた。
+    let mut p2 = sidecar(Some(other_progress()), Some("w-p2"), "pc", 20);
+    p2.epoch = Some("e2".into());
+    // Android はそれを見て「この端末の状況をサイドカーに書き込む」（e1 のまま）。
+    let mut mine = sidecar(Some(progressed()), None, "android", 30);
+    mine.epoch = Some("e1".into());
+    let written = sidecar_stamp(mine, "w-c".into(), Some(p2.clone()));
+    let pc_local = canonical_judgement(Some(other_progress()), HashMap::new(), vec![], None, Some("e2".into()));
+    assert!(matches!(
+        sidecar_plan(seen_of(&p2), pc_local, Some(written.clone()), true, false),
+        SidecarPlan::Clash { reason: ClashReason::TheirsRestarted, .. }
+    ));
+    // PC が未着手（やり直した直後のまま）なら、今までどおり確認なしに取り込む。
+    let pc_fresh = canonical_judgement(Some(fresh()), HashMap::new(), vec![], None, Some("e2".into()));
+    let mut p1 = sidecar(Some(fresh()), Some("w-p1"), "pc", 20);
+    p1.epoch = Some("e2".into());
+    let mut mine = sidecar(Some(progressed()), None, "android", 30);
+    mine.epoch = Some("e1".into());
+    let written = sidecar_stamp(mine, "w-c2".into(), Some(p1.clone()));
+    assert!(matches!(
+        sidecar_plan(seen_of(&p1), pc_fresh, Some(written), true, false),
+        SidecarPlan::Pull { reason: PullReason::LocalUntouched, .. }
+    ));
+}
+
+/// U42 で変えないこと: 端末が未着手なら、やり直された版も確認なしに取り込む。
+/// 意味が同じなら何も出さない。同じ世代の早送りは今までどおり確認なし。
+#[test]
+fn 計画_やり直された版でも端末が未着手か意味が同じなら確認しない_u42() {
+    let mut a1 = sidecar(Some(fresh()), Some("w-a1"), "android", 10);
+    a1.epoch = Some("e1".into());
+    let mut restarted = sidecar(Some(other_progress()), Some("w-r"), "pc", 20);
+    restarted.epoch = Some("e2".into());
+    restarted.based_on = Some("w-a1".into());
+    restarted.lineage = Some(vec!["w-a1".into()]);
+
+    // 端末は未着手 → 取り込む（捨てるものが無い）。
+    let untouched_local = canonical_judgement(Some(fresh()), HashMap::new(), vec![], None, Some("e1".into()));
+    assert!(matches!(
+        sidecar_plan(seen_of(&a1), untouched_local, Some(restarted.clone()), true, false),
+        SidecarPlan::Pull { reason: PullReason::LocalUntouched, aside_mine: false, .. }
+    ));
+
+    // 端末がすでに同じ状態（同じ世代・同じ星）→ 何もしない。
+    let same = sidecar_judgement(restarted.clone());
+    assert!(matches!(
+        sidecar_plan(seen_of(&a1), same, Some(restarted), true, false),
+        SidecarPlan::Settled { reason: SettledReason::Same, .. }
+    ));
+}
+
 #[test]
 fn 計画_この端末がやり直した後に相手が進んでいれば取り込まず確認_3の13() {
     let mut a1 = sidecar(Some(progressed()), Some("w-a1"), "android", 10);
@@ -731,12 +830,20 @@ fn 進み具合_roundが先なら先_食い違えば言えない_同じなら同
 // ---------------------------------------------------------------------------
 
 /// 終わった選別（全部判定済み）。
+/// 本物のセッションと同じく、`ratings` には全部の写真（NAMES）を載せ、★0 も持つ（D3 の修正で、
+/// セッションに載っていない写真は「その端末に無い＝未判定」と扱うようになったため）。
+fn session_ratings(ratings: &[(&str, i32)]) -> HashMap<String, i32> {
+    let mut all: HashMap<String, i32> = NAMES.iter().map(|name| (name.to_string(), 0)).collect();
+    all.extend(stars(ratings));
+    all
+}
+
 fn done(ratings: &[(&str, i32)]) -> Session {
     let mut session = fresh();
     session.queue.clear();
     session.current.clear();
     session.finished = true;
-    session.ratings = stars(ratings);
+    session.ratings = session_ratings(ratings);
     session
 }
 
@@ -746,7 +853,7 @@ fn midway(ratings: &[(&str, i32)], remaining: &[&str]) -> Session {
     session.current = names(remaining);
     session.queue.clear();
     session.finished = false;
-    session.ratings = stars(ratings);
+    session.ratings = session_ratings(ratings);
     session.history = vec![crate::Decision {
         group: names(&["a.jpg", "b.jpg"]),
         chosen: names(&["a.jpg"]),
@@ -886,6 +993,49 @@ fn 混ぜ方_見込みの枚数() {
     assert!(preview.mid_round);
     let union = merge_judgements(mine, theirs, MergeMode::Union, 2, "e".into());
     assert_eq!(union.starred, preview.union_starred);
+}
+
+/// D3（レビュー 2026-10-02）: PC は RAW・HEIC も選別の対象にし、Android は jpg/png/webp だけ。
+/// 片方の記録（セッションの ratings・photos）に無い写真は、その端末では「未判定」なので、
+/// 積集合でも記録のある側の★を採る（ユーザー決定「片方で未判定の写真は、判定済みの側の★」）。
+#[test]
+fn 混ぜ方_積集合で片方の記録に無い写真は記録のある側の星_d3() {
+    // PC: JPG と RAW の両方を選別した（完了）。
+    let mut pc_session = done(&[("a.jpg", 2), ("b.jpg", 1)]);
+    pc_session.ratings.insert("a.cr2".into(), 2);
+    pc_session.ratings.insert("b.heic".into(), 1);
+    pc_session.ratings.insert("c.arw".into(), 0);
+    let pc = judge(Some(pc_session));
+    // Android: JPG だけ（RAW・HEIC は記録に無い）。
+    let android = judge(Some(done(&[("a.jpg", 1), ("d.jpg", 1)])));
+
+    let expected = stars(&[("a.jpg", 1), ("a.cr2", 2), ("b.heic", 1)]);
+    assert_eq!(merge_stars(android.clone(), pc.clone(), MergeMode::Intersection), expected, "Android から");
+    assert_eq!(merge_stars(pc.clone(), android.clone(), MergeMode::Intersection), expected, "PC から");
+    // 和集合は今までどおり大きい方（記録に無い側は 0 と同じ）。
+    assert_eq!(
+        merge_stars(android.clone(), pc.clone(), MergeMode::Union),
+        stars(&[("a.jpg", 2), ("b.jpg", 1), ("d.jpg", 1), ("a.cr2", 2), ("b.heic", 1)])
+    );
+    // 見込みと結果は同じ数え方（ダイアログの数のまま混ざる）。
+    let preview = merge_preview(android.clone(), pc.clone());
+    assert_eq!(preview.intersection_starred, 3);
+    let result = merge_judgements(android, pc, MergeMode::Intersection, 2, "e".into());
+    assert_eq!(result.ratings, expected);
+    assert_eq!(result.starred, preview.intersection_starred);
+}
+
+/// D3: セッションが無い側（★だけの古い記録）でも、photos に無い写真は未判定（今までどおり）。
+/// photos に★0 で載っている写真は、セッションが無ければ未判定のまま（設計書どおり）。
+#[test]
+fn 混ぜ方_d3でも記録の比べ方は意味が同じかの判断に影響しない() {
+    // 記録の顔ぶれ（★0 の写真）だけ違う 2 つは、今までどおり「意味が同じ」（警告なし）。
+    let mut pc_session = done(&[("a.jpg", 1)]);
+    pc_session.ratings.insert("a.cr2".into(), 0);
+    let pc = judge(Some(pc_session));
+    let android = judge(Some(done(&[("a.jpg", 1)])));
+    assert!(judgement_equivalent(pc.clone(), android.clone()));
+    assert_eq!(judgement_key(pc), judgement_key(android));
 }
 
 // ---------------------------------------------------------------------------

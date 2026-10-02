@@ -75,6 +75,34 @@
       }
     }
   },
+  "restarted": {
+    "version": 2,
+    "updatedAt": 30,
+    "updatedBy": "pc-id",
+    "updatedByName": "DESKTOP-ABC",
+    "writeId": "w-r1",
+    "basedOn": "w-a1",
+    "lineage": ["w-a1"],
+    "epoch": "e-restart",
+    "keyBase": "folder",
+    "photos": { "a.jpg": { "rating": 0 }, "b.jpg": { "rating": 0 }, "sub/c.jpg": { "rating": 0 }, "d.jpg": { "rating": 0 } },
+    "burstOverrides": [],
+    "sessions": {
+      "tournament": {
+        "group_size": 2,
+        "target_star": 0,
+        "round": 1,
+        "queue": ["sub/c.jpg", "d.jpg"],
+        "current": ["a.jpg", "b.jpg"],
+        "survivors": [],
+        "ratings": { "a.jpg": 0, "b.jpg": 0, "sub/c.jpg": 0, "d.jpg": 0 },
+        "members": {},
+        "history": [],
+        "finished": false
+      }
+    }
+  },
+  "expected_restarted": { "plan": "Clash", "reason": "TheirsRestarted" },
   "seen_token": "w-a1",
   "expected_key": "j1:941dbb20dcd00558ac8e1e7eadbd7f1e16c18ed88dfb86dfd5e3d00a2714735d",
   "expected_plan": { "Push": { "expected": "w-p1", "aside_theirs": true, "reason": "TheirsUntouched" } }

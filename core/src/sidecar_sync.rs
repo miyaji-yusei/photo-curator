@@ -129,7 +129,7 @@ pub struct JudgementSession {
 ///
 /// 写真の鍵は「選んだフォルダからの相対・`/` 区切り・NFC」。呼ぶ側は、端末の中の鍵を
 /// 先に `sidecar_keys_to_folder` などでフォルダ形式にしておく。
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Judgement {
     /// ★1 以上の写真（鍵の順）。★0 と「鍵が無い」は同じ扱い。
     pub stars: Vec<PhotoStar>,
@@ -139,6 +139,35 @@ pub struct Judgement {
     pub burst_distance: Option<u32>,
     /// やり直しの世代。
     pub epoch: Option<String>,
+    /// その端末の記録にある写真（★0 も含む。セッションの `ratings` と `photos` の鍵。鍵の順）。
+    /// 積集合（D）で「その端末の記録に無い写真＝未判定」を見分けるためだけに使う（D3）。
+    /// **意味が同じかの判断と比較キーには入れない**（端末ごとに対象の拡張子が違うので、
+    /// ★0 の顔ぶれの違いで警告を出さない）。None は「分からない」＝全部を記録にあると見なす。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known: Option<Vec<String>>,
+}
+
+/// 意味が同じか。`known`（記録の顔ぶれ）は比べない。
+impl PartialEq for Judgement {
+    fn eq(&self, other: &Self) -> bool {
+        self.stars == other.stars
+            && self.session == other.session
+            && self.overrides == other.overrides
+            && self.burst_distance == other.burst_distance
+            && self.epoch == other.epoch
+    }
+}
+
+impl Eq for Judgement {}
+
+/// 比較キーに使う形（`known` を除いた Judgement と同じ JSON になる。並びも同じ）。
+#[derive(serde::Serialize)]
+struct JudgementKeyView<'a> {
+    stars: &'a Vec<PhotoStar>,
+    session: &'a Option<JudgementSession>,
+    overrides: &'a Vec<PairOverride>,
+    burst_distance: &'a Option<u32>,
+    epoch: &'a Option<String>,
 }
 
 /// 端末の控え。最後に読んだ／書いた版。**今の seenAt/seenBy/dirty の代わり。**
@@ -369,12 +398,20 @@ pub fn canonical_judgement(
             *entry = (*entry).max(*rating);
         }
     }
+    // 記録の顔ぶれ（D3）。セッションの ratings と photos の両方の鍵。
+    let known: BTreeSet<String> = session
+        .iter()
+        .flat_map(|session| session.ratings.keys())
+        .chain(photos.keys())
+        .map(|path| norm(path))
+        .collect();
     Judgement {
         stars: stars.into_iter().map(|(path, rating)| PhotoStar { path, rating }).collect(),
         session: session.as_ref().map(canonical_session),
         overrides: canonical_overrides(&overrides),
         burst_distance,
         epoch: epoch.filter(|epoch| !epoch.is_empty()),
+        known: Some(known.into_iter().collect()),
     }
 }
 
@@ -401,7 +438,14 @@ pub fn judgement_key(judgement: Judgement) -> String {
 
 fn key_of(judgement: &Judgement) -> String {
     // 正規形は Vec と Option だけでできているので、JSON は入れた順に関係なく同じ文字列になる。
-    let bytes = serde_json::to_vec(judgement).unwrap_or_default();
+    let view = JudgementKeyView {
+        stars: &judgement.stars,
+        session: &judgement.session,
+        overrides: &judgement.overrides,
+        burst_distance: &judgement.burst_distance,
+        epoch: &judgement.epoch,
+    };
+    let bytes = serde_json::to_vec(&view).unwrap_or_default();
     let digest = Sha256::digest(&bytes);
     let mut out = String::with_capacity(JUDGEMENT_KEY_PREFIX.len() + 64);
     out.push_str(JUDGEMENT_KEY_PREFIX);
@@ -619,7 +663,8 @@ fn total_of(sidecar: &Sidecar) -> u32 {
 /// 3. 見た版のまま → 端末が変わっていれば書く
 /// 4. 端末が未着手 → 確認なしに取り込む
 /// 5. NAS が未着手（端末は着手済み）→ 確認なしに書く（NAS の版は退避）
-/// 6. 早送り（NAS の版の系統に、端末が見た版がある。端末は変わっていない）→ 確認なしに取り込む
+/// 6. 早送り（NAS の版の系統に、端末が見た版がある。端末は変わっていない）→ 確認なしに取り込む。
+///    ただし NAS の側がやり直した版（epoch が違う）は早送りにせず、#9 で確認する（U42）
 /// 7. 星とセッションが同じで、手直し・境目が片方にだけある → 持っている方に合わせる
 /// 8. 書けない共有 → 何もしない（この端末だけの結果）
 /// 9. やり直しが絡む → 確認
@@ -723,10 +768,12 @@ pub fn sidecar_plan(
     }
 
     // 6. 早送り。系統（basedOn・lineage）に端末が見た版がある。古い形（writeId 無し）は見なさない。
+    //    **NAS の側がやり直した版（epoch が違う）は早送りにしない**（U42。ユーザー決定 2026-10-02）。
+    //    端末が着手済みなら #9 で確認する（未着手なら #4 で取り込み済み、同じなら #2 で済み）。
     let descends = theirs.write_id.as_deref().is_some_and(|id| !id.is_empty())
         && (theirs.based_on.as_deref() == Some(seen.token.as_str())
             || theirs.lineage.as_ref().is_some_and(|lineage| lineage.iter().any(|id| *id == seen.token)));
-    if !never_seen && !local_changed && descends {
+    if !never_seen && !local_changed && !remote_restarted && descends {
         return pull(true, PullReason::FastForward);
     }
 
@@ -794,12 +841,17 @@ fn pending_of(judgement: &Judgement) -> Option<HashSet<String>> {
     Some(pending)
 }
 
-/// 未判定か: 途中のセッションでまだ見ていない、またはセッションが無く★も 0。
+/// 未判定か: 途中のセッションでまだ見ていない、セッションが無く★も 0、
+/// または**その端末の記録に無い**（D3。PC だけが対象にする RAW・HEIC など）。
 fn undecided(judgement: &Judgement, pending: &Option<HashSet<String>>, path: &str, star: i32) -> bool {
+    let recorded = judgement
+        .known
+        .as_ref()
+        .is_none_or(|known| known.binary_search_by(|id| id.as_str().cmp(path)).is_ok());
     match (&judgement.session, pending) {
         (None, _) => star == 0,
-        (Some(_), Some(pending)) => pending.contains(path),
-        (Some(_), None) => false,
+        (Some(_), Some(pending)) => !recorded || pending.contains(path),
+        (Some(_), None) => !recorded,
     }
 }
 

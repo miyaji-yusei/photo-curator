@@ -694,8 +694,9 @@ class SidecarSync(
                 ProgressOrder.BEHIND -> "。NAS の方が進んでいます"
                 else -> ""
             }
-            ClashReason.THEIRS_RESTARTED -> nameOf(clash.theirs) + " で最初からやり直されています"
-            ClashReason.MINE_RESTARTED -> "この端末で最初からやり直しています"
+            // 端末名は NAS の行（theirsLabel）に出す。理由は「ほかの端末」で言う（U42。PC・Web と同じ）。
+            ClashReason.THEIRS_RESTARTED -> "ほかの端末が最初からやり直しました"
+            ClashReason.MINE_RESTARTED -> "この端末で最初からやり直したあと、ほかの端末で選別が進んでいます"
             ClashReason.EXTRAS_CONFLICT -> "★と選別の進みは同じで、連写のまとまりの手直しか学習した境目が違います"
         }
 

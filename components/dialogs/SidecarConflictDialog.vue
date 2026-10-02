@@ -34,10 +34,11 @@ const reasonText = computed(() => {
   const clash = sidecarClash.value
   if (!clash) return ''
   switch (clash.reason) {
+    // 端末名は下の NAS の行に出す。理由は「ほかの端末」で言う（U42）。
     case 'TheirsRestarted':
-      return `${clash.theirsName} で最初からやり直されています。`
+      return 'ほかの端末が最初からやり直しました。'
     case 'MineRestarted':
-      return 'この端末で最初からやり直したあと、NAS の側で選別が進んでいます。'
+      return 'この端末で最初からやり直したあと、ほかの端末で選別が進んでいます。'
     case 'ExtrasConflict':
       return '★と選別の途中は同じですが、連写の手直しか学習した境目が違います。'
     default: {

@@ -15,6 +15,7 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import uniffi.photo_curator_core.ClashReason
 import uniffi.photo_curator_core.Decision
 import uniffi.photo_curator_core.SeenRecord
 import uniffi.photo_curator_core.Session
@@ -511,6 +512,30 @@ class SidecarSyncTest {
         assertEquals(further, local.snapshot.session)
         assertEquals(1, local.asides.size)
         assertNotNull(nas.files[SidecarSync.asidePath(folder, SidecarSync.tag(android.id))])
+    }
+
+    // ---- U42: ほかの端末がやり直した版は、早送りの関係でも確認する ----
+
+    @Test fun ほかの端末がやり直した版は端末が変わっていなくても確認してから取り込む() = run {
+        val nas = FakeNas()
+        val a1 = written(mineAdvanced(), android, "a1")
+        val seen = FakeSeen().apply { save("project-1", seenAt(a1)) }
+        // 端末は a1 を書いたあと何も変えていない。
+        val local = FakeLocal(snapshot(mineAdvanced()))
+        // PC で「最初からやり直す」: 未着手・新しい世代・a1 の上に書いた（早送りの関係）。
+        val pc = Me("pc-desktop-1", "DESKTOP-ABC")
+        val restarted = written(untouched(), pc, "r1", basedOn = "a1").copy(epoch = "e-restart")
+        val restartedBytes = put(nas, restarted)
+
+        val answer = syncFor(android, seen).check(target(local, nas))
+
+        assertTrue("確認する（以前は早送りで確認なしに空になった）: $answer", answer is SyncOutcome.Asking)
+        val clash = (answer as SyncOutcome.Asking).clash
+        assertEquals(ClashReason.THEIRS_RESTARTED, clash.reason)
+        assertEquals("ほかの端末が最初からやり直しました", SidecarSync.reasonLine(clash))
+        assertEquals("端末の星と選別の途中はそのまま", mineAdvanced(), local.snapshot.session)
+        assertArrayEquals("NAS はそのまま", restartedBytes, nas.files[catalog])
+        assertTrue("退避もまだしない", local.asides.isEmpty())
     }
 
     // ---- そのほか ----
