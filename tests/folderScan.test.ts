@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { SourceEntry, SourceIO } from '~/composables/backends/web/sourceIO'
 import { PickerIO, joinPath } from '~/composables/backends/web/sourceIO'
-import { isVideoName, scanFolder } from '~/utils/folderScan'
+import { isVideoName, scanFolder, skipPairedRaw } from '~/utils/folderScan'
 
 /** サイドカーは走査に関係しない。 */
 const noSidecar = {
@@ -90,5 +90,52 @@ describe('joinPath', () => {
   it('根では名前だけ、それ以外は / でつなぐ', () => {
     expect(joinPath('', 'a.jpg')).toBe('a.jpg')
     expect(joinPath('x/y', 'a.jpg')).toBe('x/y/a.jpg')
+  })
+})
+
+describe('scanFolder: RAW+JPEG の組（U46）', () => {
+  it('同じフォルダに同名の JPEG がある RAW は結果に入れない', async () => {
+    const io = fakeFolder({
+      '': ['IMG_1.JPG', 'IMG_1.CR2', 'IMG_2.CR2', 'IMG_3.jpeg', 'IMG_3.NEF', 'sub/', 'IMG_4.HEIC', 'img_5.jpg', 'IMG_5.CR2'],
+      sub: ['IMG_1.CR2']
+    })
+    const files = await scanFolder(io)
+    expect(files.map(file => file.relativePath).sort()).toEqual([
+      'IMG_1.JPG', 'IMG_2.CR2', 'IMG_3.jpeg', 'IMG_4.HEIC', 'img_5.jpg', 'sub/IMG_1.CR2'
+    ])
+  })
+
+  it('PNG・WebP や HEIC との組は外さない。RAW 同士も外さない', async () => {
+    const io = fakeFolder({
+      '': ['a.png', 'a.dng', 'b.webp', 'b.arw', 'c.heic', 'c.jpg', 'd.cr2', 'd.nef']
+    })
+    const files = await scanFolder(io)
+    expect(files.map(file => file.name).sort()).toEqual([
+      'a.dng', 'a.png', 'b.arw', 'b.webp', 'c.heic', 'c.jpg', 'd.cr2', 'd.nef'
+    ])
+  })
+})
+
+describe('skipPairedRaw', () => {
+  it('入力の並びを保つ', () => {
+    const make = (relativePath: string) => ({ relativePath, subPath: '', name: relativePath, size: 1, mtimeMs: 1 })
+    const kept = skipPairedRaw(['b.cr2', 'a.JPG', 'a.cr3', 'c.cr2'].map(make))
+    expect(kept.map(file => file.relativePath)).toEqual(['b.cr2', 'a.JPG', 'c.cr2'])
+  })
+})
+
+describe('RAW+JPEG の組の設定（U46）', () => {
+  it('設定がオフなら全部を対象にする。オンなら組の RAW を外す。省略はオン', async () => {
+    const tree = { '': ['a.jpg', 'a.cr2', 'b.cr2'] }
+    const names = async (pairRawJpeg?: boolean) =>
+      (await scanFolder(fakeFolder(tree), pairRawJpeg === undefined ? {} : { pairRawJpeg })).map(file => file.name).sort()
+    expect(await names(false)).toEqual(['a.cr2', 'a.jpg', 'b.cr2'])
+    expect(await names(true)).toEqual(['a.jpg', 'b.cr2'])
+    expect(await names()).toEqual(['a.jpg', 'b.cr2'])
+  })
+
+  it('skipPairedRaw(files, false) は入力をそのまま返す', () => {
+    const files = ['a.jpg', 'a.cr2'].map(name => ({ relativePath: name, subPath: '', name }))
+    expect(skipPairedRaw(files, false)).toEqual(files)
   })
 })

@@ -33,7 +33,7 @@ export function loadCuratorModule() {
 export const project = (id: string, overrides: Partial<Project> = {}): Project => ({
   id, name: id, folderPath: `/photos/${id}`, photoCount: 10, status: 'ready',
   createdAt: 1, updatedAt: 1, burstThreshold: null, burstThresholdLearnedAt: null,
-  sourceKind: 'folder', ...overrides
+  sourceKind: 'folder', pairRawJpeg: true, ...overrides
 })
 
 /** 撮影順に 1 分おきの写真 `count` 枚。`relativePath` は `IMG_<n>.JPG`、id は `<projectId>-<n>`。 */

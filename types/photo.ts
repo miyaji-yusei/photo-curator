@@ -84,6 +84,11 @@ export interface Project {
    */
   sourceKind: 'folder' | 'amazon'
   /**
+   * 同名の JPEG と RAW を 1 枚の写真として扱う（RAW＋JPEG 同時撮影のとき、組の RAW を対象から外す）。
+   * プロジェクトごとの設定で、既定は true。変えたら再走査で反映される（U46）。
+   */
+  pairRawJpeg: boolean
+  /**
    * 写真の出所（ブラウザだけ）。省略はデスクトップ（フォルダ参照）。
    * `picker` は写真ピッカー、`folder` は File System Access のフォルダ、`dev` は開発用の HTTP。
    */
