@@ -122,12 +122,25 @@ private val COLLECTION = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
     MediaStore.Images.Media.EXTERNAL_CONTENT_URI
 }
 
-/** このアプリが扱う形式。 */
-private val MIME_TYPES = arrayOf("image/jpeg", "image/png", "image/webp")
+/**
+ * このアプリが扱う形式。U49 で RAW を足した（PC と同じ 10 種）。
+ * 組の JPEG がある RAW を外すかどうかはプロジェクトの設定で、一覧を取ったあとに決める。
+ */
+private val MIME_TYPES = arrayOf("image/jpeg", "image/png", "image/webp") +
+    RawFiles.MIME_TYPES.values.toTypedArray()
 
+/**
+ * MIME で選び、**RAW は拡張子でも拾う。** MediaStore は RAW を
+ * application/octet-stream のような型で持っていることがある。
+ */
 private fun mimeSelection(): Pair<String, Array<String>> {
     val placeholders = MIME_TYPES.joinToString(",") { "?" }
-    return "${MediaStore.Images.Media.MIME_TYPE} IN ($placeholders)" to MIME_TYPES
+    val byName = RawFiles.EXTENSIONS.joinToString(" OR ") {
+        "LOWER(${MediaStore.Images.Media.DISPLAY_NAME}) LIKE ?"
+    }
+    val names = RawFiles.EXTENSIONS.map { "%.$it" }.toTypedArray()
+    return "(${MediaStore.Images.Media.MIME_TYPE} IN ($placeholders) OR $byName)" to
+        (MIME_TYPES + names)
 }
 
 object Photos {
@@ -171,8 +184,8 @@ object Photos {
      * 出所から写真を引く。**プロジェクトはここだけを通る。**
      * 出所の種類が増えても、上の画面はこの 1 か所しか知らなくてよい。
      */
-    suspend fun forSource(context: Context, source: Source): List<Photo> = try {
-        list(context, source)
+    suspend fun forSource(context: Context, source: Source, pairRaw: Boolean = true): List<Photo> = try {
+        list(context, source, pairRaw)
     } catch (error: kotlinx.coroutines.CancellationException) {
         throw error
     } catch (error: Exception) {
@@ -185,11 +198,14 @@ object Photos {
      * 読めなかったら**理由を投げる**。準備はこちらを使う（つまずきとして残すため）。
      * Amazon の「リンクが消えた」をここで拾えないと、空のプロジェクトに見える。
      */
-    suspend fun list(context: Context, source: Source): List<Photo> = when (source.kind) {
-        SourceKind.Album -> photos(context, source.key)
-        SourceKind.Nas -> fromNas(context, source.key)
-        SourceKind.Amazon -> fromAmazon(source.key)
-    }
+    suspend fun list(context: Context, source: Source, pairRaw: Boolean = true): List<Photo> =
+        when (source.kind) {
+            // **組の RAW を外すのは端末と NAS だけ**（U49。PC の U46 と同じ規則）。
+            // Amazon は中身の種類で選んでいて、RAW の扱いは従来どおり。
+            SourceKind.Album -> RawFiles.skipPairedRaw(photos(context, source.key), pairRaw) { it.relativePath }
+            SourceKind.Nas -> RawFiles.skipPairedRaw(fromNas(context, source.key), pairRaw) { it.relativePath }
+            SourceKind.Amazon -> fromAmazon(source.key)
+        }
 
     /** Amazon の共有リンクの写真。**撮影時刻の昇順で来る。** */
     private suspend fun fromAmazon(key: String): List<Photo> =

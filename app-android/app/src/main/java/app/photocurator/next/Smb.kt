@@ -59,8 +59,11 @@ sealed interface SmbResult<out T> {
 object Smb {
     private const val TAG = "Smb"
 
-    /** このアプリが扱う形式。MediaStore 側と揃える。 */
-    private val EXTENSIONS = setOf("jpg", "jpeg", "png", "webp")
+    /**
+     * このアプリが扱う形式。MediaStore 側と揃える。U49 で RAW（PC と同じ 10 種）を足した。
+     * 組の JPEG がある RAW を外すかどうかは、一覧を取ったあとにプロジェクトの設定で決める。
+     */
+    private val EXTENSIONS = setOf("jpg", "jpeg", "png", "webp") + RawFiles.EXTENSIONS
 
     /** ディレクトリの印（SMB のファイル属性）。 */
     private const val DIRECTORY = 0x10L

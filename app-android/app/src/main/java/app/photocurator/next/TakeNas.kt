@@ -227,6 +227,7 @@ object TakeNas {
         when (name.substringAfterLast('.', "").lowercase()) {
             "png" -> "image/png"
             "webp" -> "image/webp"
-            else -> "image/jpeg"
+            // U49: RAW も一覧に入るようになった。**JPEG と偽って入れない。**
+            else -> RawFiles.mimeOf(name) ?: "image/jpeg"
         }
 }

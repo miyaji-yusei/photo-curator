@@ -337,7 +337,8 @@ object Prepare {
         // そのたびに網の往復が要る。
         val previous = Listing.load(context, project.source.key)
         val listed = if (!rescan && previous != null) previous else {
-            val fresh = Photos.list(context, project.source)
+            // U49: 組の RAW を外すかはプロジェクトの設定。変えたら「写真を再読み込み」で反映。
+            val fresh = Photos.list(context, project.source, Prefs.pairRawJpeg(context, project.id))
             when (decideListing(previous, fresh)) {
                 ListingDecision.Replace -> Listing.save(context, project.source.key, fresh)
                 ListingDecision.Skip -> Unit

@@ -128,7 +128,7 @@ fun ResultsScreen(
         // 圏外では空になる。選別と同じ並び（EXIF の撮影時刻）にもなる（A11）。
         // 端末のアルバムは写真を移すと変わるので、いつも今の状態を読む。
         photos = (if (project.source.remote) Listing.load(context, project.source.key) else null)
-            ?: Photos.forSource(context, project.source)
+            ?: Photos.forSource(context, project.source, Prefs.pairRawJpeg(context, project.id))
         val loaded = Store.load(context, project.id)
         session = loaded
         ratings = loaded?.ratings ?: emptyMap()

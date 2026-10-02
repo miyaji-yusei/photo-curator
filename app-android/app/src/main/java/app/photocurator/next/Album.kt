@@ -154,7 +154,8 @@ fun ProjectScreen(
         // **転んだままなら、まずそれを出す。** 準備をやり直すのは押されたとき。
         val noted = Trouble.load(context, project.source.key)
         photos = Listing.load(context, project.source.key)
-            ?: if (noted != null) emptyList() else Photos.forSource(context, project.source)
+            ?: if (noted != null) emptyList()
+            else Photos.forSource(context, project.source, Prefs.pairRawJpeg(context, project.id))
         scanned = true
         try {
             // 準備は**アプリが持つ**（Preparations）。画面を離れても止まらないので、
