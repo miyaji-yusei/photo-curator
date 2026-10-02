@@ -332,6 +332,9 @@ dictionary Judgement {
     sequence<PairOverride> overrides;
     u32? burst_distance;
     string? epoch;
+    // その端末の記録にある写真（★0 も含む）。積集合で「記録に無い＝未判定」を見分けるだけ（D3）。
+    // 意味が同じかの判断と比較キーには入れない。null は全部を記録にあると見なす。
+    sequence<string>? known = null;
 };
 
 // 端末の控え（最後に読んだ／書いた版）。一度も見ていなければ token は空。

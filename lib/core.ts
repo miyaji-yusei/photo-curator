@@ -135,6 +135,8 @@ export interface Judgement {
   overrides: PairOverride[]
   burst_distance: number | null
   epoch: string | null
+  /** その端末の記録にある写真（★0 も含む）。積集合で「記録に無い＝未判定」を見分けるだけ（D3）。比べない。 */
+  known?: string[] | null
 }
 
 /** 端末の控え（最後に読んだ／書いた版）。一度も見ていなければ token は空。 */

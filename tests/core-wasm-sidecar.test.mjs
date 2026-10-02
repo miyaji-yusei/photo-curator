@@ -68,6 +68,11 @@ describe('core-wasm のサイドカー同期（U33）', () => {
     const seen = { token: fixture.seen_token, key: androidKey, epoch: null }
     const plan = wasm.sidecarPlan(seen, wasm.sidecarJudgement(android), untouched, true, false)
     expect(plan).toEqual(fixture.expected_plan)
+
+    // U42: 端末は見た版のままでも、ほかの端末がやり直した版（早送りの関係）は確認する。
+    const restarted = read(fixture.restarted, fixture.pc_folder)
+    const again = wasm.sidecarPlan(seen, wasm.sidecarJudgement(android), restarted, true, false)
+    expect(again[fixture.expected_restarted.plan]?.reason).toBe(fixture.expected_restarted.reason)
   })
 
   it('意味が同じなら、並び・空白・updatedAt が違っても何もしない（警告なし）', () => {
@@ -136,12 +141,14 @@ describe('core-wasm のサイドカー同期（U33）', () => {
   })
 
   it('混ぜ方: 積集合・和集合と、混ぜた星の完了状態から続きを始められる', () => {
-    const done = { ...fresh(), queue: [], current: [], finished: true, ratings: { 'a.jpg': 2, 'b.jpg': 1, 'd.jpg': 1 } }
+    // 本物のセッションと同じく ratings には全部の写真を★0 も含めて載せる（D3: 記録に無い写真は未判定）。
+    const all = fresh().ratings
+    const done = { ...fresh(), queue: [], current: [], finished: true, ratings: { ...all, 'a.jpg': 2, 'b.jpg': 1, 'd.jpg': 1 } }
     const midway = {
       ...fresh(),
       queue: [],
       current: ['d.jpg'],
-      ratings: { 'a.jpg': 1, 'sub/c.jpg': 1 },
+      ratings: { ...all, 'a.jpg': 1, 'sub/c.jpg': 1 },
       history: [{ group: ['a.jpg', 'b.jpg'], chosen: ['a.jpg'], topped: null, before: {} }]
     }
     const mine = judge(done)
@@ -163,6 +170,15 @@ describe('core-wasm のサイドカー同期（U33）', () => {
     expect(result.ratings).toEqual({ 'a.jpg': 1, 'd.jpg': 1 })
     const again = roundFor(result.session, refs, 1, false, threshold, [])
     expect(again.current).toEqual(['a.jpg', 'd.jpg'])
+
+    // D3: 片方（Android）の記録に無い写真（RAW）は、記録のある側（PC）の★を採る。
+    const pc = judge({ ...done, ratings: { ...done.ratings, 'a.cr2': 2 } })
+    expect(pc.known).toContain('a.cr2')
+    expect(wasm.mergeStars(mine, pc, 'Intersection')).toEqual({ 'a.jpg': 2, 'b.jpg': 1, 'd.jpg': 1, 'a.cr2': 2 })
+    // 記録の顔ぶれ（★0 の写真）は、意味が同じかの判断と比較キーに入れない。
+    const pcZero = judge({ ...done, ratings: { ...done.ratings, 'a.cr2': 0 } })
+    expect(wasm.judgementEquivalent(mine, pcZero)).toBe(true)
+    expect(wasm.judgementKey(pcZero)).toBe(wasm.judgementKey(mine))
 
     const session = wasm.sessionFromRatings({ 'a.jpg': 5, 'b.jpg': 1 }, 1, 0, 2, null)
     expect(session.survivors).toEqual(['b.jpg'])
