@@ -1,6 +1,6 @@
 import type {
-  AmazonPreview, BurstGroup, Photo, PhotoSort, Project, ProjectProgress,
-  SelectionResult, SelectionSummary, TournamentSettings
+  AmazonPreview, BurstGroup, Photo, Project, ProjectProgress,
+  SelectionResult, TournamentSettings
 } from '~/types/photo'
 import { MAX_RATING } from '~/types/photo'
 import type { DisplaySettings, PhotoBackend } from '~/composables/photoBackend'
@@ -29,7 +29,6 @@ import {
 import type { CoreInputs } from '~/utils/coreInputs'
 import { applyChanges, moveRatings, pathsWithRating, reviewChanges, setRating } from '~/utils/ratingEdit'
 import { healRatings, syncRatings } from '~/utils/selectionFlow'
-import { collapseBursts } from '~/utils/collapseBursts'
 import { prepareProgress, projectStatus } from '~/utils/projectStatus'
 import type { CardState, CardStatus, PrepareLine } from '~/utils/projectStatus'
 import type { RatingChange, SavedSelection } from '~/utils/selectionFlow'
@@ -38,6 +37,7 @@ import { registerAutoPush, useSidecarSync } from '~/composables/useSidecarSync'
 import type { ClashChoice } from '~/composables/useSidecarSync'
 import type { View } from '~/composables/curator/types'
 import { useExport } from '~/composables/curator/useExport'
+import { useResults } from '~/composables/curator/useResults'
 
 /**
  * 行の星を**読む・消す・動かす**メソッド。選別の 1 タップは行の星の書き込みを待たずに次の組を出す（W1）ので、
@@ -249,20 +249,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   const restartForStart = ref(false)
   watch(restartDialog, open => { if (!open) restartForStart.value = false })
   const restartBusy = ref(false)
-  const resultsPhotos = shallowRef<Photo[]>([])
-  const resultsTotal = ref(0)
-  const resultsOffset = ref(0)
-  const resultsBusy = ref(false)
-  /** null は全件。数値はその星ちょうど。 */
-  const resultsRating = ref<number | null>(null)
-  const resultsSort = ref<PhotoSort>('rating')
-  const selectionSummary = ref<SelectionSummary | null>(null)
-  /** 星が1つでも付いていれば結果を見る意味がある。 */
-  const hasSelectionData = computed(() => {
-    const counts = selectionSummary.value?.counts ?? []
-    return counts.slice(1).some(count => count > 0)
-  })
-  const ratingCount = (rating: number) => selectionSummary.value?.counts[rating] ?? 0
 
   // レートの移動
   const moveDialog = ref(false)
@@ -1927,6 +1913,14 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     }
   }
 
+  // ---- 選別結果の一覧と集計（`composables/curator/useResults.ts`） ----
+  // 関数より前で使う名前（`loadSummary`・`selectionSummary` など）も、使うのは呼ばれたとき（作るときではない）。
+  const {
+    resultsPhotos, resultsTotal, resultsOffset, resultsBusy, resultsRating, resultsSort,
+    selectionSummary, hasSelectionData, ratingCount,
+    openResults, returnToResults, resultsTiles, loadMoreResults, loadSummary, selectResultsRating, loadResultsPage
+  } = useResults({ desktop, activeProject, coreSession, view, error })
+
   // ---- 書き出し・共有・CSV・メタデータ（`composables/curator/useExport.ts`） ----
   const {
     exportDialog, exportMode, exportDestination, exportRatings, exportBusy, exportResult, exportError,
@@ -1938,79 +1932,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     desktop, activeProject, coreSession, coreInputs, view, error, isAmazon, resultsRating, notify,
     refreshProjects, loadSummary, loadResultsPage
   })
-
-  /** 選別結果の一覧。中断中でも開ける。 */
-  async function openResults(rating?: unknown) {
-    if (!activeProject.value) return
-    view.value = 'results'
-    resultsOffset.value = 0
-    resultsPhotos.value = []
-    await loadSummary()
-    // 星の指定が無ければ、その結果で実際に付いている一番高い星に絞る（全部 ★0 なら「すべて」）。
-    // プロジェクトの画面の星の行から来たときは、その星のまま。
-    // （`@click="openResults"` はイベントを渡してくるので、数値か null だけを指定とみなす。）
-    resultsRating.value = rating === null || typeof rating === 'number' ? rating : highestRating()
-    await loadResultsPage(true)
-  }
-
-  /** 結果へ戻る（絞り込みはそのまま）。 */
-  const returnToResults = () => openResults(resultsRating.value)
-
-  /** 実際に付いている一番高い星（1〜5）。1 枚も付いていなければ null。 */
-  function highestRating(): number | null {
-    return [5, 4, 3, 2, 1].find(star => ratingCount(star) > 0) ?? null
-  }
-
-  /** 結果の格子のタイル。連写は、読み込んだ行の中で星が一番高い 1 枚に畳む。 */
-  const resultsTiles = computed(() => collapseBursts(resultsPhotos.value, coreSession.value?.members))
-
-  /** ページの末尾が見えたら次のページ。 */
-  function loadMoreResults() {
-    if (!resultsBusy.value && resultsPhotos.value.length < resultsTotal.value) void loadResultsPage()
-  }
-
-  async function loadSummary() {
-    if (!activeProject.value) return
-    try {
-      selectionSummary.value = await desktop.getSelectionSummary(activeProject.value.id)
-    } catch (cause) {
-      // 「選別結果を見る」が黙って消えないように、読めなかったことを出す。
-      selectionSummary.value = null
-      console.warn('選別の集計を読めませんでした', cause)
-      error.value = cause instanceof Error ? `選別の集計を読めませんでした（${cause.message}）` : '選別の集計を読めませんでした。'
-    }
-  }
-
-  async function selectResultsRating(rating: number | null) {
-    resultsRating.value = rating
-    await loadResultsPage(true)
-  }
-
-  /** 結果の読み直し（reset）の世代。reset が来たら、それ以前の読み込みの応答は捨てる（W7）。 */
-  let resultsToken = 0
-  async function loadResultsPage(reset = false) {
-    if (!activeProject.value) return
-    const token = reset ? ++resultsToken : resultsToken
-    resultsBusy.value = true
-    try {
-      if (reset) {
-        resultsOffset.value = 0
-        resultsPhotos.value = []
-      }
-      const page = await desktop.getProjectPhotoPage(
-        activeProject.value.id, resultsOffset.value, 80, resultsRating.value, resultsSort.value
-      )
-      if (token !== resultsToken) return
-      resultsPhotos.value = [...resultsPhotos.value, ...page.photos]
-      resultsTotal.value = page.total
-      resultsOffset.value += page.photos.length
-    } catch (cause) {
-      if (token === resultsToken) error.value = cause instanceof Error ? cause.message : '選別結果を読み込めませんでした。'
-    } finally {
-      // 古い読み込みが、新しい読み込みの「読み込み中」を落とさない。
-      if (token === resultsToken) resultsBusy.value = false
-    }
-  }
 
   // ---- 連写の見直し --------------------------------------------------------
 
