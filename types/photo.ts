@@ -43,6 +43,8 @@ export interface ExportReport {
   processed: number
   skipped: number
   failed: number
+  /** 組の RAW の .xmp に書けた数（メタデータへの書き込みだけ。無ければ 0 扱い）。 */
+  pairedRawProcessed?: number
   errors: string[]
 }
 
@@ -83,6 +85,16 @@ export interface Project {
    * `amazon` は Amazon Photos の共有リンク（PC だけ）。Amazon のとき `folderPath` はリンクの URL。
    */
   sourceKind: 'folder' | 'amazon'
+  /**
+   * 同名の JPEG と RAW を 1 枚の写真として扱う（RAW＋JPEG 同時撮影のとき、組の RAW を対象から外す）。
+   * プロジェクトごとの設定で、既定は true。変えたら再走査で反映される（U46）。
+   */
+  pairRawJpeg: boolean
+  /**
+   * `pairRawJpeg` を切り替えた時刻（ms）。0・省略は「作ったまま一度も切り替えていない」。
+   * サイドカーで端末どうしの設定が違うとき、新しく切り替えた方を採るのに使う（U48）。
+   */
+  pairRawJpegAt?: number
   /**
    * 写真の出所（ブラウザだけ）。省略はデスクトップ（フォルダ参照）。
    * `picker` は写真ピッカー、`folder` は File System Access のフォルダ、`dev` は開発用の HTTP。

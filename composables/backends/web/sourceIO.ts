@@ -9,6 +9,8 @@
  * 将来 Swift の殻に包むときは、`SourceIO` を実装した橋をここへ差し込む。
  */
 
+import { ASIDE_KEEP, asideName, asideStamp, asidesToDrop, nextAsideNumber } from '~/utils/sidecarAside'
+
 export interface SourceEntry {
   name: string
   isDirectory: boolean
@@ -33,7 +35,12 @@ export interface SourceIO {
    * `catalog.json` を楽観ロックで書く（ロック → 読んで `expected` と同じか → 書く → 読み戻す → ロックを放す）。
    * 見た版と違えば書かずに `changed`、ほかの端末が書いている最中なら `locked`。
    */
-  writeSidecarChecked(json: string, expected: string | null): Promise<SidecarWriteOutcome>
+  writeSidecarChecked(json: string, expected: string | null, asideTag?: string | null): Promise<SidecarWriteOutcome>
+  /**
+   * NAS に退避する（U52 D4。Android の U44 と同じ形）: `catalog.<tag>.<UTC 時刻>.json` を無いときだけ作り、
+   * 同じ tag の時刻つきは新しい 5 つだけ残す。書けなければ投げる。返すのは書いた名前。
+   */
+  asideSidecar(json: string, tag: string): Promise<string>
 }
 
 export type SidecarAccessKind = 'readwrite' | 'readonly' | 'none'
@@ -48,6 +55,24 @@ export const SIDECAR_LOCK_TTL_MS = 60_000
 /** `catalog.json` か `catalog.<英数字とハイフン>.json` だけ。別の名前・場所へ書かせない。 */
 export const isSidecarFileName = (name: string) =>
   name === SIDECAR_FILE || /^catalog\.[A-Za-z0-9-]{1,64}\.json$/.test(name)
+
+/**
+ * 古いロックか（U52 D5。Android の U44・PC の Rust と同じ判断）:
+ * - 中身に `at` がある: `at`（書いた端末の時計）と更新時刻の**両方**が TTL より古い
+ * - 中身が空・読めない（作った直後でまだ書いていない、など）: 更新時刻が古い
+ * - 更新時刻が分からなければ古いと見なさない
+ */
+export function lockIsStale(text: string, lastModified: number | null | undefined, now: number): boolean {
+  if (typeof lastModified !== 'number' || !Number.isFinite(lastModified) || lastModified <= 0) return false
+  if (now - lastModified <= SIDECAR_LOCK_TTL_MS) return false
+  let at: unknown
+  try {
+    at = (JSON.parse(text) as { at?: unknown } | null)?.at
+  } catch {
+    at = undefined
+  }
+  return typeof at === 'number' ? now - at > SIDECAR_LOCK_TTL_MS : true
+}
 
 export const joinPath = (base: string, name: string) => (base ? `${base}/${name}` : name)
 
@@ -107,6 +132,10 @@ export class PickerIO implements SourceIO {
   }
 
   writeSidecarChecked(): Promise<SidecarWriteOutcome> {
+    return Promise.reject(new Error('この出所にはサイドカーを書けません。'))
+  }
+
+  asideSidecar(): Promise<string> {
     return Promise.reject(new Error('この出所にはサイドカーを書けません。'))
   }
 }
@@ -229,14 +258,27 @@ export class HandleFolderIO implements SourceIO {
    * ロックは「無いことを確かめて作り、作ったあと中身が自分のものか読み直す」で取る（取り合いの隙は小さい）。
    * 確かめの本命は「読んで見た版と同じか」と「読み戻し」（古い版のアプリはロックを見ない）。
    */
-  async writeSidecarChecked(json: string, expected: string | null): Promise<SidecarWriteOutcome> {
+  async writeSidecarChecked(json: string, expected: string | null, asideTag?: string | null): Promise<SidecarWriteOutcome> {
     const dir = await this.root.getDirectoryHandle(SIDECAR_DIR, { create: true })
-    const mark = `${Date.now()}-${Math.random().toString(36).slice(2)}`
-    try {
-      const existing = await (await dir.getFileHandle(SIDECAR_LOCK)).getFile()
-      if (Date.now() - existing.lastModified < SIDECAR_LOCK_TTL_MS) return 'locked'
-    } catch (cause) {
-      if (!(cause instanceof DOMException && cause.name === 'NotFoundError')) throw cause
+    // 形は Android・PC と同じ `{"holder","at"}`（at は書いた端末の時計の ms）。nonce は放すときの見分け。
+    const mark = JSON.stringify({
+      holder: 'ブラウザ', at: Date.now(), nonce: Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2)
+    })
+    const readLock = async (): Promise<{ text: string, lastModified: number } | null> => {
+      try {
+        const file = await (await dir.getFileHandle(SIDECAR_LOCK)).getFile()
+        return { text: await file.text(), lastModified: file.lastModified }
+      } catch (cause) {
+        if (cause instanceof DOMException && cause.name === 'NotFoundError') return null
+        throw cause
+      }
+    }
+    const first = await readLock()
+    if (first) {
+      if (!lockIsStale(first.text, first.lastModified, Date.now())) return 'locked'
+      // 壊す前にもう一度読み、中身が変わっていれば（ほかの端末が取り直した）壊さない（U52 D5）。
+      const again = await readLock()
+      if (again && again.text !== first.text) return 'locked'
     }
     const lock = await dir.getFileHandle(SIDECAR_LOCK, { create: true })
     const lockWriter = await lock.createWritable()
@@ -244,7 +286,10 @@ export class HandleFolderIO implements SourceIO {
     await lockWriter.close()
     try {
       if ((await (await lock.getFile()).text()) !== mark) return 'locked'
-      if ((await this.readSidecar()) !== expected) return 'changed'
+      const current = await this.readSidecar()
+      if (current !== expected) return 'changed'
+      // 確かめたあとで、置き換える版を退避する（U52 D4）。**退避に失敗したら上書きしない**（投げる）。
+      if (asideTag && current !== null) await this.asideSidecar(current, asideTag)
       await this.writeSidecar(json, SIDECAR_FILE)
       return (await this.readSidecar()) === json ? 'written' : 'changed'
     } finally {
@@ -252,6 +297,52 @@ export class HandleFolderIO implements SourceIO {
       const still = await lock.getFile().then(file => file.text()).catch(() => '')
       if (still === mark) await dir.removeEntry(SIDECAR_LOCK).catch(() => undefined)
     }
+  }
+
+  /**
+   * NAS に退避する（U52 D4）。File System Access には「無ければ作る」が無いので、無いことを確かめてから作る
+   * （同じ名前を別の端末が同じ秒に作る隙は残るが、名前に端末の印と秒が入るので重ならない）。
+   */
+  async asideSidecar(json: string, tag: string): Promise<string> {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(tag)) throw new Error('退避のファイル名が正しくありません。')
+    const dir = await this.root.getDirectoryHandle(SIDECAR_DIR, { create: true })
+    const stamp = asideStamp(Date.now())
+    const listNames = async () => {
+      const names: string[] = []
+      for await (const [entry] of (dir as unknown as { entries(): AsyncIterable<[string, unknown]> }).entries()) {
+        names.push(entry)
+      }
+      return names
+    }
+    // 同じ秒の退避より後ろの番号から（片付けで消えた番号を使い直すと、新しい退避が古い扱いで消える）。
+    const first = nextAsideNumber(await listNames().catch(() => []), tag, stamp)
+    let name: string | null = null
+    for (let n = first; n < first + 9 && !name; n++) {
+      const candidate = asideName(tag, stamp, n)
+      try {
+        await dir.getFileHandle(candidate)
+      } catch (cause) {
+        if (cause instanceof DOMException && cause.name === 'NotFoundError') name = candidate
+        else throw cause
+      }
+    }
+    if (!name) throw new Error('NAS に退避のファイルを作れませんでした（同じ名前がありました）')
+    const handle = await dir.getFileHandle(name, { create: true })
+    const writable = await handle.createWritable()
+    try {
+      await writable.write(json)
+      await writable.close()
+    } catch (cause) {
+      await writable.abort().catch(() => undefined)
+      throw cause
+    }
+    // 同じ印の時刻つきの退避は、新しい 5 つだけ残す（片付けの失敗は止めない）。
+    try {
+      for (const old of asidesToDrop(await listNames(), tag, ASIDE_KEEP)) await dir.removeEntry(old).catch(() => undefined)
+    } catch {
+      // 片付けられなくても、退避は書けている。
+    }
+    return name
   }
 }
 
@@ -303,6 +394,10 @@ export class DevFolderIO implements SourceIO {
   }
 
   writeSidecarChecked(): Promise<SidecarWriteOutcome> {
+    return Promise.reject(new Error('開発用のフォルダにはサイドカーを書けません。'))
+  }
+
+  asideSidecar(): Promise<string> {
     return Promise.reject(new Error('開発用のフォルダにはサイドカーを書けません。'))
   }
 }

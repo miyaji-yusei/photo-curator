@@ -69,6 +69,7 @@ fn sidecar(session: Option<Session>, write_id: Option<&str>, by: &str, at: i64) 
         epoch: None,
         key_base: Some(KEY_BASE_FOLDER.into()),
         progress: None,
+        settings: None,
     }
 }
 
@@ -582,6 +583,105 @@ fn 計画_相手がやり直していれば確認_9_3の13() {
     }
 }
 
+/// U42（ユーザー決定 2026-10-02）: ほかの端末がやり直した版は、この端末が見た版のあと
+/// 何も変えていなくても（早送りの関係でも）、着手済みなら確認してから取り込む。
+/// 以前は早送り（#6）が先に当たり、確認なしに端末の星と選別の途中が消えていた。
+#[test]
+fn 計画_相手がやり直した版は早送りの関係でも端末が着手済みなら確認_u42() {
+    let mut a1 = sidecar(Some(progressed()), Some("w-a1"), "android", 10);
+    a1.epoch = Some("e1".into());
+    // 端末は a1 を書いたあと何も変えていない。
+    let local = canonical_judgement(Some(progressed()), HashMap::new(), vec![], None, Some("e1".into()));
+    assert_eq!(judgement_key(local.clone()), seen_of(&a1).key, "端末は変わっていない");
+
+    // PC で最初からやり直した（未着手・新しい epoch・a1 の上に書いた）。
+    let mut restarted = sidecar(Some(fresh()), Some("w-r"), "pc", 20);
+    restarted.epoch = Some("e2".into());
+    restarted.based_on = Some("w-a1".into());
+    restarted.lineage = Some(vec!["w-a1".into()]);
+    match sidecar_plan(seen_of(&a1), local.clone(), Some(restarted.clone()), true, false) {
+        SidecarPlan::Clash { reason: ClashReason::TheirsRestarted, .. } => {}
+        other => panic!("やり直しは早送りでも確認するはず: {other:?}"),
+    }
+    // 切り離し中でも同じ（自動では取り込まない）。
+    assert!(matches!(
+        sidecar_plan(seen_of(&a1), local.clone(), Some(restarted.clone()), true, true),
+        SidecarPlan::Clash { reason: ClashReason::TheirsRestarted, .. }
+    ));
+
+    // やり直したあと PC が少し進めて書いた版でも同じ。
+    let mut progressed_after = sidecar(Some(other_progress()), Some("w-r2"), "pc", 30);
+    progressed_after.epoch = Some("e2".into());
+    progressed_after.based_on = Some("w-r".into());
+    progressed_after.lineage = Some(vec!["w-r".into(), "w-a1".into()]);
+    assert!(matches!(
+        sidecar_plan(seen_of(&a1), local.clone(), Some(progressed_after), true, false),
+        SidecarPlan::Clash { reason: ClashReason::TheirsRestarted, .. }
+    ));
+
+    // 書けない共有では取り込まず、端末の分をそのまま（この端末だけの結果）。消さない側に倒す。
+    assert!(matches!(
+        sidecar_plan(seen_of(&a1), local, Some(restarted), false, false),
+        SidecarPlan::Settled { seen: None, reason: SettledReason::ReadOnly }
+    ));
+}
+
+/// U42 の副作用（安全側。意図して確かめる）: 世代の違う版の上に「書き込む」（C）を選ぶと、
+/// NAS の epoch が変わるので、ほかの端末（着手済み・変えていない）からも早送りではなく確認になる。
+/// epoch の違いだけでは「やり直し」と「世代をまたいだ書き込み」を見分けられないため。
+#[test]
+fn 計画_世代の違う版の上に書き込んだ版は相手から早送りでなく確認になる_u42() {
+    // PC はやり直して（e2）少し進め、書いた。
+    let mut p2 = sidecar(Some(other_progress()), Some("w-p2"), "pc", 20);
+    p2.epoch = Some("e2".into());
+    // Android はそれを見て「この端末の状況をサイドカーに書き込む」（e1 のまま）。
+    let mut mine = sidecar(Some(progressed()), None, "android", 30);
+    mine.epoch = Some("e1".into());
+    let written = sidecar_stamp(mine, "w-c".into(), Some(p2.clone()));
+    let pc_local = canonical_judgement(Some(other_progress()), HashMap::new(), vec![], None, Some("e2".into()));
+    assert!(matches!(
+        sidecar_plan(seen_of(&p2), pc_local, Some(written.clone()), true, false),
+        SidecarPlan::Clash { reason: ClashReason::TheirsRestarted, .. }
+    ));
+    // PC が未着手（やり直した直後のまま）なら、今までどおり確認なしに取り込む。
+    let pc_fresh = canonical_judgement(Some(fresh()), HashMap::new(), vec![], None, Some("e2".into()));
+    let mut p1 = sidecar(Some(fresh()), Some("w-p1"), "pc", 20);
+    p1.epoch = Some("e2".into());
+    let mut mine = sidecar(Some(progressed()), None, "android", 30);
+    mine.epoch = Some("e1".into());
+    let written = sidecar_stamp(mine, "w-c2".into(), Some(p1.clone()));
+    assert!(matches!(
+        sidecar_plan(seen_of(&p1), pc_fresh, Some(written), true, false),
+        SidecarPlan::Pull { reason: PullReason::LocalUntouched, .. }
+    ));
+}
+
+/// U42 で変えないこと: 端末が未着手なら、やり直された版も確認なしに取り込む。
+/// 意味が同じなら何も出さない。同じ世代の早送りは今までどおり確認なし。
+#[test]
+fn 計画_やり直された版でも端末が未着手か意味が同じなら確認しない_u42() {
+    let mut a1 = sidecar(Some(fresh()), Some("w-a1"), "android", 10);
+    a1.epoch = Some("e1".into());
+    let mut restarted = sidecar(Some(other_progress()), Some("w-r"), "pc", 20);
+    restarted.epoch = Some("e2".into());
+    restarted.based_on = Some("w-a1".into());
+    restarted.lineage = Some(vec!["w-a1".into()]);
+
+    // 端末は未着手 → 取り込む（捨てるものが無い）。
+    let untouched_local = canonical_judgement(Some(fresh()), HashMap::new(), vec![], None, Some("e1".into()));
+    assert!(matches!(
+        sidecar_plan(seen_of(&a1), untouched_local, Some(restarted.clone()), true, false),
+        SidecarPlan::Pull { reason: PullReason::LocalUntouched, aside_mine: false, .. }
+    ));
+
+    // 端末がすでに同じ状態（同じ世代・同じ星）→ 何もしない。
+    let same = sidecar_judgement(restarted.clone());
+    assert!(matches!(
+        sidecar_plan(seen_of(&a1), same, Some(restarted), true, false),
+        SidecarPlan::Settled { reason: SettledReason::Same, .. }
+    ));
+}
+
 #[test]
 fn 計画_この端末がやり直した後に相手が進んでいれば取り込まず確認_3の13() {
     let mut a1 = sidecar(Some(progressed()), Some("w-a1"), "android", 10);
@@ -731,12 +831,20 @@ fn 進み具合_roundが先なら先_食い違えば言えない_同じなら同
 // ---------------------------------------------------------------------------
 
 /// 終わった選別（全部判定済み）。
+/// 本物のセッションと同じく、`ratings` には全部の写真（NAMES）を載せ、★0 も持つ（D3 の修正で、
+/// セッションに載っていない写真は「その端末に無い＝未判定」と扱うようになったため）。
+fn session_ratings(ratings: &[(&str, i32)]) -> HashMap<String, i32> {
+    let mut all: HashMap<String, i32> = NAMES.iter().map(|name| (name.to_string(), 0)).collect();
+    all.extend(stars(ratings));
+    all
+}
+
 fn done(ratings: &[(&str, i32)]) -> Session {
     let mut session = fresh();
     session.queue.clear();
     session.current.clear();
     session.finished = true;
-    session.ratings = stars(ratings);
+    session.ratings = session_ratings(ratings);
     session
 }
 
@@ -746,7 +854,7 @@ fn midway(ratings: &[(&str, i32)], remaining: &[&str]) -> Session {
     session.current = names(remaining);
     session.queue.clear();
     session.finished = false;
-    session.ratings = stars(ratings);
+    session.ratings = session_ratings(ratings);
     session.history = vec![crate::Decision {
         group: names(&["a.jpg", "b.jpg"]),
         chosen: names(&["a.jpg"]),
@@ -806,7 +914,9 @@ fn 混ぜ方_セッションは混ぜた星の完了状態になり続きを始�
     assert_eq!(result.session.round, 1);
     assert_eq!(result.session.group_size, 3);
     assert_eq!(result.starred, 2);
-    assert_eq!(result.undecided, 1);
+    // U45: undecided は「混ぜたあとも残る、どちらも見ていない写真」。d は相手がまだ見ていないが、
+    // この端末は完了（判定済み）なので残りは 0 → 完了状態のまま（以前の期待は 1）。
+    assert_eq!(result.undecided, 0);
     assert_eq!(result.ratings, stars(&[("a.jpg", 1), ("d.jpg", 1)]));
     assert_eq!(result.session.ratings, result.ratings);
     // ★1 の 2 枚でもう一度選別できる。
@@ -882,10 +992,265 @@ fn 混ぜ方_見込みの枚数() {
     assert_eq!(preview.theirs_starred, 2);
     assert_eq!(preview.intersection_starred, 2);
     assert_eq!(preview.union_starred, 4);
-    assert_eq!(preview.undecided, 1);
+    // U45: 端末は完了しているので、どちらも見ていない写真は無い（以前の期待は 1）。
+    assert_eq!(preview.undecided, 0);
     assert!(preview.mid_round);
+    assert!(preview.mergeable);
     let union = merge_judgements(mine, theirs, MergeMode::Union, 2, "e".into());
     assert_eq!(union.starred, preview.union_starred);
+}
+
+/// D3（レビュー 2026-10-02）: PC は RAW・HEIC も選別の対象にし、Android は jpg/png/webp だけ。
+/// 片方の記録（セッションの ratings・photos）に無い写真は、その端末では「未判定」なので、
+/// 積集合でも記録のある側の★を採る（ユーザー決定「片方で未判定の写真は、判定済みの側の★」）。
+#[test]
+fn 混ぜ方_積集合で片方の記録に無い写真は記録のある側の星_d3() {
+    // PC: JPG と RAW の両方を選別した（完了）。
+    let mut pc_session = done(&[("a.jpg", 2), ("b.jpg", 1)]);
+    pc_session.ratings.insert("a.cr2".into(), 2);
+    pc_session.ratings.insert("b.heic".into(), 1);
+    pc_session.ratings.insert("c.arw".into(), 0);
+    let pc = judge(Some(pc_session));
+    // Android: JPG だけ（RAW・HEIC は記録に無い）。
+    let android = judge(Some(done(&[("a.jpg", 1), ("d.jpg", 1)])));
+
+    let expected = stars(&[("a.jpg", 1), ("a.cr2", 2), ("b.heic", 1)]);
+    assert_eq!(merge_stars(android.clone(), pc.clone(), MergeMode::Intersection), expected, "Android から");
+    assert_eq!(merge_stars(pc.clone(), android.clone(), MergeMode::Intersection), expected, "PC から");
+    // 和集合は今までどおり大きい方（記録に無い側は 0 と同じ）。
+    assert_eq!(
+        merge_stars(android.clone(), pc.clone(), MergeMode::Union),
+        stars(&[("a.jpg", 2), ("b.jpg", 1), ("d.jpg", 1), ("a.cr2", 2), ("b.heic", 1)])
+    );
+    // 見込みと結果は同じ数え方（ダイアログの数のまま混ざる）。
+    let preview = merge_preview(android.clone(), pc.clone());
+    assert_eq!(preview.intersection_starred, 3);
+    let result = merge_judgements(android, pc, MergeMode::Intersection, 2, "e".into());
+    assert_eq!(result.ratings, expected);
+    assert_eq!(result.starred, preview.intersection_starred);
+}
+
+/// D3: セッションが無い側（★だけの古い記録）でも、photos に無い写真は未判定（今までどおり）。
+/// photos に★0 で載っている写真は、セッションが無ければ未判定のまま（設計書どおり）。
+#[test]
+fn 混ぜ方_d3でも記録の比べ方は意味が同じかの判断に影響しない() {
+    // 記録の顔ぶれ（★0 の写真）だけ違う 2 つは、今までどおり「意味が同じ」（警告なし）。
+    let mut pc_session = done(&[("a.jpg", 1)]);
+    pc_session.ratings.insert("a.cr2".into(), 0);
+    let pc = judge(Some(pc_session));
+    let android = judge(Some(done(&[("a.jpg", 1)])));
+    assert!(judgement_equivalent(pc.clone(), android.clone()));
+    assert_eq!(judgement_key(pc), judgement_key(android));
+}
+
+// ---------------------------------------------------------------------------
+// U45: 混ぜても、どちらの端末もまだ見ていない写真をスキップしない
+// ---------------------------------------------------------------------------
+
+fn many(count: usize) -> Vec<String> {
+    (0..count).map(|index| format!("p{index:04}.jpg")).collect()
+}
+
+fn refs_named(list: &[String]) -> Vec<PhotoRef> {
+    list.iter()
+        .enumerate()
+        .map(|(index, name)| PhotoRef {
+            relative_path: name.clone(),
+            captured_at: Some(index as i64 * 100_000),
+            d_hash: Some("0000000000000000".into()),
+            d_hash_version: 2,
+        })
+        .collect()
+}
+
+/// `groups` 組を決める。各組の `pick` 番目を選ぶ。
+fn judge_groups(mut session: Session, groups: usize, pick: usize) -> Session {
+    for _ in 0..groups {
+        let chosen = session.current[pick].clone();
+        session = advance(session, vec![chosen]);
+    }
+    session
+}
+
+fn remaining_of(session: &Session) -> Vec<String> {
+    session.current.iter().chain(&session.queue).cloned().collect()
+}
+
+/// 報告（L:\20260927_NANIWA_SPLASH_Day2\Saya）の形。844 枚・4 枚ずつ。
+/// A（この端末）は ROUND 1 で 100 組（400 枚）を決め、残り 444 枚。
+/// B（NAS）は同じ ROUND 1 で 80 組（320 枚）を決め、残り 524 枚（A の残り 444 枚を含む）。
+fn reported_case() -> (Vec<String>, Session, Session) {
+    let all = many(844);
+    let start = start_round(refs_named(&all), 4, 0, false, thr(), vec![]);
+    let a = judge_groups(start.clone(), 100, 0);
+    let b = judge_groups(start, 80, 1);
+    assert_eq!(remaining_of(&a).len(), 444);
+    assert_eq!(remaining_of(&b).len(), 524);
+    (all, a, b)
+}
+
+#[test]
+fn 混ぜ方_u45_和集合でもどちらも見ていない444枚はスキップせず続きから選別できる() {
+    let (all, a, b) = reported_case();
+    let unseen: Vec<String> = all[400..].to_vec();
+    let preview = merge_preview(judge(Some(a.clone())), judge(Some(b.clone())));
+    assert!(preview.mergeable, "同じ ROUND・同じ対象★なら混ぜられる");
+    assert!(preview.mid_round);
+    assert_eq!(preview.undecided, 444, "混ぜたあとも残る、どちらも見ていない写真の数");
+
+    let result = merge_judgements(judge(Some(a)), judge(Some(b)), MergeMode::Union, 4, "e".into());
+    let session = result.session.clone();
+    assert!(!session.finished, "未判定の写真が残るので完了にしない");
+    assert_eq!(remaining_of(&session), unseen, "両方が見ていない写真が、元の並び順のまま全部残る");
+    assert_eq!(session.current.len(), 4, "先頭の 1 組を出している");
+    assert!(session.history.is_empty(), "1 つ戻すはできない");
+    assert_eq!((session.round, session.target_star, session.group_size), (1, 0, 4));
+    assert_eq!(result.undecided, 444);
+    // ★: A が選んだ 100 枚と B が選んだ 80 枚（和集合）。
+    let expected: HashMap<String, i32> = (0..100)
+        .map(|k| (all[4 * k].clone(), 1))
+        .chain((0..80).map(|k| (all[4 * k + 1].clone(), 1)))
+        .collect();
+    assert_eq!(result.ratings, expected);
+    assert_eq!(result.starred, 180);
+    // survivors（次のラウンドの対象）も和集合。
+    let mut survivors: Vec<String> = expected.keys().cloned().collect();
+    survivors.sort();
+    assert_eq!(session.survivors, survivors);
+    // 判定済みの写真は queue に出ない。
+    assert!(all[..400].iter().all(|id| !remaining_of(&session).contains(id)));
+
+    // 続きから選別できる（先頭から出て、選べば★が上がり、最後まで進める）。
+    let next = advance(session, vec![all[400].clone()]);
+    assert_eq!(next.ratings.get(&all[400]).copied(), Some(1));
+    assert_eq!(next.current, all[404..408].to_vec());
+    let mut rest = next;
+    let mut groups = 1;
+    while !rest.finished {
+        rest = advance(rest, vec![]);
+        groups += 1;
+    }
+    assert_eq!(groups, 111, "444 枚を 4 枚ずつ全部見る");
+    assert!(rest.survivors.contains(&all[400]));
+}
+
+#[test]
+fn 混ぜ方_u45_積集合でも残りは続きから_片方だけが判定した写真はその側の判断() {
+    let (all, a, b) = reported_case();
+    let result = merge_judgements(judge(Some(a)), judge(Some(b)), MergeMode::Intersection, 4, "e".into());
+    assert!(!result.session.finished);
+    assert_eq!(remaining_of(&result.session), all[400..].to_vec());
+    // 先頭 80 組は両方が判定し、選んだ写真が違う → どちらも★0。
+    // 81〜100 組目は A だけが判定 → A の判断（各組の先頭が★1）。
+    let expected: HashMap<String, i32> = (80..100).map(|k| (all[4 * k].clone(), 1)).collect();
+    assert_eq!(result.ratings, expected);
+    let mut survivors: Vec<String> = expected.keys().cloned().collect();
+    survivors.sort();
+    assert_eq!(result.session.survivors, survivors);
+}
+
+#[test]
+fn 混ぜ方_u45_片方だけが判定した写真はその側の判断で_残りは両方の未判定だけ() {
+    // A: [a,b] で a を選んだ（残り sub/c・d・e・f）。
+    // B: [a,b] はどれも選ばず、[sub/c,d] で d を選んだ（残り e・f）。
+    let a = advance(fresh(), names(&["a.jpg"]));
+    let b = advance(advance(fresh(), names(&[])), names(&["d.jpg"]));
+    // 積集合: a は両方が判定（B は選ばず）→ 0。d は B だけが判定 → 1。sub/c も B だけ → 0。
+    let result = merge_judgements(judge(Some(a.clone())), judge(Some(b.clone())), MergeMode::Intersection, 2, "e".into());
+    assert!(!result.session.finished);
+    assert_eq!(remaining_of(&result.session), names(&["e.jpg", "f.jpg"]));
+    assert_eq!(result.ratings, stars(&[("d.jpg", 1)]));
+    assert_eq!(result.session.survivors, names(&["d.jpg"]));
+    // 和集合: a（A で選んだ）と d（B で選んだ）。
+    let result = merge_judgements(judge(Some(a)), judge(Some(b)), MergeMode::Union, 2, "e".into());
+    assert_eq!(remaining_of(&result.session), names(&["e.jpg", "f.jpg"]));
+    assert_eq!(result.ratings, stars(&[("a.jpg", 1), ("d.jpg", 1)]));
+    assert_eq!(result.session.survivors, names(&["a.jpg", "d.jpg"]));
+    // 判定していない写真の★0 も記録に残す（次に混ぜるとき「記録に無い＝未判定」にならない）。
+    assert_eq!(result.session.ratings.get("e.jpg").copied(), Some(0));
+}
+
+/// 連写のまとまり: 代表 a に b、代表 e に f。代表だけが並ぶ（a・sub/c・d・e）。
+fn burst_start() -> Session {
+    let mut session = fresh();
+    session.members = HashMap::from([
+        ("a.jpg".to_string(), names(&["a.jpg", "b.jpg"])),
+        ("e.jpg".to_string(), names(&["e.jpg", "f.jpg"])),
+    ]);
+    session.current = names(&["a.jpg", "sub/c.jpg"]);
+    session.queue = names(&["d.jpg", "e.jpg"]);
+    session
+}
+
+#[test]
+fn 混ぜ方_u45_連写の仲間も判定済みとして扱い_残りのまとまりは仲間ごと続きから() {
+    let a = advance(burst_start(), names(&["a.jpg"]));
+    let b = advance(burst_start(), names(&[]));
+    let preview = merge_preview(judge(Some(a.clone())), judge(Some(b.clone())));
+    assert_eq!(preview.undecided, 3, "d と、まとまり e（e・f）");
+
+    let result = merge_judgements(judge(Some(a)), judge(Some(b)), MergeMode::Union, 2, "e".into());
+    assert!(!result.session.finished);
+    // b は a の仲間として判定済み → 出さない。e のまとまりは代表だけが出る。
+    assert_eq!(remaining_of(&result.session), names(&["d.jpg", "e.jpg"]));
+    assert_eq!(result.session.members.get("e.jpg"), Some(&names(&["e.jpg", "f.jpg"])));
+    assert_eq!(result.ratings, stars(&[("a.jpg", 1), ("b.jpg", 1)]));
+    // 続きで e を選ぶと、仲間の f にも★が配られる。
+    let next = advance(result.session, names(&["e.jpg"]));
+    assert_eq!(next.ratings.get("f.jpg").copied(), Some(1));
+    assert!(next.finished);
+}
+
+#[test]
+fn 混ぜ方_u45_roundか対象の星が違えば混ぜられず_呼ばれても端末の分を変えない() {
+    // この端末: ROUND 2（★1 から）の途中。NAS: ROUND 1 の途中。
+    let mut late = fresh();
+    late.round = 2;
+    late.target_star = 1;
+    late.ratings = session_ratings(&[("a.jpg", 1), ("b.jpg", 1), ("d.jpg", 2)]);
+    late.current = names(&["a.jpg", "b.jpg"]);
+    late.queue = vec![];
+    late.history = vec![crate::Decision {
+        group: names(&["d.jpg", "e.jpg"]),
+        chosen: names(&["d.jpg"]),
+        topped: None,
+        before: HashMap::new(),
+    }];
+    late.survivors = names(&["d.jpg"]);
+    let mine = judge(Some(late));
+    let theirs = judge(Some(other_progress()));
+
+    let preview = merge_preview(mine.clone(), theirs.clone());
+    assert!(!preview.mergeable, "途中の ROUND があり、ROUND が違う");
+    // 呼ばれても（画面が古いなど）、この端末の分をそのまま返す（スキップしない）。
+    let result = merge_judgements(mine.clone(), theirs.clone(), MergeMode::Union, 2, "e".into());
+    assert!(!result.session.finished);
+    assert_eq!(remaining_of(&result.session), names(&["a.jpg", "b.jpg"]));
+    assert_eq!((result.session.round, result.session.target_star), (2, 1));
+    assert_eq!(result.ratings, stars(&[("a.jpg", 1), ("b.jpg", 1), ("d.jpg", 2)]));
+    assert_eq!(result.session.survivors, names(&["d.jpg"]));
+
+    // 片方が完了していても、もう片方が途中で ROUND が違えば混ぜない。
+    let mut finished_late = done(&[("a.jpg", 2)]);
+    finished_late.round = 2;
+    finished_late.target_star = 1;
+    assert!(!merge_preview(judge(Some(finished_late)), theirs).mergeable);
+}
+
+#[test]
+fn 混ぜ方_u45_両方完了なら今までどおり完了状態で見込みの未判定は0() {
+    let mut late = done(&[("a.jpg", 3), ("b.jpg", 2)]);
+    late.round = 3;
+    late.target_star = 2;
+    let mine = judge(Some(late));
+    let theirs = judge(Some(done(&[("a.jpg", 1)])));
+    let preview = merge_preview(mine.clone(), theirs.clone());
+    assert!(preview.mergeable, "未判定が無いので、ROUND が違っても混ぜられる");
+    assert!(!preview.mid_round);
+    assert_eq!(preview.undecided, 0);
+    let result = merge_judgements(mine, theirs, MergeMode::Union, 2, "e".into());
+    assert!(result.session.finished);
+    assert_eq!(result.undecided, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1145,4 +1510,155 @@ fn 刻印_古い形の版の上に書くとlegacyの見分けを控える_系統
     let lineage = capped.lineage.unwrap();
     assert_eq!(lineage.len(), 32);
     assert_eq!(lineage[0], "w-top");
+}
+
+// ---------------------------------------------------------------------------
+// プロジェクトの設定の同期（U48）: settings.pairRawJpeg
+// ---------------------------------------------------------------------------
+
+fn pair(value: bool, at: i64) -> Option<SettingsRecord> {
+    Some(SettingsRecord { pair_raw_jpeg: Some(SettingValueBool { value, at }), other: HashMap::new() })
+}
+
+#[test]
+fn 設定_どちらかが無ければある方を採る_u48() {
+    assert_eq!(settings_resolve(None, None), SettingsPlan::Keep);
+    assert_eq!(settings_resolve(None, pair(false, 5)), SettingsPlan::AdoptRemote { value: false, at: 5 });
+    assert_eq!(settings_resolve(pair(false, 5), None), SettingsPlan::PushLocal);
+    // settings はあっても pairRawJpeg が無いのは、無いのと同じ。
+    let empty = Some(SettingsRecord::default());
+    assert_eq!(settings_resolve(pair(true, 0), empty.clone()), SettingsPlan::PushLocal);
+    assert_eq!(settings_resolve(empty, pair(true, 0)), SettingsPlan::AdoptRemote { value: true, at: 0 });
+}
+
+#[test]
+fn 設定_値が同じなら時刻が違っても何もしない_u48() {
+    assert_eq!(settings_resolve(pair(true, 0), pair(true, 99)), SettingsPlan::Keep);
+    assert_eq!(settings_resolve(pair(false, 99), pair(false, 1)), SettingsPlan::Keep);
+}
+
+#[test]
+fn 設定_値が違えば新しく切り替えた方_同じ時刻ならnas_u48() {
+    assert_eq!(settings_resolve(pair(false, 20), pair(true, 10)), SettingsPlan::PushLocal);
+    assert_eq!(settings_resolve(pair(false, 10), pair(true, 20)), SettingsPlan::AdoptRemote { value: true, at: 20 });
+    // 作ったまま（時刻 0）の端末は、切り替えた記録に合わせる。
+    assert_eq!(settings_resolve(pair(true, 0), pair(false, 1)), SettingsPlan::AdoptRemote { value: false, at: 1 });
+    assert_eq!(settings_resolve(pair(true, 7), pair(false, 7)), SettingsPlan::AdoptRemote { value: false, at: 7 });
+}
+
+/// 古い版（settings なし）の catalog.json は読めて、書き戻しても他が変わらず、settings も足さない。
+#[test]
+fn 設定_settingsなしの古い版を読んで書き戻しても不変_u48() {
+    let text = r#"{"version":2,"updatedAt":5,"updatedBy":"pc","updatedByName":"PC","photos":{"a.jpg":{"rating":1}},
+        "burstOverrides":[{"left":"a.jpg","right":"b.jpg","decision":"split"}],"sessions":{},"burstDistance":9,
+        "writeId":"w-1","basedOn":"w-0","lineage":["w-0"],"epoch":"e-1","keyBase":"folder"}"#;
+    let sidecar = sidecar_from_json(text.into()).expect("読める");
+    assert!(sidecar.settings.is_none());
+    let back: serde_json::Value = serde_json::from_str(&sidecar_to_json(sidecar)).unwrap();
+    let original: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(back, original);
+    assert!(back.get("settings").is_none());
+}
+
+#[test]
+fn 設定_読み書きの形と未知の設定を保つ_u48() {
+    let text = r#"{"version":2,"updatedAt":5,"updatedBy":"pc","updatedByName":"PC","photos":{},"burstOverrides":[],
+        "sessions":{},"settings":{"pairRawJpeg":{"value":false,"at":1790955613101},"futureThing":{"value":3,"at":4,"x":[1]}}}"#;
+    let sidecar = sidecar_from_json(text.into()).expect("読める");
+    let settings = sidecar.settings.clone().expect("settings");
+    assert_eq!(settings.pair_raw_jpeg, Some(SettingValueBool { value: false, at: 1790955613101 }));
+    assert!(settings.other.contains_key("futureThing"));
+    let back: serde_json::Value = serde_json::from_str(&sidecar_to_json(sidecar)).unwrap();
+    let original: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(back["settings"], original["settings"]);
+}
+
+#[test]
+fn 設定_型の違う値は読み捨てて全体は読める_u48() {
+    let base = r#""version":2,"updatedAt":5,"updatedBy":"pc","updatedByName":"PC","photos":{"a.jpg":{"rating":2}},"burstOverrides":[],"sessions":{}"#;
+    let broken = sidecar_from_json(format!(r#"{{{base},"settings":5}}"#)).expect("settings が数でも読める");
+    assert!(broken.settings.is_none());
+    assert_eq!(broken.photos["a.jpg"].rating, 2);
+    let odd = sidecar_from_json(format!(r#"{{{base},"settings":{{"pairRawJpeg":"yes","other":{{"value":1}}}}}}"#))
+        .expect("pairRawJpeg の型が違っても読める");
+    let settings = odd.settings.expect("settings");
+    assert!(settings.pair_raw_jpeg.is_none());
+    assert!(settings.other.contains_key("other"));
+    // at が無ければ 0（一度も切り替えていない）。
+    let no_at = sidecar_from_json(format!(r#"{{{base},"settings":{{"pairRawJpeg":{{"value":true}}}}}}"#)).unwrap();
+    assert_eq!(no_at.settings.unwrap().pair_raw_jpeg, Some(SettingValueBool { value: true, at: 0 }));
+}
+
+#[test]
+fn 設定_書く前の刻印で置き換える版の未知の設定と端末に無い設定を引き継ぐ_u48() {
+    let mut base = sidecar(None, Some("w-1"), "android", 5);
+    let mut other = HashMap::new();
+    other.insert("futureThing".to_string(), r#"{"value":3}"#.to_string());
+    base.settings = Some(SettingsRecord { pair_raw_jpeg: Some(SettingValueBool { value: false, at: 9 }), other });
+
+    // 端末に設定が無い（古い書き手）→ NAS の分をそのまま引き継ぐ。
+    let kept = sidecar_stamp(sidecar(None, None, "me", 6), "w-2".into(), Some(base.clone()));
+    let settings = kept.settings.expect("引き継ぐ");
+    assert_eq!(settings.pair_raw_jpeg, Some(SettingValueBool { value: false, at: 9 }));
+    assert!(settings.other.contains_key("futureThing"));
+
+    // 端末に設定がある → 端末の値を書き、未知の設定は残す。
+    let mut mine = sidecar(None, None, "me", 6);
+    mine.settings = pair(true, 12);
+    let stamped = sidecar_stamp(mine, "w-3".into(), Some(base));
+    let settings = stamped.settings.clone().expect("settings");
+    assert_eq!(settings.pair_raw_jpeg, Some(SettingValueBool { value: true, at: 12 }));
+    assert_eq!(settings.other.get("futureThing").map(String::as_str), Some(r#"{"value":3}"#));
+    let json: serde_json::Value = serde_json::from_str(&sidecar_to_json(stamped)).unwrap();
+    assert_eq!(json["settings"]["futureThing"]["value"], 3);
+    assert_eq!(json["settings"]["pairRawJpeg"], serde_json::json!({ "value": true, "at": 12 }));
+}
+
+#[test]
+fn 設定_比較キーと意味が同じかの判断に入れない_u48() {
+    let plain = sidecar(Some(progressed()), Some("w-1"), "pc", 5);
+    let mut with = plain.clone();
+    with.settings = pair(false, 123);
+    let mut other_value = plain.clone();
+    other_value.settings = pair(true, 456);
+    for candidate in [&with, &other_value] {
+        assert!(judgement_equivalent(sidecar_judgement(plain.clone()), sidecar_judgement(candidate.clone())));
+        assert_eq!(judgement_key(sidecar_judgement(plain.clone())), judgement_key(sidecar_judgement(candidate.clone())));
+        assert_eq!(sidecar_seen(plain.clone()), sidecar_seen(candidate.clone()));
+    }
+}
+
+/// 設定だけを書き直した版（writeId は新しい・選別状況は見た版のまま）は、確認も「早送りの取り込み」も起こさない。
+#[test]
+fn 計画_設定だけ書き直された版の上には端末の変更をそのまま書く_u48() {
+    let a1 = sidecar(Some(progressed()), Some("w-a1"), "android", 10);
+    let seen = seen_of(&a1);
+    // PC が設定だけ変えて書いた版。
+    let mut p2 = a1.clone();
+    p2.updated_by = "pc".into();
+    p2.settings = pair(false, 99);
+    let p2 = sidecar_stamp(p2, "w-p2".into(), Some(a1.clone()));
+
+    // 端末が変わっていなければ「意味が同じ」で何もしない（控えだけ進める）。
+    assert!(matches!(
+        sidecar_plan(seen.clone(), judge(Some(progressed())), Some(p2.clone()), true, false),
+        SidecarPlan::Settled { reason: SettledReason::Same, .. }
+    ));
+    // 端末が進んでいれば、確認せずに書く（NAS の選別状況は見た版から変わっていない）。
+    let changed = advance(progressed(), names(&["e.jpg"]));
+    match sidecar_plan(seen.clone(), judge(Some(changed.clone())), Some(p2.clone()), true, false) {
+        SidecarPlan::Push { expected, aside_theirs: false, reason: PushReason::LocalChanged } => {
+            assert_eq!(expected.as_deref(), Some("w-p2"));
+        }
+        other => panic!("書くはず: {other:?}"),
+    }
+    // 切り離し中・書けない共有なら書かない（#3 と同じ）。
+    assert!(matches!(
+        sidecar_plan(seen.clone(), judge(Some(changed.clone())), Some(p2.clone()), true, true),
+        SidecarPlan::Settled { reason: SettledReason::Detached, .. }
+    ));
+    assert!(matches!(
+        sidecar_plan(seen, judge(Some(changed)), Some(p2), false, false),
+        SidecarPlan::Settled { reason: SettledReason::ReadOnly, .. }
+    ));
 }

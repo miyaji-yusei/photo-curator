@@ -121,9 +121,25 @@ struct SidecarSyncFixture {
     pc_folder: String,
     pc: serde_json::Value,
     untouched: serde_json::Value,
+    /// U42: ほかの端末がやり直した版（未着手・別の epoch・見た版の上に書いた＝早送りの関係）。
+    restarted: serde_json::Value,
+    /// `{ "plan": "Clash", "reason": "TheirsRestarted" }`（Clash の中身は大きいので、種類と理由だけ比べる）。
+    expected_restarted: serde_json::Value,
     seen_token: String,
     expected_key: String,
     expected_plan: serde_json::Value,
+    /// U45: 途中の ROUND どうしを混ぜても、どちらも見ていない写真は queue に残る。
+    merge_mid_round: MergeMidRoundFixture,
+}
+
+#[derive(Deserialize)]
+struct MergeMidRoundFixture {
+    group_size: u32,
+    mine: Session,
+    theirs: Session,
+    expected_preview: serde_json::Value,
+    expected_union: serde_json::Value,
+    expected_intersection: serde_json::Value,
 }
 
 /// サイドカー同期（U33）: Android の古い形と PC の形の同じ選別状況が、鍵をそろえると
@@ -148,6 +164,64 @@ fn sidecar_sync_はフィクスチャの期待値と一致する() {
     assert_eq!(judgement_key(sidecar_judgement(pc)), fixture.expected_key, "PC の形");
 
     let seen = SeenRecord { token: fixture.seen_token, key: android_key, epoch: None };
-    let plan = sidecar_plan(seen, sidecar_judgement(android), Some(untouched), true, false);
+    let plan = sidecar_plan(seen.clone(), sidecar_judgement(android.clone()), Some(untouched), true, false);
     assert_eq!(serde_json::to_value(&plan).unwrap(), fixture.expected_plan);
+
+    // U42: 端末は見た版のまま（変えていない）でも、ほかの端末がやり直した版は確認する。
+    let restarted = read(&fixture.restarted, &fixture.pc_folder);
+    let plan = serde_json::to_value(sidecar_plan(seen, sidecar_judgement(android), Some(restarted), true, false)).unwrap();
+    let kind = fixture.expected_restarted["plan"].as_str().expect("plan");
+    assert_eq!(plan[kind]["reason"], fixture.expected_restarted["reason"], "やり直した版: {plan}");
+
+    // U45: D・E で混ぜても、どちらの端末もまだ見ていない写真を飛ばさない。
+    use photo_curator_core::{canonical_judgement, merge_judgements, merge_preview, MergeMode};
+    use std::collections::HashMap;
+    let merge = fixture.merge_mid_round;
+    let judge = |session: &Session| canonical_judgement(Some(session.clone()), HashMap::new(), vec![], None, None);
+    let preview = serde_json::to_value(merge_preview(judge(&merge.mine), judge(&merge.theirs))).unwrap();
+    for (field, value) in merge.expected_preview.as_object().expect("expected_preview") {
+        assert_eq!(&preview[field], value, "見込みの {field}");
+    }
+    for (mode, expected) in [(MergeMode::Union, &merge.expected_union), (MergeMode::Intersection, &merge.expected_intersection)] {
+        let result = merge_judgements(judge(&merge.mine), judge(&merge.theirs), mode, merge.group_size, "e".into());
+        let session = serde_json::to_value(&result.session).unwrap();
+        for field in ["finished", "current", "queue", "survivors"] {
+            assert_eq!(session[field], expected[field], "{mode:?} の {field}");
+        }
+        assert_eq!(serde_json::to_value(&result.ratings).unwrap(), expected["ratings"], "{mode:?} の★");
+        assert_eq!(serde_json::json!(result.undecided), expected["undecided"], "{mode:?} の残り");
+        // 続きから選別できる。
+        let next = advance(result.session, vec!["e.jpg".into()]);
+        assert_eq!(next.ratings.get("e.jpg").copied(), Some(1), "{mode:?} の続き");
+    }
+}
+
+/// U48: catalog.json の settings（pairRawJpeg）の同期。wasm 側（tests/core-wasm-sidecar.test.mjs）も同じ答え。
+#[test]
+fn settings_resolve_はフィクスチャの期待値と一致する() {
+    use photo_curator_core::{
+        judgement_key, settings_resolve, sidecar_from_json, sidecar_judgement, sidecar_to_json, SettingsRecord,
+    };
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/settings_resolve.json")).expect("fixture を読める");
+    let record = |value: &serde_json::Value| -> Option<SettingsRecord> {
+        if value.is_null() {
+            None
+        } else {
+            Some(serde_json::from_value(value.clone()).expect("settings として読める"))
+        }
+    };
+    for case in fixture["cases"].as_array().expect("cases") {
+        let plan = settings_resolve(record(&case["local"]), record(&case["remote"]));
+        assert_eq!(serde_json::to_value(plan).unwrap(), case["expected"], "{}", case["name"]);
+    }
+
+    // settings の有無は比較キーを変えない。書き戻しても settings（未知の設定も）を保つ。
+    let without = sidecar_from_json(fixture["catalog_without_settings"].to_string()).expect("読める");
+    let with = sidecar_from_json(fixture["catalog_with_settings"].to_string()).expect("読める");
+    assert_eq!(judgement_key(sidecar_judgement(without.clone())), judgement_key(sidecar_judgement(with.clone())));
+    let back: serde_json::Value = serde_json::from_str(&sidecar_to_json(with)).unwrap();
+    assert_eq!(back["settings"], fixture["catalog_with_settings"]["settings"]);
+    let back: serde_json::Value = serde_json::from_str(&sidecar_to_json(without)).unwrap();
+    assert_eq!(back, fixture["catalog_without_settings"]);
 }

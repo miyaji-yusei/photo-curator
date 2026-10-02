@@ -138,7 +138,12 @@ namespace photo_curator_core {
         boolean detached
     );
     // 書く直前に v2 の印（version・writeId・basedOn・lineage・keyBase・progress）を入れる。
+    // 設定は base にあって sidecar に無いもの（未知の設定など）を引き継ぐ（U48）。
     Sidecar sidecar_stamp(Sidecar sidecar, string write_id, Sidecar? base);
+
+    // U48: プロジェクトの設定（pairRawJpeg）をどうするか。どちらかが無ければある方、
+    // 値が同じなら何もしない、違えば切り替えた時刻（at）が新しい方、同じ時刻なら NAS。
+    SettingsPlan settings_resolve(SettingsRecord? local, SettingsRecord? remote);
 
     // 混ぜる（ダイアログの D・E）。
     record<DOMString, i32> merge_stars(Judgement mine, Judgement theirs, MergeMode mode);
@@ -283,6 +288,29 @@ dictionary Sidecar {
     string? epoch;
     string? key_base;
     SidecarProgress? progress;
+    // U48: プロジェクトの設定（比較キー・意味が同じかには入れない）。古い呼び出し側のため既定は null。
+    SettingsRecord? settings = null;
+};
+
+// U48: 真偽の設定 1 つ。at は切り替えた時刻（ms）。0 は「作ったまま一度も切り替えていない」。
+dictionary SettingValueBool {
+    boolean value;
+    i64 at;
+};
+
+// U48: catalog.json の settings。知らない設定は other に「名前 → 値の JSON 文字列」で持ち、書き戻す。
+dictionary SettingsRecord {
+    SettingValueBool? pair_raw_jpeg = null;
+    // uniffi 0.28 は {} の既定値を書けない。Kotlin では other = emptyMap() を渡す。
+    record<DOMString, string> other;
+};
+
+// U48: 設定をどうするか（settings_resolve）。今は pairRawJpeg だけ。
+[Enum]
+interface SettingsPlan {
+    Keep();
+    AdoptRemote(boolean value, i64 at);
+    PushLocal();
 };
 
 // 判断と画面のための要約（Session から作り直せる値）。
@@ -332,6 +360,9 @@ dictionary Judgement {
     sequence<PairOverride> overrides;
     u32? burst_distance;
     string? epoch;
+    // その端末の記録にある写真（★0 も含む）。積集合で「記録に無い＝未判定」を見分けるだけ（D3）。
+    // 意味が同じかの判断と比較キーには入れない。null は全部を記録にあると見なす。
+    sequence<string>? known = null;
 };
 
 // 端末の控え（最後に読んだ／書いた版）。一度も見ていなければ token は空。
@@ -356,6 +387,8 @@ dictionary MergePreview {
     u32 union_starred;
     u32 undecided;
     boolean mid_round;
+    // U45: 途中の ROUND があるのに ROUND か対象の★が違えば false（D・E を出さない）。
+    boolean mergeable;
 };
 
 dictionary MergeResult {

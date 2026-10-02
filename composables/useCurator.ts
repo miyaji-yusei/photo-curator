@@ -93,7 +93,16 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   const desktop = withRatingsBarrier(backend, () => ratingsQueue.flush())
   const { notify } = useNotice()
   // サイドカー（写真のフォルダの `.photo-curator/catalog.json`）。開き方の判断は core の sidecarPlan が行う。
-  const sidecar = useSidecarSync(desktop)
+  // ほかの端末で切り替えた「同名の JPEG と RAW を 1 枚として扱う」を取り込んだら（U48）、画面のプロジェクトを
+  // 読み直す（お知らせは useSidecarSync が出す。写真への反映は「写真を再読み込み」で、自動では走査しない）。
+  const sidecar = useSidecarSync(desktop, {
+    onSettingsAdopted: async (projectId) => {
+      await refreshProjects()
+      if (activeProject.value?.id === projectId) {
+        activeProject.value = projects.value.find(item => item.id === projectId) ?? activeProject.value
+      }
+    }
+  })
   const {
     access: sidecarAccess, clash: sidecarClash, busy: sidecarBusy,
     message: sidecarMessage, notice: sidecarNotice, detached: sidecarDetached, savedAt: sidecarSavedAt
@@ -1001,8 +1010,14 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   })
   watch(createDialog, open => {
     if (!open) resetAmazonDraft()
-    else void loadCreateDisplay()
+    else {
+      createPairRaw.value = true
+      void loadCreateDisplay()
+    }
   })
+
+  // 作成ダイアログの「ファイル名が同じ JPEG と RAW を 1 枚の写真として扱う」。既定はオン（U46）。
+  const createPairRaw = ref(true)
 
   // 作成ダイアログの「表示用画像の大きさ」。既定はアプリの設定の値。
   const createDisplayChoices = ref<number[]>([])
@@ -1059,6 +1074,36 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     }
   }
 
+  /** 作成した直後、走査を始める前に、ダイアログで選んだ「同名の JPEG と RAW」の設定をこのプロジェクトに書く。既定（オン）のときは書かない。 */
+  async function applyCreatePairRaw(projectId: string) {
+    if (createPairRaw.value) return
+    try {
+      await desktop.saveProjectPairRaw(projectId, false)
+    } catch (cause) {
+      error.value = cause instanceof Error ? cause.message : '設定を保存できませんでした。同名の JPEG と RAW をまとめる既定の設定で読み込みます。'
+    }
+  }
+
+  /**
+   * このプロジェクトの「同名の JPEG と RAW を 1 枚の写真として扱う」を切り替える。
+   * 反映は次の走査から。変えたらその旨を知らせる（自動では走査しない）。
+   * 切り替えた時刻も保存し（backend）、ほかの端末へ届くようサイドカーにも書く（U48。いつもの自動の書き込み
+   * ＝区切りで書くのと同じ経路。選別状況が同じなら設定だけを書く。書けなければ次の区切りで書く）。
+   */
+  async function setPairRawJpeg(enabled: boolean) {
+    const project = activeProject.value
+    if (!project || project.pairRawJpeg === enabled) return
+    try {
+      await desktop.saveProjectPairRaw(project.id, enabled)
+      await refreshProjects()
+      activeProject.value = projects.value.find(item => item.id === project.id) ?? activeProject.value
+      notify('設定を変えました。写真に反映するには「写真を再読み込み」を押してください。')
+      void flushThenPush().catch(() => undefined)
+    } catch (cause) {
+      error.value = cause instanceof Error ? cause.message : '設定を保存できませんでした。'
+    }
+  }
+
   /** Amazon のプロジェクトを作る。作ると走査が始まる（`openProject` が読み込みを始める）。 */
   async function createAmazonProject() {
     const preview = amazonPreview.value
@@ -1094,6 +1139,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
         projectName.value.trim() || fallbackName, devPath ? `dev:${devPath}` : folderPath.value
       )
       await applyCreateDisplayEdge(project.id)
+      await applyCreatePairRaw(project.id)
       createDialog.value = false
       projectName.value = ''
       folderPath.value = ''
@@ -2404,19 +2450,32 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     moveError.value = ''
     const { includeIds, excludeIds } = toMoveArgs(moveSelection.value)
     try {
+      // セッションに無い写真（あとから増えた写真など）で移す対象（U52 D10）。移す前の星で選ぶ。
+      // セッションに入れないと比較キーに映らず同期されないうえ、次の取り込みで行の星が 0 に戻される。
+      let outside: string[] = []
+      if (session.value) {
+        const ratings = session.value.core.ratings
+        const include = includeIds ? new Set(includeIds) : null
+        const exclude = new Set(excludeIds)
+        outside = (await desktop.getCoreInputs(activeProject.value.id))
+          .filter(row => !(row.relativePath in ratings) && row.rating === moveFrom.value
+            && (include ? include.has(row.id) : !exclude.has(row.id)))
+          .map(row => row.relativePath)
+      }
       const moved = await desktop.moveRating(
         activeProject.value.id, moveFrom.value, moveTo.value, includeIds, excludeIds
       )
       noteJudgementChanged()
       // 進行中のセッションが持つ星も合わせる。人が星を決める手直しなので `ratingEdit` で。
-      // Session に無い写真は飛ばす。行への書き込みは上の `moveRating` が済ませている。
+      // Session に無い写真は、上で選んだ `outside` として足す。行への書き込みは上の `moveRating` が済ませている。
       if (session.value) {
         await ensureCoreInputs()
         const excluded = new Set(excludeIds.map(pathOf))
         const paths = includeIds
           ? includeIds.map(pathOf).filter((path): path is string => path !== null)
           : pathsWithRating(session.value.core, moveFrom.value).filter(path => !excluded.has(path))
-        setCore(moveRatings(session.value.core, paths, moveTo.value))
+        const added = Object.fromEntries(outside.map(path => [path, moveTo.value]))
+        setCore(applyChanges(moveRatings(session.value.core, paths, moveTo.value), added))
         await saveSession()
       }
       moveDialog.value = false
@@ -2892,6 +2951,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     createDialog,
     createDisplayChoices,
     createDisplayEdge,
+    createPairRaw,
     appDisplayChoices,
     appDisplayEdge,
     saveAppDisplayEdge,
@@ -3095,6 +3155,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     applyBurstReview,
     skipBurstReview,
     applyDisplayEdge,
+    setPairRawJpeg,
     regenerateDisplayImages,
     openMoveDialog,
     loadMovePage,

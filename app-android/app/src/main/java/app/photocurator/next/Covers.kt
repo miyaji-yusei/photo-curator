@@ -44,6 +44,15 @@ object Covers {
                     coroutineScope {
                         chunk.map { path ->
                             async {
+                                // U49: RAW は中の小さいプレビューから作る（先頭 64KB の EXIF では取れない形がある）。
+                                if (RawFiles.isRaw(path)) {
+                                    val got = reader.ranged(path) { RawImages.extract(it, thumb = true) }
+                                        ?: return@async false
+                                    val bitmap = RawImages.decode(got.jpeg, got.orientation, 256)
+                                        ?: return@async false
+                                    ThumbCache.write(context, nas.id, path, RawImages.shrink(bitmap, RawImages.THUMB_STORE))
+                                    return@async true
+                                }
                                 val head = reader.head(path, SmbExifReader.HEAD_BYTES)
                                     ?: return@async false
                                 val exif = SmbExifReader.parse(head, 0L)

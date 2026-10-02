@@ -12,6 +12,9 @@ import uniffi.photo_curator_core.PairOverride
 import uniffi.photo_curator_core.ProgressOrder
 import uniffi.photo_curator_core.SeenRecord
 import uniffi.photo_curator_core.Session
+import uniffi.photo_curator_core.SettingValueBool
+import uniffi.photo_curator_core.SettingsPlan
+import uniffi.photo_curator_core.SettingsRecord
 import uniffi.photo_curator_core.SettledReason
 import uniffi.photo_curator_core.Sidecar
 import uniffi.photo_curator_core.SidecarPhoto
@@ -21,7 +24,9 @@ import uniffi.photo_curator_core.SidecarSessions
 import uniffi.photo_curator_core.isUntouched
 import uniffi.photo_curator_core.judgementKey
 import uniffi.photo_curator_core.mergeJudgements
+import uniffi.photo_curator_core.mergePreview
 import uniffi.photo_curator_core.sessionFromRatings
+import uniffi.photo_curator_core.settingsResolve
 import uniffi.photo_curator_core.sidecarFromJson
 import uniffi.photo_curator_core.sidecarJudgement
 import uniffi.photo_curator_core.sidecarKeyCoverage
@@ -58,7 +63,16 @@ interface CatalogIO {
     suspend fun createExclusive(path: String, bytes: ByteArray): SmbResult<Boolean>
 
     suspend fun delete(path: String): SmbResult<Unit>
+
+    /**
+     * フォルダの中のファイルの名前と更新時刻（NAS の時計）。フォルダが無ければ空。
+     * 退避の片付け・ロックの古さ・残りかすの片付けに使う。取れなければ Failed（片付けない・壊さない側に倒す）。
+     */
+    suspend fun list(folder: String): SmbResult<List<CatalogEntry>> = SmbResult.Failed("一覧を取れません")
 }
+
+/** [CatalogIO.list] の 1 件。[modifiedAt] は NAS の更新時刻（epoch ミリ秒）。 */
+data class CatalogEntry(val name: String, val modifiedAt: Long)
 
 /**
  * 端末の控え（プロジェクトごと）。
@@ -69,13 +83,36 @@ interface CatalogIO {
 data class SeenState(
     val seen: SeenRecord,
     val detached: Boolean,
-    val keyFromLocal: Boolean = false
+    val keyFromLocal: Boolean = false,
+    /**
+     * 端末の選別状況のファイルを**読めなかった**ことがある印（D2）。立っている間は、見た版を
+     * 「まだ何も見ていない」として判断する（見た版のままでも、端末の分で NAS を自動で上書きしない。
+     * 両方に判断があれば確認になる）。次に控えを保存したとき（取り込んだ・書いた・答えた）に下りる。
+     */
+    val localBroken: Boolean = false
 )
+
+/**
+ * 端末の選別状況のファイルはあるのに読めなかった（形が合わない・読み込みの失敗）。
+ * **「無い（未着手）」とは区別する。** 読めないまま判断すると、端末を空と見なして NAS を上書きしうる。
+ */
+class LocalUnreadable(val reason: String) : Exception(reason)
 
 /** 端末の控えの置き場所。Android では SharedPreferences「sync」（`SyncState`）。 */
 interface SeenStore {
     fun load(projectId: String): SeenState
     fun save(projectId: String, state: SeenState)
+}
+
+/**
+ * 端末のプロジェクトの設定（U51）。Android では `Prefs.pairRawSetting`／`Prefs.setPairRawJpeg`。
+ * いまは「同名の JPEG と RAW を 1 枚として扱う」だけ。**設定は選別状況ではない**（比較キーに入れない）。
+ */
+interface SettingsStore {
+    /** `changedAt` が 0 なら一度も切り替えていない（既定のまま）。 */
+    fun pairRaw(projectId: String): Prefs.PairRawSetting
+    /** サイドカーから取り込むときは**相手の時刻をそのまま**渡す。 */
+    fun setPairRaw(projectId: String, enabled: Boolean, at: Long)
 }
 
 /** 端末の選別状況。**鍵は端末の形のまま**（Android は共有の根からの相対・`/`）。 */
@@ -91,6 +128,7 @@ data class LocalSnapshot(
 interface LocalState {
     /** 端末の保存の列が空になるまで待つ（最後の 1 組まで書き終えてから読む）。 */
     suspend fun flush()
+    /** **ファイルはあるのに読めなければ [LocalUnreadable] を投げる**（空として返さない）。 */
     suspend fun read(): LocalSnapshot
     /** 置き換える。呼ぶ前に退避が済んでいること。 */
     suspend fun apply(snapshot: LocalSnapshot)
@@ -129,14 +167,27 @@ enum class SyncMode {
 
 /** 同期の結果。画面はこれを 1 行にして出す。 */
 sealed interface SyncOutcome {
-    /** 何もしなかった（意味が同じ・変更なし・まだ何も無い）。[note] は言うことがあるときだけ。 */
-    data class Settled(val note: String? = null) : SyncOutcome
-    data class Pushed(val note: String) : SyncOutcome
-    data class Pulled(val note: String) : SyncOutcome
+    /**
+     * ほかの端末の設定（U51:「同名の JPEG と RAW を 1 枚として扱う」）を取り込んだときの値（true＝オン）。
+     * 取り込んでいなければ null。選別状況の結果とは別で、どの結果にも付きうる（[SidecarSync.settingsAdoptedNotice]）。
+     */
+    val settingsAdopted: Boolean? get() = null
+
+    /**
+     * 何もしなかった（意味が同じ・変更なし・まだ何も無い）。[note] は言うことがあるときだけ。
+     * [settingsPushed] は、選別状況は同じで設定だけを NAS に書いたとき（U51）。
+     */
+    data class Settled(
+        val note: String? = null,
+        override val settingsAdopted: Boolean? = null,
+        val settingsPushed: Boolean = false
+    ) : SyncOutcome
+    data class Pushed(val note: String, override val settingsAdopted: Boolean? = null) : SyncOutcome
+    data class Pulled(val note: String, override val settingsAdopted: Boolean? = null) : SyncOutcome
     /** 両方とも着手していて中身が違う。**人に 5 択で選ばせる。** */
-    data class Asking(val clash: SidecarClash) : SyncOutcome
+    data class Asking(val clash: SidecarClash, override val settingsAdopted: Boolean? = null) : SyncOutcome
     /** つなげない・読めない・書けない。**選別は止めない。** */
-    data class Blocked(val reason: String) : SyncOutcome
+    data class Blocked(val reason: String, override val settingsAdopted: Boolean? = null) : SyncOutcome
     /** 背面への移動では取り込みも確認もしない。次に開いたときへ回した。 */
     data object Deferred : SyncOutcome
 }
@@ -175,7 +226,8 @@ enum class ClashChoice {
  * - 「変更があるか」は印ではなく「見た版の比較キーと、今の比較キーが違うか」（core が決める）
  * - 書くときは楽観ロック: ロックファイル → 読んで見た版と同じか確かめる → 一時ファイル → rename
  *   → 読み戻して確かめる（設計書 §4.4）
- * - 置き換える前に、必ず退避する（端末は [LocalState.aside]、NAS は `catalog.<端末>.json`）
+ * - 置き換える前に、必ず退避する（端末は [LocalState.aside]、NAS は `catalog.<端末>.<時刻>.json`）。
+ *   **退避できなければ置き換えない**（U44 D4）
  */
 class SidecarSync(
     private val store: SeenStore,
@@ -184,7 +236,9 @@ class SidecarSync(
     private val scope: CoroutineScope,
     private val now: () -> Long = { System.currentTimeMillis() },
     private val newId: () -> String = { java.util.UUID.randomUUID().toString().replace("-", "") },
-    private val log: (String, Throwable?) -> Unit = { _, _ -> }
+    private val log: (String, Throwable?) -> Unit = { _, _ -> },
+    /** プロジェクトの設定（U51）。null なら設定を読み書きしない（書く版の設定は core が NAS から引き継ぐ）。 */
+    private val settings: SettingsStore? = null
 ) {
     private val tails = HashMap<String, Job>()
 
@@ -231,6 +285,9 @@ class SidecarSync(
         block()
     } catch (error: kotlinx.coroutines.CancellationException) {
         throw error
+    } catch (error: LocalUnreadable) {
+        log("端末の選別状況を読めなかった", error)
+        SyncOutcome.Blocked(LOCAL_UNREADABLE + error.reason + LOCAL_UNREADABLE_TAIL)
     } catch (error: Exception) {
         log("サイドカーの同期に失敗した", error)
         SyncOutcome.Blocked("NAS の記録を同期できませんでした: " + (error.message ?: error.javaClass.simpleName))
@@ -265,6 +322,25 @@ class SidecarSync(
             }
         }
 
+    /**
+     * 端末の選別状況を読む。**読めなければ印を立てて投げる**（判断も書き込みもしない。D2）。
+     * 印が立っている間は、見た版を「まだ何も見ていない」として判断する（[planSeen]）。
+     */
+    private suspend fun readLocal(target: SyncTarget): LocalSnapshot = try {
+        target.local.read()
+    } catch (error: LocalUnreadable) {
+        store.save(target.projectId, store.load(target.projectId).copy(localBroken = true))
+        throw error
+    }
+
+    /**
+     * 判断に渡す見た版。端末を読めなかったことがあれば「まだ何も見ていない」にする。
+     * 見た版のままでも端末の分で NAS を自動で上書きせず、両方に判断があれば確認になる
+     * （端末が空なら取り込む・NAS が未着手なら退避して書く、は変わらない）。
+     */
+    private fun planSeen(state: SeenState): SeenRecord =
+        if (state.localBroken) SeenRecord("", "", null) else state.seen
+
     /** 端末の選別状況を、サイドカーの形（フォルダ形式の鍵）にする。 */
     private fun folderSidecar(target: SyncTarget, snapshot: LocalSnapshot): Sidecar {
         val who = me()
@@ -284,9 +360,40 @@ class SidecarSync(
             lineage = null,
             epoch = snapshot.epoch,
             keyBase = null,
-            progress = null
+            progress = null,
+            // プロジェクトの設定（U51）。一度も切り替えていなくても値は書く（そのとき at は 0）。
+            // 書くかどうかは選別状況で決める（設定のためだけに書くのは [settingsOnlyPush] のときだけ）。
+            settings = settings?.pairRaw(target.projectId)?.let {
+                SettingsRecord(SettingValueBool(it.enabled, it.changedAt), emptyMap())
+            }
         )
         return sidecarKeysToFolder(device, target.prefix)
+    }
+
+    /**
+     * 書く版の設定を、NAS の版と合わせる（U51）。NAS の方が新しく切り替えた値なら、**書く版も NAS の値にする**
+     * （古い端末の値で上書きしない）。端末の設定はここでは変えない（変えるのは開いたときだけ）。
+     */
+    private fun withRemoteSettings(mine: Sidecar, remote: Sidecar?): Sidecar {
+        if (settings == null) return mine
+        val plan = settingsResolve(mine.settings, remote?.settings)
+        if (plan !is SettingsPlan.AdoptRemote) return mine
+        val record = mine.settings ?: SettingsRecord(null, emptyMap())
+        return mine.copy(settings = record.copy(pairRawJpeg = SettingValueBool(plan.value, plan.at)))
+    }
+
+    /**
+     * 選別状況では書かない（Settled）ときに、設定のためだけに書くか（U51。PC・Web の `settingsOnlyPush` と同じ）。
+     * 端末で**切り替えたことがある**（at > 0）設定が NAS に無い・NAS より古いときだけ。一度も切り替えていない
+     * 既定値のためだけには書かない（古い catalog.json を開くたびに書き換えない）。切り離し中・新しすぎる版・
+     * 書けない共有は、選別状況と同じく書かない（理由で分かる）。端末の記録を読めなかったあと（D2）も書かない。
+     */
+    private fun settingsOnlyPush(plan: SettingsPlan, mine: Sidecar, reason: SettledReason, state: SeenState): Boolean {
+        if (settings == null || plan !is SettingsPlan.PushLocal) return false
+        if ((mine.settings?.pairRawJpeg?.at ?: 0L) <= 0L) return false
+        if (state.localBroken) return false
+        if (state.detached && reason != SettledReason.SAME) return false
+        return reason == SettledReason.SAME || reason == SettledReason.NO_CHANGE || reason == SettledReason.NOTHING
     }
 
     /** 古い控えから移したばかりなら、今の端末の比較キーで埋める（dirty=false＝見た版と同じ）。 */
@@ -298,19 +405,59 @@ class SidecarSync(
         return filled
     }
 
+    /** 片付けを済ませたプロジェクト（アプリの起動ごとに 1 回）。 */
+    private val tidied = HashSet<String>()
+
+    /**
+     * 書く・置き換える途中で落ちたときの残りかすを片付ける（U44 D11）。**開いたときに 1 回だけ。**
+     * 古いもの（[LEFTOVER_AGE_MS] より前）だけ消す。ロックがあれば（ほかの端末が書いている）何もしない。
+     * 失敗しても同期は止めない。
+     */
+    private suspend fun tidyOnce(target: SyncTarget) {
+        if (synchronized(tidied) { target.projectId in tidied }) return
+        try {
+            val folder = dir(target.folder)
+            val entries = when (val listed = target.io.list(folder)) {
+                is SmbResult.Failed -> return
+                is SmbResult.Ok -> listed.value
+            }
+            if (entries.any { it.name == LOCK_NAME }) return
+            for (name in leftoversToClean(entries, now())) target.io.delete("$folder\\$name")
+            synchronized(tidied) { tidied += target.projectId }
+        } catch (error: kotlinx.coroutines.CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            log("書きかけの残りかすを片付けられなかった", error)
+        }
+    }
+
     private suspend fun sync(target: SyncTarget, mode: SyncMode): SyncOutcome {
         target.local.flush()
+        if (mode == SyncMode.Open) tidyOnce(target)
         var attempts = 0
+        // ほかの端末の設定を取り込んだら、その値（どの結果にも付ける。判定し直しても 1 回だけ取り込む）。
+        var adopted: Boolean? = null
         while (true) {
             val remote = when (val read = readRemote(target)) {
-                is Remote.Bad -> return SyncOutcome.Blocked(read.reason)
+                is Remote.Bad -> return SyncOutcome.Blocked(read.reason, adopted)
                 is Remote.Read -> read
             }
-            val snapshot = target.local.read()
-            val mine = folderSidecar(target, snapshot)
+            val snapshot = readLocal(target)
+            val built = folderSidecar(target, snapshot)
+            // 設定（U51）は選別状況と別に決める（確認は出さない。新しく切り替えた方）。
+            val settingsPlan = settingsResolve(built.settings, remote.sidecar?.settings)
+            if (settings != null && settingsPlan is SettingsPlan.AdoptRemote &&
+                (mode == SyncMode.Open || mode == SyncMode.Explicit)
+            ) {
+                // 開いたときだけ端末へ取り込む（**時刻は NAS のまま**）。写真への反映は「写真を再読み込み」
+                // （ここでは走査しない）。自動の書き込みでは端末を変えず、書く版にだけ NAS の値を入れる。
+                settings.setPairRaw(target.projectId, settingsPlan.value, settingsPlan.at)
+                adopted = settingsPlan.value
+            }
+            val mine = withRemoteSettings(built, remote.sidecar)
             val judgement = sidecarJudgement(mine)
             val state = seenOf(target.projectId, judgement)
-            val plan = sidecarPlan(state.seen, judgement, remote.sidecar, true, state.detached)
+            val plan = sidecarPlan(planSeen(state), judgement, remote.sidecar, true, state.detached)
             when (plan) {
                 is SidecarPlan.Settled -> {
                     plan.seen?.let {
@@ -318,24 +465,45 @@ class SidecarSync(
                         val stillDetached = state.detached && plan.reason != SettledReason.SAME
                         store.save(target.projectId, SeenState(it, stillDetached))
                     }
-                    return SyncOutcome.Settled(settledNote(plan.reason))
+                    // 選別状況はそのままで、端末で切り替えた設定だけが NAS に無い・古い → 設定のために書く。
+                    // 既存の楽観ロックの経路（ロック → 読み直し → 一時ファイル → rename → 読み戻し）で書く。
+                    if (settingsOnlyPush(settingsPlan, mine, plan.reason, store.load(target.projectId))) {
+                        val expected = remote.sidecar?.let { sidecarToken(it) }
+                        when (val pushed = push(target, mine, judgement, expected, asideTheirs = false)) {
+                            is Pushed.Done ->
+                                return SyncOutcome.Settled(settledNote(plan.reason), adopted, settingsPushed = true)
+                            is Pushed.Failed -> return SyncOutcome.Blocked(pushed.reason, adopted)
+                            is Pushed.Retry -> {
+                                attempts += 1
+                                if (attempts >= MAX_ATTEMPTS) {
+                                    return SyncOutcome.Blocked(
+                                        "NAS の記録が書いているあいだに変わりました。あとでもう一度試します", adopted
+                                    )
+                                }
+                                continue
+                            }
+                        }
+                    }
+                    return SyncOutcome.Settled(settledNote(plan.reason), adopted)
                 }
                 is SidecarPlan.Push -> {
                     when (val pushed = push(target, mine, judgement, plan.expected, plan.asideTheirs)) {
-                        is Pushed.Done -> return SyncOutcome.Pushed(pushed.note)
-                        is Pushed.Failed -> return SyncOutcome.Blocked(pushed.reason)
+                        is Pushed.Done -> return SyncOutcome.Pushed(pushed.note, adopted)
+                        is Pushed.Failed -> return SyncOutcome.Blocked(pushed.reason, adopted)
                         is Pushed.Retry -> {
                             // 読んでから書くまでのあいだに、ほかの端末が書いた。**判定し直す。**
                             attempts += 1
                             if (attempts >= MAX_ATTEMPTS) {
-                                return SyncOutcome.Blocked("NAS の記録が書いているあいだに変わりました。あとでもう一度試します")
+                                return SyncOutcome.Blocked(
+                                    "NAS の記録が書いているあいだに変わりました。あとでもう一度試します", adopted
+                                )
                             }
                         }
                     }
                 }
                 is SidecarPlan.Pull -> {
                     if (mode == SyncMode.Background) return SyncOutcome.Deferred
-                    return pull(target, plan.theirs, plan.asideMine, plan.seen, mine, judgement)
+                    return withAdopted(pull(target, plan.theirs, plan.asideMine, plan.seen, mine, judgement), adopted)
                 }
                 is SidecarPlan.Clash -> {
                     if (mode == SyncMode.Background) return SyncOutcome.Deferred
@@ -348,10 +516,24 @@ class SidecarSync(
                             order = plan.order,
                             reason = plan.reason,
                             preview = plan.preview
-                        )
+                        ),
+                        adopted
                     )
                 }
             }
+        }
+    }
+
+    /** 設定を取り込んだ印を結果に付ける（U51）。 */
+    private fun withAdopted(outcome: SyncOutcome, adopted: Boolean?): SyncOutcome {
+        if (adopted == null) return outcome
+        return when (outcome) {
+            is SyncOutcome.Settled -> outcome.copy(settingsAdopted = adopted)
+            is SyncOutcome.Pushed -> outcome.copy(settingsAdopted = adopted)
+            is SyncOutcome.Pulled -> outcome.copy(settingsAdopted = adopted)
+            is SyncOutcome.Asking -> outcome.copy(settingsAdopted = adopted)
+            is SyncOutcome.Blocked -> outcome.copy(settingsAdopted = adopted)
+            SyncOutcome.Deferred -> outcome
         }
     }
 
@@ -364,42 +546,75 @@ class SidecarSync(
     }
 
     private sealed interface Pushed {
-        data class Done(val note: String) : Pushed
+        data class Done(val note: String, val writeId: String = "", val epoch: String? = null) : Pushed
         data class Failed(val reason: String) : Pushed
         data object Retry : Pushed
     }
 
     private sealed interface Lock {
-        data object Taken : Lock
+        /** [body] は書いた中身。放すときに、まだ自分のロックかを確かめるのに使う。 */
+        class Taken(val body: ByteArray) : Lock
         data object Busy : Lock
         data class Failed(val reason: String) : Lock
     }
 
-    /** 書く間だけ、ほかの端末と取り合わないための印。60 秒より古いものは捨てて取り直す。 */
+    /**
+     * 書く間だけ、ほかの端末と取り合わないための印。形は PC と同じ `{"holder":…,"at":ms}`
+     * （見分けのために name と nonce も入れる。PC は中身を読まない）。
+     *
+     * 古いものは捨てて取り直す。**古いと見なすのは、次のときだけ**（U44 D5）:
+     * - 中身に `at` がある: `at`（書いた端末の時計）と NAS の更新時刻の**両方**が [LOCK_TTL_MS] より古い
+     *   （PC は更新時刻で古さを見るので、どちらの時計がずれていても生きているロックを壊さない）
+     * - 中身が空・読めない（作った直後でまだ書いていない、など）: NAS の更新時刻が古い
+     * - 更新時刻が分からなければ古いと見なさない
+     * 捨てる前にもう一度読み、中身が変わっていれば（ほかの端末が取り直した）捨てない。
+     */
     private suspend fun lock(target: SyncTarget): Lock {
         val path = lockPath(target.folder)
         val who = me()
-        val body = "{\"device\":\"" + escape(who.id) + "\",\"name\":\"" + escape(who.name) +
-            "\",\"at\":" + now() + "}"
+        val body = ("{\"holder\":\"" + escape(who.id) + "\",\"at\":" + now() + ",\"name\":\"" + escape(who.name) +
+            "\",\"nonce\":\"" + java.util.UUID.randomUUID().toString().replace("-", "").take(16) + "\"}")
+            .toByteArray(Charsets.UTF_8)
         repeat(2) {
-            when (val made = target.io.createExclusive(path, body.toByteArray(Charsets.UTF_8))) {
+            when (val made = target.io.createExclusive(path, body)) {
                 is SmbResult.Failed -> return Lock.Failed(made.reason)
-                is SmbResult.Ok -> if (made.value) return Lock.Taken
+                is SmbResult.Ok -> if (made.value) return Lock.Taken(body)
             }
             // 先にある。古ければ（書いた端末が途中で止まった）捨てて取り直す。
-            val existing = target.io.read(path)
-            val text = (existing as? SmbResult.Ok)?.value?.let { String(it, Charsets.UTF_8) }
-            val at = text?.let { LOCK_AT.find(it)?.groupValues?.get(1)?.toLongOrNull() }
-            val stale = text == null || at == null || now() - at > LOCK_TTL_MS
-            if (!stale) return Lock.Busy
+            val first = when (val read = target.io.read(path)) {
+                is SmbResult.Failed -> return Lock.Busy
+                is SmbResult.Ok -> read.value ?: return@repeat // 読む前に消えた → 取り直す
+            }
+            if (!lockStale(target, first)) return Lock.Busy
+            val again = target.io.read(path)
+            if (again !is SmbResult.Ok || again.value == null || !again.value.contentEquals(first)) return Lock.Busy
             target.io.delete(path)
         }
         return Lock.Busy
     }
 
-    private suspend fun unlock(target: SyncTarget) {
+    private suspend fun lockStale(target: SyncTarget, bytes: ByteArray): Boolean {
+        val modified = (target.io.list(dir(target.folder)) as? SmbResult.Ok)?.value
+            ?.firstOrNull { it.name == LOCK_NAME }?.modifiedAt
+            ?: return false
+        val current = now()
+        if (current - modified <= LOCK_TTL_MS) return false
+        val at = LOCK_AT.find(String(bytes, Charsets.UTF_8))?.groupValues?.get(1)?.toLongOrNull()
+        return at == null || current - at > LOCK_TTL_MS
+    }
+
+    /** 放す。**まだ自分のロックのときだけ消す**（ほかの端末が古いと見なして取り直していたら残す）。 */
+    private suspend fun unlock(target: SyncTarget, body: ByteArray) {
         try {
-            target.io.delete(lockPath(target.folder))
+            val path = lockPath(target.folder)
+            val current = target.io.read(path)
+            if (current is SmbResult.Ok && current.value != null && current.value.contentEquals(body)) {
+                target.io.delete(path)
+            } else if (current !is SmbResult.Ok || current.value != null) {
+                log("ロックを放さなかった（ほかの端末のロックか、読めなかった）", null)
+            }
+        } catch (error: kotlinx.coroutines.CancellationException) {
+            throw error
         } catch (error: Exception) {
             log("ロックを消せなかった", error)
         }
@@ -416,12 +631,14 @@ class SidecarSync(
         mine: Sidecar,
         judgement: Judgement,
         expected: String?,
-        asideTheirs: Boolean
+        asideTheirs: Boolean,
+        /** false なら控え（seen）を保存しない（呼ぶ側が端末に入れてから保存する。D・E）。 */
+        saveSeen: Boolean = true
     ): Pushed {
-        when (val taken = lock(target)) {
+        val held = when (val taken = lock(target)) {
             is Lock.Failed -> return Pushed.Failed(taken.reason)
             is Lock.Busy -> return Pushed.Failed("ほかの端末が NAS に書いています。あとでもう一度試します")
-            is Lock.Taken -> Unit
+            is Lock.Taken -> taken.body
         }
         try {
             val current = when (val read = readRemote(target)) {
@@ -433,18 +650,20 @@ class SidecarSync(
 
             var aside: String? = null
             if (asideTheirs && current.sidecar != null && current.raw != null) {
-                val owner = tag(current.sidecar.updatedBy)
                 // **退避に失敗したら上書きしない。** 消してしまうより、次に持ち越す。
-                when (val kept = target.io.write(asidePath(target.folder, owner), current.raw)) {
+                when (val kept = writeAside(target, tag(current.sidecar.updatedBy), current.raw)) {
                     is SmbResult.Failed -> return Pushed.Failed(kept.reason)
-                    is SmbResult.Ok -> aside = "catalog.$owner.json"
+                    is SmbResult.Ok -> aside = kept.value
                 }
             }
 
             val who = me()
             val writeId = newId()
+            // 設定（U51）は書く直前に読んだ NAS の版と合わせる。どの経路（自動・C・D・E・退避して書く）でも、
+            // NAS の方が新しく切り替えた値なら NAS の値を書く（古い端末の値で上書きしない）。
             val stamped = sidecarStamp(
-                mine.copy(updatedAt = now(), updatedBy = who.id, updatedByName = who.name),
+                withRemoteSettings(mine, current.sidecar)
+                    .copy(updatedAt = now(), updatedBy = who.id, updatedByName = who.name),
                 writeId,
                 current.sidecar
             )
@@ -469,17 +688,57 @@ class SidecarSync(
             val back = readRemote(target)
             if (back !is Remote.Read || back.sidecar?.writeId != writeId) return Pushed.Retry
 
-            store.save(
-                target.projectId,
-                SeenState(SeenRecord(writeId, judgementKey(judgement), stamped.epoch), detached = false)
-            )
+            if (saveSeen) {
+                store.save(
+                    target.projectId,
+                    SeenState(SeenRecord(writeId, judgementKey(judgement), stamped.epoch), detached = false)
+                )
+            }
             return Pushed.Done(
                 "この端末の結果を NAS に保存しました" +
-                    (aside?.let { "（NAS にあった記録は $it に残しました）" } ?: "")
+                    (aside?.let { "（NAS にあった記録は $it に残しました）" } ?: ""),
+                writeId,
+                stamped.epoch
             )
         } finally {
-            unlock(target)
+            unlock(target, held)
         }
+    }
+
+    /**
+     * NAS に退避する（U44 D4）。**名前に時刻を入れて、前の退避を上書きしない**
+     * （`catalog.<端末>.<UTC yyyyMMddHHmmss>.json`。同じ秒に重なれば `-2` 以降）。
+     * 無いときだけ作るので、ほかの端末の退避も上書きしない。書けたら、同じ端末の印の
+     * 時刻つきの退避を新しい [ASIDE_KEEP] 個だけ残す（片付けの失敗は止めない。時刻の無い古い名前は消さない）。
+     * 返すのは書いたファイルの名前。
+     */
+    private suspend fun writeAside(target: SyncTarget, owner: String, bytes: ByteArray): SmbResult<String> {
+        val stamp = stampOf(now())
+        var name: String? = null
+        for (n in 1..9) {
+            val candidate = asideName(owner, stamp, n)
+            when (val made = target.io.createExclusive(dir(target.folder) + "\\" + candidate, bytes)) {
+                is SmbResult.Failed -> return SmbResult.Failed(made.reason)
+                is SmbResult.Ok -> if (made.value) {
+                    name = candidate
+                    break
+                }
+            }
+        }
+        if (name == null) return SmbResult.Failed("NAS に退避のファイルを作れませんでした（同じ名前がありました）")
+        try {
+            when (val listed = target.io.list(dir(target.folder))) {
+                is SmbResult.Ok -> for (old in asidesToDrop(listed.value.map { it.name }, owner, ASIDE_KEEP)) {
+                    target.io.delete(dir(target.folder) + "\\" + old)
+                }
+                is SmbResult.Failed -> log("古い退避を片付けられなかった: " + listed.reason, null)
+            }
+        } catch (error: kotlinx.coroutines.CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            log("古い退避を片付けられなかった", error)
+        }
+        return SmbResult.Ok(name)
     }
 
     /**
@@ -509,12 +768,18 @@ class SidecarSync(
             val json = sidecarToJson(mine)
             target.local.aside(json)
             if (asideMine) {
-                val kept = target.io.write(asidePath(target.folder, tag(me().id)), json.toByteArray(Charsets.UTF_8))
-                if (kept is SmbResult.Failed) log("NAS に端末の分を退避できなかった: " + kept.reason, null)
+                // **退避できてから置き換える**（U44 D4）。できなければ取り込まない。
+                val kept = writeAside(target, tag(me().id), json.toByteArray(Charsets.UTF_8))
+                if (kept is SmbResult.Failed) {
+                    log("NAS に端末の分を退避できなかった: " + kept.reason, null)
+                    return SyncOutcome.Blocked(
+                        "NAS にこの端末の記録を退避できなかったので、取り込みませんでした（" + kept.reason + "）"
+                    )
+                }
             }
         }
         apply(target, theirs)
-        val after = sidecarJudgement(folderSidecar(target, target.local.read()))
+        val after = sidecarJudgement(folderSidecar(target, readLocal(target)))
         store.save(target.projectId, SeenState(seen.copy(key = judgementKey(after)), detached = false))
         return SyncOutcome.Pulled(nameOf(theirs) + " の記録から続きを取り込みました")
     }
@@ -552,7 +817,7 @@ class SidecarSync(
         // ダイアログを出したあとで NAS が変わった → 選び直してもらう。
         if (current == null || sidecarToken(current) != clash.token) return sync(target, SyncMode.Open)
 
-        val snapshot = target.local.read()
+        val snapshot = readLocal(target)
         val mine = folderSidecar(target, snapshot)
         val judgement = sidecarJudgement(mine)
         return when (choice) {
@@ -570,10 +835,14 @@ class SidecarSync(
 
             ClashChoice.Intersection, ClashChoice.Union -> {
                 val mode = if (choice == ClashChoice.Union) MergeMode.UNION else MergeMode.INTERSECTION
+                // ROUND か対象の★が違うと混ぜない（ダイアログでも押せない。U45）。何も変えずに理由を出す。
+                if (!mergePreview(judgement, sidecarJudgement(current)).mergeable) {
+                    return SyncOutcome.Blocked(MERGE_BLOCKED_REASON)
+                }
                 // 元の 2 つは両方退避する（端末の分は端末と NAS、NAS の分は書くときに NAS）。
                 val json = sidecarToJson(mine)
                 target.local.aside(json)
-                val kept = target.io.write(asidePath(target.folder, tag(me().id)), json.toByteArray(Charsets.UTF_8))
+                val kept = writeAside(target, tag(me().id), json.toByteArray(Charsets.UTF_8))
                 if (kept is SmbResult.Failed) return SyncOutcome.Blocked(kept.reason)
 
                 val merged = mergeJudgements(
@@ -588,16 +857,27 @@ class SidecarSync(
                     keyBase = "folder"
                 )
                 val device = sidecarKeysFromFolder(folderShape, target.prefix, "/")
-                target.local.apply(
-                    LocalSnapshot(
-                        session = device.sessions.tournament,
-                        overrides = device.burstOverrides,
-                        burstDistance = device.burstDistance?.toInt(),
-                        epoch = device.epoch
-                    )
+                val mergedLocal = LocalSnapshot(
+                    session = device.sessions.tournament,
+                    overrides = device.burstOverrides,
+                    burstDistance = device.burstDistance?.toInt(),
+                    epoch = device.epoch
                 )
-                val after = folderSidecar(target, target.local.read())
-                outcomeOf(push(target, after, sidecarJudgement(after), clash.token, asideTheirs = true))
+                // **NAS に書けてから端末に入れる**（U44 D7。PC と同じ順）。書けなければ端末は元のまま。
+                // 控えは端末に入れたあとで保存する（入れる前に落ちても、控えが混ぜた版を指さない）。
+                val after = folderSidecar(target, mergedLocal)
+                when (val pushed = push(target, after, sidecarJudgement(after), clash.token, asideTheirs = true, saveSeen = false)) {
+                    is Pushed.Done -> {
+                        target.local.apply(mergedLocal)
+                        val applied = sidecarJudgement(folderSidecar(target, readLocal(target)))
+                        store.save(
+                            target.projectId,
+                            SeenState(SeenRecord(pushed.writeId, judgementKey(applied), pushed.epoch), detached = false)
+                        )
+                        SyncOutcome.Pushed(pushed.note)
+                    }
+                    else -> outcomeOf(pushed)
+                }
             }
         }
     }
@@ -608,7 +888,7 @@ class SidecarSync(
             is Remote.Bad -> return SyncOutcome.Blocked(read.reason)
             is Remote.Read -> read
         }
-        val mine = folderSidecar(target, target.local.read())
+        val mine = folderSidecar(target, readLocal(target))
         val expected = remote.sidecar?.let { sidecarToken(it) }
         return outcomeOf(push(target, mine, sidecarJudgement(mine), expected, asideTheirs = remote.sidecar != null))
     }
@@ -630,6 +910,14 @@ class SidecarSync(
         const val LOCK_TTL_MS = 60_000L
         private val LOCK_AT = Regex("\"at\"\\s*:\\s*(\\d+)")
 
+        /** ほかの端末の設定を取り込んだときのお知らせ（U51。PC・Web の `settingsAdoptedNotice` と同じ文）。 */
+        fun settingsAdoptedNotice(value: Boolean): String =
+            "ほかの端末の設定に合わせて「同名の JPEG と RAW を 1 枚として扱う」を" + (if (value) "オン" else "オフ") +
+                "にしました。写真を反映するには「写真を再読み込み」を押してください。"
+
+        const val LOCAL_UNREADABLE = "この端末の選別の記録を読めませんでした: "
+        const val LOCAL_UNREADABLE_TAIL = "。NAS の記録は変えていません（この端末の分で NAS を自動で上書きしません）"
+
         private fun dir(folder: String): String {
             val base = folder.trim('\\', '/').replace('/', '\\')
             return if (base.isEmpty()) ".photo-curator" else "$base\\.photo-curator"
@@ -637,9 +925,60 @@ class SidecarSync(
 
         /** 写真のフォルダの直下。**増やすのはこの 1 ファイルだけ**（書く間のロックと一時ファイルを除く）。 */
         fun catalogPath(folder: String) = dir(folder) + "\\catalog.json"
-        fun lockPath(folder: String) = dir(folder) + "\\catalog.lock"
-        /** 譲った方・置き換えた方を残す先。**黙って消さない。** */
-        fun asidePath(folder: String, device: String) = dir(folder) + "\\catalog.$device.json"
+        private const val LOCK_NAME = "catalog.lock"
+        fun lockPath(folder: String) = dir(folder) + "\\" + LOCK_NAME
+        /** 書きかけの残りかすと見なす古さ（U44 D11）。書き込みはロックの 60 秒より長くはかからない。 */
+        const val LEFTOVER_AGE_MS = 60 * 60 * 1000L
+
+        private val LEFTOVER = Regex("^\\.?catalog\\..+\\.tmp$")
+
+        /**
+         * 片付けてよい残りかす（U44 D11）: 一時ファイル（Android の `.catalog.<writeId>.tmp`・PC の
+         * `.catalog.json.<uuid>.tmp`・`catalog.*.tmp`）と `*.writing` のうち、更新時刻が [age] より古いもの。
+         * catalog.json・ロック・退避・壊れたファイルの写しは対象にしない。
+         */
+        fun leftoversToClean(entries: List<CatalogEntry>, now: Long, age: Long = LEFTOVER_AGE_MS): List<String> =
+            entries.filter { (LEFTOVER.matches(it.name) || it.name.endsWith(".writing")) && now - it.modifiedAt > age }
+                .map { it.name }
+
+        /** `.photo-curator` のフォルダ（共有の根から `\` 区切り）。 */
+        fun sidecarDir(folder: String) = dir(folder)
+
+        /** NAS の退避を、端末の印ごとにいくつまで残すか（U44 D4。CON-3 のため小さく）。 */
+        const val ASIDE_KEEP = 5
+
+        /**
+         * 譲った方・置き換えた方を残す名前。**黙って消さない。** 時刻（UTC）を入れて、書くたびに別の名前にする。
+         * [n] は同じ秒に重なったときの通し番号（1 なら付けない）。
+         */
+        fun asideName(device: String, stamp: String, n: Int = 1) =
+            "catalog.$device.$stamp" + (if (n > 1) "-$n" else "") + ".json"
+
+        fun asidePath(folder: String, device: String, stamp: String, n: Int = 1) =
+            dir(folder) + "\\" + asideName(device, stamp, n)
+
+        /** 退避の名前に入れる時刻（UTC・`yyyyMMddHHmmss`）。名前の順が時刻の順になる。 */
+        fun stampOf(at: Long): String =
+            SimpleDateFormat("yyyyMMddHHmmss", Locale.ROOT)
+                .apply { timeZone = java.util.TimeZone.getTimeZone("UTC") }
+                .format(Date(at))
+
+        private fun asidePattern(device: String) =
+            Regex("^catalog\\." + Regex.escape(device) + "\\.(\\d{14})(?:-(\\d+))?\\.json$")
+
+        /** その端末の印の、時刻つきの退避か（時刻の無い古い `catalog.<端末>.json` は含まない）。 */
+        fun isAsideOf(name: String, device: String): Boolean = asidePattern(device).matches(name)
+
+        /** 消してよい退避（その端末の印の時刻つきのうち、新しい [keep] 個より古いもの）。 */
+        fun asidesToDrop(names: List<String>, device: String, keep: Int): List<String> {
+            val pattern = asidePattern(device)
+            return names.mapNotNull { name ->
+                pattern.matchEntire(name)?.let { m -> Triple(name, m.groupValues[1], m.groupValues[2].toIntOrNull() ?: 1) }
+            }
+                .sortedWith(compareByDescending<Triple<String, String, Int>> { it.second }.thenByDescending { it.third })
+                .drop(keep)
+                .map { it.first }
+        }
         fun temporaryPath(folder: String, writeId: String) = dir(folder) + "\\.catalog.$writeId.tmp"
 
         /** 退避のファイル名に使う端末の印（12 文字。ファイル名に使えない文字は落とす）。 */
@@ -694,8 +1033,9 @@ class SidecarSync(
                 ProgressOrder.BEHIND -> "。NAS の方が進んでいます"
                 else -> ""
             }
-            ClashReason.THEIRS_RESTARTED -> nameOf(clash.theirs) + " で最初からやり直されています"
-            ClashReason.MINE_RESTARTED -> "この端末で最初からやり直しています"
+            // 端末名は NAS の行（theirsLabel）に出す。理由は「ほかの端末」で言う（U42。PC・Web と同じ）。
+            ClashReason.THEIRS_RESTARTED -> "ほかの端末が最初からやり直しました"
+            ClashReason.MINE_RESTARTED -> "この端末で最初からやり直したあと、ほかの端末で選別が進んでいます"
             ClashReason.EXTRAS_CONFLICT -> "★と選別の進みは同じで、連写のまとまりの手直しか学習した境目が違います"
         }
 
@@ -708,9 +1048,26 @@ class SidecarSync(
 
         fun unionLine(preview: MergePreview) = "★1 以上が ${preview.unionStarred} 枚になります"
 
-        /** 混ぜるとセッションが終わることの注意（途中のときだけ）。 */
-        fun midRoundLine(preview: MergePreview): String? = if (!preview.midRound) null else
-            "途中の ROUND は終わりにします。まだ見ていない ${preview.undecided} 枚は今の★のままになります。" +
-                "続きは結果画面の『もう一度選別する』から"
+        /** 混ぜられないとき（D・E を押せなくする）の理由。PC・Web と同じ文。 */
+        const val MERGE_BLOCKED_REASON = "ROUND か対象の★がほかの端末と違うので、混ぜられません"
+
+        /**
+         * D・E の下の注意書き（U45）。PC・Web の `SidecarConflictDialog.vue` と同じ文。
+         * - 混ぜられない（途中の ROUND があるのに ROUND か対象の★が違う）→ 理由
+         * - どちらの端末もまだ見ていない写真が残る → 続きから選別できる
+         * - 途中だが、残りはどちらかの端末で判定済み → この ROUND は完了する
+         */
+        fun mergeNote(preview: MergePreview): String? = when {
+            !preview.mergeable ->
+                "この端末とほかの端末で ROUND か対象の★が違うので、混ぜられません（まだ見ていない写真を飛ばさないため）。" +
+                    "上の 3 つから選んでください。"
+            preview.undecided > 0u ->
+                "どちらの端末でもまだ見ていない ${preview.undecided} 枚は、混ぜたあとも残ります。" +
+                    "選別画面で続きから選別できます。混ぜたあとは「1 つ戻す」はできません。"
+            preview.midRound ->
+                "まだ見ていない写真は、どれもどちらかの端末で判定済みなので、混ぜるとこの ROUND は完了します。" +
+                    "続きは結果画面の「もう一度選別する」から始めます。混ぜたあとは「1 つ戻す」はできません。"
+            else -> null
+        }
     }
 }

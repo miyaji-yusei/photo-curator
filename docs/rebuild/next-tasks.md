@@ -41,8 +41,28 @@
 | U16 | 拡大のぐるぐるを、右上でなく写真の真ん中に重ねる（Android と同じ）。U10 の見直し | S | `app.vue`（`zoom-overlay__photo`）・`assets/main.css` 254〜255 行 | 済（#33） |
 | U17 | アプリの設定の画面を足し、表示用画像の既定の大きさを変えられるようにする（Android の設定と同じ） | S〜M | 新規 `components/views/AppSettingsView.vue`・`AppNav.vue`・`useCurator.ts`（`view`）・`displayEdge` まわり | 済（#34。PC の実機は未確認） |
 | U18 | 選別の並べ方で、3 枚のときだけ 1×3 に固定する（4〜10 枚は U7 のまま）。縦長の 3 枚が 2×2 になっていた（2026-09-30 #32 の目視で。縦横比を測る案は見送り） | S | `utils/gridFor.ts`・`tests/gridFor.test.ts` | 済（#39。3 枚だけ 1×3 固定） |
-| U19 | スライドショー選別（1 枚ずつ、左＝落とす・右＝残す）。トーナメントと切り替え可 | L | `TournamentView.vue`・`useCurator.ts`・core（グループ 1 枚）・Android | PC・Web・Android とも実装済み（`feat/mb-slideshow`。ユーザーの目視待ち。Android はエミュレーターで確認、実機は未確認）。core は下限 1 に変更（Android の .so は作り直し済み。`scripts/build-core.mjs`） |
+| U19 | スライドショー選別（1 枚ずつ、左＝落とす・右＝残す）。トーナメントと切り替え可 | L | `TournamentView.vue`・`useCurator.ts`・core（グループ 1 枚）・Android | 済（#41。PC・Web・Android とも実装済み（`feat/mb-slideshow`。ユーザーの目視待ち。Android はエミュレーターで確認、実機は未確認）。core は下限 1 に変更（Android の .so は作り直し済み。`scripts/build-core.mjs`）） |
 | U20 | 表示用画像の px の不具合（1536 で作られない・作成ダイアログの値がアプリの既定に負ける）と、詳細の ⋮ から px を変える機能 | M | `useCurator.ts`・`ProjectView.vue`・新規 `DisplayEdgeDialog.vue`・`utils/displayEdge.ts`・`lib.rs`（`get_display_settings`）・`backends/local.ts` | 済（#42。PC 実機は確認待ち） |
+| U21 | スライドショー選別の操作の直し（上の帯のクリック・タップで ★5。方式の並び） | M | `utils/slideshowGesture`・`SlideshowView.vue`・`app-android/`（`Slideshow.kt`） | 済（#44。PC・Web 側は #41 の先に取り込み済み） |
+| U22 | Android の Amazon の並列を 4 → 8（PC の U14 (b') にそろえる。ユーザー決定） | S | `app-android/`（`Amazon.PARALLEL`） | 済（#43） |
+| U23 | スライドショーの中心のクリック・タップは何もせず、二度押し（タップ）で拡大 | S〜M | `SlideshowView.vue`・`app-android/`（`SlideshowGesture`） | 済（#44） |
+| U24 | 選別画面のヘルプ「？」ボタンとテンキー | S〜M | `SelectionHelpButton.vue`・`app-android/`（`CullBar`・`SelectionHelpDialog`） | 済（#44） |
+| U25 | 折りたたみ端末を閉じた幅（約 411dp）での設定・作成・上バーの表示崩れ（Android） | S | `app-android/` | 済（#44） |
+| U26 | Android の選別中の画像の出方のもたつき（先読み・サムネイルの先出し） | M | `app-android/` | 済（#45 に含む） |
+| U27 | PC Rust のレビュー R1〜R14 のうち、挙動を変えずにできる改善 | M | `src-tauri/` | 済（#45 に含む。残りは U37） |
+| U28 | Web・PC 共通の画面コードのレビュー W1〜W24 の速さ・不具合の直し | M〜L | `composables/`・`components/` | 済（#45 に含む） |
+| U29 | Android: スライドショーの中央タップが振り分けになる実機報告の調査（件 1）と、準備を撮影時刻の昇順にする（件 2） | S〜M | `app-android/` | 済（#45 に含む） |
+| U30 | Android のレビュー A1〜A36 の速さと不具合の直し | L | `app-android/` | 済（#45 に含む） |
+| U31 | （10章 §7・PR #45 の概要・コミット履歴に見当たらない） | — | — | 要確認 |
+| U32 | スライドショー選別のタップの領域の変更（上 30% ＝★5・左 30% ＝落とす・右 30% ＝残す・中央の縦帯は無反応。ユーザー決定） | S〜M | `utils/slideshowGesture`・`app-android/`（`SlideshowGesture`） | 済（#45 に含む） |
+| U33 | サイドカー同期の core（正規化・比較キー・未着手・`sidecar_plan`・混ぜ方・鍵の変換・catalog.json v2）。下の「U33」の節 | L | `core/src/sidecar_sync.rs`・UDL・`core-wasm/` | 済（#45 に含む） |
+| U34 | PC・Web のサイドカー同期を `sidecar_plan` と楽観ロックに切り替える。下の「U34」の節 | L | `composables/useSidecarSync.ts`・`src-tauri/src/sidecar.rs` | 済（#45 に含む） |
+| U35 | Android のサイドカー同期を `sidecarPlan` に切り替える。下の「U35」の節 | L | `app-android/`（`Sidecar.kt`） | 済（#45 に含む。実機は未確認） |
+| U36 | Web の準備（解析）の順序と軽い改善（W10〜W18 など） | M | `composables/`・`utils/analysisOrder.ts` | 済（#45 に含む） |
+| U37 | PC Rust の走査（取り消し・失敗・NAS 不通で欠損の印を確定しない。R4・R5・R11〜R14・R3） | M | `src-tauri/` | 済（#45 に含む） |
+| U38 | core のレビュー R15〜R17（次のラウンドで仲間の星が追従する・`advance` の検証・手直しの重複は先勝ち） | S〜M | `core/src/lib.rs` | 済（#46） |
+| U39 | 「指紋」を「ハッシュ値」に言い換える（docs・文言。識別子は変えない） | S | docs・画面の文言 | 済（#47） |
+| U40 | Android のホームのカードが「…」のまま固まる件 | S | `app-android/` | 済（#48） |
 
 ---
 
@@ -239,9 +259,9 @@
 
 | 段 | 中身 | ブランチ | 状態 |
 | --- | --- | --- | --- |
-| U33 | core: 正規化・比較キー・未着手・`sidecar_plan`・混ぜ方（D・E）・鍵の変換・catalog.json v2 の項目。UDL と core-wasm に公開 | `fix/mb-u33-core-sidecar` | 済（push・PR はまだ。10章 §7 の U33） |
-| U34 | PC・Web: `useSidecarSync` を `sidecar_plan` と楽観ロック（lock → 読む → 確かめる → 一時ファイル → rename → 読み戻し）に切り替える。`sidecar_state` に `seen_token`・`seen_key`・`seen_epoch`・`detached`（移行: 古い seen_at/seen_by から `legacy:` の token、localChanged=true なら key を空に）。5 択のダイアログ・B の帯と「NAS に書き込む」・取り込みの「元に戻す」。`lib/core.ts` に新しい関数の型を足す。鍵は書くとき `sidecarKeysToFolder(…, '')`、読んだ直後に `sidecarNormalizeKeys(…, 選んだフォルダ)`、取り込むとき `sidecarKeysFromFolder(…, '', '\\')`（Windows） | `fix/mb-u34-pcweb-sidecar` | 済（push・PR はまだ。10章 §7 の U34・下の「U34」） |
-| U35 | Android: `Sidecar.kt` の判断を core の `sidecarPlan` に置き換える（`SyncState` を token・key・epoch・detached に）。鍵は prefix＝共有の根からのフォルダで変換。プロジェクトごとに 1 本の列・一時ファイル → rename・ON_STOP は開いているプロジェクトだけ・最初の確認が終わるまで「選別を開始」を押せない・5 択のダイアログ。**先に `node scripts/build-core.mjs` で `.so` と Kotlin の束ねを作り直す（ユーザー）** | `fix/mb-u35-android-sidecar` | 済（push・PR はまだ。下の「U35」の節。実機は未確認） |
+| U33 | core: 正規化・比較キー・未着手・`sidecar_plan`・混ぜ方（D・E）・鍵の変換・catalog.json v2 の項目。UDL と core-wasm に公開 | `fix/mb-u33-core-sidecar` | 済（#45 に含む。10章 §7 の U33） |
+| U34 | PC・Web: `useSidecarSync` を `sidecar_plan` と楽観ロック（lock → 読む → 確かめる → 一時ファイル → rename → 読み戻し）に切り替える。`sidecar_state` に `seen_token`・`seen_key`・`seen_epoch`・`detached`（移行: 古い seen_at/seen_by から `legacy:` の token、localChanged=true なら key を空に）。5 択のダイアログ・B の帯と「NAS に書き込む」・取り込みの「元に戻す」。`lib/core.ts` に新しい関数の型を足す。鍵は書くとき `sidecarKeysToFolder(…, '')`、読んだ直後に `sidecarNormalizeKeys(…, 選んだフォルダ)`、取り込むとき `sidecarKeysFromFolder(…, '', '\\')`（Windows） | `fix/mb-u34-pcweb-sidecar` | 済（#45 に含む。10章 §7 の U34・下の「U34」） |
+| U35 | Android: `Sidecar.kt` の判断を core の `sidecarPlan` に置き換える（`SyncState` を token・key・epoch・detached に）。鍵は prefix＝共有の根からのフォルダで変換。プロジェクトごとに 1 本の列・一時ファイル → rename・ON_STOP は開いているプロジェクトだけ・最初の確認が終わるまで「選別を開始」を押せない・5 択のダイアログ。**先に `node scripts/build-core.mjs` で `.so` と Kotlin の束ねを作り直す（ユーザー）** | `fix/mb-u35-android-sidecar` | 済（#45 に含む。下の「U35」の節。実機は未確認） |
 
 ### U33 で足した core の公開 API（`core/src/sidecar_sync.rs`。UDL・core-wasm にも同名／camelCase）
 - 正規化・比較: `normalize_key`・`canonical_judgement`・`sidecar_judgement`・`judgement_equivalent`・`judgement_key`
@@ -270,13 +290,13 @@
 3. 星とセッションが同じで手直し・境目が違うとき、**片方だけが多いなら自動**（Q9）。両方に相手に無い分がある・食い違うときは確認（`ExtrasConflict`。和集合の自動はしない）
 4. 切り離し中（B のあと）は、#3 と #7 の自動の書き込みをしない。#5（NAS が未着手の版）は設計書どおり書く
 5. 見た版のままで端末がやり直した（未着手になった）とき、NAS の着手済みの版は退避してから書く（`aside_theirs=true`）
-6. やり直しの検出: 見た版の `epoch` と比べ、NAS 側が変えていれば `TheirsRestarted`、端末側なら `MineRestarted`（端末のやり直しは「未着手」と見なさないので、相手の進んだ版を黙って取り込まない）。一度も見ていない版では epoch で判断しない
+6. やり直しの検出: 見た版の `epoch` と比べ、NAS 側が変えていれば `TheirsRestarted`、端末側なら `MineRestarted`（端末のやり直しは「未着手」と見なさないので、相手の進んだ版を黙って取り込まない）。一度も見ていない版では epoch で判断しない。**決定により変更（U42。ユーザー決定 2026-10-02）**: NAS 側がやり直した版は、系統がつながっていても早送り（#6）にせず、端末が着手済みなら `TheirsRestarted` で確認する（以前は、端末が見た版のあと何も変えていなければ早送りが先に当たり、確認なしに取り込んでいた）。端末が未着手なら確認なしに取り込む・意味が同じなら何もしない、は変えない。世代の違う版の上に C・D・E で書いた版も、ほかの端末（着手済み）からは確認になる（10章 §7 の U42）
 7. 両方とも未着手で中身だけ違う（写真の顔ぶれなど）ときは取り込む（#4。失うものが無い）
 8. `version > 2` の版には書かない（`NewerVersion`）。端末が未着手なら取り込みはする
-9. 書けない共有では、早送り・手直しだけの取り込みはする。それ以外は `ReadOnly`（この端末だけの結果）
+9. 書けない共有では、早送り・手直しだけの取り込みはする。それ以外は `ReadOnly`（この端末だけの結果）。**決定により変更（U42）**: やり直された版は早送りにしないので、書けない共有では取り込まず `ReadOnly`（端末の分を消さない）
 10. 進み具合の比べ: ROUND（終われば半歩）→ 同じ ROUND なら決めた組の数 → ★1 以上の数。食い違えば `Unclear`。全部同じなら手直しの数・境目の学習
 11. 未判定（積集合）: 途中のセッションの `current ＋ queue` とその連写の仲間。セッションが無く★0 も未判定（設計書どおり）。両方未判定は小さい方
-12. 混ぜた完了状態: ROUND と対象の★は両方の大きい方、`survivors` は対象を超え★5 未満、連写のまとまりは端末の分（無ければ NAS の分）、`group_size` は呼ぶ側が渡す。世代が違えば呼ぶ側が作った新しい `epoch`
+12. 混ぜた完了状態: ROUND と対象の★は両方の大きい方、`survivors` は対象を超え★5 未満、連写のまとまりは端末の分（無ければ NAS の分）、`group_size` は呼ぶ側が渡す。世代が違えば呼ぶ側が作った新しい `epoch`。**U45 により変更（2026-10-03。実機の報告: 残り 444 枚が未選別のまま ROUND 1 が終わった）**: D・E を「いつも完了状態にする」のをやめた。どちらの端末もまだ見ていない写真が残るなら、**未完了のまま、その写真を queue に残して続きから選別できる形**にする（判定済みの写真は★と `survivors` に入れ、片方だけが判定した写真はその側の判断）。完了状態にするのは残りが無いときだけ。途中の ROUND があるのに 2 つの ROUND か対象の★が違うときは混ぜない（`merge_preview` の `mergeable = false`。ダイアログで D・E を押せなくする）。詳しくは 10章 §7 の U45
 13. 古い形の鍵の推定: `keyBase` が無い版は、全部の鍵に共通の頭のフォルダが、この端末で選んだフォルダのパスの末尾と一致すれば外す（Android の `photo/x` にも PC の `\\NAS\share\photo\x` にも効く）。合わなければ外さない
 14. NFC にそろえるのはフォルダ形式へ変えるときだけ。端末の形へ戻すとき（`from_folder`）は NFC のまま（macOS 由来の NFD の名前だと端末の鍵と合わない可能性。U34・U35 で必要なら端末側の鍵も NFC にする）
 15. `progress` に `overrides`（手直しの数）・`learned`（境目の学習）を足した。`total` は `sidecar_stamp` のとき（`photos` と `session.ratings` の多い方）
@@ -323,7 +343,7 @@ core の `core/src/sidecar_sync/tests.rs` に、関数名の末尾「_3のn」�
 14. 「元に戻す」（取り込みの直後）は見送り。端末の `aside/` に最後の 3 つが残る（手で戻す手がかり）
 15. 写真の場所の一致率は、端末の一覧（`Listing`）がまだ無ければ確かめない
 16. 書き込みの通知: 書いたら「この端末の結果を NAS に保存しました」（退避したら「（NAS にあった記録は catalog.<端末>.json に残しました）」）、取り込んだら「<端末名> の記録から続きを取り込みました」。意味が同じ・変更なしは何も出さない
-17. 文言で設計書に無いもの: 理由「この端末で最初からやり直しています」（MineRestarted）、「★と選別の進みは同じで、連写のまとまりの手直しか学習した境目が違います」（ExtrasConflict）、要約の「境目を学習済み」。「こちらが進んでいます」は名札の次の行
+17. 文言で設計書に無いもの: 理由「この端末で最初からやり直しています」（MineRestarted。**U42 で「この端末で最初からやり直したあと、ほかの端末で選別が進んでいます」に変更**。TheirsRestarted は「ほかの端末が最初からやり直しました」）、「★と選別の進みは同じで、連写のまとまりの手直しか学習した境目が違います」（ExtrasConflict）、要約の「境目を学習済み」。「こちらが進んでいます」は名札の次の行
 
 ### 確かめたこと・まだのこと
 - `./gradlew testDebugUnitTest`（92 件。新規 20）・`assembleDebug`・core の `cargo test`（core は変えていない）
@@ -385,7 +405,7 @@ core の `core/src/sidecar_sync/tests.rs` に、関数名の末尾「_3のn」�
 4. **両方で進める**: 3 のあと両方で 2 組ずつ進めて、Web → PC の順にホームへ戻り、PC で開き直す。**期待**: 5 択。A〜E を 1 つずつ（毎回 4 からやり直して）選び、端末の星・`catalog.json`・`catalog.*.json`・もう一方で開いたときの挙動（C・D・E は確認なしに取り込む）を見る。B のあとは「この端末だけの結果（NAS とは別）」と「NAS に書き込む」が出て、自動では書かない
 5. **開いている間に相手が書いた**: PC でプロジェクトを開いたまま、Web で選別して書く → PC で選別してホームへ戻る。**期待**: PC は書かない（Web の版のまま）。開き直すと 5 択
 6. **ロック**: `.photo-curator/catalog.lock` を手で作っておき、PC でホームへ戻る → 書かない（「ほかの端末が書き込んでいた」）。1 分後なら壊して書く
-7. **やり直し**: PC で「選別を最初からやり直す」→ ホームへ戻る → Web で（その前に Web で 1 組進めておいて）開き直す。**期待**: 「この PC の名前 で最初からやり直されています」の 5 択。Web で何も進めていなければ確認なしに空になる（core の早送りが先に当たる。下の「迷った点」）
+7. **やり直し**: PC で「選別を最初からやり直す」→ ホームへ戻る → Web で（その前に Web で 1 組進めておいて）開き直す。**期待**: 「ほかの端末が最初からやり直しました」の 5 択。Web で 1 組進めて書いたあと何も変えていなくても 5 択（U42 で変更。以前は早送りで確認なしに空になった）。Web が未着手なら確認なしに取り込む
 8. **鍵**: 入れ子のフォルダを含む写真で 1〜3 をやり、PC の `catalog.json` の鍵が `sub/IMG.JPG`（`/` 区切り・`keyBase: "folder"`）になっていること
 9. **古い catalog.json**: U34 より前の PC か Android が書いた `catalog.json`（`version` なし・Android はフォルダ名付きの鍵）を置いて、未着手のプロジェクトで開く → 確認なしに取り込み、★の数が合う（Web の開発用フォルダで確認済み）
 
@@ -394,9 +414,64 @@ core の `core/src/sidecar_sync/tests.rs` に、関数名の末尾「_3のn」�
 - 同じフォルダのプロジェクトが端末に 2 つあるとき（設計書 §3 の #11・Q11）・壊れた catalog.json の `catalog.broken-<時刻>.json` への移動（今は今までどおり理由を出して何もしない）
 
 ### 迷った点
-- core の判断では、相手が**やり直した**版でも、この端末が見た版のあと何も変えていなければ早送り（#6）が先に当たり、確認なしに空になる（端末の分は NAS の `catalog.<自分>.json` に退避される）。設計書 §4.3 では #9 で確認。core は変えない決まりなので、そのままにした（必要なら core の順番を変える）
+- core の判断では、相手が**やり直した**版でも、この端末が見た版のあと何も変えていなければ早送り（#6）が先に当たり、確認なしに空になる（端末の分は NAS の `catalog.<自分>.json` に退避される）。設計書 §4.3 では #9 で確認。core は変えない決まりなので、そのままにした（必要なら core の順番を変える）。→ **U42 で core の順番を変えた**（ユーザー決定 2026-10-02。確認する）
 - 自動の書き込みで「取り込み」を後回しにしたので、窓を隠しただけでは取り込まない（次に開いたとき・戻ったときに取り込む）
 
 ### 未確認
 - Tauri の実機（ロック・rename・NAS 越しの読み戻し）、Web の書き込み（File System Access。偽物でだけ確かめた）、ダイアログの実画面（書ける 2 台を用意できなかった）
 - Android は U35（今の Android は旧い判断のまま。PC が U34 で書いた v2 の catalog.json を読んでも壊れないことは U33 のテストで固定済み）
+
+## U48 「同名の JPEG と RAW を 1 枚として扱う」をサイドカーで同期する（2026-10-03）
+
+ユーザー決定（2026-10-03）: U46 のプロジェクト設定（PC・Web `pair_raw_jpeg`／`pairRawJpeg`、既定オン）の ON・OFF を、
+サイドカー（NAS のフォルダの `.photo-curator/catalog.json`。NAS 以外のプロジェクトは端末）にも記録して同期する。
+PC と Android で違う値にしたときは**新しく切り替えた方**を採る（確認ダイアログは出さない。選別状況の食い違いとは別扱い）。
+
+core・PC・Web は `fix/mb-u48-settings-sync` で済み（10章 §7 の U48 の行）。**Android の配線も U51 で済み**（`fix/mb-u51-android-settings-sync`。10章 §7 の U51 の行）。
+
+### 形（catalog.json v2 に足した省略可能な項目）
+
+```json
+"settings": { "pairRawJpeg": { "value": true, "at": 1790955613101 } }
+```
+
+- `at` は切り替えた時刻（ms）。0 は「作ったまま一度も切り替えていない」（NAS に値があれば NAS を採る）
+- 設定は**選別状況ではない**。比較キー・`judgementEquivalent`・`sidecarSeen` には入らない
+- 知らない設定は core が読んで書き戻す（`SettingsRecord.other`）。`sidecarStamp(mine, writeId, base)` は、
+  `base`（置き換える NAS の版）にあって `mine` に無い設定を引き継ぐ
+
+### core の API（UDL・Kotlin。`node scripts/build-core.mjs` で作り直すこと）
+
+- `Sidecar.settings: SettingsRecord?`（既定 null。今の Kotlin はそのままコンパイルできる）
+- `SettingsRecord(pairRawJpeg: SettingValueBool?, other: Map<String, String>)`（`other` は必須。新しく作るときは `emptyMap()`）
+- `SettingValueBool(value: Boolean, at: Long)`
+- `settingsResolve(local: SettingsRecord?, remote: SettingsRecord?): SettingsPlan`
+  - `SettingsPlan.Keep`／`SettingsPlan.AdoptRemote(value, at)`／`SettingsPlan.PushLocal`
+  - 規則: どちらかが無ければある方、両方あって値が同じなら Keep（at が違っても）、違えば at が新しい方、同じ at なら NAS
+- `sidecarPlan` の #7b: 版の見分けは違うが NAS の選別状況の比較キーが見た版のもの（ほかの端末が設定だけを書き直した版）なら、
+  #3 と同じく端末の変更を確認せずに書く（Push LocalChanged）。Android は呼ぶだけで効く
+
+### Android への依頼（U49 の写真の一覧・RAW・トグルの画面のあと）— **U51 で済み**
+
+1〜5 はすべて U51 で済み（2026-10-03）。違いは 2 点: 取り込むのは Open に加えて Explicit（「NAS に保存」。判断が Open と同じ）でも行う。
+書けない共有で設定だけを書けなかったときは、黙らず Blocked で理由を出す（NAS は変えない）。以下は依頼の元の文（記録として残す）。
+
+1. **設定の置き場**: プロジェクトごとに `pairRawJpeg`（既定 true）と `pairRawJpegAt`（既定 0）を持つ（U49 でトグルを足すときに一緒に）。
+   画面で切り替えたら `at = 今の時刻`。作成時に既定のままなら 0
+2. **書くとき**（`SidecarSync.folderSidecar`）: `settings = SettingsRecord(SettingValueBool(value, at), emptyMap())` を入れる（at が 0 でも値は書く）
+3. **読んだとき**（`sync` の中、`readRemote` のあと・`sidecarPlan` の前）: `settingsResolve(mine.settings, remote.settings)` を呼ぶ
+   - `AdoptRemote(value, at)`: 開いたとき（`SyncMode.Open`）はプロジェクトの設定を `value`・`at` にし、
+     「ほかの端末の設定に合わせて「同名の JPEG と RAW を 1 枚として扱う」を{オン/オフ}にしました。写真を反映するには「写真を再読み込み」を押してください。」を出す（自動では再走査しない）。
+     どのモードでも、この回に書く版（Push・C・D・E・退避）の `settings.pairRawJpeg` は NAS の値にする（古い端末の値で上書きしない）
+   - `PushLocal`: 書く版に端末の値を入れる（2 のとおり）
+4. **設定だけが変わったときに書く契機**: `sidecarPlan` が `Settled`（理由 `Same`・`NoChange`・`Nothing`）で、`PushLocal` かつ端末の `at > 0`、
+   書ける共有なら、既存の楽観ロックの書き込み（`push` と同じ経路・ロック・読み戻し）で書く。`Detached`・`ReadOnly`・`NewerVersion` では書かない。
+   一度も切り替えていない既定値のためだけには書かない。トグルを切り替えたら、いつもの区切りの書き込み（`pushIfChanged`）を呼ぶ
+5. **テスト**（JVM の `SidecarSyncTest` の偽物で、先に赤）: PC が切り替えた版を取り込む・新しい方が勝つ・同じなら何もしない・
+   settings なしの古い版・設定の違いだけでは確認も「変更あり」も出ない（PC 側は `tests/sidecarSync.test.mjs` の U48 の節と同じ場面）
+
+### 迷った点（PC・Web で決めたこと。Android も合わせる）
+
+- 自動の書き込み（背面へ回る・ラウンドの終わりなど）では端末の設定を変えない（お知らせを出せないため）。書く版にだけ NAS の値を入れ、
+  端末は次に開いたときに取り込む
+- 写真 0 枚で作った直後は走査が先に走るので、NAS の設定を取り込むのは走査のあと（お知らせで再読み込みを促す）

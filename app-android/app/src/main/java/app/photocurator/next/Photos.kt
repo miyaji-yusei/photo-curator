@@ -78,11 +78,20 @@ data class Photo(
     val uri get() = ContentUris.withAppendedId(COLLECTION, id)
 
     /**
+     * RAW か（U49）。**Amazon は除く**（名前が .cr2 でも中身は JPEG で、縮小も向こうがする）。
+     * RAW の絵は、中のプレビュー JPEG を取り出して出す（[RawImage]）。
+     */
+    val isRaw: Boolean get() = remote !is AmazonRef && RawFiles.isRaw(name)
+
+    private fun raw(size: ImageSize, edge: Int = 1024): RawImage? = if (!isRaw) null else
+        RawImage(if (remote == null) uri else null, remote as? SmbRef, size, edge)
+
+    /**
      * 小さく並べるときの絵。**EXIF の縮小画像（160x120）。**
      * 詳細の一覧と、まとまりの確認だけ。選別には使わない。
      */
     val thumbModel: Any
-        get() = when (val r = remote) {
+        get() = raw(ImageSize.Thumb) ?: when (val r = remote) {
             is SmbRef -> SmbImage(r.nasId, r.path, ImageSize.Thumb)
             is AmazonRef -> AmazonImage(r, ImageSize.Thumb)
             null -> uri
@@ -95,7 +104,7 @@ data class Photo(
      * 要求した大きさでデコードすれば足りる。NAS は網越しなので、
      * 準備のときに作って置いたものを使う。
      */
-    fun displayModel(edge: Int): Any = when (val r = remote) {
+    fun displayModel(edge: Int): Any = raw(ImageSize.Display, edge) ?: when (val r = remote) {
         is SmbRef -> SmbImage(r.nasId, r.path, ImageSize.Display, edge)
         is AmazonRef -> AmazonImage(r, ImageSize.Display, edge)
         null -> uri
@@ -103,11 +112,25 @@ data class Photo(
 
     /** 拡大して見るときの絵。原本。 */
     val fullModel: Any
-        get() = when (val r = remote) {
+        get() = raw(ImageSize.Full) ?: when (val r = remote) {
             is SmbRef -> SmbImage(r.nasId, r.path, ImageSize.Full)
             is AmazonRef -> AmazonImage(r, ImageSize.Full)
             null -> uri
         }
+}
+
+/**
+ * 取り直した一覧と、**欠けていないか**（U50・レビュー D8）。
+ * NAS の入れ子で読めなかったフォルダがある・上限で止めたとき、欠けた一覧で控えを置き換えない。
+ */
+data class Listed(
+    val photos: List<Photo>,
+    /** 読めなかったフォルダの数。 */
+    val incomplete: Int = 0,
+    /** 深さか枚数の上限で、たどり切れなかったか。 */
+    val truncated: Boolean = false
+) {
+    val complete: Boolean get() = incomplete == 0 && !truncated
 }
 
 /** `photo.smb?.path` のような書き方を残すための計算プロパティ。**保持はしない。** */
@@ -122,12 +145,25 @@ private val COLLECTION = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
     MediaStore.Images.Media.EXTERNAL_CONTENT_URI
 }
 
-/** このアプリが扱う形式。 */
-private val MIME_TYPES = arrayOf("image/jpeg", "image/png", "image/webp")
+/**
+ * このアプリが扱う形式。U49 で RAW を足した（PC と同じ 10 種）。
+ * 組の JPEG がある RAW を外すかどうかはプロジェクトの設定で、一覧を取ったあとに決める。
+ */
+private val MIME_TYPES = arrayOf("image/jpeg", "image/png", "image/webp") +
+    RawFiles.MIME_TYPES.values.toTypedArray()
 
+/**
+ * MIME で選び、**RAW は拡張子でも拾う。** MediaStore は RAW を
+ * application/octet-stream のような型で持っていることがある。
+ */
 private fun mimeSelection(): Pair<String, Array<String>> {
     val placeholders = MIME_TYPES.joinToString(",") { "?" }
-    return "${MediaStore.Images.Media.MIME_TYPE} IN ($placeholders)" to MIME_TYPES
+    val byName = RawFiles.EXTENSIONS.joinToString(" OR ") {
+        "LOWER(${MediaStore.Images.Media.DISPLAY_NAME}) LIKE ?"
+    }
+    val names = RawFiles.EXTENSIONS.map { "%.$it" }.toTypedArray()
+    return "(${MediaStore.Images.Media.MIME_TYPE} IN ($placeholders) OR $byName)" to
+        (MIME_TYPES + names)
 }
 
 object Photos {
@@ -171,8 +207,8 @@ object Photos {
      * 出所から写真を引く。**プロジェクトはここだけを通る。**
      * 出所の種類が増えても、上の画面はこの 1 か所しか知らなくてよい。
      */
-    suspend fun forSource(context: Context, source: Source): List<Photo> = try {
-        list(context, source)
+    suspend fun forSource(context: Context, source: Source, pairRaw: Boolean = true): List<Photo> = try {
+        list(context, source, pairRaw)
     } catch (error: kotlinx.coroutines.CancellationException) {
         throw error
     } catch (error: Exception) {
@@ -185,11 +221,25 @@ object Photos {
      * 読めなかったら**理由を投げる**。準備はこちらを使う（つまずきとして残すため）。
      * Amazon の「リンクが消えた」をここで拾えないと、空のプロジェクトに見える。
      */
-    suspend fun list(context: Context, source: Source): List<Photo> = when (source.kind) {
-        SourceKind.Album -> photos(context, source.key)
-        SourceKind.Nas -> fromNas(context, source.key)
-        SourceKind.Amazon -> fromAmazon(source.key)
+    suspend fun list(context: Context, source: Source, pairRaw: Boolean = true): List<Photo> {
+        val listed = listing(context, source, pairRaw)
+        // **欠けた一覧を、欠けていない顔で渡さない**（U50・D8）。理由を投げる。
+        if (!listed.complete) throw IllegalStateException(Prepare.incompleteReason(listed, hadPrevious = false))
+        return listed.photos
     }
+
+    /**
+     * 一覧と、**欠けていないか**（U50・D8）。準備（[Prepare.run]）はこちらを使い、欠けていれば
+     * 前の控えを残す。端末と Amazon は欠けることがない（読めなければ例外）。
+     */
+    suspend fun listing(context: Context, source: Source, pairRaw: Boolean = true): Listed =
+        when (source.kind) {
+            // **組の RAW を外すのは端末と NAS だけ**（U49。PC の U46 と同じ規則）。
+            // Amazon は中身の種類で選んでいて、RAW の扱いは従来どおり。
+            SourceKind.Album -> Listed(RawFiles.skipPairedRaw(photos(context, source.key), pairRaw) { it.relativePath })
+            SourceKind.Nas -> fromNas(context, source.key, pairRaw)
+            SourceKind.Amazon -> Listed(fromAmazon(source.key))
+        }
 
     /** Amazon の共有リンクの写真。**撮影時刻の昇順で来る。** */
     private suspend fun fromAmazon(key: String): List<Photo> =
@@ -219,7 +269,7 @@ object Photos {
      * EXIF は原本の先頭 64KB に入っているので、そこだけ読む。
      * 読めたぶんはハッシュ値と一緒に控えるので、2 回目以降は網に行かない。
      */
-    private suspend fun fromNas(context: Context, key: String): List<Photo> {
+    private suspend fun fromNas(context: Context, key: String, pairRaw: Boolean): Listed {
         val nasId = key.substringBefore("|")
         val deep = key.endsWith("|**")
         val folder = key.removeSuffix("|**").substringAfter("|")
@@ -230,11 +280,23 @@ object Photos {
         val password = NasPasswords.password(context, nas)
             ?: throw IllegalStateException("NAS のパスワードが要ります")
         // **「以下ぜんぶ」なら入れ子もたどる。** 印は鍵の末尾に付いている。
+        // 1 階層だけのときは、読めなければ全体が失敗になる（欠けることはない）。
         val listed = if (deep) Smb.photosDeep(nas, password, folder)
-        else Smb.photos(nas, password, folder)
+        else when (val flat = Smb.photos(nas, password, folder)) {
+            is SmbResult.Failed -> flat
+            is SmbResult.Ok -> SmbResult.Ok(Smb.Scan(flat.value, emptyList(), truncated = false))
+        }
         if (listed is SmbResult.Failed) throw IllegalStateException(listed.reason)
         listed as SmbResult.Ok
-        return listed.value.map { entry ->
+        return fromScan(nasId, listed.value, pairRaw)
+    }
+
+    /**
+     * NAS をたどった結果を写真に（U50: 欠けていたかを一緒に運ぶ）。組の RAW を外す規則（U49）は
+     * ここで当てる。**網には行かない**（テストで確かめられるように分けた）。
+     */
+    internal fun fromScan(nasId: String, scan: Smb.Scan, pairRaw: Boolean): Listed {
+        val photos = scan.photos.map { entry ->
             Photo(
                 // MediaStore の id は無いので、道筋から作る。**同じ道筋なら同じ値。**
                 id = entry.path.hashCode().toLong() and 0xffffffffL,
@@ -246,6 +308,11 @@ object Photos {
                 remote = SmbRef(nasId, entry.path)
             )
         }
+        return Listed(
+            RawFiles.skipPairedRaw(photos, pairRaw) { it.relativePath },
+            incomplete = scan.unreadable.size,
+            truncated = scan.truncated
+        )
     }
 
     /** あるアルバムの写真。**撮影時刻の昇順**で返す。 */

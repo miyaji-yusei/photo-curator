@@ -71,6 +71,10 @@ export interface StoredProject {
   burstThresholdLearnedAt: number | null
   /** このプロジェクトの表示用画像の長辺。無ければアプリの既定。 */
   displayEdge?: number | null
+  /** 同名の JPEG と RAW を 1 枚の写真として扱う。無ければ true（既定。U46）。 */
+  pairRawJpeg?: boolean
+  /** `pairRawJpeg` を切り替えた時刻（ms）。無い・0 は「一度も切り替えていない」（U48）。 */
+  pairRawJpegAt?: number
 }
 
 let opening: Promise<IDBDatabase> | null = null

@@ -91,12 +91,22 @@ fun ProjectScreen(
     // 「この端末の状況を残す」を選んだあと（NAS から切り離し、自動で書かない）。
     var detached by remember { mutableStateOf(Sidecar.detached(context, project)) }
 
+    // U49: 同名の JPEG がある RAW を外すか（プロジェクトごと、既定オン）。
+    var pairRaw by remember(project.id) { mutableStateOf(Prefs.pairRawJpeg(context, project.id)) }
+    // 切り替えたら「再読み込みで反映」を出す。**再読み込みしたら消す。**
+    var pairRawChanged by remember(project.id) { mutableStateOf(false) }
+
     /** 同期の結果を画面に映す。取り込んだら読み直す。 */
     suspend fun show(outcome: SyncOutcome) {
         when (outcome) {
             is SyncOutcome.Asking -> clash = outcome.clash
             is SyncOutcome.Pulled -> session = Store.load(context, project.id)
             else -> Unit
+        }
+        // U51: ほかの端末の設定を取り込んだ。スイッチを合わせ、再読み込みを促す（自動では取り直さない）。
+        outcome.settingsAdopted?.let {
+            pairRaw = it
+            pairRawChanged = true
         }
         Sidecar.note(outcome)?.let {
             syncNote = it
@@ -134,7 +144,9 @@ fun ProjectScreen(
 
     // 準備の進みを見る。**持ち主はアプリなので、画面はただ映すだけ。**
     val prepared by Preparations.watch().collectAsState()
-    LaunchedEffect(prepared, project.id) {
+    // **このプロジェクトの進みだけを鍵にする**（A12）。全体の Map を鍵にすると、他のプロジェクトの
+    // 準備が 10 枚進むたびに、止まっているこちらの控え（一覧・ハッシュ値）を全部読み直していた。
+    LaunchedEffect(prepared[project.id], project.id) {
         val mine = prepared[project.id] ?: return@LaunchedEffect
         preparing = mine.meta
         rendering = mine.display
@@ -154,7 +166,8 @@ fun ProjectScreen(
         // **転んだままなら、まずそれを出す。** 準備をやり直すのは押されたとき。
         val noted = Trouble.load(context, project.source.key)
         photos = Listing.load(context, project.source.key)
-            ?: if (noted != null) emptyList() else Photos.forSource(context, project.source)
+            ?: if (noted != null) emptyList()
+            else Photos.forSource(context, project.source, Prefs.pairRawJpeg(context, project.id))
         scanned = true
         try {
             // 準備は**アプリが持つ**（Preparations）。画面を離れても止まらないので、
@@ -217,7 +230,9 @@ fun ProjectScreen(
 
     val live = session
     val ratings = live?.ratings ?: emptyMap()
-    val starred = photos.count { (ratings[it.relativePath] ?: 0) > 0 }
+    // 準備の進み（10 枚ごと）で組み直されても、全写真を数え直さない（A12）。
+    val starred = remember(photos, ratings) { photos.count { (ratings[it.relativePath] ?: 0) > 0 } }
+    val photoSpan = remember(photos) { span(photos) }
     val bursts = live?.members?.size ?: 0
 
     // 拡大は画面を覆う。**開いているあいだ下は組まない。**
@@ -287,7 +302,7 @@ fun ProjectScreen(
                     Text(
                         // **いつ撮ったものかを 1 行で。** 同じ名前のフォルダが
                         // 並んだとき、枚数だけでは見分けがつかない。
-                        "${photos.size} 枚" + span(photos)?.let { " · $it" }.orEmpty(),
+                        "${photos.size} 枚" + photoSpan?.let { " · $it" }.orEmpty(),
                         fontSize = 12.sp, color = Faint,
                         modifier = Modifier.padding(top = 6.dp)
                     )
@@ -532,7 +547,7 @@ fun ProjectScreen(
                                     zooming = shown to shown.indexOf(photo)
                                 }
                         ) {
-                            EmptyTile(state, format)
+                            EmptyTile(state, format, raw = photo.isRaw)
                             if (state != Preview.Unsupported) {
                                 AsyncImage(
                                     model = ImageRequest.Builder(LocalContext.current)
@@ -617,8 +632,29 @@ fun ProjectScreen(
         // ところが白く残り、一番下のボタンに被る。
         contentWindowInsets = { WindowInsets(0) }
     ) {
-            Column(Modifier.padding(horizontal = 8.dp).padding(bottom = 24.dp)) {
-                DetailMenuRow("写真を再読み込み") { menu = false; rescan = true; reloads += 1 }
+            Column(
+                Modifier.verticalScroll(rememberScrollState())
+                    .padding(horizontal = 8.dp).padding(bottom = 24.dp)
+            ) {
+                DetailMenuRow("写真を再読み込み") {
+                    menu = false; rescan = true; reloads += 1; pairRawChanged = false
+                }
+                // U49: 組の RAW を外すか。**自動では取り直さない**（PC と同じ。押されたときだけ網へ行く）。
+                if (project.source.kind != SourceKind.Amazon) {
+                    PairRawSwitch(
+                        checked = pairRaw,
+                        onChange = { on ->
+                            pairRaw = on
+                            Prefs.setPairRawJpeg(context, project.id, on)
+                            pairRawChanged = true
+                            // U51: NAS のプロジェクトはサイドカーにも書く（いつもの区切りの書き込みと同じ列。
+                            // 選別状況が同じでも、切り替えた設定が NAS より新しければ書く）。NAS 以外は何もしない。
+                            Sidecar.pushIfChanged(context, project)
+                        },
+                        note = if (pairRawChanged) "「写真を再読み込み」で反映します" else null,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                    )
+                }
                 if (project.source.remote) {
                     DetailMenuRow("表示用画像の大きさ（${displayEdge}px）") {
                         menu = false; choosingEdge = true
@@ -633,7 +669,9 @@ fun ProjectScreen(
                             // **開いたときと同じ判断で書く**（NAS の中身を確かめずに上書きしない）。
                             val outcome = Sidecar.save(context, project)
                             show(outcome)
-                            if (outcome is SyncOutcome.Settled && outcome.note == null) {
+                            if (outcome is SyncOutcome.Settled && outcome.settingsPushed && outcome.settingsAdopted == null) {
+                                syncNote = "プロジェクトの設定を NAS に書き込みました"
+                            } else if (outcome is SyncOutcome.Settled && outcome.note == null && outcome.settingsAdopted == null) {
                                 syncNote = "書く必要はありません（NAS の記録と同じか、まだ選別していません）"
                             }
                         }

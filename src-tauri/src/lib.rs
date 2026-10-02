@@ -259,6 +259,11 @@ struct Project {
     burst_threshold_learned_at: Option<i64>,
     /// 写真の出所。`folder`（PC のフォルダ）か `amazon`（Amazon Photos の共有リンク）。
     source_kind: String,
+    /// 同名の JPEG と RAW を 1 枚の写真として扱い、組の RAW を対象から外す（U46）。既定は true。
+    pair_raw_jpeg: bool,
+    /// `pair_raw_jpeg` を切り替えた時刻（ms）。0 は「作ったまま一度も切り替えていない」。
+    /// サイドカーで端末どうしの設定が違うとき、新しく切り替えた方を採るのに使う（U48）。
+    pair_raw_jpeg_at: i64,
 }
 
 #[derive(Serialize)]
@@ -550,6 +555,10 @@ fn open_database(path: &Path) -> Result<Connection, String> {
     // `"{host}|{shareId}"` を持ち、`folder_path` にはリンクの URL を置く。
     add_column_if_missing(&conn, "projects", "source_kind", "TEXT NOT NULL DEFAULT 'folder'")?;
     add_column_if_missing(&conn, "projects", "source_key", "TEXT")?;
+    // 同名の JPEG と RAW を 1 枚の写真として扱う（U46）。既存のプロジェクトも既定の 1（オン）。
+    add_column_if_missing(&conn, "projects", "pair_raw_jpeg", "INTEGER NOT NULL DEFAULT 1")?;
+    // その設定を切り替えた時刻（U48）。既存のプロジェクトは 0（一度も切り替えていない）。
+    add_column_if_missing(&conn, "projects", "pair_raw_jpeg_at", "INTEGER NOT NULL DEFAULT 0")?;
     // d_hash の算出方式。旧ビルドの行は NULL になり、キャッシュとして使われない。
     // 古い方式のハッシュと新しい方式のハッシュが混ざると連写判定が壊れるため、
     // 値を消さずに「使わない」ことで移行する。
@@ -1879,6 +1888,49 @@ fn extension_lower(path: &Path) -> Option<String> {
         .map(|value| value.to_ascii_lowercase())
 }
 
+/// RAW の拡張子（`IMAGE_EXTENSIONS` のうち HEIC・HEIF 以外。rw2・pef・srw は今は走査の
+/// 候補に入らないが、入れる日のために並べておく）。
+const RAW_EXTENSIONS: [&str; 10] = [
+    "cr2", "cr3", "nef", "arw", "dng", "raf", "orf", "rw2", "pef", "srw",
+];
+
+/// RAW＋JPEG 同時撮影の「組」の RAW を除く（U46）。同じフォルダに、拡張子を除いた名前が
+/// 大文字小文字を無視して一致する JPEG（.jpg・.jpeg）がある RAW は、写真に数えない。
+/// Android は jpg/png/webp だけを走査するので、これで 2 台の顔ぶれが揃う。
+/// 組の JPEG が無い RAW、別フォルダの同名、HEIC・HEIF、PNG・WebP との組は除かない。
+/// `enabled` はプロジェクトの設定（`pair_raw_jpeg`）。false なら何も除かない。
+fn skip_paired_raw<T>(items: Vec<T>, enabled: bool, path_of: impl Fn(&T) -> &Path) -> Vec<T> {
+    if !enabled {
+        return items;
+    }
+    let key_of = |path: &Path| -> Option<(PathBuf, String)> {
+        let stem = path.file_stem()?.to_string_lossy().to_lowercase();
+        Some((path.parent().map(Path::to_path_buf).unwrap_or_default(), stem))
+    };
+    let jpeg_keys: HashSet<(PathBuf, String)> = items
+        .iter()
+        .filter_map(|item| {
+            let path = path_of(item);
+            let ext = extension_lower(path)?;
+            if ext == "jpg" || ext == "jpeg" {
+                key_of(path)
+            } else {
+                None
+            }
+        })
+        .collect();
+    items
+        .into_iter()
+        .filter(|item| {
+            let path = path_of(item);
+            let is_raw = extension_lower(path)
+                .map(|ext| RAW_EXTENSIONS.contains(&ext.as_str()))
+                .unwrap_or(false);
+            !(is_raw && key_of(path).is_some_and(|key| jpeg_keys.contains(&key)))
+        })
+        .collect()
+}
+
 /// 拡張子が画像・RAW の名前か、拡張子が無いもの。動画の拡張子は常に除く。
 fn is_supported(path: &Path) -> bool {
     match extension_lower(path) {
@@ -1931,7 +1983,7 @@ struct FolderListing {
 /// 更新時刻・大きさは、ディレクトリの列挙で得た情報（Windows では列挙の結果に
 /// 入っている）から取る。ファイルごとに `stat` をやり直すと、ネットワークの
 /// フォルダでは 1 枚 1 往復になる。
-fn list_photo_files(folder: &str) -> Result<FolderListing, String> {
+fn list_photo_files(folder: &str, pair_raw: bool) -> Result<FolderListing, String> {
     fs::read_dir(folder)
         .map_err(|error| format!("フォルダに接続できませんでした（{folder}）: {error}"))?;
     let mut files = Vec::new();
@@ -1956,6 +2008,8 @@ fn list_photo_files(folder: &str) -> Result<FolderListing, String> {
             Err(_) => unreadable += 1,
         }
     }
+    // RAW＋JPEG 同時撮影の組の RAW は写真に数えない（U46）。
+    let files = skip_paired_raw(files, pair_raw, |file| file.path.as_path());
     Ok(FolderListing { files, unreadable })
 }
 
@@ -2061,7 +2115,8 @@ fn scan_folder(
     is_cancelled: &dyn Fn() -> bool,
     on_progress: &mut dyn FnMut(&str, usize, usize, &str),
 ) -> Result<ScanEnd, String> {
-    let listing = list_photo_files(folder)?;
+    let pair_raw = project_pair_raw(conn, project_id);
+    let listing = list_photo_files(folder, pair_raw)?;
     let entries = listing.files;
     let total = entries.len();
     on_progress("indexing", 0, total, "Scanning photo files…");
@@ -2934,7 +2989,7 @@ fn run_burst_analysis(
 fn list_projects(app: AppHandle) -> Result<Vec<Project>, String> {
     let conn = connection(&app)?;
     let mut statement = conn
-        .prepare("SELECT id,name,folder_path,photo_count,status,created_at,updated_at,burst_threshold,burst_threshold_learned_at,source_kind FROM projects ORDER BY updated_at DESC")
+        .prepare("SELECT id,name,folder_path,photo_count,status,created_at,updated_at,burst_threshold,burst_threshold_learned_at,source_kind,pair_raw_jpeg,pair_raw_jpeg_at FROM projects ORDER BY updated_at DESC")
         .map_err(|error| error.to_string())?;
     let rows = statement
         .query_map([], |row| {
@@ -2949,6 +3004,8 @@ fn list_projects(app: AppHandle) -> Result<Vec<Project>, String> {
                 burst_threshold: row.get(7)?,
                 burst_threshold_learned_at: row.get(8)?,
                 source_kind: row.get(9)?,
+                pair_raw_jpeg: row.get::<_, i64>(10)? != 0,
+                pair_raw_jpeg_at: row.get(11)?,
             })
         })
         .map_err(|error| error.to_string())?;
@@ -2974,6 +3031,8 @@ fn create_project(app: AppHandle, name: String, folder_path: String) -> Result<P
         burst_threshold: None,
         burst_threshold_learned_at: None,
         source_kind: SOURCE_FOLDER.into(),
+        pair_raw_jpeg: true,
+        pair_raw_jpeg_at: 0,
     };
     connection(&app)?
         .execute(
@@ -3098,6 +3157,8 @@ fn create_amazon_project_blocking(app: AppHandle, name: String, share_url: Strin
         burst_threshold: None,
         burst_threshold_learned_at: None,
         source_kind: SOURCE_AMAZON.into(),
+        pair_raw_jpeg: true,
+        pair_raw_jpeg_at: 0,
     };
     connection(&app)?
         .execute(
@@ -3672,6 +3733,8 @@ struct ExportReport {
     processed: usize,
     skipped: usize,
     failed: usize,
+    /// 組の RAW の `.xmp` に書けた数（U47。`processed` には含めない。失敗は `failed`）。
+    paired_raw_processed: usize,
     /// 失敗と、その理由。全部は返さず先頭だけ。
     errors: Vec<String>,
 }
@@ -3904,8 +3967,8 @@ fn export_amazon_copy(
 }
 
 /// JPEG の XMP パケットを組み立てる。`xmp:Rating` は 0〜5 をそのまま持てる。
-fn xmp_packet(rating: i64) -> Vec<u8> {
-    let body = format!(
+fn xmp_body(rating: i64) -> String {
+    format!(
         r#"<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/">
  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
@@ -3913,7 +3976,11 @@ fn xmp_packet(rating: i64) -> Vec<u8> {
  </rdf:RDF>
 </x:xmpmeta>
 <?xpacket end="w"?>"#
-    );
+    )
+}
+
+fn xmp_packet(rating: i64) -> Vec<u8> {
+    let body = xmp_body(rating);
     let mut packet = b"http://ns.adobe.com/xap/1.0/\0".to_vec();
     packet.extend_from_slice(body.as_bytes());
     packet
@@ -4015,20 +4082,340 @@ fn verify_image_file(path: &Path) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-fn write_ratings_to_photos_blocking(
-    app: AppHandle,
-    project_id: String,
-    photo_ids: Vec<String>,
-) -> Result<ExportReport, String> {
-    let conn = connection(&app)?;
-    // Amazon の写真の原本は書き換えられない。
-    if amazon_source_of(&conn, &project_id)?.is_some() {
-        return Err(AMAZON_UNSUPPORTED.into());
+// ---- 組の RAW の .xmp（U47）----------------------------------------------
+
+/// XML のタグ 1 つの位置（`text` 内のバイト位置。`end` は `>` の次）。
+struct XmlTag {
+    start: usize,
+    end: usize,
+    name: String,
+    is_end: bool,
+    self_closing: bool,
+}
+
+/// XML のタグを前から拾う。コメント・処理命令・CDATA・DOCTYPE は読み飛ばす。
+/// タグの入れ子が合っていなければ（`.xmp` が壊れている）Err。**XML として読めるかの検証を兼ねる。**
+fn scan_xml_tags(text: &str) -> Result<Vec<XmlTag>, String> {
+    let bytes = text.as_bytes();
+    let mut tags = Vec::new();
+    let mut stack: Vec<String> = Vec::new();
+    let mut index = 0usize;
+    let skip_to = |from: usize, needle: &str| -> Result<usize, String> {
+        text[from..]
+            .find(needle)
+            .map(|offset| from + offset + needle.len())
+            .ok_or_else(|| "XML が途中で終わっています".to_string())
+    };
+    while index < bytes.len() {
+        if bytes[index] != b'<' {
+            index += 1;
+            continue;
+        }
+        let rest = &text[index..];
+        if rest.starts_with("<!--") {
+            index = skip_to(index + 4, "-->")?;
+        } else if rest.starts_with("<?") {
+            index = skip_to(index + 2, "?>")?;
+        } else if rest.starts_with("<![CDATA[") {
+            index = skip_to(index + 9, "]]>")?;
+        } else if rest.starts_with("<!") {
+            index = skip_to(index + 2, ">")?;
+        } else {
+            // 開始タグ・終了タグ。属性の値の中の `>` は無視する。
+            let mut cursor = index + 1;
+            let mut quote: Option<u8> = None;
+            let mut close = None;
+            while cursor < bytes.len() {
+                let byte = bytes[cursor];
+                match quote {
+                    Some(q) => {
+                        if byte == q {
+                            quote = None;
+                        }
+                    }
+                    None => {
+                        if byte == b'"' || byte == b'\'' {
+                            quote = Some(byte);
+                        } else if byte == b'>' {
+                            close = Some(cursor);
+                            break;
+                        }
+                    }
+                }
+                cursor += 1;
+            }
+            let close = close.ok_or_else(|| "タグが閉じていません".to_string())?;
+            let inner = &text[index + 1..close];
+            let is_end = inner.starts_with('/');
+            let self_closing = !is_end && inner.ends_with('/');
+            let name_source = inner.trim_start_matches('/');
+            let name: String = name_source
+                .chars()
+                .take_while(|c| !c.is_whitespace() && *c != '/' && *c != '>')
+                .collect();
+            if name.is_empty() {
+                return Err("タグの名前がありません".into());
+            }
+            if is_end {
+                match stack.pop() {
+                    Some(open) if open == name => {}
+                    _ => return Err(format!("タグの対応が合っていません: {name}")),
+                }
+            } else if !self_closing {
+                stack.push(name.clone());
+            }
+            tags.push(XmlTag { start: index, end: close + 1, name, is_end, self_closing });
+            index = close + 1;
+        }
     }
-    let targets = photos_for_export(&conn, &project_id, &photo_ids)?;
+    if !stack.is_empty() {
+        return Err("閉じていないタグがあります".into());
+    }
+    if tags.is_empty() {
+        return Err("XML のタグがありません".into());
+    }
+    Ok(tags)
+}
+
+/// 開始タグの属性（名前・値の範囲。範囲は `text` 内のバイト位置で、引用符の内側）。
+fn tag_attributes(text: &str, tag: &XmlTag) -> Vec<(String, std::ops::Range<usize>)> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let limit = tag.end - 1;
+    let mut cursor = tag.start + 1;
+    // タグの名前を飛ばす。
+    while cursor < limit && !bytes[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+    loop {
+        while cursor < limit && (bytes[cursor].is_ascii_whitespace() || bytes[cursor] == b'/') {
+            cursor += 1;
+        }
+        if cursor >= limit {
+            break;
+        }
+        let name_start = cursor;
+        while cursor < limit && bytes[cursor] != b'=' && !bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        let name = text[name_start..cursor].to_string();
+        while cursor < limit && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= limit || bytes[cursor] != b'=' {
+            continue;
+        }
+        cursor += 1;
+        while cursor < limit && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= limit || (bytes[cursor] != b'"' && bytes[cursor] != b'\'') {
+            break;
+        }
+        let quote = bytes[cursor];
+        let value_start = cursor + 1;
+        let Some(length) = bytes[value_start..limit].iter().position(|b| *b == quote) else {
+            break;
+        };
+        out.push((name, value_start..value_start + length));
+        cursor = value_start + length + 1;
+    }
+    out
+}
+
+/// `.xmp` の中の `xmp:Rating`（属性・要素）の値を、見つけた順に返す。読めなければ Err。
+fn xmp_ratings_of_document(text: &str) -> Result<Vec<String>, String> {
+    let tags = scan_xml_tags(text)?;
+    let mut found = Vec::new();
+    for (position, tag) in tags.iter().enumerate() {
+        if tag.is_end {
+            continue;
+        }
+        for (name, range) in tag_attributes(text, tag) {
+            if name == "xmp:Rating" {
+                found.push(text[range].trim().to_string());
+            }
+        }
+        if tag.name == "xmp:Rating" && !tag.self_closing {
+            if let Some(next) = tags.get(position + 1) {
+                if next.is_end && next.name == "xmp:Rating" {
+                    found.push(text[tag.end..next.start].trim().to_string());
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// 既にある `.xmp` の星（`xmp:Rating`）だけを書き換える。ほかの内容は 1 バイトも変えない。
+/// `xmp:Rating` が無ければ、最初の `rdf:Description` に属性として足す。
+/// 読めない・`rdf:Description` が無いときは Err（呼び出し側は何も書かない）。
+fn xmp_with_rating(existing: &str, rating: i64) -> Result<String, String> {
+    let tags = scan_xml_tags(existing)?;
+    let value = rating.to_string();
+    // (差し替える範囲, 入れる文字列)
+    let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    for (position, tag) in tags.iter().enumerate() {
+        if tag.is_end {
+            continue;
+        }
+        for (name, range) in tag_attributes(existing, tag) {
+            if name == "xmp:Rating" {
+                edits.push((range, value.clone()));
+            }
+        }
+        if tag.name == "xmp:Rating" && !tag.self_closing {
+            if let Some(next) = tags.get(position + 1) {
+                if next.is_end && next.name == "xmp:Rating" {
+                    edits.push((tag.end..next.start, value.clone()));
+                }
+            }
+        }
+    }
+    if edits.is_empty() {
+        let description = tags
+            .iter()
+            .find(|tag| !tag.is_end && tag.name == "rdf:Description")
+            .ok_or_else(|| "rdf:Description が見つかりません".to_string())?;
+        let has_namespace = tag_attributes(existing, description)
+            .iter()
+            .any(|(name, _)| name == "xmlns:xmp");
+        let insert_at = description.end - if description.self_closing { 2 } else { 1 };
+        let mut addition = String::new();
+        if !has_namespace {
+            addition.push_str(" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\"");
+        }
+        addition.push_str(&format!(" xmp:Rating=\"{value}\""));
+        edits.push((insert_at..insert_at, addition));
+    }
+    edits.sort_by_key(|(range, _)| range.start);
+    let mut out = existing.to_string();
+    for (range, replacement) in edits.into_iter().rev() {
+        out.replace_range(range, &replacement);
+    }
+    Ok(out)
+}
+
+/// 新しく作る `.xmp` の中身（最小の XMP パケット）。
+fn new_sidecar_xmp(rating: i64) -> String {
+    xmp_body(rating)
+}
+
+/// JPEG（`.jpg`・`.jpeg`）の組の RAW を、同じフォルダの一覧から選ぶ純関数。
+/// 拡張子を除いた名前が大文字小文字を無視して一致し、拡張子が RAW の一覧にあるもの。
+/// フォルダが違うものは組ではない。並びはパス順。
+fn paired_raw_files(jpeg: &Path, siblings: &[PathBuf]) -> Vec<PathBuf> {
+    let Some(stem) = jpeg.file_stem().map(|v| v.to_string_lossy().to_lowercase()) else {
+        return Vec::new();
+    };
+    let folder = jpeg.parent();
+    let mut found: Vec<PathBuf> = siblings
+        .iter()
+        .filter(|candidate| {
+            candidate.parent() == folder
+                && candidate
+                    .file_stem()
+                    .is_some_and(|v| v.to_string_lossy().to_lowercase() == stem)
+                && extension_lower(candidate).is_some_and(|ext| RAW_EXTENSIONS.contains(&ext.as_str()))
+        })
+        .cloned()
+        .collect();
+    found.sort();
+    found
+}
+
+/// JPEG と同じフォルダのファイルを列挙して、組の RAW を返す（読めなければ空）。
+fn find_paired_raws(jpeg: &Path) -> Vec<PathBuf> {
+    let Some(folder) = jpeg.parent() else {
+        return Vec::new();
+    };
+    let siblings: Vec<PathBuf> = match fs::read_dir(folder) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file())
+            .collect(),
+        Err(_) => return Vec::new(),
+    };
+    paired_raw_files(jpeg, &siblings)
+}
+
+/// RAW の隣の `.xmp` に星を書く。**RAW 本体は読みも書きもしない。**
+/// 既にあれば（名前の大文字小文字は問わない）`xmp:Rating` だけを更新し、無ければ新しく作る。
+/// 同じフォルダの一時ファイルへ書き、XML として読めて星が期待どおりか確かめてから置き換える。
+/// 読み取り専用の `.xmp`・UTF-8 でない `.xmp`・構造が読めない `.xmp` には触らず Err。
+fn write_sidecar_xmp_for_raw(raw: &Path, rating: i64) -> Result<PathBuf, String> {
+    let folder = raw.parent().ok_or("RAW のフォルダが分かりません")?;
+    let stem = raw.file_stem().ok_or("RAW の名前が分かりません")?;
+    let wanted = format!("{}.xmp", stem.to_string_lossy().to_lowercase());
+    let existing: Option<PathBuf> = fs::read_dir(folder)
+        .map_err(|error| error.to_string())?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().to_lowercase() == wanted)
+        });
+
+    let (target, content) = match &existing {
+        Some(path) => {
+            let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+            if metadata.permissions().readonly() {
+                return Err("既存の .xmp が読み取り専用のため書きませんでした".into());
+            }
+            let bytes = fs::read(path).map_err(|error| error.to_string())?;
+            let text = String::from_utf8(bytes)
+                .map_err(|_| "既存の .xmp が UTF-8 ではないため書きませんでした".to_string())?;
+            let updated = xmp_with_rating(&text, rating)
+                .map_err(|reason| format!("既存の .xmp を読めないため書きませんでした: {reason}"))?;
+            (path.clone(), updated)
+        }
+        None => {
+            let mut name = stem.to_os_string();
+            name.push(".xmp");
+            (folder.join(name), new_sidecar_xmp(rating))
+        }
+    };
+
+    let mut temporary_name = target.file_name().unwrap_or_default().to_os_string();
+    temporary_name.push(".photocurator-tmp");
+    let temporary = folder.join(temporary_name);
+    if let Err(error) = fs::write(&temporary, content.as_bytes()) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
+    let expected = rating.to_string();
+    let verified = fs::read_to_string(&temporary)
+        .map_err(|error| error.to_string())
+        .and_then(|text| xmp_ratings_of_document(&text))
+        .and_then(|ratings| {
+            if !ratings.is_empty() && ratings.iter().all(|value| *value == expected) {
+                Ok(())
+            } else {
+                Err("星が期待どおりに書けていません".to_string())
+            }
+        });
+    if let Err(reason) = verified {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("検証に失敗したため .xmp は変更していません: {reason}"));
+    }
+    match fs::rename(&temporary, &target) {
+        Ok(()) => Ok(target),
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(error.to_string())
+        }
+    }
+}
+
+/// 対象の写真（id・パス・星）に星を書く。JPEG は中の XMP に、
+/// `pair_raw` がオンなら組の RAW の隣の `.xmp` にも。JPEG の書き込みが失敗したら RAW 側は書かない。
+fn write_ratings_to_targets(targets: &[(String, String, i64)], pair_raw: bool) -> ExportReport {
     let mut report = ExportReport::default();
 
-    for (_id, path, rating) in &targets {
+    for (_id, path, rating) in targets {
         let source = Path::new(path);
         let is_jpeg = matches!(
             source
@@ -4079,10 +4466,42 @@ fn write_ratings_to_photos_blocking(
             Err(error) => {
                 let _ = fs::remove_file(&temporary);
                 report.fail(path, error);
+                continue;
+            }
+        }
+
+        // 組の RAW の隣の .xmp（U47）。オフのときは RAW が自分の行で扱われるので何もしない。
+        // 同じ名前の RAW が複数あっても `.xmp` は 1 つなので、1 回だけ書く。
+        if pair_raw {
+            let mut written: HashSet<PathBuf> = HashSet::new();
+            for raw in find_paired_raws(source) {
+                let key = raw.with_extension("").to_string_lossy().to_lowercase();
+                if !written.insert(PathBuf::from(key)) {
+                    continue;
+                }
+                match write_sidecar_xmp_for_raw(&raw, *rating) {
+                    Ok(_) => report.paired_raw_processed += 1,
+                    Err(reason) => report.fail(&raw.to_string_lossy(), reason),
+                }
             }
         }
     }
-    Ok(report)
+    report
+}
+
+fn write_ratings_to_photos_blocking(
+    app: AppHandle,
+    project_id: String,
+    photo_ids: Vec<String>,
+) -> Result<ExportReport, String> {
+    let conn = connection(&app)?;
+    // Amazon の写真の原本は書き換えられない。
+    if amazon_source_of(&conn, &project_id)?.is_some() {
+        return Err(AMAZON_UNSUPPORTED.into());
+    }
+    let targets = photos_for_export(&conn, &project_id, &photo_ids)?;
+    let pair_raw = project_pair_raw(&conn, &project_id);
+    Ok(write_ratings_to_targets(&targets, pair_raw))
 }
 
 /// 結果の CSV を、保存ダイアログで選ばれた場所へ書く。**書けるのは `.csv` だけ**
@@ -4155,6 +4574,37 @@ fn get_core_inputs_blocking(app: AppHandle, project_id: String) -> Result<Vec<Ph
         .map_err(|error| error.to_string())
 }
 
+/// 欠損の印の写真のうち、星が 1 以上のもの（U52 D13）。サイドカーに載せて、一時的に見えないだけの写真の
+/// 星を NAS から消さないために使う。
+#[derive(Clone, Serialize, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase")]
+struct MissingRating {
+    relative_path: String,
+    rating: i64,
+}
+
+fn missing_ratings(conn: &Connection, project_id: &str) -> Result<Vec<MissingRating>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT relative_path, rating FROM photos WHERE project_id=?1 AND is_missing=1 AND rating>=1
+             ORDER BY relative_path",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params![project_id], |row| {
+            Ok(MissingRating { relative_path: row.get(0)?, rating: row.get(1)? })
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn get_missing_ratings(app: AppHandle, project_id: String) -> Result<Vec<MissingRating>, String> {
+    tauri::async_runtime::spawn_blocking(move || missing_ratings(&connection(&app)?, &project_id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// 手で直した連写の例外（core の `PairOverride`）。鍵は relativePath。
 #[derive(Clone, Serialize, serde::Deserialize)]
 struct PairOverrideRow {
@@ -4208,11 +4658,12 @@ fn replace_pair_overrides(
     )
     .map_err(|error| error.to_string())?;
     for item in overrides {
-        // 同じ組が重ねて来ても、後のものが勝つ。
+        // 同じ組が重ねて来たら、**先に出たものが勝つ**（core の `group_bursts` と同じ。U41。
+        // 以前は後のものが勝ち、core と食い違っていた）。
         tx.execute(
             "INSERT INTO pair_overrides (project_id,left_path,right_path,decision)
              VALUES (?1,?2,?3,?4)
-             ON CONFLICT(project_id,left_path,right_path) DO UPDATE SET decision=excluded.decision",
+             ON CONFLICT(project_id,left_path,right_path) DO NOTHING",
             params![project_id, item.left, item.right, item.decision],
         )
         .map_err(|error| error.to_string())?;
@@ -4296,6 +4747,47 @@ fn save_display_edge(app: AppHandle, edge: u32) -> Result<u32, String> {
         )
         .map_err(|error| error.to_string())?;
     Ok(normalized)
+}
+
+/// プロジェクトの「同名の JPEG と RAW を 1 枚の写真として扱う」設定（U46）。
+/// 既定はオン。読めない・行が無いときもオン（既定どおり）。
+fn project_pair_raw(conn: &Connection, project_id: &str) -> bool {
+    conn.query_row(
+        "SELECT pair_raw_jpeg FROM projects WHERE id=?1",
+        params![project_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|value| value != 0)
+    .unwrap_or(true)
+}
+
+/// 設定と、切り替えた時刻を保存する（U48）。`at` が None なら今の時刻（画面で切り替えたとき）、
+/// Some ならその時刻（ほかの端末の設定をサイドカーから取り込んだとき）。
+fn store_project_pair_raw(
+    conn: &Connection,
+    project_id: &str,
+    enabled: bool,
+    at: Option<i64>,
+) -> Result<bool, String> {
+    let stamp = now();
+    conn.execute(
+        "UPDATE projects SET pair_raw_jpeg=?1, pair_raw_jpeg_at=?2, updated_at=?3 WHERE id=?4",
+        params![enabled as i64, at.unwrap_or(stamp), stamp, project_id],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(project_pair_raw(conn, project_id))
+}
+
+/// 設定を保存する。反映は次の走査（「写真を再読み込み」）から。
+#[tauri::command]
+fn save_project_pair_raw(
+    app: AppHandle,
+    project_id: String,
+    enabled: bool,
+    at: Option<i64>,
+) -> Result<bool, String> {
+    let conn = connection(&app)?;
+    store_project_pair_raw(&conn, &project_id, enabled, at)
 }
 
 /// プロジェクト単位の上書き。`None` を渡すと全体の設定に戻す。
@@ -4945,13 +5437,15 @@ async fn write_sidecar(
 }
 
 /// `catalog.json` を楽観ロックで書く（U34。設計書 §4.4）。`expected` は画面が判断に使った中身
-/// （無かったなら None）。返すのは "written" / "changed" / "locked"。
+/// （無かったなら None）。`aside_tag` があれば、確かめたあとで置き換える版を退避する（U52 D4）。
+/// 返すのは "written" / "changed" / "locked"。
 #[tauri::command]
 async fn write_sidecar_checked(
     app: AppHandle,
     project_id: String,
     json: String,
     expected: Option<String>,
+    aside_tag: Option<String>,
 ) -> Result<sidecar::CheckedWrite, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let conn = connection(&app)?;
@@ -4959,12 +5453,36 @@ async fn write_sidecar_checked(
             return Err("Amazon の共有リンクにはサイドカーを書けません。".to_string());
         }
         let holder = sidecar::device_identity(&conn)?;
-        sidecar::write_checked(
+        sidecar::write_checked_aside(
             &sidecar_folder(&app, &project_id)?,
             &json,
             expected.as_deref(),
             &format!("{} ({})", holder.name, holder.id),
+            aside_tag.as_deref(),
         )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// NAS に退避する（U52 D4。`catalog.<印>.<UTC 時刻>.json` を無いときだけ作り、同じ印は最新 5 つ）。返すのは名前。
+#[tauri::command]
+async fn aside_sidecar(app: AppHandle, project_id: String, json: String, tag: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if amazon_source_of(&connection(&app)?, &project_id)?.is_some() {
+            return Err("Amazon の共有リンクにはサイドカーを書けません。".to_string());
+        }
+        sidecar::write_aside(&sidecar_folder(&app, &project_id)?, &tag, &json)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// 端末の中に退避する（U52 D4。アプリのデータフォルダの `aside/`、プロジェクトごとに最新 5 つ）。
+#[tauri::command]
+async fn aside_local(app: AppHandle, project_id: String, json: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        sidecar::write_local_aside(&data_subdir(&app, "aside")?, &project_id, &json)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -5014,6 +5532,7 @@ pub fn run() {
             get_display_settings,
             save_display_edge,
             save_project_display_edge,
+            save_project_pair_raw,
             get_display_backlog,
             start_display_generation,
             reset_display_images,
@@ -5032,6 +5551,9 @@ pub fn run() {
             read_sidecar,
             write_sidecar,
             write_sidecar_checked,
+            get_missing_ratings,
+            aside_sidecar,
+            aside_local,
             load_sidecar_state,
             save_sidecar_state,
             device_identity
@@ -5387,6 +5909,29 @@ mod tests {
 
     // 接続の使い回し（U27 R1）: 初回だけ整備し、2 回目以降は整備なしで同じデータが見える。
     // Amazon の行は backfill の対象外（fingerprint が NULL のまま、stat も走らない）。
+    #[test]
+    fn missing_ratings_lists_only_missing_rows_with_stars() {
+        let directory = test_directory("missing-ratings");
+        let conn = open_connection(&directory.join("m.sqlite3")).expect("open");
+        conn.execute(
+            "INSERT INTO projects (id,name,folder_path,created_at,updated_at,source_kind) VALUES ('p','p','/x',1,1,'folder')",
+            [],
+        )
+        .unwrap();
+        for (id, path, rating, missing) in [("a", "a.jpg", 2, 1), ("b", "b.jpg", 0, 1), ("c", "c.jpg", 3, 0)] {
+            conn.execute(
+                "INSERT INTO photos (id,project_id,path,relative_path,name,rating,is_missing) VALUES (?1,'p',?2,?2,?2,?3,?4)",
+                params![id, path, rating, missing],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            missing_ratings(&conn, "p").unwrap(),
+            vec![MissingRating { relative_path: "a.jpg".into(), rating: 2 }]
+        );
+        assert!(missing_ratings(&conn, "other").unwrap().is_empty());
+    }
+
     #[test]
     fn open_connection_migrates_once_and_keeps_data_visible() {
         let directory = test_directory("open-connection");
@@ -7257,6 +7802,28 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_pair_overrides_keep_the_first_one_like_core() {
+        let directory = test_directory("pair-overrides-first");
+        let mut conn = open_database(&directory.join("overrides.sqlite3")).expect("open database");
+        let row = |decision: &str| PairOverrideRow {
+            left: "a.jpg".to_string(),
+            right: "b.jpg".to_string(),
+            decision: decision.to_string(),
+        };
+        replace_pair_overrides(&mut conn, "p1", &[row("join"), row("split")]).expect("save");
+        let decision: String = conn
+            .query_row(
+                "SELECT decision FROM pair_overrides WHERE project_id=?1 AND left_path='a.jpg' AND right_path='b.jpg'",
+                params!["p1"],
+                |r| r.get(0),
+            )
+            .expect("read");
+        assert_eq!(decision, "join", "同じ組が重なったら先のものが残る（core と同じ）");
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
     fn burst_threshold_columns_migrate_without_touching_existing_projects() {
         let directory = test_directory("burst-threshold");
         let database = directory.join("legacy.sqlite3");
@@ -7754,7 +8321,7 @@ mod tests {
         fs::write(directory.join("a.jpg"), b"one").unwrap();
         fs::create_dir_all(directory.join("sub")).unwrap();
         fs::write(directory.join("sub/b.jpg"), b"two two").unwrap();
-        let listing = list_photo_files(&directory.to_string_lossy()).expect("list");
+        let listing = list_photo_files(&directory.to_string_lossy(), true).expect("list");
         assert_eq!(listing.files.len(), 2);
         for file in &listing.files {
             assert!(file.fingerprint.is_some());
@@ -7810,7 +8377,7 @@ mod tests {
         // HEIC は先頭が `ftyp` だが画像。数から外さず、「読めなかった」に数える。
         fs::write(directory.join("photo.heic"), b"\0\0\0\x18ftypheic\0\0\0\0mif1heic").unwrap();
 
-        let files: Vec<PathBuf> = list_photo_files(&root)
+        let files: Vec<PathBuf> = list_photo_files(&root, true)
             .expect("list")
             .files
             .into_iter()
@@ -7872,6 +8439,178 @@ mod tests {
             .query_row("SELECT captured_at FROM photos WHERE name='fake.cr2'", [], |row| row.get(0))
             .unwrap();
         assert!(captured.is_some());
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    /// U46: 同じフォルダに同名の JPEG がある RAW は、走査の結果に入れない。
+    #[test]
+    fn listing_skips_a_raw_that_has_a_same_named_jpeg_beside_it() {
+        let directory = test_directory("scan-paired-raw");
+        let root = directory.to_string_lossy().to_string();
+        fs::create_dir_all(directory.join("sub")).unwrap();
+        for name in [
+            "IMG_1.JPG", "IMG_1.CR2", "IMG_2.CR2", "IMG_3.jpeg", "IMG_3.NEF", "sub/IMG_1.CR2",
+            "IMG_4.HEIC", "img_5.jpg", "IMG_5.CR2", "IMG_6.png", "IMG_6.DNG", "IMG_7.heic",
+            "IMG_7.jpg",
+        ] {
+            fs::write(directory.join(name), b"photo bytes").unwrap();
+        }
+        let files: Vec<PathBuf> = list_photo_files(&root, true)
+            .expect("list")
+            .files
+            .into_iter()
+            .map(|file| file.path)
+            .collect();
+        assert_eq!(
+            relative_names(&directory, &files),
+            vec![
+                "IMG_1.JPG", "IMG_2.CR2", "IMG_3.jpeg", "IMG_4.HEIC", "IMG_6.DNG", "IMG_6.png",
+                "IMG_7.heic", "IMG_7.jpg", "img_5.jpg", "sub/IMG_1.CR2",
+            ]
+        );
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn skip_paired_raw_is_a_pure_function_of_the_paths() {
+        let paths: Vec<PathBuf> = ["d/a.jpg", "d/A.cr3", "d/b.cr3", "e/a.arw", "d/c.heif", "d/c.jpeg"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        let kept = skip_paired_raw(paths, true, |path| path.as_path());
+        let names: Vec<String> = kept
+            .iter()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(names, vec!["d/a.jpg", "d/b.cr3", "e/a.arw", "d/c.heif", "d/c.jpeg"]);
+    }
+
+    /// U46: 既に DB にある組の RAW は、再走査で「見つからなかった」ことになり欠損になる
+    /// （解析エラーの表示から消える）。組でない RAW は残る。
+    #[test]
+    fn rescanning_marks_an_already_registered_paired_raw_as_missing() {
+        let (directory, root, conn) = scan_fixture("scan-paired-raw-db", &["a.jpg", "a.cr2", "b.cr2"]);
+        // 以前の版が RAW も登録していた状態を作る。
+        for name in ["a.jpg", "a.cr2", "b.cr2"] {
+            let path = directory.join(name);
+            upsert_photo(&conn, "p1", &path.to_string_lossy(), name, name, Some(1), Some(1))
+                .expect("upsert");
+        }
+        let ended = scan_for_test(&conn, &root, &|| false).expect("scan");
+        assert!(matches!(ended, ScanEnd::Completed { total: 2, count: 2, unreadable: 0 }));
+        assert_eq!(missing_names(&conn), vec!["a.cr2"]);
+        assert_eq!(project_row(&conn), (2, "ready".to_string()));
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    /// U46: 設定がオフなら、同名の JPEG があっても RAW を全部対象にする（今までどおり）。
+    #[test]
+    fn with_the_setting_off_every_file_stays_in_the_scan() {
+        let kept = skip_paired_raw(
+            vec![PathBuf::from("d/a.jpg"), PathBuf::from("d/a.cr2")],
+            false,
+            |path| path.as_path(),
+        );
+        assert_eq!(kept.len(), 2);
+
+        let (directory, root, conn) = scan_fixture("scan-paired-raw-off", &["a.jpg", "a.cr2", "b.cr2"]);
+        assert!(project_pair_raw(&conn, "p1"), "既定はオン");
+        conn.execute("UPDATE projects SET pair_raw_jpeg=0 WHERE id='p1'", []).unwrap();
+        assert!(!project_pair_raw(&conn, "p1"));
+        let ended = scan_for_test(&conn, &root, &|| false).expect("scan");
+        assert!(matches!(ended, ScanEnd::Completed { total: 3, count: 3, unreadable: 0 }));
+        assert!(missing_names(&conn).is_empty());
+        // オンに戻して再走査すると、組の RAW が欠損になる。
+        conn.execute("UPDATE projects SET pair_raw_jpeg=1 WHERE id='p1'", []).unwrap();
+        scan_for_test(&conn, &root, &|| false).expect("rescan");
+        assert_eq!(missing_names(&conn), vec!["a.cr2"]);
+        assert_eq!(project_row(&conn), (2, "ready".to_string()));
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    /// U46: `pair_raw_jpeg` 列は既存のプロジェクトを壊さずに足され、既定は 1（オン）。
+    #[test]
+    fn pair_raw_jpeg_column_migrates_with_the_default_on() {
+        let directory = test_directory("pair-raw-migrate");
+        let database = directory.join("legacy.sqlite3");
+        {
+            let legacy = Connection::open(&database).expect("open legacy");
+            legacy
+                .execute_batch(
+                    "CREATE TABLE projects (
+                       id TEXT PRIMARY KEY, name TEXT NOT NULL, folder_path TEXT NOT NULL,
+                       photo_count INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'new',
+                       created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+                     );
+                     INSERT INTO projects (id,name,folder_path,photo_count,status,created_at,updated_at)
+                     VALUES ('p1','旧プロジェクト','C:/photos',632,'ready',100,200);",
+                )
+                .expect("create legacy projects");
+        }
+        let conn = open_database(&database).expect("migrate");
+        let (name, count, pair): (String, i64, i64) = conn
+            .query_row(
+                "SELECT name,photo_count,pair_raw_jpeg FROM projects WHERE id='p1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read migrated project");
+        assert_eq!((name.as_str(), count, pair), ("旧プロジェクト", 632, 1));
+        assert!(project_pair_raw(&conn, "p1"));
+        conn.execute("UPDATE projects SET pair_raw_jpeg=0 WHERE id='p1'", []).unwrap();
+        drop(conn);
+        // 冪等で、保存した値を既定に戻さない。
+        let conn = open_database(&database).expect("reopen");
+        assert!(!project_pair_raw(&conn, "p1"));
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    /// U48: 切り替えた時刻の列は既存のプロジェクトを壊さずに 0 で足され、保存で値と時刻が入る。
+    #[test]
+    fn pair_raw_jpeg_at_column_migrates_to_zero_and_stores_the_switch_time() {
+        let directory = test_directory("pair-raw-at-migrate");
+        let database = directory.join("legacy.sqlite3");
+        {
+            let legacy = Connection::open(&database).expect("open legacy");
+            legacy
+                .execute_batch(
+                    "CREATE TABLE projects (
+                       id TEXT PRIMARY KEY, name TEXT NOT NULL, folder_path TEXT NOT NULL,
+                       photo_count INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'new',
+                       created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                       pair_raw_jpeg INTEGER NOT NULL DEFAULT 1
+                     );
+                     INSERT INTO projects (id,name,folder_path,photo_count,status,created_at,updated_at,pair_raw_jpeg)
+                     VALUES ('p1','U46 のプロジェクト','C:/photos',10,'ready',100,200,0);",
+                )
+                .expect("create legacy projects");
+        }
+        let conn = open_database(&database).expect("migrate");
+        let read = |conn: &Connection| -> (i64, i64) {
+            conn.query_row("SELECT pair_raw_jpeg,pair_raw_jpeg_at FROM projects WHERE id='p1'", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .expect("read project")
+        };
+        // U46 で保存したオフはそのまま、時刻は 0（一度も切り替えていない扱い）。
+        assert_eq!(read(&conn), (0, 0));
+        // サイドカーから取り込んだときは、その時刻を残す。
+        assert!(store_project_pair_raw(&conn, "p1", true, Some(1_790_955_613_101)).expect("store"));
+        assert_eq!(read(&conn), (1, 1_790_955_613_101));
+        // 画面で切り替えたときは今の時刻。
+        let before = now();
+        assert!(!store_project_pair_raw(&conn, "p1", false, None).expect("store"));
+        let (value, at) = read(&conn);
+        assert_eq!(value, 0);
+        assert!(at >= before, "切り替えた時刻: {at}");
+        drop(conn);
+        // 冪等で、時刻を 0 に戻さない。
+        let conn = open_database(&database).expect("reopen");
+        assert_eq!(read(&conn).1, at);
         drop(conn);
         fs::remove_dir_all(&directory).expect("remove test directory");
     }
@@ -8487,6 +9226,212 @@ mod tests {
         let rebuilt = hash_one_amazon(&book, &thumbnails, 0, &old);
         assert!(rebuilt.error.is_none() && !rebuilt.hash_reused);
         assert_eq!(rebuilt.d_hash, expected);
+        fs::remove_dir_all(&directory).ok();
+    }
+    // ---- 組の RAW の .xmp（U47）-----------------------------------------
+
+    fn rating_target(path: &Path, rating: i64) -> (String, String, i64) {
+        ("id".to_string(), path.to_string_lossy().to_string(), rating)
+    }
+
+    fn jpeg_ratings(path: &Path) -> Vec<String> {
+        xmp_ratings_in(&fs::read(path).expect("read jpeg"))
+    }
+
+    const RAW_BYTES: &[u8] = b"II*\0 not a real raw but must never change \xFF\xD8\x00";
+
+    #[test]
+    fn rating_a_jpeg_also_writes_the_xmp_next_to_its_paired_raw() {
+        let directory = test_directory("u47-basic");
+        let jpeg = directory.join("IMG_1.JPG");
+        let raw = directory.join("IMG_1.CR2");
+        fs::write(&jpeg, jpeg_bytes(32, 24, 7)).unwrap();
+        fs::write(&raw, RAW_BYTES).unwrap();
+
+        let report = write_ratings_to_targets(&[rating_target(&jpeg, 3)], true);
+
+        assert_eq!((report.processed, report.paired_raw_processed, report.failed), (1, 1, 0));
+        assert_eq!(jpeg_ratings(&jpeg), vec!["3"]);
+        let xmp = fs::read_to_string(directory.join("IMG_1.xmp")).expect("xmp is created");
+        assert_eq!(xmp_ratings_of_document(&xmp).unwrap(), vec!["3"]);
+        assert_eq!(fs::read(&raw).unwrap(), RAW_BYTES, "RAW 本体は不変");
+        let leftovers: Vec<_> = fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains("photocurator-tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "一時ファイルを残さない");
+        fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn existing_xmp_only_has_its_rating_updated() {
+        let directory = test_directory("u47-existing");
+        let jpeg = directory.join("IMG_2.jpg");
+        let raw = directory.join("IMG_2.CR2");
+        fs::write(&jpeg, jpeg_bytes(32, 24, 7)).unwrap();
+        fs::write(&raw, RAW_BYTES).unwrap();
+        let existing = "<?xpacket begin=\"\" id=\"x\"?>\n<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n  <rdf:Description rdf:about=\"\" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" xmlns:crs=\"http://ns.adobe.com/camera-raw-settings/1.0/\" xmp:Rating=\"1\" crs:Exposure2012=\"+0.50\">\n   <crs:ToneCurve><rdf:Seq><rdf:li>0, 0</rdf:li></rdf:Seq></crs:ToneCurve>\n  </rdf:Description>\n </rdf:RDF>\n</x:xmpmeta>\n<?xpacket end=\"w\"?>";
+        fs::write(directory.join("IMG_2.xmp"), existing).unwrap();
+
+        let report = write_ratings_to_targets(&[rating_target(&jpeg, 5)], true);
+
+        assert_eq!((report.paired_raw_processed, report.failed), (1, 0));
+        let after = fs::read_to_string(directory.join("IMG_2.xmp")).unwrap();
+        assert_eq!(after, existing.replace("xmp:Rating=\"1\"", "xmp:Rating=\"5\""), "Rating 以外は 1 文字も変わらない");
+        assert!(after.contains("crs:Exposure2012=\"+0.50\"") && after.contains("<rdf:li>0, 0</rdf:li>"));
+        assert_eq!(fs::read(&raw).unwrap(), RAW_BYTES);
+        fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn existing_xmp_with_rating_element_or_without_rating_is_handled() {
+        let element = "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"r\"><rdf:Description xmlns:xmp=\"n\"><xmp:Rating>2</xmp:Rating><a:b xmlns:a=\"a\">keep</a:b></rdf:Description></rdf:RDF></x:xmpmeta>";
+        let updated = xmp_with_rating(element, 4).unwrap();
+        assert_eq!(updated, element.replace("<xmp:Rating>2<", "<xmp:Rating>4<"));
+
+        let none = "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"r\"><rdf:Description rdf:about=\"\" xmlns:crs=\"c\" crs:Exposure=\"1\"/></rdf:RDF></x:xmpmeta>";
+        let added = xmp_with_rating(none, 3).unwrap();
+        assert_eq!(xmp_ratings_of_document(&added).unwrap(), vec!["3"]);
+        assert!(added.contains("crs:Exposure=\"1\"") && added.contains("xmlns:xmp="));
+
+        // 読めない XML・Description の無い XML は Err（何も書かせない）。
+        assert!(xmp_with_rating("<a><b></a>", 1).is_err());
+        assert!(xmp_with_rating("not xml", 1).is_err());
+        assert!(xmp_with_rating("<a/>", 1).is_err());
+        // 値の中の `>` や、コメントの中の偽のタグに惑わされない。
+        let tricky = "<x><!-- <xmp:Rating>9</xmp:Rating> --><rdf:Description a=\"1>2\" xmp:Rating=\"1\"/></x>";
+        assert_eq!(xmp_with_rating(tricky, 2).unwrap(), tricky.replace("Rating=\"1\"", "Rating=\"2\""));
+    }
+
+    #[test]
+    fn a_jpeg_without_a_paired_raw_creates_no_xmp() {
+        let directory = test_directory("u47-nopair");
+        let jpeg = directory.join("IMG_3.jpg");
+        fs::write(&jpeg, jpeg_bytes(32, 24, 7)).unwrap();
+        fs::write(directory.join("IMG_30.CR2"), RAW_BYTES).unwrap();
+        fs::write(directory.join("IMG_3.png"), b"x").unwrap();
+
+        let report = write_ratings_to_targets(&[rating_target(&jpeg, 2)], true);
+
+        assert_eq!((report.processed, report.paired_raw_processed, report.failed), (1, 0, 0));
+        assert!(!directory.join("IMG_3.xmp").exists());
+        assert!(!directory.join("IMG_30.xmp").exists());
+        fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn a_raw_in_another_folder_is_not_a_pair() {
+        let directory = test_directory("u47-folders");
+        fs::create_dir_all(directory.join("a")).unwrap();
+        fs::create_dir_all(directory.join("b")).unwrap();
+        let jpeg = directory.join("a").join("IMG_4.jpg");
+        fs::write(&jpeg, jpeg_bytes(32, 24, 7)).unwrap();
+        fs::write(directory.join("b").join("IMG_4.CR2"), RAW_BYTES).unwrap();
+
+        let report = write_ratings_to_targets(&[rating_target(&jpeg, 2)], true);
+
+        assert_eq!(report.paired_raw_processed, 0);
+        assert!(!directory.join("b").join("IMG_4.xmp").exists());
+        assert!(!directory.join("a").join("IMG_4.xmp").exists());
+
+        // 純関数の側でも同じ。
+        let found = paired_raw_files(
+            &jpeg,
+            &[directory.join("b").join("IMG_4.CR2"), directory.join("a").join("IMG_4.CR2"), directory.join("a").join("IMG_4.png")],
+        );
+        assert_eq!(found, vec![directory.join("a").join("IMG_4.CR2")]);
+        fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn pairing_ignores_case_of_names_and_extensions() {
+        let directory = test_directory("u47-case");
+        let jpeg = directory.join("img_5.jpg");
+        let raw = directory.join("IMG_5.CR2");
+        fs::write(&jpeg, jpeg_bytes(32, 24, 7)).unwrap();
+        fs::write(&raw, RAW_BYTES).unwrap();
+
+        let report = write_ratings_to_targets(&[rating_target(&jpeg, 4)], true);
+
+        assert_eq!((report.processed, report.paired_raw_processed, report.failed), (1, 1, 0));
+        let xmp = fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name.to_lowercase().ends_with(".xmp"))
+            .collect::<Vec<_>>();
+        assert_eq!(xmp.len(), 1, "大文字小文字違いの .xmp を 2 つ作らない");
+        assert_eq!(fs::read(&raw).unwrap(), RAW_BYTES);
+        fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn nothing_is_written_next_to_raw_when_pairing_is_off() {
+        let directory = test_directory("u47-off");
+        let jpeg = directory.join("IMG_6.jpg");
+        let raw = directory.join("IMG_6.CR2");
+        fs::write(&jpeg, jpeg_bytes(32, 24, 7)).unwrap();
+        fs::write(&raw, RAW_BYTES).unwrap();
+
+        let report = write_ratings_to_targets(&[rating_target(&jpeg, 3)], false);
+
+        assert_eq!((report.processed, report.paired_raw_processed, report.failed), (1, 0, 0));
+        assert!(!directory.join("IMG_6.xmp").exists());
+        // RAW が自分の行で渡されても、今までどおり飛ばす（RAW は書き換えない）。
+        let report = write_ratings_to_targets(&[rating_target(&raw, 3)], false);
+        assert_eq!((report.processed, report.skipped), (0, 1));
+        assert_eq!(fs::read(&raw).unwrap(), RAW_BYTES);
+        fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn zero_stars_writes_rating_zero() {
+        let directory = test_directory("u47-zero");
+        let jpeg = directory.join("IMG_7.jpg");
+        fs::write(&jpeg, jpeg_bytes(32, 24, 7)).unwrap();
+        fs::write(directory.join("IMG_7.NEF"), RAW_BYTES).unwrap();
+        fs::write(directory.join("IMG_7.xmp"), new_sidecar_xmp(4)).unwrap();
+
+        let report = write_ratings_to_targets(&[rating_target(&jpeg, 0)], true);
+
+        assert_eq!((report.processed, report.paired_raw_processed, report.failed), (1, 1, 0));
+        let xmp = fs::read_to_string(directory.join("IMG_7.xmp")).unwrap();
+        assert_eq!(xmp_ratings_of_document(&xmp).unwrap(), vec!["0"]);
+        assert_eq!(jpeg_ratings(&jpeg), vec!["0"]);
+        assert!(new_sidecar_xmp(0).contains("xmp:Rating=\"0\""));
+        fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn a_failing_xmp_is_reported_while_the_jpeg_write_still_counts() {
+        let directory = test_directory("u47-fail");
+        let jpeg = directory.join("IMG_8.jpg");
+        fs::write(&jpeg, jpeg_bytes(32, 24, 7)).unwrap();
+        fs::write(directory.join("IMG_8.CR2"), RAW_BYTES).unwrap();
+        let xmp = directory.join("IMG_8.xmp");
+        let original_xmp = new_sidecar_xmp(1);
+        fs::write(&xmp, &original_xmp).unwrap();
+        let mut permissions = fs::metadata(&xmp).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&xmp, permissions).unwrap();
+
+        let report = write_ratings_to_targets(&[rating_target(&jpeg, 5)], true);
+
+        assert_eq!((report.processed, report.paired_raw_processed, report.failed), (1, 0, 1));
+        assert!(report.errors[0].contains("IMG_8.CR2"));
+        assert_eq!(jpeg_ratings(&jpeg), vec!["5"], "JPEG の書き込みは成功のまま");
+        assert_eq!(fs::read_to_string(&xmp).unwrap(), original_xmp, "既存の .xmp は変わらない");
+
+        let mut permissions = fs::metadata(&xmp).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&xmp, permissions).unwrap();
+
+        // 壊れた .xmp も触らない。
+        fs::write(&xmp, "<broken><x></broken>").unwrap();
+        let report = write_ratings_to_targets(&[rating_target(&jpeg, 2)], true);
+        assert_eq!((report.processed, report.paired_raw_processed, report.failed), (1, 0, 1));
+        assert_eq!(fs::read_to_string(&xmp).unwrap(), "<broken><x></broken>");
         fs::remove_dir_all(&directory).ok();
     }
 }

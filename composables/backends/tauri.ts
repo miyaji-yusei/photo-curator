@@ -70,6 +70,8 @@ export function createTauriBackend(): PhotoBackend {
     getSelectionSummary: (projectId: string) => invokeDesktop<SelectionSummary>('get_selection_summary', { projectId }),
     getPhotosByIds: (projectId: string, photoIds: string[]) => invokeDesktop<Photo[]>('get_photos_by_ids', { projectId, photoIds }),
     getCoreInputs: (projectId: string) => invokeDesktop<Photo[]>('get_core_inputs', { projectId }),
+    getMissingRatings: (projectId: string) =>
+      invokeDesktop<{ relativePath: string, rating: number }[]>('get_missing_ratings', { projectId }),
     exportPhotos: (projectId: string, destination: string, photoIds: string[], moveFiles: boolean) =>
       invokeDesktop<ExportReport>('export_photos', { projectId, destination, photoIds, moveFiles }),
     writeRatingsToPhotos: (projectId: string, photoIds: string[]) =>
@@ -109,8 +111,11 @@ export function createTauriBackend(): PhotoBackend {
     readSidecar: (projectId: string) => invokeDesktop<string | null>('read_sidecar', { projectId }),
     writeSidecar: (projectId: string, json: string, fileName = 'catalog.json') =>
       invokeDesktop<void>('write_sidecar', { projectId, json, fileName }),
-    writeSidecarChecked: (projectId: string, json: string, expected: string | null) =>
-      invokeDesktop<SidecarWriteResult>('write_sidecar_checked', { projectId, json, expected }),
+    writeSidecarChecked: (projectId: string, json: string, expected: string | null, asideTag?: string | null) =>
+      invokeDesktop<SidecarWriteResult>('write_sidecar_checked', { projectId, json, expected, asideTag: asideTag ?? null }),
+    asideSidecar: (projectId: string, json: string, tag: string) =>
+      invokeDesktop<string>('aside_sidecar', { projectId, json, tag }),
+    asideLocal: (projectId: string, json: string) => invokeDesktop<void>('aside_local', { projectId, json }),
     loadSidecarState: (projectId: string) => invokeDesktop<SidecarState>('load_sidecar_state', { projectId }),
     saveSidecarState: (projectId: string, state: SidecarState) =>
       invokeDesktop<void>('save_sidecar_state', { projectId, state }),
@@ -144,6 +149,8 @@ export function createTauriBackend(): PhotoBackend {
     saveDisplayEdge: (edge: number) => invokeDesktop<number>('save_display_edge', { edge }),
     saveProjectDisplayEdge: (projectId: string, edge: number | null) =>
       invokeDesktop<number>('save_project_display_edge', { projectId, edge }),
+    saveProjectPairRaw: (projectId: string, enabled: boolean, at?: number) =>
+      invokeDesktop<boolean>('save_project_pair_raw', { projectId, enabled, at: at ?? null }),
     getDisplayBacklog: (projectId: string) => invokeDesktop<number>('get_display_backlog', { projectId }),
     startDisplayGeneration: (projectId: string) => invokeDesktop<void>('start_display_generation', { projectId }),
     resetDisplayImages: (projectId: string) => invokeDesktop<void>('reset_display_images', { projectId })

@@ -210,10 +210,13 @@ object Images {
             .components {
                 add(SmbFetcher.Factory(context.applicationContext))
                 add(AmazonFetcher.Factory(context.applicationContext))
+                // U49: RAW は中のプレビュー JPEG を取り出して出す。
+                add(RawFetcher.Factory(context.applicationContext))
                 // **鍵が無いと Coil は同じ写真だと分からない。**
                 // 分からなければ覚えられず、毎回読み直すことになる。
                 add(SmbKeyer())
                 add(AmazonKeyer())
+                add(RawKeyer())
             }
             .memoryCache {
                 coil.memory.MemoryCache.Builder(context.applicationContext)

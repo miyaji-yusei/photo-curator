@@ -59,8 +59,11 @@ sealed interface SmbResult<out T> {
 object Smb {
     private const val TAG = "Smb"
 
-    /** このアプリが扱う形式。MediaStore 側と揃える。 */
-    private val EXTENSIONS = setOf("jpg", "jpeg", "png", "webp")
+    /**
+     * このアプリが扱う形式。MediaStore 側と揃える。U49 で RAW（PC と同じ 10 種）を足した。
+     * 組の JPEG がある RAW を外すかどうかは、一覧を取ったあとにプロジェクトの設定で決める。
+     */
+    private val EXTENSIONS = setOf("jpg", "jpeg", "png", "webp") + RawFiles.EXTENSIONS
 
     /** ディレクトリの印（SMB のファイル属性）。 */
     private const val DIRECTORY = 0x10L
@@ -201,7 +204,48 @@ object Smb {
             Log.w(TAG, "原本を読めなかった: $path", error)
             null
         }
+
+        /**
+         * 開いて、要る範囲だけを読む（U49: RAW のプレビュー）。**25MB を丸ごと引かない。**
+         * 読めなければ null（1 枚で全体を止めない）。
+         */
+        fun <T> ranged(path: String, work: (ByteSource) -> T): T? = try {
+            openRead(share, path).use { file -> work(BlockCache(FileRange(file))) }
+        } catch (error: Exception) {
+            Log.w(TAG, "範囲を読めなかった: $path", error)
+            null
+        }
     }
+
+    private fun openRead(share: DiskShare, path: String) = share.openFile(
+        path,
+        EnumSet.of(AccessMask.GENERIC_READ),
+        null,
+        SMB2ShareAccess.ALL,
+        SMB2CreateDisposition.FILE_OPEN,
+        null
+    )
+
+    /** 開いたファイルの決めた範囲。**1 回の読みの上限は smbj が交渉した大きさで切られる**ので、埋まるまで回す。 */
+    private class FileRange(private val file: com.hierynomus.smbj.share.File) : ByteSource {
+        override fun read(offset: Long, length: Int): ByteArray? {
+            if (offset < 0 || length <= 0) return null
+            val buffer = ByteArray(length)
+            var filled = 0
+            while (filled < length) {
+                val read = file.read(buffer, offset + filled, filled, length - filled)
+                if (read <= 0) break
+                filled += read
+            }
+            return if (filled == 0) null else buffer.copyOf(filled)
+        }
+    }
+
+    /** 1 枚だけ、要る範囲を読む（U49: RAW のプレビュー）。まとめて読むところは [Reader.ranged]。 */
+    suspend fun <T> ranged(nas: Nas, password: String, path: String, work: (ByteSource) -> T): SmbResult<T> =
+        connect(nas, password) { share ->
+            openRead(share, path).use { file -> work(BlockCache(FileRange(file))) }
+        }
 
     /** 例外を人の言葉にする。**次に何をすればいいかが分かる言い方で。** */
     /**
@@ -351,6 +395,19 @@ object Smb {
             if (share.fileExists(path)) share.rm(path)
         }
 
+    /**
+     * `.photo-curator` の中のファイルの名前と更新時刻（NAS の時計、epoch ミリ秒）。**フォルダが無ければ空。**
+     * 退避の片付け・ロックの古さ・残りかすの片付けに使う（U44）。
+     */
+    suspend fun listSidecar(nas: Nas, password: String, folder: String): SmbResult<List<Pair<String, Long>>> =
+        connect(nas, password) { share ->
+            requireSidecar(folder)
+            if (!share.folderExists(folder)) return@connect emptyList()
+            share.list(folder)
+                .filter { it.fileName != "." && it.fileName != ".." && !isFolder(it) }
+                .map { it.fileName to it.lastWriteTime.toEpochMillis() }
+        }
+
     /** 書いてよいのは `.photo-curator` の下だけ（設計 CON-3）。**原本には触らない。** */
     private fun requireSidecar(path: String) {
         require(path.split('\\', '/').contains(".photo-curator")) { "サイドカーの外には書かない: $path" }
@@ -469,38 +526,93 @@ object Smb {
     suspend fun photosDeep(
         nas: Nas,
         password: String,
+        folder: String
+    ): SmbResult<Scan> = connect(nas, password) { share ->
+        val scan = scanDeep(folder, { path ->
+            share.list(path).map { entry ->
+                Entry(
+                    name = entry.fileName,
+                    folder = isFolder(entry),
+                    size = entry.endOfFile,
+                    modifiedAt = entry.lastWriteTime.toEpochMillis()
+                )
+            }
+        })
+        for (path in scan.unreadable) Log.w(TAG, "たどれなかった: $path")
+        if (scan.truncated) Log.w(TAG, "上限（深さ $DEEP_MAX_DEPTH・$DEEP_LIMIT 枚）で数えきれなかった: $folder")
+        scan
+    }
+
+    /** 一覧の 1 件。**smbj の型に頼らない形**にして、たどり方を偽の NAS で確かめられるようにする（U50）。 */
+    data class Entry(val name: String, val folder: Boolean, val size: Long, val modifiedAt: Long)
+
+    /**
+     * 入れ子をたどった結果。**読めなかったフォルダと、上限で止めたことを隠さない**（U50・レビュー D8）。
+     * 欠けた一覧で控えを置き換えると、写真が一覧から抜け、ハッシュ値の控えも消える。
+     */
+    data class Scan(
+        val photos: List<SmbPhoto>,
+        /** 読めなかったフォルダの道筋。 */
+        val unreadable: List<String>,
+        /** 深さか枚数の上限で、たどり切れなかったか。 */
+        val truncated: Boolean
+    ) {
+        val complete: Boolean get() = unreadable.isEmpty() && !truncated
+    }
+
+    /**
+     * たどる深さの上限。**事故（共有の根を選んだ等）で網を延々と歩かないため。**
+     * U50 で 4 から広げた（超えたら黙って切らず「不完全」になるので、普通の置き方で当たらない値に）。
+     */
+    const val DEEP_MAX_DEPTH = 8
+
+    /** 集める枚数の上限。U50 で 20,000 から広げた（超えたら「不完全」）。 */
+    const val DEEP_LIMIT = 50_000
+
+    /**
+     * フォルダの下を全部たどる（中身は [list] で読む。テストでは偽物を渡す）。
+     *
+     * **選んだフォルダそのものが読めなければ例外**（空の一覧にしない）。途中のフォルダが
+     * 読めなければ [Scan.unreadable] に残して続ける。上限に当たったら [Scan.truncated]。
+     */
+    internal fun scanDeep(
         folder: String,
-        limit: Int = 20000
-    ): SmbResult<List<SmbPhoto>> = connect(nas, password) { share ->
+        list: (String) -> List<Entry>,
+        maxDepth: Int = DEEP_MAX_DEPTH,
+        limit: Int = DEEP_LIMIT
+    ): Scan {
         val found = ArrayList<SmbPhoto>()
+        val unreadable = ArrayList<String>()
+        var truncated = false
         fun walk(path: String, depth: Int) {
-            if (depth > 4 || found.size >= limit) return
-            val entries = try {
-                share.list(path)
+            val entries = if (depth == 0) list(path) else try {
+                list(path)
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
             } catch (error: Exception) {
-                Log.w(TAG, "たどれなかった: " + path, error)
+                unreadable += path
                 return
             }
             for (entry in entries) {
-                val name = entry.fileName
+                if (truncated) return
+                val name = entry.name
                 if (name == "." || name == ".." || name.startsWith(".")) continue
                 val child = if (path.isEmpty()) name else path + "\\" + name
                 if (isPhoto(name)) {
-                    found += SmbPhoto(
-                        name = name,
-                        path = child,
-                        size = entry.endOfFile,
-                        modifiedAt = entry.lastWriteTime.toEpochMillis()
-                    )
-                    if (found.size >= limit) return
-                } else if (isFolder(entry)) {
-                    walk(child, depth + 1)
+                    if (found.size >= limit) {
+                        truncated = true
+                        return
+                    }
+                    found += SmbPhoto(name = name, path = child, size = entry.size, modifiedAt = entry.modifiedAt)
+                } else if (entry.folder) {
+                    if (depth + 1 > maxDepth) truncated = true
+                    else walk(child, depth + 1)
                 }
             }
         }
         walk(folder, 0)
         // **使う値そのもので並べる。** 同時刻は道筋で決める（毎回同じ順）。
-        found.sortedWith(compareBy({ it.modifiedAt }, { it.path }))
+        return Scan(found.sortedWith(compareBy({ it.modifiedAt }, { it.path })), unreadable, truncated)
     }
 
     /**

@@ -105,6 +105,8 @@ internal fun DisplayImage(
 ) {
     val context = LocalContext.current
     var shown by remember(photo.relativePath, displayEdge) { mutableStateOf(false) }
+    // U49: RAW の中にプレビューが無かった。**空白のままにせず、理由を出す**（選別・星は続けられる）。
+    var rawFailed by remember(photo.relativePath, displayEdge) { mutableStateOf(false) }
     val thumb = remember(photo.relativePath) { Prefetch.cachedThumb(context, photo) }
     val loader = Images.loader(context)
     Box(modifier) {
@@ -135,7 +137,9 @@ internal fun DisplayImage(
                 val s = state.painter.intrinsicSize
                 if (s.width > 0f && s.height > 0f) onSize?.invoke(s.width, s.height)
             },
+            onError = { if (photo.isRaw) rawFailed = true },
             modifier = Modifier.fillMaxSize()
         )
+        if (rawFailed && !shown) EmptyTile(Preview.Failed, raw = true)
     }
 }

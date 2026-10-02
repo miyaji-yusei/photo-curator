@@ -87,6 +87,8 @@ fun CreateScreen(
     // （Compose は入力が等しければ省く）。取れたことを別の状態で伝える。
     var covers by remember { mutableStateOf<Map<String, java.io.File>>(emptyMap()) }
     var stripNote by remember { mutableStateOf("") }
+    // U49: 同名の JPEG がある RAW を対象から外すか。**既定はオン**（PC と同じ）。Amazon は対象外。
+    var pairRaw by remember { mutableStateOf(true) }
 
     // ---- Amazon Photos（共有リンク。設計 08 章）----
     var linkText by remember { mutableStateOf(initialLink ?: "") }
@@ -137,7 +139,7 @@ fun CreateScreen(
     LaunchedEffect(Unit) { nasList = NasStore.all(context) }
 
     // 選んだフォルダの中身を少しだけ出す。**選んだものだけ、最大 12 枚。**
-    LaunchedEffect(chosen?.id, chosenFolder?.path, tab) {
+    LaunchedEffect(chosen?.id, chosenFolder?.path, tab, pairRaw) {
         strip = emptyList()
         stripNote = ""
         val album = chosen
@@ -145,7 +147,7 @@ fun CreateScreen(
         when {
             album != null -> {
                 // 端末は手元なので、そのまま並べてよい。
-                val inside = Photos.forSource(context, Source(SourceKind.Album, album.name, album.id))
+                val inside = Photos.forSource(context, Source(SourceKind.Album, album.name, album.id), pairRaw)
                 strip = inside.take(Covers.STRIP).map { it.thumbModel }
                 stripNote = if (inside.size > Covers.STRIP)
                     "先頭の ${Covers.STRIP} 枚" else ""
@@ -453,6 +455,14 @@ fun CreateScreen(
                         fontSize = 11.sp, color = Faint,
                         modifier = Modifier.padding(top = 4.dp, bottom = 14.dp)
                     )
+                    // U49: 端末と NAS だけ（Amazon の RAW は従来どおり）。
+                    if (tab != "amazon" && (chosen != null || chosenFolder != null)) {
+                        PairRawSwitch(
+                            checked = pairRaw,
+                            onChange = { pairRaw = it },
+                            modifier = Modifier.padding(bottom = 10.dp)
+                        )
+                    }
                     chosenFolder?.let { folder ->
                         val nas = nasList.firstOrNull { it.id == tab }
                         // **入れ子があるときだけ聞く。** 無いフォルダで聞いても
@@ -595,7 +605,8 @@ fun CreateScreen(
                 Row(Modifier.weight(1f)) {
                     Column(Modifier.weight(1f)) { leftPane() }
                     Spacer(Modifier.width(16.dp))
-                    Column(Modifier.width(260.dp)) { rightPane() }
+                    // 確認の欄が伸びても切れないように、ここだけ縦に送れる（U49 でスイッチが増えた）。
+                    Column(Modifier.width(260.dp).verticalScroll(rememberScrollState())) { rightPane() }
                 }
             }
 
@@ -650,7 +661,8 @@ fun CreateScreen(
                                         // 出所の鍵は「どの NAS の、どの道筋か」。
                                         // 以下ぜんぶなら末尾に印を足す（形は変えない）。
                                         key = "${nas.id}|${folder.path}" + (if (deep) "|**" else "")
-                                    )
+                                    ),
+                                    pairRaw = pairRaw
                                 )
                                 album != null -> Projects.add(
                                     context, name.trim().ifEmpty { album.name },
@@ -658,7 +670,8 @@ fun CreateScreen(
                                         kind = SourceKind.Album,
                                         label = "この端末・アルバム「${album.name}」",
                                         key = album.id
-                                    )
+                                    ),
+                                    pairRaw = pairRaw
                                 )
                                 else -> null
                             }
@@ -806,5 +819,36 @@ private fun FolderCover(model: Any?) {
                 modifier = Modifier.fillMaxSize()
             )
         }
+    }
+}
+
+/**
+ * 「ファイル名が同じ JPEG と RAW を 1 枚の写真として扱う」（U49。PC の U46 と同じ言い方）。
+ * 作成の画面と、プロジェクトの「その他の操作」で使う。**狭い幅でも、文は折り返してスイッチは右に残す。**
+ */
+@Composable
+internal fun PairRawSwitch(
+    checked: Boolean,
+    onChange: (Boolean) -> Unit,
+    modifier: Modifier = Modifier,
+    note: String? = null
+) {
+    Row(modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text("ファイル名が同じ JPEG と RAW を 1 枚の写真として扱う", fontSize = 13.sp)
+            Text(
+                "RAW＋JPEG 同時撮影のとき、RAW を対象から外します。",
+                fontSize = 11.sp, color = Faint
+            )
+            if (note != null) {
+                Text(note, fontSize = 11.sp, color = Sky, modifier = Modifier.padding(top = 2.dp))
+            }
+        }
+        Spacer(Modifier.width(8.dp))
+        Switch(
+            checked = checked,
+            onCheckedChange = onChange,
+            colors = SwitchDefaults.colors(checkedThumbColor = Color.Black, checkedTrackColor = Lime)
+        )
     }
 }
