@@ -12,6 +12,9 @@ import uniffi.photo_curator_core.PairOverride
 import uniffi.photo_curator_core.ProgressOrder
 import uniffi.photo_curator_core.SeenRecord
 import uniffi.photo_curator_core.Session
+import uniffi.photo_curator_core.SettingValueBool
+import uniffi.photo_curator_core.SettingsPlan
+import uniffi.photo_curator_core.SettingsRecord
 import uniffi.photo_curator_core.SettledReason
 import uniffi.photo_curator_core.Sidecar
 import uniffi.photo_curator_core.SidecarPhoto
@@ -23,6 +26,7 @@ import uniffi.photo_curator_core.judgementKey
 import uniffi.photo_curator_core.mergeJudgements
 import uniffi.photo_curator_core.mergePreview
 import uniffi.photo_curator_core.sessionFromRatings
+import uniffi.photo_curator_core.settingsResolve
 import uniffi.photo_curator_core.sidecarFromJson
 import uniffi.photo_curator_core.sidecarJudgement
 import uniffi.photo_curator_core.sidecarKeyCoverage
@@ -100,6 +104,17 @@ interface SeenStore {
     fun save(projectId: String, state: SeenState)
 }
 
+/**
+ * 端末のプロジェクトの設定（U51）。Android では `Prefs.pairRawSetting`／`Prefs.setPairRawJpeg`。
+ * いまは「同名の JPEG と RAW を 1 枚として扱う」だけ。**設定は選別状況ではない**（比較キーに入れない）。
+ */
+interface SettingsStore {
+    /** `changedAt` が 0 なら一度も切り替えていない（既定のまま）。 */
+    fun pairRaw(projectId: String): Prefs.PairRawSetting
+    /** サイドカーから取り込むときは**相手の時刻をそのまま**渡す。 */
+    fun setPairRaw(projectId: String, enabled: Boolean, at: Long)
+}
+
 /** 端末の選別状況。**鍵は端末の形のまま**（Android は共有の根からの相対・`/`）。 */
 data class LocalSnapshot(
     val session: Session?,
@@ -152,14 +167,27 @@ enum class SyncMode {
 
 /** 同期の結果。画面はこれを 1 行にして出す。 */
 sealed interface SyncOutcome {
-    /** 何もしなかった（意味が同じ・変更なし・まだ何も無い）。[note] は言うことがあるときだけ。 */
-    data class Settled(val note: String? = null) : SyncOutcome
-    data class Pushed(val note: String) : SyncOutcome
-    data class Pulled(val note: String) : SyncOutcome
+    /**
+     * ほかの端末の設定（U51:「同名の JPEG と RAW を 1 枚として扱う」）を取り込んだときの値（true＝オン）。
+     * 取り込んでいなければ null。選別状況の結果とは別で、どの結果にも付きうる（[SidecarSync.settingsAdoptedNotice]）。
+     */
+    val settingsAdopted: Boolean? get() = null
+
+    /**
+     * 何もしなかった（意味が同じ・変更なし・まだ何も無い）。[note] は言うことがあるときだけ。
+     * [settingsPushed] は、選別状況は同じで設定だけを NAS に書いたとき（U51）。
+     */
+    data class Settled(
+        val note: String? = null,
+        override val settingsAdopted: Boolean? = null,
+        val settingsPushed: Boolean = false
+    ) : SyncOutcome
+    data class Pushed(val note: String, override val settingsAdopted: Boolean? = null) : SyncOutcome
+    data class Pulled(val note: String, override val settingsAdopted: Boolean? = null) : SyncOutcome
     /** 両方とも着手していて中身が違う。**人に 5 択で選ばせる。** */
-    data class Asking(val clash: SidecarClash) : SyncOutcome
+    data class Asking(val clash: SidecarClash, override val settingsAdopted: Boolean? = null) : SyncOutcome
     /** つなげない・読めない・書けない。**選別は止めない。** */
-    data class Blocked(val reason: String) : SyncOutcome
+    data class Blocked(val reason: String, override val settingsAdopted: Boolean? = null) : SyncOutcome
     /** 背面への移動では取り込みも確認もしない。次に開いたときへ回した。 */
     data object Deferred : SyncOutcome
 }
@@ -208,7 +236,9 @@ class SidecarSync(
     private val scope: CoroutineScope,
     private val now: () -> Long = { System.currentTimeMillis() },
     private val newId: () -> String = { java.util.UUID.randomUUID().toString().replace("-", "") },
-    private val log: (String, Throwable?) -> Unit = { _, _ -> }
+    private val log: (String, Throwable?) -> Unit = { _, _ -> },
+    /** プロジェクトの設定（U51）。null なら設定を読み書きしない（書く版の設定は core が NAS から引き継ぐ）。 */
+    private val settings: SettingsStore? = null
 ) {
     private val tails = HashMap<String, Job>()
 
@@ -330,9 +360,40 @@ class SidecarSync(
             lineage = null,
             epoch = snapshot.epoch,
             keyBase = null,
-            progress = null
+            progress = null,
+            // プロジェクトの設定（U51）。一度も切り替えていなくても値は書く（そのとき at は 0）。
+            // 書くかどうかは選別状況で決める（設定のためだけに書くのは [settingsOnlyPush] のときだけ）。
+            settings = settings?.pairRaw(target.projectId)?.let {
+                SettingsRecord(SettingValueBool(it.enabled, it.changedAt), emptyMap())
+            }
         )
         return sidecarKeysToFolder(device, target.prefix)
+    }
+
+    /**
+     * 書く版の設定を、NAS の版と合わせる（U51）。NAS の方が新しく切り替えた値なら、**書く版も NAS の値にする**
+     * （古い端末の値で上書きしない）。端末の設定はここでは変えない（変えるのは開いたときだけ）。
+     */
+    private fun withRemoteSettings(mine: Sidecar, remote: Sidecar?): Sidecar {
+        if (settings == null) return mine
+        val plan = settingsResolve(mine.settings, remote?.settings)
+        if (plan !is SettingsPlan.AdoptRemote) return mine
+        val record = mine.settings ?: SettingsRecord(null, emptyMap())
+        return mine.copy(settings = record.copy(pairRawJpeg = SettingValueBool(plan.value, plan.at)))
+    }
+
+    /**
+     * 選別状況では書かない（Settled）ときに、設定のためだけに書くか（U51。PC・Web の `settingsOnlyPush` と同じ）。
+     * 端末で**切り替えたことがある**（at > 0）設定が NAS に無い・NAS より古いときだけ。一度も切り替えていない
+     * 既定値のためだけには書かない（古い catalog.json を開くたびに書き換えない）。切り離し中・新しすぎる版・
+     * 書けない共有は、選別状況と同じく書かない（理由で分かる）。端末の記録を読めなかったあと（D2）も書かない。
+     */
+    private fun settingsOnlyPush(plan: SettingsPlan, mine: Sidecar, reason: SettledReason, state: SeenState): Boolean {
+        if (settings == null || plan !is SettingsPlan.PushLocal) return false
+        if ((mine.settings?.pairRawJpeg?.at ?: 0L) <= 0L) return false
+        if (state.localBroken) return false
+        if (state.detached && reason != SettledReason.SAME) return false
+        return reason == SettledReason.SAME || reason == SettledReason.NO_CHANGE || reason == SettledReason.NOTHING
     }
 
     /** 古い控えから移したばかりなら、今の端末の比較キーで埋める（dirty=false＝見た版と同じ）。 */
@@ -374,13 +435,26 @@ class SidecarSync(
         target.local.flush()
         if (mode == SyncMode.Open) tidyOnce(target)
         var attempts = 0
+        // ほかの端末の設定を取り込んだら、その値（どの結果にも付ける。判定し直しても 1 回だけ取り込む）。
+        var adopted: Boolean? = null
         while (true) {
             val remote = when (val read = readRemote(target)) {
-                is Remote.Bad -> return SyncOutcome.Blocked(read.reason)
+                is Remote.Bad -> return SyncOutcome.Blocked(read.reason, adopted)
                 is Remote.Read -> read
             }
             val snapshot = readLocal(target)
-            val mine = folderSidecar(target, snapshot)
+            val built = folderSidecar(target, snapshot)
+            // 設定（U51）は選別状況と別に決める（確認は出さない。新しく切り替えた方）。
+            val settingsPlan = settingsResolve(built.settings, remote.sidecar?.settings)
+            if (settings != null && settingsPlan is SettingsPlan.AdoptRemote &&
+                (mode == SyncMode.Open || mode == SyncMode.Explicit)
+            ) {
+                // 開いたときだけ端末へ取り込む（**時刻は NAS のまま**）。写真への反映は「写真を再読み込み」
+                // （ここでは走査しない）。自動の書き込みでは端末を変えず、書く版にだけ NAS の値を入れる。
+                settings.setPairRaw(target.projectId, settingsPlan.value, settingsPlan.at)
+                adopted = settingsPlan.value
+            }
+            val mine = withRemoteSettings(built, remote.sidecar)
             val judgement = sidecarJudgement(mine)
             val state = seenOf(target.projectId, judgement)
             val plan = sidecarPlan(planSeen(state), judgement, remote.sidecar, true, state.detached)
@@ -391,24 +465,45 @@ class SidecarSync(
                         val stillDetached = state.detached && plan.reason != SettledReason.SAME
                         store.save(target.projectId, SeenState(it, stillDetached))
                     }
-                    return SyncOutcome.Settled(settledNote(plan.reason))
+                    // 選別状況はそのままで、端末で切り替えた設定だけが NAS に無い・古い → 設定のために書く。
+                    // 既存の楽観ロックの経路（ロック → 読み直し → 一時ファイル → rename → 読み戻し）で書く。
+                    if (settingsOnlyPush(settingsPlan, mine, plan.reason, store.load(target.projectId))) {
+                        val expected = remote.sidecar?.let { sidecarToken(it) }
+                        when (val pushed = push(target, mine, judgement, expected, asideTheirs = false)) {
+                            is Pushed.Done ->
+                                return SyncOutcome.Settled(settledNote(plan.reason), adopted, settingsPushed = true)
+                            is Pushed.Failed -> return SyncOutcome.Blocked(pushed.reason, adopted)
+                            is Pushed.Retry -> {
+                                attempts += 1
+                                if (attempts >= MAX_ATTEMPTS) {
+                                    return SyncOutcome.Blocked(
+                                        "NAS の記録が書いているあいだに変わりました。あとでもう一度試します", adopted
+                                    )
+                                }
+                                continue
+                            }
+                        }
+                    }
+                    return SyncOutcome.Settled(settledNote(plan.reason), adopted)
                 }
                 is SidecarPlan.Push -> {
                     when (val pushed = push(target, mine, judgement, plan.expected, plan.asideTheirs)) {
-                        is Pushed.Done -> return SyncOutcome.Pushed(pushed.note)
-                        is Pushed.Failed -> return SyncOutcome.Blocked(pushed.reason)
+                        is Pushed.Done -> return SyncOutcome.Pushed(pushed.note, adopted)
+                        is Pushed.Failed -> return SyncOutcome.Blocked(pushed.reason, adopted)
                         is Pushed.Retry -> {
                             // 読んでから書くまでのあいだに、ほかの端末が書いた。**判定し直す。**
                             attempts += 1
                             if (attempts >= MAX_ATTEMPTS) {
-                                return SyncOutcome.Blocked("NAS の記録が書いているあいだに変わりました。あとでもう一度試します")
+                                return SyncOutcome.Blocked(
+                                    "NAS の記録が書いているあいだに変わりました。あとでもう一度試します", adopted
+                                )
                             }
                         }
                     }
                 }
                 is SidecarPlan.Pull -> {
                     if (mode == SyncMode.Background) return SyncOutcome.Deferred
-                    return pull(target, plan.theirs, plan.asideMine, plan.seen, mine, judgement)
+                    return withAdopted(pull(target, plan.theirs, plan.asideMine, plan.seen, mine, judgement), adopted)
                 }
                 is SidecarPlan.Clash -> {
                     if (mode == SyncMode.Background) return SyncOutcome.Deferred
@@ -421,10 +516,24 @@ class SidecarSync(
                             order = plan.order,
                             reason = plan.reason,
                             preview = plan.preview
-                        )
+                        ),
+                        adopted
                     )
                 }
             }
+        }
+    }
+
+    /** 設定を取り込んだ印を結果に付ける（U51）。 */
+    private fun withAdopted(outcome: SyncOutcome, adopted: Boolean?): SyncOutcome {
+        if (adopted == null) return outcome
+        return when (outcome) {
+            is SyncOutcome.Settled -> outcome.copy(settingsAdopted = adopted)
+            is SyncOutcome.Pushed -> outcome.copy(settingsAdopted = adopted)
+            is SyncOutcome.Pulled -> outcome.copy(settingsAdopted = adopted)
+            is SyncOutcome.Asking -> outcome.copy(settingsAdopted = adopted)
+            is SyncOutcome.Blocked -> outcome.copy(settingsAdopted = adopted)
+            SyncOutcome.Deferred -> outcome
         }
     }
 
@@ -550,8 +659,11 @@ class SidecarSync(
 
             val who = me()
             val writeId = newId()
+            // 設定（U51）は書く直前に読んだ NAS の版と合わせる。どの経路（自動・C・D・E・退避して書く）でも、
+            // NAS の方が新しく切り替えた値なら NAS の値を書く（古い端末の値で上書きしない）。
             val stamped = sidecarStamp(
-                mine.copy(updatedAt = now(), updatedBy = who.id, updatedByName = who.name),
+                withRemoteSettings(mine, current.sidecar)
+                    .copy(updatedAt = now(), updatedBy = who.id, updatedByName = who.name),
                 writeId,
                 current.sidecar
             )
@@ -797,6 +909,11 @@ class SidecarSync(
         private const val MAX_ATTEMPTS = 3
         const val LOCK_TTL_MS = 60_000L
         private val LOCK_AT = Regex("\"at\"\\s*:\\s*(\\d+)")
+
+        /** ほかの端末の設定を取り込んだときのお知らせ（U51。PC・Web の `settingsAdoptedNotice` と同じ文）。 */
+        fun settingsAdoptedNotice(value: Boolean): String =
+            "ほかの端末の設定に合わせて「同名の JPEG と RAW を 1 枚として扱う」を" + (if (value) "オン" else "オフ") +
+                "にしました。写真を反映するには「写真を再読み込み」を押してください。"
 
         const val LOCAL_UNREADABLE = "この端末の選別の記録を読めませんでした: "
         const val LOCAL_UNREADABLE_TAIL = "。NAS の記録は変えていません（この端末の分で NAS を自動で上書きしません）"
