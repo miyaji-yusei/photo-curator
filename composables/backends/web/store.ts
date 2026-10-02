@@ -58,6 +58,10 @@ export interface WebStore {
   /** サイドカーで端末が覚える 3 つの値。まだ無ければ「未確認・変更なし」。 */
   readSidecarState: (projectId: string) => Promise<SidecarState>
   writeSidecarState: (projectId: string, state: SidecarState) => Promise<void>
+  /** 端末の中の退避（U52 D4）。置き換える前の選別状況の JSON を、プロジェクトごとに新しい 5 つだけ残す。 */
+  writeLocalAside: (projectId: string, json: string) => Promise<void>
+  /** 端末の中の退避を新しい順に（調べる・戻すとき用）。 */
+  readLocalAsides: (projectId: string) => Promise<{ at: number, json: string }[]>
   /** 表示用画像の長辺の既定（アプリ全体）。まだ保存が無ければ null。 */
   readDisplayEdge: () => Promise<number | null>
   writeDisplayEdge: (edge: number) => Promise<void>
@@ -80,6 +84,10 @@ export const handleKey = (projectId: string) => `handle:${projectId}`
 export const amazonLinksKey = (projectId: string) => `amazonLinks:${projectId}`
 /** サイドカーの端末の記憶を置く `states` のキー。 */
 export const sidecarStateKey = (projectId: string) => `sidecar:${projectId}`
+/** 端末の中の退避（U52 D4）を置く `states` のキー。 */
+export const localAsideKey = (projectId: string) => `aside:${projectId}`
+/** 端末の中の退避を、プロジェクトごとにいくつ残すか（PC の `aside/`・Android と同じ）。 */
+export const LOCAL_ASIDE_KEEP = 5
 /** 端末の id を置く `states` のキー。 */
 export const DEVICE_KEY = 'device'
 /** 表示用画像の長辺の既定を置く `states` のキー。 */
@@ -301,6 +309,24 @@ export function createIdbStore(): WebStore {
           detached: state.detached === true,
           updatedAt: Date.now()
         }))
+    },
+
+    writeLocalAside: async (projectId, json) => {
+      // 読むと書くを同じトランザクションに入れる（2 つの退避が互いを消さない）。
+      await withStores([STORE_STATES], 'readwrite', async (transaction) => {
+        const row = await getOne<{ projectId: string, asides?: { at: number, json: string }[] }>(
+          transaction, STORE_STATES, localAsideKey(projectId))
+        const previous = Array.isArray(row?.asides) ? row.asides : []
+        const asides = [{ at: Date.now(), json }, ...previous].slice(0, LOCAL_ASIDE_KEEP)
+        await putOne(transaction, STORE_STATES, { projectId: localAsideKey(projectId), asides, updatedAt: Date.now() })
+      })
+    },
+
+    readLocalAsides: async (projectId) => {
+      const row = await withStores([STORE_STATES], 'readonly', transaction =>
+        getOne<{ projectId: string, asides?: { at: number, json: string }[] }>(
+          transaction, STORE_STATES, localAsideKey(projectId)))
+      return Array.isArray(row?.asides) ? row.asides : []
     },
 
     deviceId: () =>

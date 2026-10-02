@@ -8,7 +8,8 @@ const noSidecar = {
   sidecarAccess: () => Promise.resolve('none' as const),
   readSidecar: () => Promise.resolve(null),
   writeSidecar: () => Promise.reject(new Error('not used')),
-  writeSidecarChecked: () => Promise.reject(new Error('not used'))
+  writeSidecarChecked: () => Promise.reject(new Error('not used')),
+  asideSidecar: () => Promise.reject(new Error('not used'))
 }
 
 /** `{ 'a/b.jpg': size, 'a/': 0 }` のような平らな表から作る偽のフォルダ。 */

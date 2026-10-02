@@ -29,6 +29,7 @@ import type {
 import type { PhotoBackend, SidecarAccess, SidecarState } from '~/composables/photoBackend'
 import type { SavedSelection } from '~/utils/selectionFlow'
 import { applyChanges } from '~/utils/ratingEdit'
+import { asideTag } from '~/utils/sidecarAside'
 
 /** 新しく書くサイドカーの `version`（core の `SIDECAR_VERSION` と同じ）。 */
 export const SIDECAR_VERSION = 2
@@ -37,7 +38,7 @@ export const SIDECAR_VERSION = 2
 const MAX_ATTEMPTS = 3
 
 export type SidecarBackend = Pick<PhotoBackend,
-  | 'sidecarSupported' | 'readSidecar' | 'writeSidecar' | 'writeSidecarChecked' | 'loadSidecarState'
+  | 'sidecarSupported' | 'readSidecar' | 'asideSidecar' | 'asideLocal' | 'writeSidecarChecked' | 'loadSidecarState'
   | 'saveSidecarState' | 'deviceIdentity' | 'getCoreInputs' | 'saveSelectionResults' | 'getPairOverrides'
   | 'savePairOverrides' | 'loadSession' | 'saveSession' | 'listProjects' | 'saveBurstThreshold'
   | 'clearBurstThreshold' | 'saveProjectPairRaw'>
@@ -123,12 +124,6 @@ export function summarize(sidecar: Sidecar): SidecarSummary {
 export function settingsAdoptedNotice(value: boolean): string {
   return `ほかの端末の設定に合わせて「同名の JPEG と RAW を 1 枚として扱う」を${value ? 'オン' : 'オフ'}にしました。`
     + '写真を反映するには「写真を再読み込み」を押してください。'
-}
-
-/** 退避のファイル名に使える文字だけにする（`catalog.<端末の id の先頭 12 文字>.json`）。 */
-export function asideFileName(deviceId: string): string {
-  const head = [...deviceId].slice(0, 12).join('').replace(/[^A-Za-z0-9-]/g, '-')
-  return `catalog.${head || 'other'}.json`
 }
 
 /** サイドカーの Session から、この端末の「選別の途中」の封筒を作る。 */
@@ -347,19 +342,18 @@ export function createSidecarSync(backend: SidecarBackend, now: () => number = D
 
   /**
    * 端末の分を楽観ロックで書く。`base` は置き換える NAS の版（無ければ null）、`expected` はその中身。
-   * `aside` なら NAS の版を `catalog.<相手>.json` へ先に退避する（退避が書けなければ書かない）。
+   * `aside` なら、backend が**ロックを取って見た版と同じことを確かめたあとで**、置き換える NAS の版を
+   * `catalog.<相手>.<時刻>.json` へ退避する（退避が書けなければ書かない。U52 D4。Android の U44 と同じ順）。
    */
   async function writeMine(
     project: ProjectRef, snap: Snapshot, aside: boolean
   ): Promise<'written' | 'changed' | 'locked' | 'empty'> {
     // 載せる行が 0 件（例: 全部が欠損扱いの間）なら書かない。空の記録で共有を上書きしない。
     if (snap.photoKeys.length === 0) return 'empty'
-    if (aside && snap.text !== null && snap.remote) {
-      await backend.writeSidecar(project.id, snap.text, asideFileName(snap.remote.updatedBy))
-    }
+    const asideOwner = aside && snap.text !== null && snap.remote ? asideTag(snap.remote.updatedBy) : null
     const writeId = randomId()
     const stamped = core.sidecarStamp(snap.mine, writeId, snap.remote)
-    const result = await backend.writeSidecarChecked(project.id, core.sidecarToJson(stamped), snap.text)
+    const result = await backend.writeSidecarChecked(project.id, core.sidecarToJson(stamped), snap.text, asideOwner)
     if (result !== 'written') return result
     // 控えの比較キーは「書いた写し」のもの。書いている間に増えた判断は、次に変更ありとして残る。
     await saveState(project.id, stateFor(snap.state, stamped, {
@@ -368,9 +362,15 @@ export function createSidecarSync(backend: SidecarBackend, now: () => number = D
     return 'written'
   }
 
-  /** 端末の分を NAS の `catalog.<自分>.json` に退避する（取り込む・混ぜる前）。 */
-  async function asideMine(project: ProjectRef, snap: Snapshot) {
-    await backend.writeSidecar(project.id, core.sidecarToJson(snap.mine), asideFileName(snap.identity.id))
+  /**
+   * 置き換える前の端末の分を控える（取り込む・混ぜる前。U52 D4）。**控えられなければ投げる**（置き換えない）。
+   * 端末の中（PC はアプリのデータフォルダの `aside/`、Web は IndexedDB。最新 5 つ）には必ず、
+   * `nas` なら NAS の `catalog.<自分>.<時刻>.json` にも。
+   */
+  async function asideMine(project: ProjectRef, snap: Snapshot, nas: boolean) {
+    const json = core.sidecarToJson(snap.mine)
+    await backend.asideLocal(project.id, json)
+    if (nas) await backend.asideSidecar(project.id, json, asideTag(snap.identity.id))
   }
 
   /** 端末の鍵の Sidecar を、端末の選別状況に入れる（星・Session・手直し・距離）。 */
@@ -407,9 +407,13 @@ export function createSidecarSync(backend: SidecarBackend, now: () => number = D
     if (entries.length) await backend.saveSelectionResults(projectId, entries)
   }
 
-  /** NAS の版（フォルダ形式の鍵）を取り込み、控えをその版にする。 */
-  async function pull(project: ProjectRef, snap: Snapshot, theirs: Sidecar, token: string) {
+  /**
+   * NAS の版（フォルダ形式の鍵）を取り込み、控えをその版にする。端末が未着手でなければ、**先に控える**
+   * （端末の中には必ず、`asideNas` で書ける共有なら NAS にも。控えられなければ取り込まない。U52 D4）。
+   */
+  async function pull(project: ProjectRef, snap: Snapshot, theirs: Sidecar, token: string, asideNas: boolean) {
     const untouched = core.isUntouched(snap.local)
+    if (!untouched) await asideMine(project, snap, asideNas && snap.access === 'readwrite')
     await applyLocal(project, core.sidecarKeysFromFolder(theirs, '', snap.separator), untouched)
     // 控えの比較キーは「取り込んだあとの端末」のもの（端末に残した分があっても、変更ありと読み違えない）。
     const key = await currentKey(project)
@@ -494,8 +498,7 @@ export function createSidecarSync(backend: SidecarBackend, now: () => number = D
         const { theirs, aside_mine: asideFirst, seen, reason } = plan.Pull
         const problem = coverageProblem(snap, theirs)
         if (problem) return note({ kind: 'mismatch', access: level, ...problem })
-        if (asideFirst && level === 'readwrite' && !core.isUntouched(snap.local)) await asideMine(project, snap)
-        await pull(project, snap, theirs, seen.token)
+        await pull(project, snap, theirs, seen.token, asideFirst)
         return note({ kind: 'pulled', access: level, reason, from: theirs.updatedByName })
       }
       return note({ kind: 'clash', access: level, clash: clashInfo(snap, plan.Clash) })
@@ -525,7 +528,7 @@ export function createSidecarSync(backend: SidecarBackend, now: () => number = D
       const snap = await snapshot(project, await access(project.id))
       const built = await buildWith(project)
       const theirs = core.sidecarNormalizeKeys(sidecar, built.folderPath)
-      await pull(project, snap, theirs, core.sidecarToken(theirs))
+      await pull(project, snap, theirs, core.sidecarToken(theirs), true)
     })
   }
 
@@ -576,9 +579,8 @@ export function createSidecarSync(backend: SidecarBackend, now: () => number = D
               access: level
             } as const
           }
-          // A: 端末の分を NAS に退避してから取り込む（退避が書けなければ取り込まない）。
-          if (writable && !core.isUntouched(snap.local)) await asideMine(project, snap)
-          await pull(project, snap, theirs, core.sidecarToken(theirs))
+          // A: 端末の分を端末の中（と、書ける共有なら NAS）に控えてから取り込む（控えられなければ取り込まない）。
+          await pull(project, snap, theirs, core.sidecarToken(theirs), true)
           return { kind: 'done' } as const
         }
         if (choice === 'mine') {
@@ -593,11 +595,10 @@ export function createSidecarSync(backend: SidecarBackend, now: () => number = D
         }
         const mode: MergeMode = choice === 'intersection' ? 'Intersection' : 'Union'
         const next = merged(snap, theirs, mode)
-        await asideMine(project, snap)
-        await backend.writeSidecar(project.id, snap.text ?? '', asideFileName(theirs.updatedBy))
+        await asideMine(project, snap, true)
         const writeId = randomId()
         const stamped = core.sidecarStamp(next, writeId, theirs)
-        const written = await backend.writeSidecarChecked(project.id, core.sidecarToJson(stamped), snap.text)
+        const written = await backend.writeSidecarChecked(project.id, core.sidecarToJson(stamped), snap.text, asideTag(theirs.updatedBy))
         if (written !== 'written') return afterWrite(project, written, level)
         await applyLocal(project, core.sidecarKeysFromFolder(next, '', snap.separator), false)
         const key = await currentKey(project)

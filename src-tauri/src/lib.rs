@@ -5406,13 +5406,15 @@ async fn write_sidecar(
 }
 
 /// `catalog.json` を楽観ロックで書く（U34。設計書 §4.4）。`expected` は画面が判断に使った中身
-/// （無かったなら None）。返すのは "written" / "changed" / "locked"。
+/// （無かったなら None）。`aside_tag` があれば、確かめたあとで置き換える版を退避する（U52 D4）。
+/// 返すのは "written" / "changed" / "locked"。
 #[tauri::command]
 async fn write_sidecar_checked(
     app: AppHandle,
     project_id: String,
     json: String,
     expected: Option<String>,
+    aside_tag: Option<String>,
 ) -> Result<sidecar::CheckedWrite, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let conn = connection(&app)?;
@@ -5420,12 +5422,36 @@ async fn write_sidecar_checked(
             return Err("Amazon の共有リンクにはサイドカーを書けません。".to_string());
         }
         let holder = sidecar::device_identity(&conn)?;
-        sidecar::write_checked(
+        sidecar::write_checked_aside(
             &sidecar_folder(&app, &project_id)?,
             &json,
             expected.as_deref(),
             &format!("{} ({})", holder.name, holder.id),
+            aside_tag.as_deref(),
         )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// NAS に退避する（U52 D4。`catalog.<印>.<UTC 時刻>.json` を無いときだけ作り、同じ印は最新 5 つ）。返すのは名前。
+#[tauri::command]
+async fn aside_sidecar(app: AppHandle, project_id: String, json: String, tag: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if amazon_source_of(&connection(&app)?, &project_id)?.is_some() {
+            return Err("Amazon の共有リンクにはサイドカーを書けません。".to_string());
+        }
+        sidecar::write_aside(&sidecar_folder(&app, &project_id)?, &tag, &json)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// 端末の中に退避する（U52 D4。アプリのデータフォルダの `aside/`、プロジェクトごとに最新 5 つ）。
+#[tauri::command]
+async fn aside_local(app: AppHandle, project_id: String, json: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        sidecar::write_local_aside(&data_subdir(&app, "aside")?, &project_id, &json)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -5494,6 +5520,8 @@ pub fn run() {
             read_sidecar,
             write_sidecar,
             write_sidecar_checked,
+            aside_sidecar,
+            aside_local,
             load_sidecar_state,
             save_sidecar_state,
             device_identity

@@ -10,7 +10,8 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { beforeAll, describe, expect, it } from 'vitest'
 import * as core from '~/lib/core'
-import { asideFileName, createSidecarSync, summarize } from '~/composables/useSidecarSync'
+import { createSidecarSync, summarize } from '~/composables/useSidecarSync'
+import { asideName, asideStamp, asideTag, asidesToDrop } from '~/utils/sidecarAside'
 
 const wasmPath = join(import.meta.dirname, '..', 'core-wasm', 'pkg', 'photo_curator_core_wasm_bg.wasm')
 
@@ -35,9 +36,42 @@ function sharedNas() {
     failWrite: false,
     locked: false,
     /** 楽観ロックの書き込みで、「読んで確かめる」直前に 1 回だけ呼ぶ（別の端末の割り込み）。 */
-    beforeCheck: null
+    beforeCheck: null,
+    /** 退避の名前の時刻（偽物の時計。退避のたびに 1 秒進める）。 */
+    asideClock: Date.UTC(2026, 9, 3, 0, 0, 0)
   }
 }
+
+/**
+ * NAS の退避（U52 D4。Android の U44 と同じ形）: `catalog.<端末>.<UTC yyyyMMddHHmmss>.json` を無いときだけ作り、
+ * 同じ秒なら `-2` 以降。書けたら同じ端末の時刻つきの退避は新しい 5 つだけ残す。
+ */
+function fakeAside(nas, json, owner) {
+  if (nas.failWrite) throw new Error('書けません')
+  nas.asideClock += 1000
+  const stamp = asideStamp(nas.asideClock)
+  let name = null
+  for (let n = 1; n <= 9 && !name; n++) {
+    const candidate = asideName(owner, stamp, n)
+    if (!nas.files.has(candidate)) name = candidate
+  }
+  if (!name) throw new Error('退避の名前がありません')
+  nas.files.set(name, json)
+  nas.writes.push(name)
+  for (const old of asidesToDrop([...nas.files.keys()], owner, 5)) nas.files.delete(old)
+  return name
+}
+
+/** その端末の印の、時刻つきの退避の名前か。 */
+const asideRe = id => new RegExp(`^catalog\\.${asideTag(id)}\\.\\d{14}(-\\d+)?\\.json$`)
+/** その端末の印の、いちばん新しい退避の名前（無ければ undefined）。 */
+const latestAsideName = (backend, id) => [...backend.files.keys()].filter(name => asideRe(id).test(name)).sort().pop()
+/** その端末の印の、いちばん新しい退避の中身（Sidecar）。 */
+const latestAside = (backend, id) => {
+  const name = latestAsideName(backend, id)
+  return name ? core.sidecarFromJson(backend.files.get(name)) : null
+}
+const anAside = id => expect.stringMatching(asideRe(id))
 
 /** 写真 6 枚のプロジェクト 1 つを持つ、1 台ぶんの偽の backend。`nas` を渡すと 2 台で共有する。 */
 function fakeBackend(options = {}) {
@@ -66,13 +100,24 @@ function fakeBackend(options = {}) {
       nas.files.set(fileName, json)
       nas.writes.push(fileName)
     },
-    writeSidecarChecked: async (_projectId, json, expected) => {
+    asideSidecar: async (_projectId, json, owner) => fakeAside(nas, json, owner),
+    /** 端末の中の退避（U52 D4。PC はアプリのデータフォルダの aside/、Web は IndexedDB）。 */
+    localAsides: [],
+    failLocalAside: false,
+    asideLocal: async (_projectId, json) => {
+      if (backend.failLocalAside) throw new Error('端末に控えられません')
+      backend.localAsides.push(json)
+    },
+    writeSidecarChecked: async (_projectId, json, expected, asideOwner) => {
       if (nas.failWrite) throw new Error('書けません')
       if (nas.locked) return 'locked'
       const hook = nas.beforeCheck
       nas.beforeCheck = null
       if (hook) await hook()
-      if ((nas.files.get('catalog.json') ?? null) !== expected) return 'changed'
+      const current = nas.files.get('catalog.json') ?? null
+      if (current !== expected) return 'changed'
+      // ロックを取って確かめたあとで、置き換える版を退避する（退避が書けなければ書かない）。
+      if (asideOwner && current !== null) fakeAside(nas, current, asideOwner)
       nas.files.set('catalog.json', json)
       nas.writes.push('catalog.json')
       return 'written'
@@ -197,10 +242,22 @@ describe('Sidecar の組み立て', () => {
     expect(summary.deviceName).toBe('Pixel')
   })
 
-  it('退避のファイル名は端末の id の先頭 12 文字', () => {
-    expect(asideFileName('zzzzzzzz-1111-2222')).toBe('catalog.zzzzzzzz-111.json')
-    expect(asideFileName('a/b:c')).toBe('catalog.a-b-c.json')
-    expect(asideFileName('')).toBe('catalog.other.json')
+  it('退避のファイル名は Android（U44）と同じ: catalog.<端末の印 12 文字>.<UTC yyyyMMddHHmmss>(-n).json', () => {
+    expect(asideTag('zzzzzzzz-1111-2222')).toBe('zzzzzzzz-111')
+    expect(asideTag('a/b:c_d')).toBe('abc_d')
+    expect(asideTag('')).toBe('unknown')
+    expect(asideStamp(Date.UTC(2026, 9, 3, 4, 5, 6))).toBe('20261003040506')
+    expect(asideName('zzzzzzzz-111', '20261003040506')).toBe('catalog.zzzzzzzz-111.20261003040506.json')
+    expect(asideName('zzzzzzzz-111', '20261003040506', 2)).toBe('catalog.zzzzzzzz-111.20261003040506-2.json')
+    // 同じ端末の時刻つきだけを、新しい 5 つ残して消す（時刻の無い古い名前・ほかの端末の退避は消さない）。
+    const names = [
+      'catalog.json', 'catalog.lock', 'catalog.abc.json', 'catalog.other.20200101000000.json',
+      ...['20260101000001', '20260101000002', '20260101000003', '20260101000004', '20260101000005']
+        .map(stamp => `catalog.abc.${stamp}.json`),
+      'catalog.abc.20260101000005-2.json', 'catalog.abc.20260101000006.json'
+    ]
+    expect(asidesToDrop(names, 'abc', 5).sort())
+      .toEqual(['catalog.abc.20260101000001.json', 'catalog.abc.20260101000002.json'])
   })
 })
 
@@ -448,7 +505,7 @@ describe('2 台で 1 つのファイル（報告されたシナリオ）', () =>
     expect(outcome).toMatchObject({ kind: 'pushed', reason: 'TheirsUntouched' })
     expect(JSON.stringify(android.session)).toBe(androidBefore)
     expect(nasCatalog(android).updatedBy).toBe(ANDROID.id)
-    expect(core.sidecarFromJson(android.files.get(asideFileName(PC.id))).updatedByName).toBe('DESKTOP-ABC')
+    expect(latestAside(android, PC.id).updatedByName).toBe('DESKTOP-ABC')
   })
 
   it('PC 側の視点: PC も進んでいるときは、Android の進んだ版を黙って取り込まずに確認する（端末の分を失わない）', async () => {
@@ -476,7 +533,7 @@ describe('2 台で 1 つのファイル（報告されたシナリオ）', () =>
     expect(outcome).toMatchObject({ kind: 'pulled', reason: 'FastForward' })
     expect(android.session.core.history).toHaveLength(2)
     expect(ratingsOf(android)).toEqual(ratingsOf(pc))
-    expect(android.files.has(asideFileName(ANDROID.id))).toBe(true)
+    expect(latestAsideName(android, ANDROID.id)).toBeDefined()
   })
 
   it('PC が書いた（\\ 区切りの）入れ子の写真の星を、Android 形式の古い記録とも行き来できる', async () => {
@@ -690,8 +747,8 @@ describe('食い違いの 5 択', () => {
     const { pc, pcSync, clash } = await clashed()
     const result = await pcSync.resolveClash(project, clash, 'theirs')
     expect(result.kind).toBe('done')
-    expect(pc.writes).toEqual([asideFileName(PC.id)])
-    const aside = core.sidecarFromJson(pc.files.get(asideFileName(PC.id)))
+    expect(pc.writes).toEqual([anAside(PC.id)])
+    const aside = latestAside(pc, PC.id)
     expect(aside.sessions.tournament.ratings['IMG_1.JPG']).toBe(1)
     expect(ratingsOf(pc)).toEqual([1, 0, 1, 0, 0, 0])
     expect(nasCatalog(pc).updatedBy).toBe(ANDROID.id)
@@ -719,7 +776,7 @@ describe('食い違いの 5 択', () => {
     const { pc, pcSync, clash } = await clashed()
     await pcSync.resolveClash(project, clash, 'keep')
     expect(await pcSync.writeToNas(project)).toBe(true)
-    expect(pc.writes).toEqual([asideFileName(ANDROID.id), 'catalog.json'])
+    expect(pc.writes).toEqual([anAside(ANDROID.id), 'catalog.json'])
     expect(nasCatalog(pc).updatedBy).toBe(PC.id)
     expect(pc.state.detached).toBe(false)
   })
@@ -727,7 +784,7 @@ describe('食い違いの 5 択', () => {
   it('C 書き込む: NAS の版を退避して端末の分を書く。Android は次に開いたとき確認なしに取り込む', async () => {
     const { pc, android, pcSync, androidSync, clash } = await clashed()
     expect((await pcSync.resolveClash(project, clash, 'mine')).kind).toBe('done')
-    expect(pc.writes).toEqual([asideFileName(ANDROID.id), 'catalog.json'])
+    expect(pc.writes).toEqual([anAside(ANDROID.id), 'catalog.json'])
     const written = nasCatalog(pc)
     expect(written.updatedBy).toBe(PC.id)
     expect(written.basedOn).toBe(clash.theirs.writeId)
@@ -750,7 +807,7 @@ describe('食い違いの 5 択', () => {
       const want = expected ?? pc.rows.map(row => stars[row.relativePath] ?? 0)
 
       expect((await pcSync.resolveClash(project, clash, choice)).kind).toBe('done')
-      expect(pc.writes).toEqual([asideFileName(PC.id), asideFileName(ANDROID.id), 'catalog.json'])
+      expect(pc.writes).toEqual([anAside(PC.id), anAside(ANDROID.id), 'catalog.json'])
       expect(ratingsOf(pc)).toEqual(want)
       // U45: 両方とも IMG_4・IMG_5 をまだ見ていない → 完了にせず、選別画面で続きから出す（以前は完了・結果画面）。
       expect(pc.session.core.finished).toBe(false)
@@ -895,7 +952,7 @@ describe('やり直し（epoch）', () => {
     await pcSync.markRestarted('p1')
     expect(await pcSync.pushIfChanged(project)).toBe(true)
     // 着手済みの版（Android の A1）を未着手で置き換える前に退避している。
-    expect(core.sidecarFromJson(nas.files.get(asideFileName(ANDROID.id))).updatedBy).toBe(ANDROID.id)
+    expect(latestAside(pc, ANDROID.id).updatedBy).toBe(ANDROID.id)
     expect(nasCatalog(pc).epoch).toMatch(/^e-/)
     const outcome = await androidSync.checkOnOpen(project)
     expect(outcome.kind).toBe('clash')
@@ -1088,5 +1145,92 @@ describe('プロジェクトの設定の同期（U48: settings.pairRawJpeg）', 
     // C（端末の分を書く）でも、取り込んだ設定を書く（古い値で上書きしない）。
     expect((await pcSync.resolveClash(project, outcome.clash, 'mine')).kind).toBe('done')
     expect(pairOf(pc)).toEqual({ value: false, at: 5_000_000 })
+  })
+})
+
+describe('U52 D4: 退避に成功してから変える（PC・Web。Android の U44 と同じ水準）', () => {
+  async function clashedPair() {
+    const nas = sharedNas()
+    const pc = fakeBackend({ nas, identity: PC })
+    const android = fakeBackend({ nas, identity: ANDROID })
+    const pcSync = createSidecarSync(pc, nextClock)
+    const androidSync = createSidecarSync(android, nextClock)
+    play(android, [['IMG_0.JPG'], ['IMG_2.JPG']])
+    await androidSync.pushIfChanged(project)
+    play(pc, [['IMG_1.JPG'], ['IMG_2.JPG']])
+    const outcome = await pcSync.checkOnOpen(project)
+    expect(outcome.kind).toBe('clash')
+    nas.writes.length = 0
+    return { nas, pc, android, pcSync, androidSync, clash: outcome.clash }
+  }
+
+  it('書けない共有で A（取り込む）を選んでも、端末の中に控えてから取り込む', async () => {
+    const { pc, pcSync, clash } = await clashedPair()
+    pc.access = 'readonly'
+    expect((await pcSync.resolveClash(project, clash, 'theirs')).kind).toBe('done')
+    expect(pc.writes).toEqual([]) // NAS には書かない
+    expect(pc.localAsides).toHaveLength(1)
+    const kept = core.sidecarFromJson(pc.localAsides[0])
+    expect(kept.sessions.tournament.ratings['IMG_1.JPG']).toBe(1) // 取り込む前の PC の分
+    expect(ratingsOf(pc)).toEqual([1, 0, 1, 0, 0, 0])
+  })
+
+  it('A: 端末の中に控えられなければ取り込まない（何も変えずに理由を返す）', async () => {
+    const { pc, pcSync, clash } = await clashedPair()
+    pc.failLocalAside = true
+    const stateBefore = { ...pc.state }
+    const result = await pcSync.resolveClash(project, clash, 'theirs')
+    expect(result).toMatchObject({ kind: 'failed', reason: '端末に控えられません' })
+    expect(ratingsOf(pc)).toEqual([0, 1, 1, 0, 0, 0])
+    expect(pc.state).toEqual(stateBefore)
+    expect(pc.writes).toEqual([])
+  })
+
+  it('A: 端末の中と NAS の両方に控える（NAS は時刻つきの名前）', async () => {
+    const { pc, pcSync, clash } = await clashedPair()
+    expect((await pcSync.resolveClash(project, clash, 'theirs')).kind).toBe('done')
+    expect(pc.localAsides).toHaveLength(1)
+    expect(pc.writes).toEqual([anAside(PC.id)])
+  })
+
+  it('自動の早送りの取り込みでも、取り込む前の端末の分を端末の中に控える', async () => {
+    const nas = sharedNas()
+    const pc = fakeBackend({ nas, identity: PC })
+    const android = fakeBackend({ nas, identity: ANDROID })
+    const pcSync = createSidecarSync(pc, nextClock)
+    const androidSync = createSidecarSync(android, nextClock)
+    play(android, [['IMG_0.JPG']])
+    await androidSync.pushIfChanged(project)
+    await pcSync.checkOnOpen(project)
+    const continued = core.advance(pc.session.core, ['IMG_2.JPG'])
+    pc.session = envelope(continued)
+    for (const row of pc.rows) row.rating = continued.ratings[row.relativePath] ?? 0
+    expect(await pcSync.pushIfChanged(project)).toBe(true)
+    expect(await androidSync.checkOnOpen(project)).toMatchObject({ kind: 'pulled', reason: 'FastForward' })
+    expect(android.localAsides).toHaveLength(1)
+    expect(core.sidecarFromJson(android.localAsides[0]).sessions.tournament.history).toHaveLength(1)
+  })
+
+  it('C: 確かめる前に NAS が変わって書かなかったときは、置き換えなかった版の退避も書かない', async () => {
+    const { nas, pc, pcSync, clash } = await clashedPair()
+    // 置き換える直前に、別の端末が（意味の同じ）版を書き直した。
+    nas.beforeCheck = async () => { nas.files.set('catalog.json', `${nas.files.get('catalog.json')}\n`) }
+    const result = await pcSync.resolveClash(project, clash, 'mine')
+    expect(result.kind).toBe('changed')
+    expect(pc.writes.filter(name => name !== 'catalog.json')).toEqual([])
+  })
+
+  it('NAS の退避は上書きせず、同じ端末の時刻つきの退避は新しい 5 つだけ残す', async () => {
+    const { nas, pc, pcSync, clash } = await clashedPair()
+    // 時刻の無い古い退避（U44 より前の名前）は消さない。
+    nas.files.set('catalog.zzzzzzzz-111.json', 'old')
+    for (let index = 0; index < 7; index++) {
+      // 「NAS に書き込む」で Android の版を置き換え（退避する）、また Android の版に戻す。
+      expect(await pcSync.writeToNas(project)).toBe(true)
+      nas.files.set('catalog.json', clash.theirsText)
+    }
+    const asides = [...nas.files.keys()].filter(name => asideRe(ANDROID.id).test(name))
+    expect(asides).toHaveLength(5)
+    expect(nas.files.get('catalog.zzzzzzzz-111.json')).toBe('old')
   })
 })

@@ -109,8 +109,11 @@ export function createTauriBackend(): PhotoBackend {
     readSidecar: (projectId: string) => invokeDesktop<string | null>('read_sidecar', { projectId }),
     writeSidecar: (projectId: string, json: string, fileName = 'catalog.json') =>
       invokeDesktop<void>('write_sidecar', { projectId, json, fileName }),
-    writeSidecarChecked: (projectId: string, json: string, expected: string | null) =>
-      invokeDesktop<SidecarWriteResult>('write_sidecar_checked', { projectId, json, expected }),
+    writeSidecarChecked: (projectId: string, json: string, expected: string | null, asideTag?: string | null) =>
+      invokeDesktop<SidecarWriteResult>('write_sidecar_checked', { projectId, json, expected, asideTag: asideTag ?? null }),
+    asideSidecar: (projectId: string, json: string, tag: string) =>
+      invokeDesktop<string>('aside_sidecar', { projectId, json, tag }),
+    asideLocal: (projectId: string, json: string) => invokeDesktop<void>('aside_local', { projectId, json }),
     loadSidecarState: (projectId: string) => invokeDesktop<SidecarState>('load_sidecar_state', { projectId }),
     saveSidecarState: (projectId: string, state: SidecarState) =>
       invokeDesktop<void>('save_sidecar_state', { projectId, state }),
