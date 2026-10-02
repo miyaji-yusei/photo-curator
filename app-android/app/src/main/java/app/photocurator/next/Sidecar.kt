@@ -17,7 +17,7 @@ import java.io.File
  * **写真と判断が一緒に移動する。**
  *
  * 原本のフォルダに増やすのは `.photo-curator/catalog.json` の 1 つだけ
- * （設計 CON-3。書く間のロックと一時ファイル、退避の `catalog.<端末>.json` を除く）。
+ * （設計 CON-3。書く間のロックと一時ファイル、退避の `catalog.<端末>.<時刻>.json`（端末ごとに最新 5 つ）を除く）。
  *
  * **判断は core の `sidecarPlan`**（PC・Web と同じ規則）。列・楽観ロック・退避は [SidecarSync]。
  * ここは Android とのつなぎ（NAS の接続・端末の保存場所・控え）だけを持つ（U35）。
@@ -25,8 +25,8 @@ import java.io.File
 object Sidecar {
     private const val TAG = "Sidecar"
 
-    /** 端末の退避（`filesDir/aside/`）をプロジェクトごとにいくつまで残すか。 */
-    private const val ASIDE_KEEP = 3
+    /** 端末の退避（`filesDir/aside/`）をプロジェクトごとにいくつまで残すか（U44 D4 で 3 → 5）。 */
+    private const val ASIDE_KEEP = 5
 
     /** 画面が消えても書き終えるように、アプリの寿命で動く。 */
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -131,6 +131,11 @@ object Sidecar {
         override suspend fun createExclusive(path: String, bytes: ByteArray) =
             with { nas, password -> Smb.createExclusive(nas, password, path, bytes) }
         override suspend fun delete(path: String) = with { nas, password -> Smb.delete(nas, password, path) }
+        override suspend fun list(folder: String): SmbResult<List<CatalogEntry>> =
+            when (val listed = with { nas, password -> Smb.listSidecar(nas, password, folder) }) {
+                is SmbResult.Failed -> SmbResult.Failed(listed.reason)
+                is SmbResult.Ok -> SmbResult.Ok(listed.value.map { CatalogEntry(it.first, it.second) })
+            }
     }
 
     /** 端末の選別状況（星とセッション・手直し・学習した境目・やり直しの世代）。 */
@@ -176,8 +181,11 @@ object Sidecar {
         override suspend fun aside(json: String) = withContext(Dispatchers.IO) {
             // 置き換える前の端末の選別状況。**書けなければ置き換えない**（例外のまま返す）。
             val dir = File(context.filesDir, "aside").apply { mkdirs() }
-            File(dir, "$id-${System.currentTimeMillis()}.json").writeAtomically { it.writeText(json) }
-            // **最後の 3 つまで**残す（元に戻す手がかり）。片付けの失敗は止めない。
+            // 名前は時刻（ミリ秒）。**前の退避を上書きしない**（同じ時刻があれば 1 つずらす）。
+            var at = System.currentTimeMillis()
+            while (File(dir, "$id-$at.json").exists()) at += 1
+            File(dir, "$id-$at.json").writeAtomically { it.writeText(json) }
+            // **最後の 5 つまで**残す（元に戻す手がかり）。片付けの失敗は止めない。
             try {
                 dir.listFiles { file -> file.name.startsWith("$id-") && file.name.endsWith(".json") }
                     ?.sortedByDescending { it.name.removePrefix("$id-").removeSuffix(".json").toLongOrNull() ?: 0L }

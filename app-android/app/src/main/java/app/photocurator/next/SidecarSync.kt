@@ -58,7 +58,16 @@ interface CatalogIO {
     suspend fun createExclusive(path: String, bytes: ByteArray): SmbResult<Boolean>
 
     suspend fun delete(path: String): SmbResult<Unit>
+
+    /**
+     * フォルダの中のファイルの名前と更新時刻（NAS の時計）。フォルダが無ければ空。
+     * 退避の片付け・ロックの古さ・残りかすの片付けに使う。取れなければ Failed（片付けない・壊さない側に倒す）。
+     */
+    suspend fun list(folder: String): SmbResult<List<CatalogEntry>> = SmbResult.Failed("一覧を取れません")
 }
+
+/** [CatalogIO.list] の 1 件。[modifiedAt] は NAS の更新時刻（epoch ミリ秒）。 */
+data class CatalogEntry(val name: String, val modifiedAt: Long)
 
 /**
  * 端末の控え（プロジェクトごと）。
@@ -188,7 +197,8 @@ enum class ClashChoice {
  * - 「変更があるか」は印ではなく「見た版の比較キーと、今の比較キーが違うか」（core が決める）
  * - 書くときは楽観ロック: ロックファイル → 読んで見た版と同じか確かめる → 一時ファイル → rename
  *   → 読み戻して確かめる（設計書 §4.4）
- * - 置き換える前に、必ず退避する（端末は [LocalState.aside]、NAS は `catalog.<端末>.json`）
+ * - 置き換える前に、必ず退避する（端末は [LocalState.aside]、NAS は `catalog.<端末>.<時刻>.json`）。
+ *   **退避できなければ置き換えない**（U44 D4）
  */
 class SidecarSync(
     private val store: SeenStore,
@@ -468,11 +478,10 @@ class SidecarSync(
 
             var aside: String? = null
             if (asideTheirs && current.sidecar != null && current.raw != null) {
-                val owner = tag(current.sidecar.updatedBy)
                 // **退避に失敗したら上書きしない。** 消してしまうより、次に持ち越す。
-                when (val kept = target.io.write(asidePath(target.folder, owner), current.raw)) {
+                when (val kept = writeAside(target, tag(current.sidecar.updatedBy), current.raw)) {
                     is SmbResult.Failed -> return Pushed.Failed(kept.reason)
-                    is SmbResult.Ok -> aside = "catalog.$owner.json"
+                    is SmbResult.Ok -> aside = kept.value
                 }
             }
 
@@ -518,6 +527,42 @@ class SidecarSync(
     }
 
     /**
+     * NAS に退避する（U44 D4）。**名前に時刻を入れて、前の退避を上書きしない**
+     * （`catalog.<端末>.<UTC yyyyMMddHHmmss>.json`。同じ秒に重なれば `-2` 以降）。
+     * 無いときだけ作るので、ほかの端末の退避も上書きしない。書けたら、同じ端末の印の
+     * 時刻つきの退避を新しい [ASIDE_KEEP] 個だけ残す（片付けの失敗は止めない。時刻の無い古い名前は消さない）。
+     * 返すのは書いたファイルの名前。
+     */
+    private suspend fun writeAside(target: SyncTarget, owner: String, bytes: ByteArray): SmbResult<String> {
+        val stamp = stampOf(now())
+        var name: String? = null
+        for (n in 1..9) {
+            val candidate = asideName(owner, stamp, n)
+            when (val made = target.io.createExclusive(dir(target.folder) + "\\" + candidate, bytes)) {
+                is SmbResult.Failed -> return SmbResult.Failed(made.reason)
+                is SmbResult.Ok -> if (made.value) {
+                    name = candidate
+                    break
+                }
+            }
+        }
+        if (name == null) return SmbResult.Failed("NAS に退避のファイルを作れませんでした（同じ名前がありました）")
+        try {
+            when (val listed = target.io.list(dir(target.folder))) {
+                is SmbResult.Ok -> for (old in asidesToDrop(listed.value.map { it.name }, owner, ASIDE_KEEP)) {
+                    target.io.delete(dir(target.folder) + "\\" + old)
+                }
+                is SmbResult.Failed -> log("古い退避を片付けられなかった: " + listed.reason, null)
+            }
+        } catch (error: kotlinx.coroutines.CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            log("古い退避を片付けられなかった", error)
+        }
+        return SmbResult.Ok(name)
+    }
+
+    /**
      * 取り込む。**先に端末の分を退避する**（端末に。[asideMine] なら NAS にも）。
      * 控えの比較キーは、取り込んだあとの端末の選別状況から作る。
      */
@@ -544,8 +589,14 @@ class SidecarSync(
             val json = sidecarToJson(mine)
             target.local.aside(json)
             if (asideMine) {
-                val kept = target.io.write(asidePath(target.folder, tag(me().id)), json.toByteArray(Charsets.UTF_8))
-                if (kept is SmbResult.Failed) log("NAS に端末の分を退避できなかった: " + kept.reason, null)
+                // **退避できてから置き換える**（U44 D4）。できなければ取り込まない。
+                val kept = writeAside(target, tag(me().id), json.toByteArray(Charsets.UTF_8))
+                if (kept is SmbResult.Failed) {
+                    log("NAS に端末の分を退避できなかった: " + kept.reason, null)
+                    return SyncOutcome.Blocked(
+                        "NAS にこの端末の記録を退避できなかったので、取り込みませんでした（" + kept.reason + "）"
+                    )
+                }
             }
         }
         apply(target, theirs)
@@ -608,7 +659,7 @@ class SidecarSync(
                 // 元の 2 つは両方退避する（端末の分は端末と NAS、NAS の分は書くときに NAS）。
                 val json = sidecarToJson(mine)
                 target.local.aside(json)
-                val kept = target.io.write(asidePath(target.folder, tag(me().id)), json.toByteArray(Charsets.UTF_8))
+                val kept = writeAside(target, tag(me().id), json.toByteArray(Charsets.UTF_8))
                 if (kept is SmbResult.Failed) return SyncOutcome.Blocked(kept.reason)
 
                 val merged = mergeJudgements(
@@ -676,8 +727,44 @@ class SidecarSync(
         /** 写真のフォルダの直下。**増やすのはこの 1 ファイルだけ**（書く間のロックと一時ファイルを除く）。 */
         fun catalogPath(folder: String) = dir(folder) + "\\catalog.json"
         fun lockPath(folder: String) = dir(folder) + "\\catalog.lock"
-        /** 譲った方・置き換えた方を残す先。**黙って消さない。** */
-        fun asidePath(folder: String, device: String) = dir(folder) + "\\catalog.$device.json"
+        /** `.photo-curator` のフォルダ（共有の根から `\` 区切り）。 */
+        fun sidecarDir(folder: String) = dir(folder)
+
+        /** NAS の退避を、端末の印ごとにいくつまで残すか（U44 D4。CON-3 のため小さく）。 */
+        const val ASIDE_KEEP = 5
+
+        /**
+         * 譲った方・置き換えた方を残す名前。**黙って消さない。** 時刻（UTC）を入れて、書くたびに別の名前にする。
+         * [n] は同じ秒に重なったときの通し番号（1 なら付けない）。
+         */
+        fun asideName(device: String, stamp: String, n: Int = 1) =
+            "catalog.$device.$stamp" + (if (n > 1) "-$n" else "") + ".json"
+
+        fun asidePath(folder: String, device: String, stamp: String, n: Int = 1) =
+            dir(folder) + "\\" + asideName(device, stamp, n)
+
+        /** 退避の名前に入れる時刻（UTC・`yyyyMMddHHmmss`）。名前の順が時刻の順になる。 */
+        fun stampOf(at: Long): String =
+            SimpleDateFormat("yyyyMMddHHmmss", Locale.ROOT)
+                .apply { timeZone = java.util.TimeZone.getTimeZone("UTC") }
+                .format(Date(at))
+
+        private fun asidePattern(device: String) =
+            Regex("^catalog\\." + Regex.escape(device) + "\\.(\\d{14})(?:-(\\d+))?\\.json$")
+
+        /** その端末の印の、時刻つきの退避か（時刻の無い古い `catalog.<端末>.json` は含まない）。 */
+        fun isAsideOf(name: String, device: String): Boolean = asidePattern(device).matches(name)
+
+        /** 消してよい退避（その端末の印の時刻つきのうち、新しい [keep] 個より古いもの）。 */
+        fun asidesToDrop(names: List<String>, device: String, keep: Int): List<String> {
+            val pattern = asidePattern(device)
+            return names.mapNotNull { name ->
+                pattern.matchEntire(name)?.let { m -> Triple(name, m.groupValues[1], m.groupValues[2].toIntOrNull() ?: 1) }
+            }
+                .sortedWith(compareByDescending<Triple<String, String, Int>> { it.second }.thenByDescending { it.third })
+                .drop(keep)
+                .map { it.first }
+        }
         fun temporaryPath(folder: String, writeId: String) = dir(folder) + "\\.catalog.$writeId.tmp"
 
         /** 退避のファイル名に使う端末の印（12 文字。ファイル名に使えない文字は落とす）。 */
