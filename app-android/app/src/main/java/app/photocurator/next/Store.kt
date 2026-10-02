@@ -44,17 +44,27 @@ object Store {
         }
     }
 
-    /** 読み戻す。**形が合わなければ null。** 最初からやり直してもらう。 */
+    /**
+     * 読み戻す。**形が合わなければ null。** 最初からやり直してもらう。
+     * サイドカーの同期は [read] を使う（「無い」と「読めなかった」を分ける）。
+     */
     suspend fun load(context: Context, projectId: String): Session? =
+        (read(context, projectId) as? Stored.Ok)?.value
+
+    /**
+     * 読み戻す。**無ければ Ok(null)、あるのに読めなければ Broken**（D2）。
+     * 読めなかったら、元のファイルを残したまま `session-<id>.broken-<時刻>.json` に写しを残し、
+     * サイドカーの同期に「読めなかった」印を立てる（このあと選別画面が作り直して上書きしても、
+     * 端末の分で NAS を自動で上書きしない）。
+     */
+    suspend fun read(context: Context, projectId: String): Stored<Session?> =
         withContext(Dispatchers.IO) {
-            val target = file(context, projectId)
-            if (!target.exists()) return@withContext null
-            try {
-                sessionFromJson(target.readText())
-            } catch (error: Exception) {
-                Log.w(TAG, "選別の途中を読めなかった: $projectId", error)
-                null
+            val read = file(context, projectId).readStored(null as Session?) { sessionFromJson(it) }
+            if (read is Stored.Broken) {
+                Log.w(TAG, "選別の途中を読めなかった: $projectId（${read.reason}）。控え: ${read.keptAs?.name}")
+                SyncState.markLocalBroken(context, projectId)
             }
+            read
         }
 
     /**
@@ -339,12 +349,15 @@ object Overrides {
     internal fun file(context: Context, projectId: String) =
         File(context.filesDir, "overrides-$projectId.json")
 
+    // 読めないものは無かったことにする。**中途半端に読まない。**（同期は [read] で区別する）
     suspend fun load(context: Context, projectId: String): List<PairOverride> =
+        (read(context, projectId) as? Stored.Ok)?.value ?: emptyList()
+
+    /** 無ければ Ok(空)、あるのに読めなければ Broken（写しを残し、同期に印を立てる。[Store.read] と同じ）。 */
+    suspend fun read(context: Context, projectId: String): Stored<List<PairOverride>> =
         withContext(Dispatchers.IO) {
-            val target = file(context, projectId)
-            if (!target.exists()) return@withContext emptyList()
-            try {
-                val array = org.json.JSONArray(target.readText())
+            val read = file(context, projectId).readStored(emptyList<PairOverride>()) { text ->
+                val array = org.json.JSONArray(text)
                 (0 until array.length()).map { at ->
                     val entry = array.getJSONObject(at)
                     PairOverride(
@@ -353,11 +366,12 @@ object Overrides {
                         decision = entry.getString("d")
                     )
                 }
-            } catch (error: Exception) {
-                // 読めないものは無かったことにする。**中途半端に読まない。**
-                Log.w(TAG, "手直しを読めなかった: $projectId", error)
-                emptyList()
             }
+            if (read is Stored.Broken) {
+                Log.w(TAG, "手直しを読めなかった: $projectId（${read.reason}）。控え: ${read.keptAs?.name}")
+                SyncState.markLocalBroken(context, projectId)
+            }
+            read
         }
 
     /** 手直しを全部消す。**やり直しのときだけ。** */
@@ -619,20 +633,30 @@ object SyncState {
                     store.getString("$projectId-seenKey", "") ?: "",
                     store.getString("$projectId-seenEpoch", null)
                 ),
-                detached = store.getBoolean("$projectId-detached", false)
+                detached = store.getBoolean("$projectId-detached", false),
+                localBroken = store.getBoolean("$projectId-localBroken", false)
             )
         }
+        val broken = store.getBoolean("$projectId-localBroken", false)
         // 古い控えからの移し替え。seenAt/seenBy は core の legacy の token と同じ形にする。
         // dirty=true なら比較キーを空にして「変更あり」、false なら今の端末の比較キーで埋める。
         val seenAt = store.getLong("$projectId-seenAt", -1L)
-        if (seenAt < 0) return SeenState(uniffi.photo_curator_core.SeenRecord("", "", null), detached = false)
+        if (seenAt < 0) {
+            return SeenState(uniffi.photo_curator_core.SeenRecord("", "", null), detached = false, localBroken = broken)
+        }
         val seenBy = store.getString("$projectId-seenBy", "") ?: ""
         val dirty = store.getBoolean("$projectId-dirty", false)
         return SeenState(
             uniffi.photo_curator_core.SeenRecord("legacy:$seenAt:$seenBy", "", null),
             detached = false,
-            keyFromLocal = !dirty
+            keyFromLocal = !dirty,
+            localBroken = broken
         )
+    }
+
+    /** 端末の選別状況のファイルを読めなかった（D2）。次に控えを保存するまで、自動で上書きしない。 */
+    fun markLocalBroken(context: Context, projectId: String) {
+        prefs(context).edit().putBoolean("$projectId-localBroken", true).commit()
     }
 
     fun save(context: Context, projectId: String, state: SeenState) {
@@ -641,6 +665,7 @@ object SyncState {
             .putString("$projectId-seenKey", state.seen.key)
             .putString("$projectId-seenEpoch", state.seen.epoch)
             .putBoolean("$projectId-detached", state.detached)
+            .putBoolean("$projectId-localBroken", state.localBroken)
             // 古い控えは移したので消す（残すと、消したあとの移し替えで古い版に戻る）。
             .remove("$projectId-seenAt")
             .remove("$projectId-seenBy")

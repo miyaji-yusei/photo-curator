@@ -112,8 +112,13 @@ class SidecarSyncTest {
 
     class FakeLocal(var snapshot: LocalSnapshot, private val keys: List<String> = emptyList()) : LocalState {
         val asides = ArrayList<String>()
+        /** null でなければ、端末のファイルが読めない（形が合わない）ことにする。 */
+        @Volatile var broken: String? = null
         override suspend fun flush() = Unit
-        override suspend fun read() = snapshot
+        override suspend fun read(): LocalSnapshot {
+            broken?.let { throw LocalUnreadable(it) }
+            return snapshot
+        }
         override suspend fun apply(snapshot: LocalSnapshot) {
             this.snapshot = snapshot
         }
@@ -593,6 +598,61 @@ class SidecarSyncTest {
         val answer = syncFor(android, seen).check(target(local, nas))
         assertTrue("$answer", answer is SyncOutcome.Settled)
         assertFalse(seen.load("project-1").keyFromLocal)
+    }
+
+    // ---- U44 D2: 端末の選別状況を読めなかったとき ----
+
+    @Test fun 端末の記録を読めなければ判断も書き込みもせず理由を出す() = run {
+        val nas = FakeNas()
+        val a1 = written(mineAdvanced(), android, "a1")
+        val before = put(nas, a1)
+        val seen = FakeSeen().apply { save("project-1", seenAt(a1)) }
+        val local = FakeLocal(snapshot(mineAdvanced())).apply { broken = "session-project-1.json の形が違う" }
+
+        val answer = syncFor(android, seen).check(target(local, nas))
+
+        assertTrue("$answer", answer is SyncOutcome.Blocked)
+        assertTrue((answer as SyncOutcome.Blocked).reason, answer.reason.contains("この端末の選別の記録を読めませんでした"))
+        assertArrayEquals("NAS はそのまま", before, nas.files[catalog])
+        assertEquals("NAS に何も増やさない", setOf(catalog), nas.files.keys.toSet())
+        assertTrue("読めなかった印が残る", seen.load("project-1").localBroken)
+        assertEquals("a1", seen.load("project-1").seen.token)
+        assertTrue(local.asides.isEmpty())
+    }
+
+    @Test fun 読めなかったあとは見た版のままでも端末の分で自動に上書きせず確認する() = run {
+        val nas = FakeNas()
+        val a1 = written(mineAdvanced(), android, "a1")
+        val before = put(nas, a1)
+        val seen = FakeSeen().apply { save("project-1", seenAt(a1)) }
+        val local = FakeLocal(snapshot(mineAdvanced())).apply { broken = "形が違う" }
+        val sync = syncFor(android, seen)
+        val t = target(local, nas)
+        assertTrue(sync.check(t) is SyncOutcome.Blocked)
+
+        // アプリの更新で Session を読めなくなり、端末には学習した境目だけが残った（Session は作り直し前）。
+        local.broken = null
+        local.snapshot = LocalSnapshot(null, emptyList(), 9, null)
+        val background = sync.pushIfChanged(t).await()
+        assertEquals("背面では書かない", SyncOutcome.Deferred, background)
+        val answer = sync.check(t)
+
+        assertTrue("見た版のままでも上書きせず確認: $answer", answer is SyncOutcome.Asking)
+        assertArrayEquals("NAS の Session は残る", before, nas.files[catalog])
+    }
+
+    @Test fun 読めなかったあと端末が空ならNASから取り込み印を下ろす() = run {
+        val nas = FakeNas()
+        val a1 = written(mineAdvanced(), android, "a1")
+        put(nas, a1)
+        val seen = FakeSeen().apply { save("project-1", seenAt(a1).copy(localBroken = true)) }
+        val local = FakeLocal(snapshot(null))
+
+        val answer = syncFor(android, seen).check(target(local, nas))
+
+        assertTrue("$answer", answer is SyncOutcome.Pulled)
+        assertEquals(mineAdvanced(), local.snapshot.session)
+        assertFalse(seen.load("project-1").localBroken)
     }
 
     @Test fun 文言はPCと同じ形() {

@@ -143,12 +143,27 @@ object Sidecar {
             Persist.settle("overrides:$id")
         }
 
-        override suspend fun read() = LocalSnapshot(
-            session = Store.load(context, id),
-            overrides = Overrides.load(context, id),
-            burstDistance = Learning.learned(context, id),
-            epoch = SyncState.epoch(context, id)
-        )
+        override suspend fun read(): LocalSnapshot {
+            // **「無い」と「読めなかった」を分ける**（D2）。読めなければ空として渡さない。
+            val session = when (val read = Store.read(context, id)) {
+                is Stored.Ok -> read.value
+                is Stored.Broken -> throw LocalUnreadable(brokenNote("選別の途中", read))
+            }
+            val overrides = when (val read = Overrides.read(context, id)) {
+                is Stored.Ok -> read.value
+                is Stored.Broken -> throw LocalUnreadable(brokenNote("連写の手直し", read))
+            }
+            return LocalSnapshot(
+                session = session,
+                overrides = overrides,
+                burstDistance = Learning.learned(context, id),
+                epoch = SyncState.epoch(context, id)
+            )
+        }
+
+        private fun brokenNote(what: String, read: Stored.Broken) =
+            what + "（" + read.reason.take(60) + "）" +
+                (read.keptAs?.let { "。元の中身は ${it.name} に残しました" } ?: "")
 
         override suspend fun apply(snapshot: LocalSnapshot) {
             snapshot.session?.let { Store.save(context, id, it) } ?: Store.clear(context, id)

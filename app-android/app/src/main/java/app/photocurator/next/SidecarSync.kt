@@ -69,8 +69,20 @@ interface CatalogIO {
 data class SeenState(
     val seen: SeenRecord,
     val detached: Boolean,
-    val keyFromLocal: Boolean = false
+    val keyFromLocal: Boolean = false,
+    /**
+     * 端末の選別状況のファイルを**読めなかった**ことがある印（D2）。立っている間は、見た版を
+     * 「まだ何も見ていない」として判断する（見た版のままでも、端末の分で NAS を自動で上書きしない。
+     * 両方に判断があれば確認になる）。次に控えを保存したとき（取り込んだ・書いた・答えた）に下りる。
+     */
+    val localBroken: Boolean = false
 )
+
+/**
+ * 端末の選別状況のファイルはあるのに読めなかった（形が合わない・読み込みの失敗）。
+ * **「無い（未着手）」とは区別する。** 読めないまま判断すると、端末を空と見なして NAS を上書きしうる。
+ */
+class LocalUnreadable(val reason: String) : Exception(reason)
 
 /** 端末の控えの置き場所。Android では SharedPreferences「sync」（`SyncState`）。 */
 interface SeenStore {
@@ -91,6 +103,7 @@ data class LocalSnapshot(
 interface LocalState {
     /** 端末の保存の列が空になるまで待つ（最後の 1 組まで書き終えてから読む）。 */
     suspend fun flush()
+    /** **ファイルはあるのに読めなければ [LocalUnreadable] を投げる**（空として返さない）。 */
     suspend fun read(): LocalSnapshot
     /** 置き換える。呼ぶ前に退避が済んでいること。 */
     suspend fun apply(snapshot: LocalSnapshot)
@@ -231,6 +244,9 @@ class SidecarSync(
         block()
     } catch (error: kotlinx.coroutines.CancellationException) {
         throw error
+    } catch (error: LocalUnreadable) {
+        log("端末の選別状況を読めなかった", error)
+        SyncOutcome.Blocked(LOCAL_UNREADABLE + error.reason + LOCAL_UNREADABLE_TAIL)
     } catch (error: Exception) {
         log("サイドカーの同期に失敗した", error)
         SyncOutcome.Blocked("NAS の記録を同期できませんでした: " + (error.message ?: error.javaClass.simpleName))
@@ -264,6 +280,25 @@ class SidecarSync(
                 }
             }
         }
+
+    /**
+     * 端末の選別状況を読む。**読めなければ印を立てて投げる**（判断も書き込みもしない。D2）。
+     * 印が立っている間は、見た版を「まだ何も見ていない」として判断する（[planSeen]）。
+     */
+    private suspend fun readLocal(target: SyncTarget): LocalSnapshot = try {
+        target.local.read()
+    } catch (error: LocalUnreadable) {
+        store.save(target.projectId, store.load(target.projectId).copy(localBroken = true))
+        throw error
+    }
+
+    /**
+     * 判断に渡す見た版。端末を読めなかったことがあれば「まだ何も見ていない」にする。
+     * 見た版のままでも端末の分で NAS を自動で上書きせず、両方に判断があれば確認になる
+     * （端末が空なら取り込む・NAS が未着手なら退避して書く、は変わらない）。
+     */
+    private fun planSeen(state: SeenState): SeenRecord =
+        if (state.localBroken) SeenRecord("", "", null) else state.seen
 
     /** 端末の選別状況を、サイドカーの形（フォルダ形式の鍵）にする。 */
     private fun folderSidecar(target: SyncTarget, snapshot: LocalSnapshot): Sidecar {
@@ -306,11 +341,11 @@ class SidecarSync(
                 is Remote.Bad -> return SyncOutcome.Blocked(read.reason)
                 is Remote.Read -> read
             }
-            val snapshot = target.local.read()
+            val snapshot = readLocal(target)
             val mine = folderSidecar(target, snapshot)
             val judgement = sidecarJudgement(mine)
             val state = seenOf(target.projectId, judgement)
-            val plan = sidecarPlan(state.seen, judgement, remote.sidecar, true, state.detached)
+            val plan = sidecarPlan(planSeen(state), judgement, remote.sidecar, true, state.detached)
             when (plan) {
                 is SidecarPlan.Settled -> {
                     plan.seen?.let {
@@ -514,7 +549,7 @@ class SidecarSync(
             }
         }
         apply(target, theirs)
-        val after = sidecarJudgement(folderSidecar(target, target.local.read()))
+        val after = sidecarJudgement(folderSidecar(target, readLocal(target)))
         store.save(target.projectId, SeenState(seen.copy(key = judgementKey(after)), detached = false))
         return SyncOutcome.Pulled(nameOf(theirs) + " の記録から続きを取り込みました")
     }
@@ -552,7 +587,7 @@ class SidecarSync(
         // ダイアログを出したあとで NAS が変わった → 選び直してもらう。
         if (current == null || sidecarToken(current) != clash.token) return sync(target, SyncMode.Open)
 
-        val snapshot = target.local.read()
+        val snapshot = readLocal(target)
         val mine = folderSidecar(target, snapshot)
         val judgement = sidecarJudgement(mine)
         return when (choice) {
@@ -596,7 +631,7 @@ class SidecarSync(
                         epoch = device.epoch
                     )
                 )
-                val after = folderSidecar(target, target.local.read())
+                val after = folderSidecar(target, readLocal(target))
                 outcomeOf(push(target, after, sidecarJudgement(after), clash.token, asideTheirs = true))
             }
         }
@@ -608,7 +643,7 @@ class SidecarSync(
             is Remote.Bad -> return SyncOutcome.Blocked(read.reason)
             is Remote.Read -> read
         }
-        val mine = folderSidecar(target, target.local.read())
+        val mine = folderSidecar(target, readLocal(target))
         val expected = remote.sidecar?.let { sidecarToken(it) }
         return outcomeOf(push(target, mine, sidecarJudgement(mine), expected, asideTheirs = remote.sidecar != null))
     }
@@ -629,6 +664,9 @@ class SidecarSync(
         private const val MAX_ATTEMPTS = 3
         const val LOCK_TTL_MS = 60_000L
         private val LOCK_AT = Regex("\"at\"\\s*:\\s*(\\d+)")
+
+        const val LOCAL_UNREADABLE = "この端末の選別の記録を読めませんでした: "
+        const val LOCAL_UNREADABLE_TAIL = "。NAS の記録は変えていません（この端末の分で NAS を自動で上書きしません）"
 
         private fun dir(folder: String): String {
             val base = folder.trim('\\', '/').replace('/', '\\')
