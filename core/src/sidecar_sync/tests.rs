@@ -830,12 +830,20 @@ fn 進み具合_roundが先なら先_食い違えば言えない_同じなら同
 // ---------------------------------------------------------------------------
 
 /// 終わった選別（全部判定済み）。
+/// 本物のセッションと同じく、`ratings` には全部の写真（NAMES）を載せ、★0 も持つ（D3 の修正で、
+/// セッションに載っていない写真は「その端末に無い＝未判定」と扱うようになったため）。
+fn session_ratings(ratings: &[(&str, i32)]) -> HashMap<String, i32> {
+    let mut all: HashMap<String, i32> = NAMES.iter().map(|name| (name.to_string(), 0)).collect();
+    all.extend(stars(ratings));
+    all
+}
+
 fn done(ratings: &[(&str, i32)]) -> Session {
     let mut session = fresh();
     session.queue.clear();
     session.current.clear();
     session.finished = true;
-    session.ratings = stars(ratings);
+    session.ratings = session_ratings(ratings);
     session
 }
 
@@ -845,7 +853,7 @@ fn midway(ratings: &[(&str, i32)], remaining: &[&str]) -> Session {
     session.current = names(remaining);
     session.queue.clear();
     session.finished = false;
-    session.ratings = stars(ratings);
+    session.ratings = session_ratings(ratings);
     session.history = vec![crate::Decision {
         group: names(&["a.jpg", "b.jpg"]),
         chosen: names(&["a.jpg"]),
@@ -985,6 +993,49 @@ fn 混ぜ方_見込みの枚数() {
     assert!(preview.mid_round);
     let union = merge_judgements(mine, theirs, MergeMode::Union, 2, "e".into());
     assert_eq!(union.starred, preview.union_starred);
+}
+
+/// D3（レビュー 2026-10-02）: PC は RAW・HEIC も選別の対象にし、Android は jpg/png/webp だけ。
+/// 片方の記録（セッションの ratings・photos）に無い写真は、その端末では「未判定」なので、
+/// 積集合でも記録のある側の★を採る（ユーザー決定「片方で未判定の写真は、判定済みの側の★」）。
+#[test]
+fn 混ぜ方_積集合で片方の記録に無い写真は記録のある側の星_d3() {
+    // PC: JPG と RAW の両方を選別した（完了）。
+    let mut pc_session = done(&[("a.jpg", 2), ("b.jpg", 1)]);
+    pc_session.ratings.insert("a.cr2".into(), 2);
+    pc_session.ratings.insert("b.heic".into(), 1);
+    pc_session.ratings.insert("c.arw".into(), 0);
+    let pc = judge(Some(pc_session));
+    // Android: JPG だけ（RAW・HEIC は記録に無い）。
+    let android = judge(Some(done(&[("a.jpg", 1), ("d.jpg", 1)])));
+
+    let expected = stars(&[("a.jpg", 1), ("a.cr2", 2), ("b.heic", 1)]);
+    assert_eq!(merge_stars(android.clone(), pc.clone(), MergeMode::Intersection), expected, "Android から");
+    assert_eq!(merge_stars(pc.clone(), android.clone(), MergeMode::Intersection), expected, "PC から");
+    // 和集合は今までどおり大きい方（記録に無い側は 0 と同じ）。
+    assert_eq!(
+        merge_stars(android.clone(), pc.clone(), MergeMode::Union),
+        stars(&[("a.jpg", 2), ("b.jpg", 1), ("d.jpg", 1), ("a.cr2", 2), ("b.heic", 1)])
+    );
+    // 見込みと結果は同じ数え方（ダイアログの数のまま混ざる）。
+    let preview = merge_preview(android.clone(), pc.clone());
+    assert_eq!(preview.intersection_starred, 3);
+    let result = merge_judgements(android, pc, MergeMode::Intersection, 2, "e".into());
+    assert_eq!(result.ratings, expected);
+    assert_eq!(result.starred, preview.intersection_starred);
+}
+
+/// D3: セッションが無い側（★だけの古い記録）でも、photos に無い写真は未判定（今までどおり）。
+/// photos に★0 で載っている写真は、セッションが無ければ未判定のまま（設計書どおり）。
+#[test]
+fn 混ぜ方_d3でも記録の比べ方は意味が同じかの判断に影響しない() {
+    // 記録の顔ぶれ（★0 の写真）だけ違う 2 つは、今までどおり「意味が同じ」（警告なし）。
+    let mut pc_session = done(&[("a.jpg", 1)]);
+    pc_session.ratings.insert("a.cr2".into(), 0);
+    let pc = judge(Some(pc_session));
+    let android = judge(Some(done(&[("a.jpg", 1)])));
+    assert!(judgement_equivalent(pc.clone(), android.clone()));
+    assert_eq!(judgement_key(pc), judgement_key(android));
 }
 
 // ---------------------------------------------------------------------------
