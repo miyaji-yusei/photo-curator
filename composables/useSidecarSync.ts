@@ -520,6 +520,10 @@ export function createSidecarSync(backend: SidecarBackend, now: () => number = D
           return afterWrite(project, written, level)
         }
         // D・E: 混ぜる。両方を退避し、混ぜた結果を書いてから端末にも入れる。
+        // ROUND か対象の★が違うと混ぜない（ダイアログでも押せない。U45）。何も変えずに理由を返す。
+        if (!core.mergePreview(snap.local, core.sidecarJudgement(theirs)).mergeable) {
+          return { kind: 'failed', reason: 'ROUND か対象の★がほかの端末と違うので、混ぜられません。', access: level } as const
+        }
         const mode: MergeMode = choice === 'intersection' ? 'Intersection' : 'Union'
         const next = merged(snap, theirs, mode)
         await asideMine(project, snap)
