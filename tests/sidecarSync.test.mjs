@@ -91,9 +91,20 @@ function fakeBackend(options = {}) {
     savePairOverrides: async (_projectId, overrides) => { backend.overrides = overrides },
     loadSession: async () => backend.session,
     saveSession: async (_projectId, value) => { backend.session = value },
-    listProjects: async () => [{ id: 'p1', burstThreshold: backend.distance, folderPath: backend.folderPath }],
+    listProjects: async () => [{
+      id: 'p1', burstThreshold: backend.distance, folderPath: backend.folderPath,
+      pairRawJpeg: backend.pair.value, pairRawJpegAt: backend.pair.at
+    }],
     saveBurstThreshold: async (_projectId, value) => { backend.distance = value },
-    clearBurstThreshold: async () => { backend.distance = null }
+    clearBurstThreshold: async () => { backend.distance = null },
+    // U48: プロジェクトの「同名の JPEG と RAW を 1 枚の写真として扱う」と、切り替えた時刻。
+    pair: options.pair ?? { value: true, at: 0 },
+    pairSaves: [],
+    saveProjectPairRaw: async (_projectId, enabled, at) => {
+      backend.pair = { value: enabled, at: at ?? clock }
+      backend.pairSaves.push({ ...backend.pair })
+      return enabled
+    }
   }
   return backend
 }
@@ -916,5 +927,166 @@ describe('やり直し（epoch）', () => {
     expect(outcome.kind).toBe('clash')
     expect(outcome.clash.reason).toBe('TheirsRestarted')
     expect(ratingsOf(android)).toEqual([1, 0, 0, 1, 0, 0])
+  })
+})
+
+describe('プロジェクトの設定の同期（U48: settings.pairRawJpeg）', () => {
+  function twoDevices() {
+    const nas = sharedNas()
+    const pc = fakeBackend({ nas, identity: PC })
+    const android = fakeBackend({ nas, identity: ANDROID })
+    return { nas, pc, android, pcSync: createSidecarSync(pc, nextClock), androidSync: createSidecarSync(android, nextClock) }
+  }
+
+  /** Android が選別を進めて書き、PC がそれを取り込んだ（両方が同じ版を見ている）。 */
+  async function synced() {
+    const devices = twoDevices()
+    play(devices.android, [['IMG_0.JPG'], ['IMG_2.JPG']])
+    await devices.androidSync.pushIfChanged(project)
+    expect((await devices.pcSync.checkOnOpen(project)).kind).toBe('pulled')
+    return devices
+  }
+
+  const pairOf = backend => nasCatalog(backend).settings?.pairRawJpeg
+
+  it('書くとき、端末の値と切り替えた時刻を settings.pairRawJpeg に入れる（一度も切り替えていなければ at は 0）', async () => {
+    const backend = fakeBackend()
+    play(backend, [['IMG_0.JPG']])
+    const sync = createSidecarSync(backend, nextClock)
+    expect((await sync.checkOnOpen(project)).kind).toBe('pushed')
+    expect(pairOf(backend)).toEqual({ value: true, at: 0 })
+  })
+
+  it('PC が切り替える → 区切りで設定だけを書く → もう一台は確認なしに取り込み、再読み込みを促す', async () => {
+    const { pc, android, pcSync, androidSync } = await synced()
+    const writesBefore = pc.writes.length
+    await pc.saveProjectPairRaw('p1', false, 5_000_000)
+    const pushed = await pcSync.pushAuto(project)
+    expect(pushed).toMatchObject({ kind: 'settled', settingsPushed: true })
+    expect(pc.writes.length).toBe(writesBefore + 1)
+    expect(pairOf(pc)).toEqual({ value: false, at: 5_000_000 })
+
+    const androidBefore = JSON.stringify(android.session)
+    const outcome = await androidSync.checkOnOpen(project)
+    // 選別状況は同じ。確認も取り込みも書き込みも無い（設定だけが変わった版）。
+    expect(outcome).toMatchObject({ kind: 'settled', reason: 'Same', settingsAdopted: false })
+    expect(android.pair).toEqual({ value: false, at: 5_000_000 })
+    expect(JSON.stringify(android.session)).toBe(androidBefore)
+    expect(pc.writes.length).toBe(writesBefore + 1)
+    // 「端末が変わった」にもならない（次の自動の書き込みで書かない）。
+    expect((await androidSync.pushAuto(project)).kind).toBe('settled')
+    expect((await pcSync.pushAuto(project)).kind).toBe('settled')
+    expect(pc.writes.length).toBe(writesBefore + 1)
+  })
+
+  it('設定だけを書き直した版の上に、もう一台の進んだ選別を確認なしに書く（設定は新しい方のまま）', async () => {
+    const { pc, android, pcSync, androidSync } = await synced()
+    play(android, [['IMG_0.JPG'], ['IMG_2.JPG'], ['IMG_4.JPG']]) // Android はまだ書いていない判断がある
+    await pc.saveProjectPairRaw('p1', false, 5_000_000)
+    await pcSync.pushAuto(project)
+
+    const outcome = await androidSync.checkOnOpen(project)
+    expect(outcome).toMatchObject({ kind: 'pushed', reason: 'LocalChanged', settingsAdopted: false })
+    expect(nasCatalog(android).updatedBy).toBe(ANDROID.id)
+    expect(pairOf(android)).toEqual({ value: false, at: 5_000_000 })
+    // PC は Android の進んだ版を早送りで取り込む（確認は出ない）。
+    expect((await pcSync.checkOnOpen(project)).kind).toBe('pulled')
+    expect(ratingsOf(pc)).toEqual(ratingsOf(android))
+  })
+
+  it('新しく切り替えた方が勝つ（NAS の方が新しければ取り込み、端末の方が新しければ書く）', async () => {
+    const { pc, android, pcSync, androidSync } = await synced()
+    await pc.saveProjectPairRaw('p1', false, 5_000_000)
+    await pcSync.pushAuto(project)
+    // Android はそのあとで（オフの記録を見る前に）オンに切り替えていた。
+    await android.saveProjectPairRaw('p1', true, 6_000_000)
+    const outcome = await androidSync.checkOnOpen(project)
+    expect(outcome).toMatchObject({ kind: 'settled', settingsPushed: true })
+    expect(outcome.settingsAdopted).toBeUndefined()
+    expect(android.pair).toEqual({ value: true, at: 6_000_000 })
+    expect(pairOf(android)).toEqual({ value: true, at: 6_000_000 })
+    // PC は古い方なので取り込む。
+    expect(await pcSync.checkOnOpen(project)).toMatchObject({ kind: 'settled', settingsAdopted: true })
+    expect(pc.pair).toEqual({ value: true, at: 6_000_000 })
+
+    // 逆: 端末で先に（古い時刻で）切り替えていても、NAS の新しい方に合わせる。
+    await pc.saveProjectPairRaw('p1', false, 7_000_000)
+    await pcSync.pushAuto(project)
+    await android.saveProjectPairRaw('p1', true, 6_500_000)
+    expect(await androidSync.checkOnOpen(project)).toMatchObject({ kind: 'settled', settingsAdopted: false })
+    expect(android.pair).toEqual({ value: false, at: 7_000_000 })
+  })
+
+  it('値が同じなら時刻が違っても何もしない（取り込まない・書かない）', async () => {
+    const { pc, android, pcSync, androidSync } = await synced()
+    await pc.saveProjectPairRaw('p1', true, 5_000_000) // オンのまま（切り替えて戻した）
+    await pcSync.pushAuto(project)
+    const writes = pc.writes.length
+    const outcome = await androidSync.checkOnOpen(project)
+    expect(outcome.kind).toBe('settled')
+    expect(outcome.settingsAdopted).toBeUndefined()
+    expect(outcome.settingsPushed).toBeUndefined()
+    expect(android.pairSaves).toEqual([])
+    expect(android.pair).toEqual({ value: true, at: 0 })
+    expect(pc.writes.length).toBe(writes)
+  })
+
+  it('settings の無い古い版: 端末が一度も切り替えていなければ、設定のためだけには書かない', async () => {
+    const backend = fakeBackend()
+    const remote = remoteSidecar()
+    backend.files.set('catalog.json', core.sidecarToJson(remote))
+    backend.state = seeFor(remote)
+    const outcome = await createSidecarSync(backend, nextClock).checkOnOpen(project)
+    expect(outcome.kind).toBe('settled') // 見た版のままで端末も変わっていない（今までどおり）
+    expect(outcome.settingsAdopted).toBeUndefined()
+    expect(backend.writes).toEqual([])
+    expect(backend.pair).toEqual({ value: true, at: 0 })
+  })
+
+  it('settings の無い古い版: 端末で切り替えていれば設定を足して書く。選別状況は変えない', async () => {
+    const { pc, android, pcSync, androidSync } = await synced()
+    // 古いアプリが書いた版（settings なし）に置き換わった（中身は同じ選別状況）。
+    const old = nasCatalog(pc)
+    delete old.settings
+    pc.files.set('catalog.json', core.sidecarToJson({ ...old, writeId: 'old-app' }))
+    const keyBefore = core.judgementKey(core.sidecarJudgement(nasCatalog(pc)))
+    await pc.saveProjectPairRaw('p1', false, 5_000_000)
+    expect(await pcSync.checkOnOpen(project)).toMatchObject({ kind: 'settled', settingsPushed: true })
+    expect(pairOf(pc)).toEqual({ value: false, at: 5_000_000 })
+    expect(core.judgementKey(core.sidecarJudgement(nasCatalog(pc)))).toBe(keyBefore)
+    expect(await androidSync.checkOnOpen(project)).toMatchObject({ kind: 'settled', settingsAdopted: false })
+    expect(android.pair.value).toBe(false)
+  })
+
+  it('NAS が書けない共有・切り離し中は、設定のためだけに書かない', async () => {
+    const { pc, android, pcSync, androidSync } = await synced()
+    await pc.saveProjectPairRaw('p1', false, 5_000_000)
+    await pcSync.pushAuto(project)
+    android.access = 'readonly'
+    await android.saveProjectPairRaw('p1', true, 6_000_000)
+    const writes = pc.writes.length
+    expect((await androidSync.checkOnOpen(project)).kind).toBe('settled')
+    expect(pc.writes.length).toBe(writes)
+    // 切り離し中（「この端末の状況を残す」のあと。端末の選別状況は NAS と違う）。
+    android.access = 'readwrite'
+    play(android, [['IMG_0.JPG'], ['IMG_2.JPG'], ['IMG_4.JPG']])
+    android.state = { ...android.state, detached: true }
+    expect(await androidSync.checkOnOpen(project)).toMatchObject({ kind: 'settled', reason: 'Detached' })
+    expect(pc.writes.length).toBe(writes)
+  })
+
+  it('食い違いの確認には設定の違いを含めない（確認は選別状況だけ。設定は確認なしに新しい方）', async () => {
+    const { pc, android, pcSync, androidSync } = twoDevices()
+    play(android, [['IMG_0.JPG'], ['IMG_2.JPG']])
+    await android.saveProjectPairRaw('p1', false, 5_000_000)
+    await androidSync.pushIfChanged(project)
+    play(pc, [['IMG_1.JPG']])
+    const outcome = await pcSync.checkOnOpen(project)
+    expect(outcome.kind).toBe('clash')
+    expect(outcome.settingsAdopted).toBe(false)
+    expect(pc.pair).toEqual({ value: false, at: 5_000_000 })
+    // C（端末の分を書く）でも、取り込んだ設定を書く（古い値で上書きしない）。
+    expect((await pcSync.resolveClash(project, outcome.clash, 'mine')).kind).toBe('done')
+    expect(pairOf(pc)).toEqual({ value: false, at: 5_000_000 })
   })
 })

@@ -24,7 +24,7 @@
 import * as core from '~/lib/core'
 import type {
   ClashReason, Judgement, MergeMode, MergePreview, ProgressOrder, PullReason, PushReason, SeenRecord, Session,
-  SettledReason, Sidecar, SidecarProgress
+  SettingValueBool, SettledReason, Sidecar, SidecarProgress
 } from '~/lib/core'
 import type { PhotoBackend, SidecarAccess, SidecarState } from '~/composables/photoBackend'
 import type { SavedSelection } from '~/utils/selectionFlow'
@@ -40,7 +40,7 @@ export type SidecarBackend = Pick<PhotoBackend,
   | 'sidecarSupported' | 'readSidecar' | 'writeSidecar' | 'writeSidecarChecked' | 'loadSidecarState'
   | 'saveSidecarState' | 'deviceIdentity' | 'getCoreInputs' | 'saveSelectionResults' | 'getPairOverrides'
   | 'savePairOverrides' | 'loadSession' | 'saveSession' | 'listProjects' | 'saveBurstThreshold'
-  | 'clearBurstThreshold'>
+  | 'clearBurstThreshold' | 'saveProjectPairRaw'>
 
 /** 古い要約（表示用。今は使っていないが、外から使えるよう残す）。 */
 export interface SidecarSummary {
@@ -72,7 +72,17 @@ export interface ClashInfo {
 
 export type ClashChoice = 'theirs' | 'keep' | 'mine' | 'intersection' | 'union'
 
-export type SyncOutcome =
+/**
+ * プロジェクトの設定（U48: settings.pairRawJpeg）の結果。どの結果にも付きうる（選別状況の判断とは別）。
+ * - `settingsAdopted`: ほかの端末の設定を取り込んだ（値。true＝オン）。写真に反映するには再走査が要る
+ * - `settingsPushed`: 選別状況は同じで、設定だけをサイドカーに書いた
+ */
+export interface SettingsNote {
+  settingsAdopted?: boolean
+  settingsPushed?: boolean
+}
+
+export type SyncOutcome = SettingsNote & (
   | { kind: 'skipped', access: SidecarAccess }
   | { kind: 'settled', access: SidecarAccess, reason: SettledReason }
   | { kind: 'pushed', access: SidecarAccess, reason: PushReason }
@@ -88,6 +98,7 @@ export type SyncOutcome =
   | { kind: 'mismatch', access: SidecarAccess, matched: number, total: number }
   /** 載せる写真の行が 0 件。空の記録で共有を上書きしない。 */
   | { kind: 'empty', access: SidecarAccess }
+)
 
 /** 互換のための別名。 */
 export type OpenOutcome = SyncOutcome
@@ -106,6 +117,12 @@ export function summarize(sidecar: Sidecar): SidecarSummary {
     updatedAt: sidecar.updatedAt,
     deviceName: sidecar.updatedByName
   }
+}
+
+/** ほかの端末の設定（U48）を取り込んだときのお知らせ。自動では走査しないので、再読み込みを促す。 */
+export function settingsAdoptedNotice(value: boolean): string {
+  return `ほかの端末の設定に合わせて「同名の JPEG と RAW を 1 枚として扱う」を${value ? 'オン' : 'オフ'}にしました。`
+    + '写真を反映するには「写真を再読み込み」を押してください。'
 }
 
 /** 退避のファイル名に使える文字だけにする（`catalog.<端末の id の先頭 12 文字>.json`）。 */
@@ -174,6 +191,13 @@ interface Snapshot {
   /** 端末の写真の鍵（フォルダ形式）。 */
   photoKeys: string[]
   identity: { id: string, name: string }
+  /**
+   * 設定（U48）をどうするか。`AdoptRemote` のときは `mine` の設定をもう NAS の値にしてある
+   * （どの書き込みでも、古い端末の値で NAS の新しい値を上書きしない）。
+   */
+  settings: core.SettingsPlan
+  /** 端末の設定（`pairRawJpeg`）。`at` が 0 なら一度も切り替えていない。 */
+  localPair: SettingValueBool
 }
 
 export interface SidecarSync {
@@ -251,8 +275,11 @@ export function createSidecarSync(backend: SidecarBackend, now: () => number = D
     }
     if (typeof distance === 'number') sidecar.burstDistance = distance
     if (state.localEpoch) sidecar.epoch = state.localEpoch
+    // プロジェクトの設定（U48）。一度も切り替えていなくても値は書く（そのとき at は 0）。
+    const pair: SettingValueBool = { value: info?.pairRawJpeg !== false, at: info?.pairRawJpegAt ?? 0 }
+    sidecar.settings = { pairRawJpeg: pair }
     const separator = rows.some(row => row.relativePath.includes('\\')) ? '\\' : '/'
-    return { sidecar, identity, rows, saved, state, folderPath: info?.folderPath ?? '', separator }
+    return { sidecar, identity, rows, saved, state, folderPath: info?.folderPath ?? '', separator, pair }
   }
 
   async function buildSidecar(project: ProjectRef, updatedAt?: number): Promise<Sidecar> {
@@ -276,10 +303,17 @@ export function createSidecarSync(backend: SidecarBackend, now: () => number = D
       throw new Error('サイドカー（.photo-curator/catalog.json）の形式を読めませんでした。')
     }
     const built = await buildWith(project, now())
-    const mine = core.sidecarKeysToFolder(built.sidecar, '')
+    let mine = core.sidecarKeysToFolder(built.sidecar, '')
     const local = core.sidecarJudgement(mine)
     const localKey = core.judgementKey(local)
+    // 設定（U48）は選別状況と別に決める（確認は出さない。新しく切り替えた方）。
+    const settings = core.settingsResolve(mine.settings ?? null, parsed?.settings ?? null)
+    if (typeof settings === 'object' && 'AdoptRemote' in settings) {
+      mine = { ...mine, settings: { ...(mine.settings ?? {}), pairRawJpeg: { ...settings.AdoptRemote } } }
+    }
     return {
+      settings,
+      localPair: built.pair,
       access: level,
       text,
       remote: parsed ? core.sidecarNormalizeKeys(parsed, built.folderPath) : null,
@@ -412,8 +446,19 @@ export function createSidecarSync(backend: SidecarBackend, now: () => number = D
   async function syncNow(project: ProjectRef, mode: 'full' | 'auto'): Promise<SyncOutcome> {
     const level = await access(project.id)
     if (level === 'none') return { kind: 'skipped', access: level }
+    // 設定（U48）を取り込んだら、その値（どの結果にも付ける。判定し直しても 1 回だけ取り込む）。
+    let adopted: boolean | undefined
+    const note = (outcome: SyncOutcome): SyncOutcome =>
+      adopted === undefined ? outcome : { ...outcome, settingsAdopted: adopted }
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
       const snap = await snapshot(project, level)
+      // ほかの端末で新しく切り替えた設定は、確認なしに端末へ取り込む（開いたときだけ。自動の書き込みでは
+      // 端末を変えず、書く版にだけ NAS の値を入れる）。写真への反映は再走査（ここでは走査しない）。
+      if (mode === 'full' && typeof snap.settings === 'object' && 'AdoptRemote' in snap.settings) {
+        const { value, at } = snap.settings.AdoptRemote
+        await backend.saveProjectPairRaw(project.id, value, at)
+        adopted = value
+      }
       const plan = core.sidecarPlan(snap.seen, snap.local, snap.remote, level === 'readwrite', snap.state.detached === true)
       if ('Settled' in plan) {
         const { seen, reason } = plan.Settled
@@ -426,27 +471,49 @@ export function createSidecarSync(backend: SidecarBackend, now: () => number = D
             ...snap.state, localChanged: false, seenToken: snap.seen.token, seenKey: snap.seen.key, seenEpoch: null
           })
         }
-        return { kind: 'settled', access: level, reason }
+        // 選別状況はそのままで、端末で切り替えた設定だけが NAS に無い・古い → 設定のために書く（U48）。
+        if (settingsOnlyPush(snap, reason, level)) {
+          const written = await writeMine(project, snap, false)
+          if (written === 'changed') continue
+          if (written === 'locked') return note({ kind: 'locked', access: level })
+          return note(written === 'written'
+            ? { kind: 'settled', access: level, reason, settingsPushed: true }
+            : { kind: 'settled', access: level, reason })
+        }
+        return note({ kind: 'settled', access: level, reason })
       }
       if ('Push' in plan) {
         const written = await writeMine(project, snap, plan.Push.aside_theirs)
-        if (written === 'written') return { kind: 'pushed', access: level, reason: plan.Push.reason }
-        if (written === 'empty') return { kind: 'empty', access: level }
-        if (written === 'locked') return { kind: 'locked', access: level }
+        if (written === 'written') return note({ kind: 'pushed', access: level, reason: plan.Push.reason })
+        if (written === 'empty') return note({ kind: 'empty', access: level })
+        if (written === 'locked') return note({ kind: 'locked', access: level })
         continue // 見た版と違った → 読み直して判定し直す
       }
-      if (mode === 'auto') return { kind: 'deferred', access: level }
+      if (mode === 'auto') return note({ kind: 'deferred', access: level })
       if ('Pull' in plan) {
         const { theirs, aside_mine: asideFirst, seen, reason } = plan.Pull
         const problem = coverageProblem(snap, theirs)
-        if (problem) return { kind: 'mismatch', access: level, ...problem }
+        if (problem) return note({ kind: 'mismatch', access: level, ...problem })
         if (asideFirst && level === 'readwrite' && !core.isUntouched(snap.local)) await asideMine(project, snap)
         await pull(project, snap, theirs, seen.token)
-        return { kind: 'pulled', access: level, reason, from: theirs.updatedByName }
+        return note({ kind: 'pulled', access: level, reason, from: theirs.updatedByName })
       }
-      return { kind: 'clash', access: level, clash: clashInfo(snap, plan.Clash) }
+      return note({ kind: 'clash', access: level, clash: clashInfo(snap, plan.Clash) })
     }
-    return { kind: 'busy', access: level }
+    return note({ kind: 'busy', access: level })
+  }
+
+  /**
+   * 選別状況では書かない（Settled）ときに、設定のためだけに書くか（U48）。
+   * 端末で**切り替えたことがある**（at > 0）設定が NAS に無い・NAS より新しいときだけ。一度も切り替えていない
+   * 既定の値のためだけには書かない（古い版の catalog.json を開くたびに書き換えない）。書けない共有・
+   * 切り離し中・新しすぎる版は、選別状況と同じく書かない（それぞれ Settled の理由で分かる）。
+   */
+  function settingsOnlyPush(snap: Snapshot, reason: SettledReason, level: SidecarAccess): boolean {
+    return snap.settings === 'PushLocal'
+      && snap.localPair.at > 0
+      && level === 'readwrite'
+      && (reason === 'Same' || reason === 'NoChange' || reason === 'Nothing')
   }
 
   const checkOnOpen = (project: ProjectRef) => serialized(project.id, () => syncNow(project, 'full'))
@@ -610,7 +677,13 @@ export interface SidecarClash extends ClashInfo {
  * 画面が使うサイドカーの状態。`useCurator` が 1 つだけ持つ。
  * 自動の書き込み（背面へ回る・窓を閉じる・ホームへ戻る）の失敗は握りつぶさず `message` に出す。
  */
-export function useSidecarSync(backend: PhotoBackend) {
+export function useSidecarSync(
+  backend: PhotoBackend,
+  hooks: {
+    /** ほかの端末の設定（U48）を取り込んだ。画面が持っているプロジェクトを読み直す。 */
+    onSettingsAdopted?: (projectId: string, value: boolean) => void | Promise<void>
+  } = {}
+) {
   const sync = createSidecarSync(backend)
   const access = ref<SidecarAccess>('none')
   const clash = ref<SidecarClash | null>(null)
@@ -638,6 +711,11 @@ export function useSidecarSync(backend: PhotoBackend) {
       message.value = `写真の場所が違う記録のようです（一致 ${outcome.matched}/${outcome.total}）。取り込みませんでした。`
     }
     if (outcome.kind === 'locked') message.value = 'ほかの端末が書き込んでいたため、今回は書きませんでした。'
+    if (outcome.settingsAdopted !== undefined) {
+      const adopted = settingsAdoptedNotice(outcome.settingsAdopted)
+      notice.value = notice.value ? `${notice.value}${adopted}` : adopted
+      void Promise.resolve(hooks.onSettingsAdopted?.(project.id, outcome.settingsAdopted)).catch(() => undefined)
+    }
   }
 
   async function checkOnOpen(project: ProjectRef): Promise<SyncOutcome | null> {
@@ -662,7 +740,7 @@ export function useSidecarSync(backend: PhotoBackend) {
     if (!project || clash.value) return
     try {
       const outcome = await sync.pushAuto(project)
-      if (outcome.kind === 'pushed') savedAt.value = Date.now()
+      if (outcome.kind === 'pushed' || outcome.settingsPushed) savedAt.value = Date.now()
     } catch (cause) {
       message.value = cause instanceof Error ? cause.message : 'サイドカーに書けませんでした。'
     }
@@ -674,7 +752,12 @@ export function useSidecarSync(backend: PhotoBackend) {
     busy.value = true
     try {
       const outcome = await checkOnOpen(project)
-      if (outcome?.kind === 'settled' && outcome.reason !== 'ReadOnly') notice.value = '保存する変更はありません。'
+      if (outcome?.kind === 'settled' && outcome.settingsPushed) {
+        savedAt.value = Date.now()
+        notice.value = notice.value || 'プロジェクトの設定をサイドカーに書き込みました。'
+      } else if (outcome?.kind === 'settled' && outcome.reason !== 'ReadOnly' && outcome.settingsAdopted === undefined) {
+        notice.value = '保存する変更はありません。'
+      }
       return outcome
     } finally {
       busy.value = false

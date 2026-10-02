@@ -106,7 +106,27 @@ export interface Sidecar {
   keyBase?: string | null
   /** 要約（判断には使わない）。 */
   progress?: SidecarProgress | null
+  /** プロジェクトの設定（U48）。選別状況ではない（比較キーに入らない）。 */
+  settings?: SidecarSettings | null
 }
+
+/** 真偽の設定 1 つ。`at` は切り替えた時刻（ms）。0 は「作ったまま一度も切り替えていない」。 */
+export interface SettingValueBool {
+  value: boolean
+  at: number
+}
+
+/**
+ * catalog.json の `settings`（U48）。今は `pairRawJpeg` だけを読む。知らない設定も core が読んで書き戻す
+ * （`sidecarStamp` が置き換える版から引き継ぐ）。
+ */
+export interface SidecarSettings {
+  pairRawJpeg?: SettingValueBool | null
+  [name: string]: unknown
+}
+
+/** 設定をどうするか（`settingsResolve`）。 */
+export type SettingsPlan = 'Keep' | 'PushLocal' | { AdoptRemote: SettingValueBool }
 
 // ---- サイドカー同期（U33。core の sidecar_sync。形は core の serde のまま） ----
 
@@ -455,6 +475,15 @@ export function sidecarPlan(
 export function sidecarStamp(sidecar: Sidecar, writeId: string, base: Sidecar | null): Sidecar {
   ensureReady()
   return wasm.sidecarStamp(sidecar, writeId, base ?? null)
+}
+
+/**
+ * U48: プロジェクトの設定（pairRawJpeg）をどうするか。どちらかが無ければある方、値が同じなら何もしない、
+ * 違えば切り替えた時刻（at）が新しい方、同じ時刻なら NAS。
+ */
+export function settingsResolve(local: SidecarSettings | null, remote: SidecarSettings | null): SettingsPlan {
+  ensureReady()
+  return wasm.settingsResolve(local ?? null, remote ?? null)
 }
 
 export function mergeJudgements(
