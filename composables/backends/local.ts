@@ -145,6 +145,7 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
       burstThreshold: row.burstThreshold,
       burstThresholdLearnedAt: row.burstThresholdLearnedAt,
       sourceKind: source.kind === 'amazon' ? 'amazon' : 'folder',
+      pairRawJpeg: row.pairRawJpeg !== false,
       source: source.kind,
       ...(folderAccess ? { folderAccess } : {})
     }
@@ -349,6 +350,7 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
       await requestPersistence()
 
       const files = await scanFolder(io, {
+        pairRawJpeg: row.pairRawJpeg !== false,
         isCancelled: () => cancelled.has(projectId),
         onFound: count => emit(progressOf(projectId, 'scan', 'indexing', count, 0, '写真フォルダを確認しています'))
       })
@@ -869,6 +871,10 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
     saveProjectDisplayEdge: async (projectId: string, edge: number | null) => {
       if (edge !== null) await store.patchProject(projectId, { displayEdge: nearestDisplayEdge(edge) })
       return displayEdgeOf(projectId)
+    },
+    saveProjectPairRaw: async (projectId: string, enabled: boolean) => {
+      await store.patchProject(projectId, { pairRawJpeg: enabled })
+      return enabled
     },
     // 準備と同時に作っているので、あとから溜まる分は無い。
     getDisplayBacklog: () => Promise.resolve(0),

@@ -97,6 +97,8 @@ export interface PhotoBackend {
   saveDisplayEdge: (edge: number) => Promise<number>
   /** null を渡すと全体の設定に戻す。戻り値は解決後の長辺。 */
   saveProjectDisplayEdge: (projectId: string, edge: number | null) => Promise<number>
+  /** 「同名の JPEG と RAW を 1 枚の写真として扱う」の設定を保存する。反映は次の走査から。戻り値は保存後の値。 */
+  saveProjectPairRaw: (projectId: string, enabled: boolean) => Promise<boolean>
   /** まだ表示用画像が要る枚数。0 なら生成を起動しない。 */
   getDisplayBacklog: (projectId: string) => Promise<number>
   startDisplayGeneration: (projectId: string) => Promise<void>

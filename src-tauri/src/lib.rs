@@ -259,6 +259,8 @@ struct Project {
     burst_threshold_learned_at: Option<i64>,
     /// 写真の出所。`folder`（PC のフォルダ）か `amazon`（Amazon Photos の共有リンク）。
     source_kind: String,
+    /// 同名の JPEG と RAW を 1 枚の写真として扱い、組の RAW を対象から外す（U46）。既定は true。
+    pair_raw_jpeg: bool,
 }
 
 #[derive(Serialize)]
@@ -550,6 +552,8 @@ fn open_database(path: &Path) -> Result<Connection, String> {
     // `"{host}|{shareId}"` を持ち、`folder_path` にはリンクの URL を置く。
     add_column_if_missing(&conn, "projects", "source_kind", "TEXT NOT NULL DEFAULT 'folder'")?;
     add_column_if_missing(&conn, "projects", "source_key", "TEXT")?;
+    // 同名の JPEG と RAW を 1 枚の写真として扱う（U46）。既存のプロジェクトも既定の 1（オン）。
+    add_column_if_missing(&conn, "projects", "pair_raw_jpeg", "INTEGER NOT NULL DEFAULT 1")?;
     // d_hash の算出方式。旧ビルドの行は NULL になり、キャッシュとして使われない。
     // 古い方式のハッシュと新しい方式のハッシュが混ざると連写判定が壊れるため、
     // 値を消さずに「使わない」ことで移行する。
@@ -1879,6 +1883,49 @@ fn extension_lower(path: &Path) -> Option<String> {
         .map(|value| value.to_ascii_lowercase())
 }
 
+/// RAW の拡張子（`IMAGE_EXTENSIONS` のうち HEIC・HEIF 以外。rw2・pef・srw は今は走査の
+/// 候補に入らないが、入れる日のために並べておく）。
+const RAW_EXTENSIONS: [&str; 10] = [
+    "cr2", "cr3", "nef", "arw", "dng", "raf", "orf", "rw2", "pef", "srw",
+];
+
+/// RAW＋JPEG 同時撮影の「組」の RAW を除く（U46）。同じフォルダに、拡張子を除いた名前が
+/// 大文字小文字を無視して一致する JPEG（.jpg・.jpeg）がある RAW は、写真に数えない。
+/// Android は jpg/png/webp だけを走査するので、これで 2 台の顔ぶれが揃う。
+/// 組の JPEG が無い RAW、別フォルダの同名、HEIC・HEIF、PNG・WebP との組は除かない。
+/// `enabled` はプロジェクトの設定（`pair_raw_jpeg`）。false なら何も除かない。
+fn skip_paired_raw<T>(items: Vec<T>, enabled: bool, path_of: impl Fn(&T) -> &Path) -> Vec<T> {
+    if !enabled {
+        return items;
+    }
+    let key_of = |path: &Path| -> Option<(PathBuf, String)> {
+        let stem = path.file_stem()?.to_string_lossy().to_lowercase();
+        Some((path.parent().map(Path::to_path_buf).unwrap_or_default(), stem))
+    };
+    let jpeg_keys: HashSet<(PathBuf, String)> = items
+        .iter()
+        .filter_map(|item| {
+            let path = path_of(item);
+            let ext = extension_lower(path)?;
+            if ext == "jpg" || ext == "jpeg" {
+                key_of(path)
+            } else {
+                None
+            }
+        })
+        .collect();
+    items
+        .into_iter()
+        .filter(|item| {
+            let path = path_of(item);
+            let is_raw = extension_lower(path)
+                .map(|ext| RAW_EXTENSIONS.contains(&ext.as_str()))
+                .unwrap_or(false);
+            !(is_raw && key_of(path).is_some_and(|key| jpeg_keys.contains(&key)))
+        })
+        .collect()
+}
+
 /// 拡張子が画像・RAW の名前か、拡張子が無いもの。動画の拡張子は常に除く。
 fn is_supported(path: &Path) -> bool {
     match extension_lower(path) {
@@ -1931,7 +1978,7 @@ struct FolderListing {
 /// 更新時刻・大きさは、ディレクトリの列挙で得た情報（Windows では列挙の結果に
 /// 入っている）から取る。ファイルごとに `stat` をやり直すと、ネットワークの
 /// フォルダでは 1 枚 1 往復になる。
-fn list_photo_files(folder: &str) -> Result<FolderListing, String> {
+fn list_photo_files(folder: &str, pair_raw: bool) -> Result<FolderListing, String> {
     fs::read_dir(folder)
         .map_err(|error| format!("フォルダに接続できませんでした（{folder}）: {error}"))?;
     let mut files = Vec::new();
@@ -1956,6 +2003,8 @@ fn list_photo_files(folder: &str) -> Result<FolderListing, String> {
             Err(_) => unreadable += 1,
         }
     }
+    // RAW＋JPEG 同時撮影の組の RAW は写真に数えない（U46）。
+    let files = skip_paired_raw(files, pair_raw, |file| file.path.as_path());
     Ok(FolderListing { files, unreadable })
 }
 
@@ -2061,7 +2110,8 @@ fn scan_folder(
     is_cancelled: &dyn Fn() -> bool,
     on_progress: &mut dyn FnMut(&str, usize, usize, &str),
 ) -> Result<ScanEnd, String> {
-    let listing = list_photo_files(folder)?;
+    let pair_raw = project_pair_raw(conn, project_id);
+    let listing = list_photo_files(folder, pair_raw)?;
     let entries = listing.files;
     let total = entries.len();
     on_progress("indexing", 0, total, "Scanning photo files…");
@@ -2934,7 +2984,7 @@ fn run_burst_analysis(
 fn list_projects(app: AppHandle) -> Result<Vec<Project>, String> {
     let conn = connection(&app)?;
     let mut statement = conn
-        .prepare("SELECT id,name,folder_path,photo_count,status,created_at,updated_at,burst_threshold,burst_threshold_learned_at,source_kind FROM projects ORDER BY updated_at DESC")
+        .prepare("SELECT id,name,folder_path,photo_count,status,created_at,updated_at,burst_threshold,burst_threshold_learned_at,source_kind,pair_raw_jpeg FROM projects ORDER BY updated_at DESC")
         .map_err(|error| error.to_string())?;
     let rows = statement
         .query_map([], |row| {
@@ -2949,6 +2999,7 @@ fn list_projects(app: AppHandle) -> Result<Vec<Project>, String> {
                 burst_threshold: row.get(7)?,
                 burst_threshold_learned_at: row.get(8)?,
                 source_kind: row.get(9)?,
+                pair_raw_jpeg: row.get::<_, i64>(10)? != 0,
             })
         })
         .map_err(|error| error.to_string())?;
@@ -2974,6 +3025,7 @@ fn create_project(app: AppHandle, name: String, folder_path: String) -> Result<P
         burst_threshold: None,
         burst_threshold_learned_at: None,
         source_kind: SOURCE_FOLDER.into(),
+        pair_raw_jpeg: true,
     };
     connection(&app)?
         .execute(
@@ -3098,6 +3150,7 @@ fn create_amazon_project_blocking(app: AppHandle, name: String, share_url: Strin
         burst_threshold: None,
         burst_threshold_learned_at: None,
         source_kind: SOURCE_AMAZON.into(),
+        pair_raw_jpeg: true,
     };
     connection(&app)?
         .execute(
@@ -4299,6 +4352,30 @@ fn save_display_edge(app: AppHandle, edge: u32) -> Result<u32, String> {
     Ok(normalized)
 }
 
+/// プロジェクトの「同名の JPEG と RAW を 1 枚の写真として扱う」設定（U46）。
+/// 既定はオン。読めない・行が無いときもオン（既定どおり）。
+fn project_pair_raw(conn: &Connection, project_id: &str) -> bool {
+    conn.query_row(
+        "SELECT pair_raw_jpeg FROM projects WHERE id=?1",
+        params![project_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|value| value != 0)
+    .unwrap_or(true)
+}
+
+/// 設定を保存する。反映は次の走査（「写真を再読み込み」）から。
+#[tauri::command]
+fn save_project_pair_raw(app: AppHandle, project_id: String, enabled: bool) -> Result<bool, String> {
+    let conn = connection(&app)?;
+    conn.execute(
+        "UPDATE projects SET pair_raw_jpeg=?1, updated_at=?2 WHERE id=?3",
+        params![enabled as i64, now(), project_id],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(project_pair_raw(&conn, &project_id))
+}
+
 /// プロジェクト単位の上書き。`None` を渡すと全体の設定に戻す。
 #[tauri::command]
 fn save_project_display_edge(
@@ -5015,6 +5092,7 @@ pub fn run() {
             get_display_settings,
             save_display_edge,
             save_project_display_edge,
+            save_project_pair_raw,
             get_display_backlog,
             start_display_generation,
             reset_display_images,
@@ -7777,7 +7855,7 @@ mod tests {
         fs::write(directory.join("a.jpg"), b"one").unwrap();
         fs::create_dir_all(directory.join("sub")).unwrap();
         fs::write(directory.join("sub/b.jpg"), b"two two").unwrap();
-        let listing = list_photo_files(&directory.to_string_lossy()).expect("list");
+        let listing = list_photo_files(&directory.to_string_lossy(), true).expect("list");
         assert_eq!(listing.files.len(), 2);
         for file in &listing.files {
             assert!(file.fingerprint.is_some());
@@ -7833,7 +7911,7 @@ mod tests {
         // HEIC は先頭が `ftyp` だが画像。数から外さず、「読めなかった」に数える。
         fs::write(directory.join("photo.heic"), b"\0\0\0\x18ftypheic\0\0\0\0mif1heic").unwrap();
 
-        let files: Vec<PathBuf> = list_photo_files(&root)
+        let files: Vec<PathBuf> = list_photo_files(&root, true)
             .expect("list")
             .files
             .into_iter()
@@ -7895,6 +7973,132 @@ mod tests {
             .query_row("SELECT captured_at FROM photos WHERE name='fake.cr2'", [], |row| row.get(0))
             .unwrap();
         assert!(captured.is_some());
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    /// U46: 同じフォルダに同名の JPEG がある RAW は、走査の結果に入れない。
+    #[test]
+    fn listing_skips_a_raw_that_has_a_same_named_jpeg_beside_it() {
+        let directory = test_directory("scan-paired-raw");
+        let root = directory.to_string_lossy().to_string();
+        fs::create_dir_all(directory.join("sub")).unwrap();
+        for name in [
+            "IMG_1.JPG", "IMG_1.CR2", "IMG_2.CR2", "IMG_3.jpeg", "IMG_3.NEF", "sub/IMG_1.CR2",
+            "IMG_4.HEIC", "img_5.jpg", "IMG_5.CR2", "IMG_6.png", "IMG_6.DNG", "IMG_7.heic",
+            "IMG_7.jpg",
+        ] {
+            fs::write(directory.join(name), b"photo bytes").unwrap();
+        }
+        let files: Vec<PathBuf> = list_photo_files(&root, true)
+            .expect("list")
+            .files
+            .into_iter()
+            .map(|file| file.path)
+            .collect();
+        assert_eq!(
+            relative_names(&directory, &files),
+            vec![
+                "IMG_1.JPG", "IMG_2.CR2", "IMG_3.jpeg", "IMG_4.HEIC", "IMG_6.DNG", "IMG_6.png",
+                "IMG_7.heic", "IMG_7.jpg", "img_5.jpg", "sub/IMG_1.CR2",
+            ]
+        );
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn skip_paired_raw_is_a_pure_function_of_the_paths() {
+        let paths: Vec<PathBuf> = ["d/a.jpg", "d/A.cr3", "d/b.cr3", "e/a.arw", "d/c.heif", "d/c.jpeg"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        let kept = skip_paired_raw(paths, true, |path| path.as_path());
+        let names: Vec<String> = kept
+            .iter()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(names, vec!["d/a.jpg", "d/b.cr3", "e/a.arw", "d/c.heif", "d/c.jpeg"]);
+    }
+
+    /// U46: 既に DB にある組の RAW は、再走査で「見つからなかった」ことになり欠損になる
+    /// （解析エラーの表示から消える）。組でない RAW は残る。
+    #[test]
+    fn rescanning_marks_an_already_registered_paired_raw_as_missing() {
+        let (directory, root, conn) = scan_fixture("scan-paired-raw-db", &["a.jpg", "a.cr2", "b.cr2"]);
+        // 以前の版が RAW も登録していた状態を作る。
+        for name in ["a.jpg", "a.cr2", "b.cr2"] {
+            let path = directory.join(name);
+            upsert_photo(&conn, "p1", &path.to_string_lossy(), name, name, Some(1), Some(1))
+                .expect("upsert");
+        }
+        let ended = scan_for_test(&conn, &root, &|| false).expect("scan");
+        assert!(matches!(ended, ScanEnd::Completed { total: 2, count: 2, unreadable: 0 }));
+        assert_eq!(missing_names(&conn), vec!["a.cr2"]);
+        assert_eq!(project_row(&conn), (2, "ready".to_string()));
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    /// U46: 設定がオフなら、同名の JPEG があっても RAW を全部対象にする（今までどおり）。
+    #[test]
+    fn with_the_setting_off_every_file_stays_in_the_scan() {
+        let kept = skip_paired_raw(
+            vec![PathBuf::from("d/a.jpg"), PathBuf::from("d/a.cr2")],
+            false,
+            |path| path.as_path(),
+        );
+        assert_eq!(kept.len(), 2);
+
+        let (directory, root, conn) = scan_fixture("scan-paired-raw-off", &["a.jpg", "a.cr2", "b.cr2"]);
+        assert!(project_pair_raw(&conn, "p1"), "既定はオン");
+        conn.execute("UPDATE projects SET pair_raw_jpeg=0 WHERE id='p1'", []).unwrap();
+        assert!(!project_pair_raw(&conn, "p1"));
+        let ended = scan_for_test(&conn, &root, &|| false).expect("scan");
+        assert!(matches!(ended, ScanEnd::Completed { total: 3, count: 3, unreadable: 0 }));
+        assert!(missing_names(&conn).is_empty());
+        // オンに戻して再走査すると、組の RAW が欠損になる。
+        conn.execute("UPDATE projects SET pair_raw_jpeg=1 WHERE id='p1'", []).unwrap();
+        scan_for_test(&conn, &root, &|| false).expect("rescan");
+        assert_eq!(missing_names(&conn), vec!["a.cr2"]);
+        assert_eq!(project_row(&conn), (2, "ready".to_string()));
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    /// U46: `pair_raw_jpeg` 列は既存のプロジェクトを壊さずに足され、既定は 1（オン）。
+    #[test]
+    fn pair_raw_jpeg_column_migrates_with_the_default_on() {
+        let directory = test_directory("pair-raw-migrate");
+        let database = directory.join("legacy.sqlite3");
+        {
+            let legacy = Connection::open(&database).expect("open legacy");
+            legacy
+                .execute_batch(
+                    "CREATE TABLE projects (
+                       id TEXT PRIMARY KEY, name TEXT NOT NULL, folder_path TEXT NOT NULL,
+                       photo_count INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'new',
+                       created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+                     );
+                     INSERT INTO projects (id,name,folder_path,photo_count,status,created_at,updated_at)
+                     VALUES ('p1','旧プロジェクト','C:/photos',632,'ready',100,200);",
+                )
+                .expect("create legacy projects");
+        }
+        let conn = open_database(&database).expect("migrate");
+        let (name, count, pair): (String, i64, i64) = conn
+            .query_row(
+                "SELECT name,photo_count,pair_raw_jpeg FROM projects WHERE id='p1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read migrated project");
+        assert_eq!((name.as_str(), count, pair), ("旧プロジェクト", 632, 1));
+        assert!(project_pair_raw(&conn, "p1"));
+        conn.execute("UPDATE projects SET pair_raw_jpeg=0 WHERE id='p1'", []).unwrap();
+        drop(conn);
+        // 冪等で、保存した値を既定に戻さない。
+        let conn = open_database(&database).expect("reopen");
+        assert!(!project_pair_raw(&conn, "p1"));
         drop(conn);
         fs::remove_dir_all(&directory).expect("remove test directory");
     }

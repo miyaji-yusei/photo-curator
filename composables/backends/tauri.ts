@@ -144,6 +144,8 @@ export function createTauriBackend(): PhotoBackend {
     saveDisplayEdge: (edge: number) => invokeDesktop<number>('save_display_edge', { edge }),
     saveProjectDisplayEdge: (projectId: string, edge: number | null) =>
       invokeDesktop<number>('save_project_display_edge', { projectId, edge }),
+    saveProjectPairRaw: (projectId: string, enabled: boolean) =>
+      invokeDesktop<boolean>('save_project_pair_raw', { projectId, enabled }),
     getDisplayBacklog: (projectId: string) => invokeDesktop<number>('get_display_backlog', { projectId }),
     startDisplayGeneration: (projectId: string) => invokeDesktop<void>('start_display_generation', { projectId }),
     resetDisplayImages: (projectId: string) => invokeDesktop<void>('reset_display_images', { projectId })
