@@ -8,6 +8,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -52,8 +53,12 @@ object Preparations {
     fun of(projectId: String): Progress = progress.value[projectId] ?: Progress()
 
     private fun put(projectId: String, change: (Progress) -> Progress) {
-        progress.value = progress.value.toMutableMap().apply {
-            put(projectId, change(this[projectId] ?: Progress()))
+        // **読んで書く間に他の更新が入っても失わない**（update は競合したらやり直す）。
+        // 端末のアルバムは NAS の仕事と同時に動くので、読み書きが重なりうる（A19）。
+        progress.update { current ->
+            current.toMutableMap().apply {
+                put(projectId, change(this[projectId] ?: Progress()))
+            }
         }
     }
 
@@ -89,7 +94,7 @@ object Preparations {
                         }
                         // EXIF に縮小画像が無かった写真を、落とした表示用画像から
                         // 埋める。**網へは行かない。**
-                        // Amazon は縮小画像から指紋を作るので要らない。
+                        // Amazon は縮小画像からハッシュ値を作るので要らない。
                         if (kind == SourceKind.Nas) Prepare.fillFromRenders(app, project, ready.first, displayEdge)
                     }
                     Trouble.clear(app, project.source.key)

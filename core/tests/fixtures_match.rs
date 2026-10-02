@@ -113,3 +113,41 @@ fn d_hash_from_gray_はフィクスチャの期待値と一致する() {
     let actual = d_hash_from_gray(fixture.gray, fixture.width, fixture.height);
     assert_eq!(actual, Some(fixture.expected));
 }
+
+#[derive(Deserialize)]
+struct SidecarSyncFixture {
+    android_folder: String,
+    android: serde_json::Value,
+    pc_folder: String,
+    pc: serde_json::Value,
+    untouched: serde_json::Value,
+    seen_token: String,
+    expected_key: String,
+    expected_plan: serde_json::Value,
+}
+
+/// サイドカー同期（U33）: Android の古い形と PC の形の同じ選別状況が、鍵をそろえると
+/// 同じ比較キーになり、未着手の版に対しては取り込まずに書く判断になる。
+#[test]
+fn sidecar_sync_はフィクスチャの期待値と一致する() {
+    use photo_curator_core::{
+        judgement_key, sidecar_from_json, sidecar_judgement, sidecar_normalize_keys, sidecar_plan, SeenRecord,
+    };
+    let fixture: SidecarSyncFixture =
+        serde_json::from_str(include_str!("fixtures/sidecar_sync.json")).expect("fixture を読める");
+    let read = |value: &serde_json::Value, folder: &str| {
+        let sidecar = sidecar_from_json(value.to_string()).expect("catalog.json として読める");
+        sidecar_normalize_keys(sidecar, folder.to_string())
+    };
+    let android = read(&fixture.android, &fixture.android_folder);
+    let pc = read(&fixture.pc, &fixture.pc_folder);
+    let untouched = read(&fixture.untouched, &fixture.pc_folder);
+
+    let android_key = judgement_key(sidecar_judgement(android.clone()));
+    assert_eq!(android_key, fixture.expected_key, "Android の形");
+    assert_eq!(judgement_key(sidecar_judgement(pc)), fixture.expected_key, "PC の形");
+
+    let seen = SeenRecord { token: fixture.seen_token, key: android_key, epoch: None };
+    let plan = sidecar_plan(seen, sidecar_judgement(android), Some(untouched), true, false);
+    assert_eq!(serde_json::to_value(&plan).unwrap(), fixture.expected_plan);
+}

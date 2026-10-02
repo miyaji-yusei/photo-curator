@@ -77,11 +77,49 @@ fun ProjectScreen(
     var troubleDetail by remember { mutableStateOf(false) }
     // 大きく見ている並びと、その何枚目か。**ここは見るだけ**なので星は動かない。
     var zooming by remember { mutableStateOf<Pair<List<Photo>, Int>?>(null) }
-    // サイドカーとの食い違い。**選ぶまで選別を始めさせない。**
-    var clash by remember { mutableStateOf<Catalog?>(null) }
-    var mineSummary by remember { mutableStateOf("") }
+    // 一覧のスクロール位置。**拡大を開くと下の一覧は組まれなくなる**が、位置はここに残して、
+    // 閉じたときに戻す（A10）。早期 return より前に置くこと。
+    val gridState = androidx.compose.foundation.lazy.grid.rememberLazyGridState()
+    // サイドカーとの食い違い（両方とも進んでいて違う）。5 択で選ばせる。
+    var clash by remember { mutableStateOf<SidecarClash?>(null) }
     // 同期の結果を 1 行で。**黙って書かない、黙って失敗しない。**
     var syncNote by remember { mutableStateOf<String?>(null) }
+    var syncBad by remember { mutableStateOf(false) }
+    // NAS を確かめている間は**選別を始めさせない**（確かめる前に始めると、NAS の版を一度も
+    // 見ないまま進み、あとで食い違う。設計書 §2.3・§4.5）。
+    var checking by remember { mutableStateOf(Sidecar.supports(project)) }
+    // 「この端末の状況を残す」を選んだあと（NAS から切り離し、自動で書かない）。
+    var detached by remember { mutableStateOf(Sidecar.detached(context, project)) }
+
+    /** 同期の結果を画面に映す。取り込んだら読み直す。 */
+    suspend fun show(outcome: SyncOutcome) {
+        when (outcome) {
+            is SyncOutcome.Asking -> clash = outcome.clash
+            is SyncOutcome.Pulled -> session = Store.load(context, project.id)
+            else -> Unit
+        }
+        Sidecar.note(outcome)?.let {
+            syncNote = it
+            syncBad = outcome is SyncOutcome.Blocked
+        }
+        detached = Sidecar.detached(context, project)
+    }
+
+    /**
+     * 選別を始める（続ける）前に、もう一度 NAS と合わせる（設計書 §4.5）。
+     * 相手が着手済みでこの端末が未着手なら、ここで取り込んでから始める。確認が要るなら始めない。
+     */
+    suspend fun syncBeforeCull(): Boolean {
+        if (!Sidecar.supports(project)) return true
+        checking = true
+        val outcome = try {
+            Sidecar.check(context, project)
+        } finally {
+            checking = false
+        }
+        show(outcome)
+        return outcome !is SyncOutcome.Asking
+    }
 
     // **開いたら準備が動き出す。** カードに数が出ているのに何も進まないと、
     // 止まっているのか終わっているのか分からない。
@@ -122,7 +160,7 @@ fun ProjectScreen(
             // 準備は**アプリが持つ**（Preparations）。画面を離れても止まらないので、
             // 別のプロジェクトを選別しているあいだにも進む。
             Preparations.ensure(context, project, rescan, displayEdge) {
-                // 終わったら顔ぶれと指紋を読み直す。
+                // 終わったら顔ぶれとハッシュ値を読み直す。
                 scope.launch {
                     photos = Listing.load(context, project.source.key) ?: photos
                     prints = Fingerprints.load(context, project.source.key)
@@ -133,33 +171,17 @@ fun ProjectScreen(
             rescan = false
 
             // ---- サイドカー ----
-            // **開いたときに 1 回だけ見る。** 時刻の大小では決めない。
+            // 開いたとき・戻ったときに確かめる。判断は core（意味が同じなら何もしない／
+            // 片方が未着手なら確認なしに合わせる／両方着手で違えば 5 択）。
+            // **選別画面を離れたときの書き込みと同じ列に並ぶ**ので、それを追い越さない。
             if (Sidecar.supports(project)) {
-                when (val sync = Sidecar.check(context, project)) {
-                    is Sync.Settled -> Unit
-                    is Sync.Push -> {
-                        // **書いたことは言う。** 黙って書くと、共有されたのか
-                        // されていないのかが分からない。
-                        val failed = Sidecar.push(context, project)
-                        syncNote = if (failed != null) "NAS に保存できませんでした: " + failed
-                        else "この端末の結果を NAS に保存しました"
-                    }
-                    is Sync.Pull -> {
-                        Sidecar.adopt(context, project, sync.catalog)
-                        session = Store.load(context, project.id)
-                        syncNote = "NAS の記録から続きを取り込みました"
-                    }
-                    is Sync.Clash -> {
-                        val local = Store.load(context, project.id)
-                        val kept = local?.ratings?.values?.count { it > 0 } ?: 0
-                        val round = local?.let {
-                            "ROUND " + it.round + (if (it.finished) "（完了）" else " の途中")
-                        } ?: "選別なし"
-                        mineSummary = "★1 以上 " + kept + " 枚 · " + round
-                        clash = sync.catalog
-                    }
-                    is Sync.Blocked -> syncNote = sync.reason
+                checking = true
+                val outcome = try {
+                    Sidecar.check(context, project)
+                } finally {
+                    checking = false
                 }
+                show(outcome)
             }
 
             // ---- Amazon のリンク ----
@@ -174,12 +196,16 @@ fun ProjectScreen(
                     else alive.reason
                 }
             }
+        } catch (error: kotlinx.coroutines.CancellationException) {
+            throw error
         } catch (error: Exception) {
             // **黙って落とさない。** 何が起きたかを 1 文にして、ホームにも残す。
             val said = Smb.describe(error)
             trouble = said to (error.message ?: error.javaClass.name)
             Trouble.note(context, project.source.key, said)
             rescan = false
+            // NAS を確かめる前に転んだ。**始められないままにしない**（選別は端末だけでもできる）。
+            checking = false
         }
     }
 
@@ -224,11 +250,12 @@ fun ProjectScreen(
                         live?.finished == true -> onResults()
                         // 初回か、「毎回確認」が on のときだけ挟む。
                         live == null || Prefs.askBeforeStart(context) -> starting = true
-                        else -> onCull(false)
+                        else -> scope.launch { if (syncBeforeCull()) onCull(false) }
                     }
                 },
                 // **走査が終わるまで始められない。** 枚数と時間順が決まらないため。
-                enabled = scanned && photos.isNotEmpty(),
+                // **NAS を確かめ終えるまでも始められない**（つながらなければ、そこで押せるようになる）。
+                enabled = scanned && photos.isNotEmpty() && !checking,
                 shape = RoundedCornerShape(50)
             ) {
                 Icon(Icons.Filled.PlayArrow, null, Modifier.size(18.dp))
@@ -236,6 +263,7 @@ fun ProjectScreen(
                 Text(
                     when {
                         !scanned -> "走査中…"
+                        checking -> "NAS を確認中…"
                         live == null -> "選別を開始"
                         live.finished -> "結果を見る"
                         else -> "選別を続ける"
@@ -267,9 +295,27 @@ fun ProjectScreen(
                         Text(
                             note,
                             fontSize = 11.sp,
-                            color = if (note.contains("できません")) Warn else Sky,
+                            color = if (syncBad || note.contains("できません")) Warn else Sky,
                             modifier = Modifier.padding(top = 6.dp)
                         )
+                    }
+                    // 「この端末の状況を残す」を選んだあと。**NAS とは別の結果であることを出し続ける。**
+                    if (detached) {
+                        Row(
+                            Modifier.padding(top = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                "この端末だけの結果（NAS とは別）",
+                                fontSize = 11.sp, color = Warn,
+                                modifier = Modifier.weight(1f)
+                            )
+                            TextButton(onClick = {
+                                syncNote = "この端末の状況を NAS に書いています…"
+                                syncBad = false
+                                scope.launch { show(Sidecar.writeNow(context, project)) }
+                            }) { Text("NAS に書き込む", fontSize = 12.sp) }
+                        }
                     }
                 }
 
@@ -336,8 +382,8 @@ fun ProjectScreen(
                     Spacer(Modifier.height(10.dp))
                     PrepRow("写真の走査", if (scanned) photos.size else 0, photos.size, scanned)
                     // Tauri 版の「表示用画像」に当たる段。ネイティブでは OS の縮小画像を
-                    // そのまま使うので、実際に作るのは連写のまとめに使う指紋だけ。
-                    // 指紋は撮影時刻と同じ 1 回の読みで取れるので、同じ行に畳む。
+                    // そのまま使うので、実際に作るのは連写のまとめに使うハッシュ値だけ。
+                    // ハッシュ値は撮影時刻と同じ 1 回の読みで取れるので、同じ行に畳む。
                     PrepRow(
                         "撮影時刻・サムネイル",
                         maxOf(prints.size, preparing.first),
@@ -454,20 +500,21 @@ fun ProjectScreen(
                     else -> photos
                 }
                 LazyVerticalGrid(
+                    state = gridState,
                     columns = if (columns > 0) GridCells.Fixed(columns)
                     else GridCells.Adaptive(minSize = 96.dp),
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                     horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
-                    items(shown, key = { it.id }) { photo ->
+                    items(shown, key = { it.relativePath }) { photo ->
                         // **なぜ絵が無いのかを、タイルの中で言う。**
                         // 読めない形式・まだ作っていない・作れなかった、を分ける。
-                        val format = remember(photo.id) { unsupportedFormat(photo) }
-                        var state by remember(photo.id) {
+                        val format = remember(photo.relativePath) { unsupportedFormat(photo) }
+                        var state by remember(photo.relativePath) {
                             mutableStateOf(
                                 when {
                                     format != null -> Preview.Unsupported
-                                    // 指紋が出来ていれば、その 1 回の読みで
+                                    // ハッシュ値が出来ていれば、その 1 回の読みで
                                     // サムネイルも取れている。
                                     prints.containsKey(photo.relativePath) -> Preview.Ready
                                     preparing.second > 0 -> Preview.Generating
@@ -551,6 +598,8 @@ fun ProjectScreen(
                 // 連写をまとめる設定で、まだ基準を決めていなければ学習へ。
                 // **一度決めたら二度は聞かない。**
                 scope.launch {
+                    // **始める前に NAS と合わせる。** 相手の続きがあればここで取り込む。
+                    if (!syncBeforeCull()) return@launch
                     val needsLearning = Prefs.groupBursts(context) &&
                         Learning.learned(context, project.id) == null
                     onCull(needsLearning)
@@ -579,9 +628,14 @@ fun ProjectScreen(
                     DetailMenuRow("NAS に保存（この端末の結果を書く）") {
                         menu = false
                         syncNote = "NAS に保存しています…"
+                        syncBad = false
                         scope.launch {
-                            val failed = Sidecar.push(context, project)
-                            syncNote = failed ?: "NAS に保存しました"
+                            // **開いたときと同じ判断で書く**（NAS の中身を確かめずに上書きしない）。
+                            val outcome = Sidecar.save(context, project)
+                            show(outcome)
+                            if (outcome is SyncOutcome.Settled && outcome.note == null) {
+                                syncNote = "書く必要はありません（NAS の記録と同じか、まだ選別していません）"
+                            }
                         }
                     }
                 }
@@ -638,54 +692,28 @@ fun ProjectScreen(
         }
     }
 
-    // ---- サイドカーの食い違い ----
-    // **プロジェクト単位で選ばせる。写真 1 枚ずつは選ばせない。**
-    // どちらを選んでも、選ばなかった方は catalog.<端末>.json に残る。
-    clash?.let { theirs ->
-        AlertDialog(
-            onDismissRequest = { },
-            title = { Text("別の端末の記録があります") },
-            text = {
-                Column {
-                    Text(
-                        "この端末と NAS の記録が、どちらも進んでいます。" +
-                            "どちらを残すか選んでください。",
-                        fontSize = 13.sp
-                    )
-                    Spacer(Modifier.height(12.dp))
-                    Text("この端末（${Device.name()}）", fontSize = 12.sp, color = Lime)
-                    Text(mineSummary, fontSize = 13.sp)
-                    Spacer(Modifier.height(8.dp))
-                    Text("NAS の記録（${theirs.updatedByName}）", fontSize = 12.sp, color = Sky)
-                    Text(theirs.summary(), fontSize = 13.sp)
-                    Spacer(Modifier.height(12.dp))
-                    Text(
-                        "選ばなかった方は消しません。NAS の .photo-curator に " +
-                            "catalog.<端末>.json として残します。",
-                        fontSize = 11.sp, color = Faint
-                    )
+    // ---- サイドカーの食い違い（両方とも進んでいて違う） ----
+    // **プロジェクト単位で選ばせる。写真 1 枚ずつは選ばせない。** 5 択（設計書 §4.6）。
+    // どれを選んでも元の 2 つは消さない（NAS の catalog.<端末>.json と、この端末の aside/）。
+    clash?.let { asked ->
+        SidecarClashDialog(
+            clash = asked,
+            deviceName = Device.name(),
+            onChoose = { choice ->
+                clash = null
+                syncNote = "NAS の記録と合わせています…"
+                syncBad = false
+                scope.launch {
+                    show(Sidecar.resolve(context, project, asked, choice))
+                    // 取り込んだ・混ぜたときは、星と選別の進みを読み直す。
+                    session = Store.load(context, project.id)
                 }
             },
-            confirmButton = {
-                TextButton(onClick = {
-                    clash = null
-                    syncNote = "この端末の結果を NAS に書いています…"
-                    scope.launch {
-                        val failed = Sidecar.keepMine(context, project, theirs)
-                        syncNote = failed ?: "この端末の結果を NAS に反映しました"
-                    }
-                }) { Text("この端末の結果を使う") }
-            },
-            dismissButton = {
-                TextButton(onClick = {
-                    clash = null
-                    syncNote = "NAS の記録を取り込んでいます…"
-                    scope.launch {
-                        Sidecar.adopt(context, project, theirs)
-                        syncNote = "NAS の記録を取り込みました"
-                        reloads += 1
-                    }
-                }) { Text("NAS の記録を使う") }
+            onDismiss = {
+                // 閉じただけ。**何も変えない。** 選別を始める前にもう一度聞く。
+                clash = null
+                syncNote = "NAS の記録との食い違いは、まだ選んでいません（始める前にもう一度聞きます）"
+                syncBad = true
             }
         )
     }
@@ -728,7 +756,7 @@ fun ProjectScreen(
                     """
                         ID: ${project.id}
                         出所: ${project.source.technical}
-                        写真: ${photos.size} 枚 / 指紋 ${prints.size} 枚
+                        写真: ${photos.size} 枚 / ハッシュ値 ${prints.size} 枚
                         表示用画像: ${rendering.first} / ${rendering.second}（${displayEdge}px）
                     """.trimIndent(),
                     fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,

@@ -53,7 +53,7 @@ sealed interface SmbResult<out T> {
  * **接続は「ひと仕事」ごとに張って閉じる。** アプリが持ち歩かないので、
  * Wi-Fi が切れたときに「繋がっているつもり」の状態が残らない。
  *
- * ただし 1 枚ごとに張り直すのは高い。187 枚の指紋づくりで実測 40 秒/50 枚
+ * ただし 1 枚ごとに張り直すのは高い。187 枚のハッシュ値づくりで実測 40 秒/50 枚
  * だった。まとめて読むところは reading{} で 1 本にまとめる。
  */
 object Smb {
@@ -119,6 +119,8 @@ object Smb {
                     share.use { SmbResult.Ok(work(it)) }
                 }
             }
+        } catch (error: kotlinx.coroutines.CancellationException) {
+            throw error
         } catch (error: Exception) {
             Log.w(TAG, "NAS につなげない: ${nas.host}/${nas.share}", error)
             SmbResult.Failed(describe(error))
@@ -126,7 +128,7 @@ object Smb {
     }
 
     /**
-     * 1 本の接続で、たくさん読む。**指紋づくりや一覧のように数が多いところ用。**
+     * 1 本の接続で、たくさん読む。**ハッシュ値づくりや一覧のように数が多いところ用。**
      *
      * 1 枚ごとに connect / authenticate / connectShare を繰り返すと、
      * 網の往復がそのまま待ち時間になる。開けたままにするのはこの仕事の間だけ。
@@ -149,6 +151,8 @@ object Smb {
                     share.use { SmbResult.Ok(work(Reader(it))) }
                 }
             }
+        } catch (error: kotlinx.coroutines.CancellationException) {
+            throw error
         } catch (error: Exception) {
             Log.w(TAG, "NAS の読み取りが途中で切れた: ${nas.host}", error)
             SmbResult.Failed(describe(error))
@@ -288,8 +292,76 @@ object Smb {
         path: String,
         bytes: ByteArray
     ): SmbResult<Unit> = connect(nas, password) { share ->
+        requireSidecar(path)
+        makeParent(share, path)
+        // **一時ファイルに書いてから置き換える。** 途中で切れても、前の中身が残る
+        // （直接書き換えると、壊れた catalog.json が残って両方の端末が同期できなくなる）。
+        val temporary = path + "." + java.util.UUID.randomUUID().toString().take(8) + ".writing"
+        try {
+            writeTo(share, temporary, bytes)
+            renameIn(share, temporary, path)
+        } finally {
+            if (share.fileExists(temporary)) share.rm(temporary)
+        }
+        Unit
+    }
+
+    /** そのまま書く（あれば置き換える）。**一時ファイルを書くとき用**（置き換えは [rename]）。 */
+    suspend fun writeDirect(nas: Nas, password: String, path: String, bytes: ByteArray): SmbResult<Unit> =
+        connect(nas, password) { share ->
+            requireSidecar(path)
+            makeParent(share, path)
+            writeTo(share, path, bytes)
+        }
+
+    /** 名前を変える。**先にあれば置き換える。** */
+    suspend fun rename(nas: Nas, password: String, from: String, to: String): SmbResult<Unit> =
+        connect(nas, password) { share ->
+            requireSidecar(from)
+            requireSidecar(to)
+            renameIn(share, from, to)
+        }
+
+    /** 無いときだけ作る（書く間のロック）。先にあれば false。 */
+    suspend fun createExclusive(nas: Nas, password: String, path: String, bytes: ByteArray): SmbResult<Boolean> =
+        connect(nas, password) { share ->
+            requireSidecar(path)
+            makeParent(share, path)
+            try {
+                share.openFile(
+                    path,
+                    EnumSet.of(AccessMask.GENERIC_WRITE),
+                    null,
+                    SMB2ShareAccess.ALL,
+                    // 無いときだけ作る。あれば失敗する（NAS の側で 1 つに決まる）。
+                    SMB2CreateDisposition.FILE_CREATE,
+                    null
+                ).use { file -> file.outputStream.use { it.write(bytes) } }
+                true
+            } catch (error: com.hierynomus.mssmb2.SMBApiException) {
+                if (error.status == com.hierynomus.mserref.NtStatus.STATUS_OBJECT_NAME_COLLISION) false
+                else throw error
+            }
+        }
+
+    /** 消す。**無くても失敗にしない。** サイドカーの下だけ。 */
+    suspend fun delete(nas: Nas, password: String, path: String): SmbResult<Unit> =
+        connect(nas, password) { share ->
+            requireSidecar(path)
+            if (share.fileExists(path)) share.rm(path)
+        }
+
+    /** 書いてよいのは `.photo-curator` の下だけ（設計 CON-3）。**原本には触らない。** */
+    private fun requireSidecar(path: String) {
+        require(path.split('\\', '/').contains(".photo-curator")) { "サイドカーの外には書かない: $path" }
+    }
+
+    private fun makeParent(share: DiskShare, path: String) {
         val parent = path.substringBeforeLast('\\', "")
         if (parent.isNotEmpty() && !share.folderExists(parent)) share.mkdir(parent)
+    }
+
+    private fun writeTo(share: DiskShare, path: String, bytes: ByteArray) {
         share.openFile(
             path,
             EnumSet.of(AccessMask.GENERIC_WRITE),
@@ -299,7 +371,17 @@ object Smb {
             SMB2CreateDisposition.FILE_OVERWRITE_IF,
             null
         ).use { file -> file.outputStream.use { it.write(bytes) } }
-        Unit
+    }
+
+    private fun renameIn(share: DiskShare, from: String, to: String) {
+        share.openFile(
+            from,
+            EnumSet.of(AccessMask.DELETE, AccessMask.GENERIC_READ),
+            null,
+            SMB2ShareAccess.ALL,
+            SMB2CreateDisposition.FILE_OPEN,
+            null
+        ).use { file -> file.rename(to, true) }
     }
 
     /** つながるかだけ試す。**設定画面の「接続を確認」。** */
@@ -424,7 +506,7 @@ object Smb {
     /**
      * ファイルの先頭を読む。**全部は読まない。**
      *
-     * 指紋と一覧のサムネイルには EXIF の縮小画像で足りる。原本 1 枚 6MB を
+     * ハッシュ値と一覧のサムネイルには EXIF の縮小画像で足りる。原本 1 枚 6MB を
      * 網越しに引くと、2,000 枚で 12GB になる。前の版はこれで詰まっていた。
      */
     suspend fun head(nas: Nas, password: String, path: String, bytes: Int): SmbResult<ByteArray> =

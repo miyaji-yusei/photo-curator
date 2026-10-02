@@ -22,25 +22,27 @@ import java.io.File
 object Store {
     private const val TAG = "Store"
 
-    private fun file(context: Context, projectId: String) =
+    internal fun file(context: Context, projectId: String) =
         File(context.filesDir, "session-$projectId.json")
 
     /**
      * 保存する。**確定のたびに呼ばれる想定なので、失敗しても選別は止めない。**
      * 書けなかったことは記録する（黙って落とさない）。
      */
-    suspend fun save(context: Context, projectId: String, session: Session) =
-        withContext(Dispatchers.IO) {
-            // **判断が変わった。** サイドカーへ渡すべきものが端末にできた印。
-            SyncState.touch(context, projectId)
+    suspend fun save(context: Context, projectId: String, session: Session) {
+        // **保存はアプリの列で 1 本ずつ。最後に頼んだ状態が必ず残る**（A2）。
+        // 確定を連打しても、同じ一時ファイルを奪い合わず、古い状態が新しい状態を戻さない。
+        val target = file(context, projectId)
+        Persist.latest("session:$projectId") {
             try {
                 // 途中で落ちても壊れた JSON を残さないよう、書いてから差し替える。
                 // rename が使えない環境ではコピーで置き換える。
-                file(context, projectId).writeAtomically { it.writeText(sessionToJson(session)) }
+                target.writeAtomically { it.writeText(sessionToJson(session)) }
             } catch (error: Exception) {
                 Log.w(TAG, "選別の途中を保存できなかった: $projectId", error)
             }
         }
+    }
 
     /** 読み戻す。**形が合わなければ null。** 最初からやり直してもらう。 */
     suspend fun load(context: Context, projectId: String): Session? =
@@ -70,16 +72,17 @@ object Store {
         }
     }
 
-    suspend fun clear(context: Context, projectId: String) = withContext(Dispatchers.IO) {
-        file(context, projectId).delete()
-        Unit
+    suspend fun clear(context: Context, projectId: String) {
+        // 保存と同じ列に載せる。**消したあとに、前の保存が書き戻さない。**
+        val target = file(context, projectId)
+        Persist.latest("session:$projectId") { target.delete() }
     }
 }
 
 /**
- * 1 枚ぶんの指紋と、それが**いつの原本のものか**。
+ * 1 枚ぶんのハッシュ値と、それが**いつの原本のものか**。
  *
- * 大きさを控えるのは、写真が差し替わったときに古い指紋を使わないため。
+ * 大きさを控えるのは、写真が差し替わったときに古いハッシュ値を使わないため。
  * 版を控えるのは、作り方を変えたときに黙って混ざらないため。
  */
 data class Fingerprint(
@@ -89,13 +92,13 @@ data class Fingerprint(
     /**
      * 撮影時刻。**NAS のときだけ入る。**
      * 端末は MediaStore が持っているが、NAS は EXIF を読まないと分からない。
-     * 指紋と同じ 1 回の読みで取れるので、一緒に控える。
+     * ハッシュ値と同じ 1 回の読みで取れるので、一緒に控える。
      */
     val takenAt: Long? = null
 )
 
 /**
- * 指紋の置き場。**一度作ったものは作り直さない。**
+ * ハッシュ値の置き場。**一度作ったものは作り直さない。**
  *
  * Tauri 版はプロジェクトを開くたびに解析し直していて、
  * 何が起きているのか誰にも分からなかった。作った結果は必ず残す。
@@ -108,7 +111,7 @@ object Fingerprints {
      * NAS の鍵は "nasId|フォルダ道筋" の形で、区切り記号がそのまま入ると
      * **扱いにくい名前のファイル**ができる。英数字以外は _ に潰す。
      */
-    private fun file(context: Context, sourceKey: String) =
+    internal fun file(context: Context, sourceKey: String) =
         File(context.filesDir, "fingerprints-${sourceKey.replace(Regex("[^A-Za-z0-9_-]"), "_")}.json")
 
     suspend fun load(context: Context, sourceKey: String): Map<String, Fingerprint> =
@@ -130,13 +133,13 @@ object Fingerprints {
                 out
             } catch (error: Exception) {
                 // 読めないものは無かったことにして作り直す。**部分的に読まない。**
-                Log.w(TAG, "指紋を読めなかった: $sourceKey", error)
+                Log.w(TAG, "ハッシュ値を読めなかった: $sourceKey", error)
                 emptyMap()
             }
         }
 
     suspend fun save(context: Context, sourceKey: String, prints: Map<String, Fingerprint>) =
-        withContext(Dispatchers.IO) {
+        Persist.latest("fingerprints:$sourceKey") {
             try {
                 val root = org.json.JSONObject()
                 for ((path, print) in prints) {
@@ -151,7 +154,7 @@ object Fingerprints {
                 }
                 file(context, sourceKey).writeAtomically { it.writeText(root.toString()) }
             } catch (error: Exception) {
-                Log.w(TAG, "指紋を保存できなかった: $sourceKey", error)
+                Log.w(TAG, "ハッシュ値を保存できなかった: $sourceKey", error)
             }
         }
 }
@@ -195,10 +198,28 @@ object Prefs {
             .getInt("display_edge", 1024)
             .coerceIn(768, 1920)
 
+    /**
+     * 既定を変える。**効くのは新しいプロジェクトだけ**（設定画面にもそう書いてある）。
+     * 自分の値をまだ持たない既存のプロジェクトには、変える前の既定をここで書き留める。
+     * 書き留めないと、次に開いたとき新しい既定として扱われて、全部作り直しになる（A7）。
+     */
     fun setDisplayEdge(context: Context, edge: Int) {
-        context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
-            .edit().putInt("display_edge", edge.coerceIn(768, 1920)).apply()
+        val preferences = context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+        val old = displayEdge(context)
+        val editor = preferences.edit()
+        if (old != edge.coerceIn(768, 1920)) {
+            // 設定の画面から呼ばれる。一覧のファイルは小さいので、その場で読む。
+            val ids = kotlinx.coroutines.runBlocking { Projects.all(context) }.map { it.id }
+            for (id in edgesToPin(ids) { preferences.contains("display_edge_$it") }) {
+                editor.putInt("display_edge_$id", old)
+            }
+        }
+        editor.putInt("display_edge", edge.coerceIn(768, 1920)).apply()
     }
+
+    /** 自分の大きさをまだ持たないプロジェクト。 */
+    fun edgesToPin(ids: List<String>, hasOwn: (String) -> Boolean): List<String> =
+        ids.filterNot(hasOwn)
 
     /**
      * プロジェクトごとの長辺。**設定の値は「新しいプロジェクトの既定」**で、
@@ -315,7 +336,7 @@ object Prefs {
 object Overrides {
     private const val TAG = "Overrides"
 
-    private fun file(context: Context, projectId: String) =
+    internal fun file(context: Context, projectId: String) =
         File(context.filesDir, "overrides-$projectId.json")
 
     suspend fun load(context: Context, projectId: String): List<PairOverride> =
@@ -340,15 +361,12 @@ object Overrides {
         }
 
     /** 手直しを全部消す。**やり直しのときだけ。** */
-    suspend fun clear(context: Context, projectId: String) = withContext(Dispatchers.IO) {
-        file(context, projectId).delete()
-        Unit
+    suspend fun clear(context: Context, projectId: String) {
+        Persist.latest("overrides:$projectId") { file(context, projectId).delete() }
     }
 
     suspend fun save(context: Context, projectId: String, list: List<PairOverride>) =
-        withContext(Dispatchers.IO) {
-            // 手直しも判断。**サイドカーへ渡すもの。**
-            SyncState.touch(context, projectId)
+        Persist.latest("overrides:$projectId") {
             try {
                 val array = org.json.JSONArray()
                 for (item in list) {
@@ -388,7 +406,7 @@ object Overrides {
 object Listing {
     private const val TAG = "Listing"
 
-    private fun file(context: Context, sourceKey: String) =
+    internal fun file(context: Context, sourceKey: String) =
         File(context.filesDir, "listing-${sourceKey.replace(Regex("[^A-Za-z0-9_-]"), "_")}.json")
 
     suspend fun load(context: Context, sourceKey: String): List<Photo>? = withContext(Dispatchers.IO) {
@@ -418,7 +436,7 @@ object Listing {
     }
 
     suspend fun save(context: Context, sourceKey: String, photos: List<Photo>) =
-        withContext(Dispatchers.IO) {
+        Persist.latest("listing:$sourceKey") {
             try {
                 val array = org.json.JSONArray()
                 for (photo in photos) {
@@ -443,9 +461,8 @@ object Listing {
             }
         }
 
-    suspend fun clear(context: Context, sourceKey: String) = withContext(Dispatchers.IO) {
-        file(context, sourceKey).delete()
-        Unit
+    suspend fun clear(context: Context, sourceKey: String) {
+        Persist.latest("listing:$sourceKey") { file(context, sourceKey).delete() }
     }
 }
 
@@ -459,7 +476,7 @@ object Listing {
 object Trouble {
     private const val TAG = "Trouble"
 
-    private fun file(context: Context, sourceKey: String) =
+    internal fun file(context: Context, sourceKey: String) =
         File(context.filesDir, "trouble-${sourceKey.replace(Regex("[^A-Za-z0-9_-]"), "_")}.txt")
 
     suspend fun note(context: Context, sourceKey: String, message: String) =
@@ -567,15 +584,15 @@ object Device {
 }
 
 /**
- * サイドカーと端末の食い違いを見分けるための控え。
+ * サイドカーと端末の食い違いを見分けるための控え（U35 で core の `sidecarPlan` 用に置き換えた）。
  *
- * **時刻の大小で勝敗を決めない。** 端末ごとに時計はずれるので、
- * 「新しい方を採る」は狂った端末が常に勝つ。見るのは
- * 「**自分が最後に見た版と同じかどうか**」だけ。
+ * **時刻の大小で勝敗を決めない。** 見るのは「自分が最後に見た版（token）と同じか」と、
+ * 「その版の選別状況の比較キー（key）と、今の端末の比較キーが同じか」。
+ * 「変更があるか」は印（dirty）ではなく中身で決める（core）。印を立てる・消す操作が無いので、
+ * 書いている最中の判断の印を消す・キャンセルで印が落ちる、が起きない。
  *
- * `changed` が動くのは**判断が変わったときだけ**（星・まとまりの手直し・
- * 学習した基準・やり直し）。準備（指紋や表示用画像）では動かさない。
- * 動かすと、見ただけで食い違い扱いになる。
+ * 置き場所は SharedPreferences「sync」。キーは `<プロジェクト>-seenToken` など。
+ * 古い控え（`-seenAt`・`-seenBy`・`-dirty`）は、最初に読んだときに移す（設計書 §5 の PR-5）。
  */
 object SyncState {
     private const val FILE = "sync"
@@ -583,32 +600,65 @@ object SyncState {
     private fun prefs(context: Context) =
         context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
 
-    fun seenAt(context: Context, projectId: String): Long =
-        prefs(context).getLong("$projectId-seenAt", -1L)
-
-    fun seenBy(context: Context, projectId: String): String =
-        prefs(context).getString("$projectId-seenBy", "") ?: ""
-
-    /** 端末側に、まだ共有していない判断があるか。 */
-    fun changed(context: Context, projectId: String): Boolean =
-        prefs(context).getBoolean("$projectId-dirty", false)
-
-    /** 判断が変わった。**ここでしか印を付けない。** */
-    fun touch(context: Context, projectId: String) {
-        prefs(context).edit().putBoolean("$projectId-dirty", true).apply()
+    /** [SidecarSync] に渡す控えの置き場所。 */
+    fun store(context: Context): SeenStore {
+        val app = context.applicationContext
+        return object : SeenStore {
+            override fun load(projectId: String): SeenState = load(app, projectId)
+            override fun save(projectId: String, state: SeenState) = save(app, projectId, state)
+        }
     }
 
-    /** 読んだ／書いた版を控える。**書けたときだけ呼ぶ。** */
-    fun saw(context: Context, projectId: String, updatedAt: Long, updatedBy: String) {
+    fun load(context: Context, projectId: String): SeenState {
+        val store = prefs(context)
+        val token = store.getString("$projectId-seenToken", null)
+        if (token != null) {
+            return SeenState(
+                uniffi.photo_curator_core.SeenRecord(
+                    token,
+                    store.getString("$projectId-seenKey", "") ?: "",
+                    store.getString("$projectId-seenEpoch", null)
+                ),
+                detached = store.getBoolean("$projectId-detached", false)
+            )
+        }
+        // 古い控えからの移し替え。seenAt/seenBy は core の legacy の token と同じ形にする。
+        // dirty=true なら比較キーを空にして「変更あり」、false なら今の端末の比較キーで埋める。
+        val seenAt = store.getLong("$projectId-seenAt", -1L)
+        if (seenAt < 0) return SeenState(uniffi.photo_curator_core.SeenRecord("", "", null), detached = false)
+        val seenBy = store.getString("$projectId-seenBy", "") ?: ""
+        val dirty = store.getBoolean("$projectId-dirty", false)
+        return SeenState(
+            uniffi.photo_curator_core.SeenRecord("legacy:$seenAt:$seenBy", "", null),
+            detached = false,
+            keyFromLocal = !dirty
+        )
+    }
+
+    fun save(context: Context, projectId: String, state: SeenState) {
         prefs(context).edit()
-            .putLong("$projectId-seenAt", updatedAt)
-            .putString("$projectId-seenBy", updatedBy)
-            .putBoolean("$projectId-dirty", false)
-            .apply()
+            .putString("$projectId-seenToken", state.seen.token)
+            .putString("$projectId-seenKey", state.seen.key)
+            .putString("$projectId-seenEpoch", state.seen.epoch)
+            .putBoolean("$projectId-detached", state.detached)
+            // 古い控えは移したので消す（残すと、消したあとの移し替えで古い版に戻る）。
+            .remove("$projectId-seenAt")
+            .remove("$projectId-seenBy")
+            .remove("$projectId-dirty")
+            .commit()
     }
 
-    fun clean(context: Context, projectId: String) {
-        prefs(context).edit().putBoolean("$projectId-dirty", false).apply()
+    /** この端末のやり直しの世代。**やり直したことを、ほかの端末に伝えるため**（設計書 §6 の Q10）。 */
+    fun epoch(context: Context, projectId: String): String? =
+        prefs(context).getString("$projectId-epoch", null)
+
+    fun setEpoch(context: Context, projectId: String, epoch: String?) {
+        prefs(context).edit().putString("$projectId-epoch", epoch).commit()
+    }
+
+    /** やり直した。**新しい世代にする**（相手の進んだ分で黙って埋め戻されないように）。 */
+    fun restarted(context: Context, projectId: String) {
+        setEpoch(context, projectId, "e-" + java.util.UUID.randomUUID().toString().replace("-", "").take(16))
     }
 
     fun forget(context: Context, projectId: String) {

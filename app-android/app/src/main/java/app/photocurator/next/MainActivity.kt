@@ -50,6 +50,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         // 網の状態を言い分けるために預ける。**ここでしか渡さない。**
         Smb.remember(this)
+        // 旧い名前の絵のキャッシュを一度だけ片付ける（A6）。
+        Thread { runCatching { CacheName.dropLegacy(applicationContext) } }.start()
         requestPhotoPermissions()
         take(intent)
         setContent { App() }
@@ -125,10 +127,20 @@ private fun App() {
     // 止められるので、その前に渡しておく（設計 03「中断されたときは必ず書く」）。
     val context = LocalContext.current
     val owner = LocalLifecycleOwner.current
+    var screen by remember { mutableStateOf<Screen>(Screen.Home) }
     DisposableEffect(owner) {
         val watch = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_STOP) {
-                for (project in Projects.cached()) Sidecar.pushIfChanged(context, project)
+                // **開いているプロジェクトだけ。** 全部を書くと、同じフォルダの古いプロジェクトや
+                // 前に開いたプロジェクトが、ほかの端末の版の上に書きに行く（設計書 §4.5）。
+                val open = when (val here = screen) {
+                    is Screen.Detail -> here.project
+                    is Screen.Learn -> here.project
+                    is Screen.Cull -> here.project
+                    is Screen.Results -> here.project
+                    else -> null
+                }
+                open?.let { Sidecar.pushIfChanged(context, it) }
             }
         }
         owner.lifecycle.addObserver(watch)
@@ -136,7 +148,6 @@ private fun App() {
     }
 
     MaterialTheme(colorScheme = darkColorScheme(primary = Lime, background = Ink, surface = Surface)) {
-        var screen by remember { mutableStateOf<Screen>(Screen.Home) }
         // ホームへ戻るたびに一覧を読み直すための鍵。
         var homeKey by remember { mutableStateOf(0) }
 

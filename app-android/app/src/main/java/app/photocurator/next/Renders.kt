@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 
@@ -31,12 +32,34 @@ object Renders {
 
     private fun dir(context: Context) = File(context.filesDir, "renders").apply { mkdirs() }
 
+    /** 置き場そのもの（更新時刻を見て、変わったかを知るため）。 */
+    fun dirOf(context: Context): File = dir(context)
+
     /**
      * 名前に**大きさを含める。** 設定を変えたときに、古い小さい絵を
      * そのまま出してしまわないため。
      */
     private fun name(cacheId: String, path: String, edge: Int): String =
-        "${cacheId}_${path.hashCode().toUInt().toString(16)}_$edge.jpg"
+        "${cacheId}_${CacheName.of(path)}_$edge.jpg"
+
+    private val locks = java.util.concurrent.ConcurrentHashMap<String, kotlinx.coroutines.sync.Mutex>()
+
+    /**
+     * 同じ表示用画像を**同時に作らせない**（U26）。先読みが取りかけの写真へ
+     * 選別が進むと、同じ原本を 2 本の接続で読むことになる。後から来たほうは
+     * 待って、できたものを読む（block の先頭で read し直すこと）。
+     */
+    suspend fun <T> exclusive(
+        cacheId: String, path: String, edge: Int, block: suspend () -> T
+    ): T {
+        val key = name(cacheId, path, edge)
+        val mutex = locks.computeIfAbsent(key) { kotlinx.coroutines.sync.Mutex() }
+        try {
+            return mutex.withLock { block() }
+        } finally {
+            if (!mutex.isLocked) locks.remove(key, mutex)
+        }
+    }
 
     fun file(context: Context, cacheId: String, path: String, edge: Int) =
         File(dir(context), name(cacheId, path, edge))
@@ -162,8 +185,20 @@ object Renders {
     /** いま置いてある枚数。準備の進み具合に使う。 */
     fun count(context: Context, cacheId: String, edge: Int): Int =
         dir(context).listFiles { file ->
-            file.name.startsWith("${cacheId}_") && file.name.endsWith("_$edge.jpg")
+            CacheName.isRender(file.name, cacheId, edge)
         }?.size ?: 0
+
+    /**
+     * 置いてある枚数を、（置き場の id, 大きさ）ごとに**1 回の列挙で**数える。
+     * ホームが全プロジェクトぶんを数えるときに、フォルダを何度も舐めない（A3）。
+     */
+    fun tally(context: Context): Map<Pair<String, Int>, Int> {
+        val out = HashMap<Pair<String, Int>, Int>()
+        dir(context).list()?.forEach { name ->
+            CacheName.parseRender(name)?.let { out.merge(it, 1, Int::plus) }
+        }
+        return out
+    }
 
     /** 置いてある量。**消すときに何 MB 消えるかを言うため。** */
     fun bytes(context: Context, cacheId: String): Long =

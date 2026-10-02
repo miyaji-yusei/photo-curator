@@ -29,12 +29,22 @@ export interface SourceIO {
   readSidecar(): Promise<string | null>
   /** 原子的に書く。`fileName` は `catalog.json` か退避の `catalog.<id>.json`。 */
   writeSidecar(json: string, fileName: string): Promise<void>
+  /**
+   * `catalog.json` を楽観ロックで書く（ロック → 読んで `expected` と同じか → 書く → 読み戻す → ロックを放す）。
+   * 見た版と違えば書かずに `changed`、ほかの端末が書いている最中なら `locked`。
+   */
+  writeSidecarChecked(json: string, expected: string | null): Promise<SidecarWriteOutcome>
 }
 
 export type SidecarAccessKind = 'readwrite' | 'readonly' | 'none'
+export type SidecarWriteOutcome = 'written' | 'changed' | 'locked'
 
 export const SIDECAR_DIR = '.photo-curator'
 export const SIDECAR_FILE = 'catalog.json'
+/** 書き込みの間だけ置く排他のロック。 */
+export const SIDECAR_LOCK = 'catalog.lock'
+/** これより古いロックは、書いた端末が途中で止まったものと見なして壊す。 */
+export const SIDECAR_LOCK_TTL_MS = 60_000
 /** `catalog.json` か `catalog.<英数字とハイフン>.json` だけ。別の名前・場所へ書かせない。 */
 export const isSidecarFileName = (name: string) =>
   name === SIDECAR_FILE || /^catalog\.[A-Za-z0-9-]{1,64}\.json$/.test(name)
@@ -95,6 +105,10 @@ export class PickerIO implements SourceIO {
   writeSidecar(): Promise<void> {
     return Promise.reject(new Error('この出所にはサイドカーを書けません。'))
   }
+
+  writeSidecarChecked(): Promise<SidecarWriteOutcome> {
+    return Promise.reject(new Error('この出所にはサイドカーを書けません。'))
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -132,10 +146,21 @@ export async function requestHandlePermission(handle: FileSystemDirectoryHandle)
 export class HandleFolderIO implements SourceIO {
   constructor(private readonly root: FileSystemDirectoryHandle) {}
 
+  /** 辿ったディレクトリ handle（サブパス → handle）。読み込みのたびに根から辿り直さない。 */
+  private readonly dirs = new Map<string, FileSystemDirectoryHandle>()
+
   private async resolveDir(subPath: string): Promise<FileSystemDirectoryHandle> {
     let dir = this.root
+    let walked = ''
     for (const part of subPath.split('/').filter(Boolean)) {
+      walked = walked ? `${walked}/${part}` : part
+      const cached = this.dirs.get(walked)
+      if (cached) {
+        dir = cached
+        continue
+      }
       dir = await dir.getDirectoryHandle(part)
+      this.dirs.set(walked, dir)
     }
     return dir
   }
@@ -151,8 +176,9 @@ export class HandleFolderIO implements SourceIO {
       if (handle.kind === 'directory') {
         result.push({ name, isDirectory: true, size: 0, mtimeMs: 0 })
       } else {
-        const file = await (handle as FileSystemFileHandle).getFile()
-        result.push({ name, isDirectory: false, size: file.size, mtimeMs: file.lastModified })
+        // size・mtimeMs は走査の側で使わない。getFile() は 1 枚ごとにブラウザとファイルシステムの
+        // 往復になるので呼ばない（読み込み時の File.lastModified は本物なので、撮影時刻の手がかりは残る）。
+        result.push({ name, isDirectory: false, size: 0, mtimeMs: 0 })
       }
     }
     return result
@@ -195,6 +221,36 @@ export class HandleFolderIO implements SourceIO {
     } catch (cause) {
       await writable.abort().catch(() => undefined)
       throw cause
+    }
+  }
+
+  /**
+   * 楽観ロックで `catalog.json` を書く。File System Access には「無ければ作る（あれば失敗）」が無いので、
+   * ロックは「無いことを確かめて作り、作ったあと中身が自分のものか読み直す」で取る（取り合いの隙は小さい）。
+   * 確かめの本命は「読んで見た版と同じか」と「読み戻し」（古い版のアプリはロックを見ない）。
+   */
+  async writeSidecarChecked(json: string, expected: string | null): Promise<SidecarWriteOutcome> {
+    const dir = await this.root.getDirectoryHandle(SIDECAR_DIR, { create: true })
+    const mark = `${Date.now()}-${Math.random().toString(36).slice(2)}`
+    try {
+      const existing = await (await dir.getFileHandle(SIDECAR_LOCK)).getFile()
+      if (Date.now() - existing.lastModified < SIDECAR_LOCK_TTL_MS) return 'locked'
+    } catch (cause) {
+      if (!(cause instanceof DOMException && cause.name === 'NotFoundError')) throw cause
+    }
+    const lock = await dir.getFileHandle(SIDECAR_LOCK, { create: true })
+    const lockWriter = await lock.createWritable()
+    await lockWriter.write(mark)
+    await lockWriter.close()
+    try {
+      if ((await (await lock.getFile()).text()) !== mark) return 'locked'
+      if ((await this.readSidecar()) !== expected) return 'changed'
+      await this.writeSidecar(json, SIDECAR_FILE)
+      return (await this.readSidecar()) === json ? 'written' : 'changed'
+    } finally {
+      // 自分のロックだけ消す（取り合いで負けたときは、勝った方のロックを残す）。
+      const still = await lock.getFile().then(file => file.text()).catch(() => '')
+      if (still === mark) await dir.removeEntry(SIDECAR_LOCK).catch(() => undefined)
     }
   }
 }
@@ -243,6 +299,10 @@ export class DevFolderIO implements SourceIO {
   }
 
   writeSidecar(): Promise<void> {
+    return Promise.reject(new Error('開発用のフォルダにはサイドカーを書けません。'))
+  }
+
+  writeSidecarChecked(): Promise<SidecarWriteOutcome> {
     return Promise.reject(new Error('開発用のフォルダにはサイドカーを書けません。'))
   }
 }

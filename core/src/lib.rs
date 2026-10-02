@@ -9,6 +9,9 @@
 #[cfg(feature = "uniffi")]
 uniffi::include_scaffolding!("photo_curator_core");
 
+pub mod sidecar_sync;
+pub use sidecar_sync::*;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PhotoRef {
     pub relative_path: String,
@@ -30,7 +33,7 @@ pub struct BurstThreshold {
     pub d_hash_version: i32,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PairOverride {
     /// **読むときは旧い短い形（`l`/`r`/`d`）も受け付ける。**
     /// 2026-09-16 までの Android 版がこの名前で書いていて、NAS には
@@ -405,13 +408,21 @@ fn shift_star(session: &mut Session, id: &str, delta: i32) {
 /// **選ばれたものだけ星が 1 つ上がる。** 選ばれなかったものは据え置きで、
 /// そのラウンドから外れる。「落とす」は星を下げることではない。
 pub fn advance(session: Session, selected: Vec<String>) -> Session {
+    // 出しているものが無い（終わっている）なら何もしない。空の判断を履歴に
+    // 積むと、次の「1 つ戻す」が何も戻さず、1 回無駄に押させる（U38・R16）。
+    if session.current.is_empty() {
+        return session;
+    }
     let mut next = session;
     let group = next.current.clone();
     // 画面に無いものが渡ってきても無視する。**呼び出し側を信用しない。**
-    let chosen: Vec<String> = selected
-        .into_iter()
-        .filter(|id| group.contains(id))
-        .collect();
+    // 同じものが 2 回来ても 1 回として扱う（2 回入れると星が +2 になる。R16）。
+    let mut chosen: Vec<String> = Vec::new();
+    for id in selected {
+        if group.contains(&id) && !chosen.contains(&id) {
+            chosen.push(id);
+        }
+    }
 
     // 確定の前の星を控える（代表と仲間）。
     let mut before: HashMap<String, i32> = HashMap::new();
@@ -740,6 +751,8 @@ pub fn round_for(
     if chosen.len() < 2 {
         return None;
     }
+    let in_round: std::collections::HashSet<String> =
+        chosen.iter().map(|photo| photo.relative_path.clone()).collect();
 
     let mut session = start_round(
         chosen,
@@ -754,10 +767,53 @@ pub fn round_for(
     session.ratings = previous.ratings;
     // **まとまりも引き継ぐ。** 作り直すだけだと、前のラウンドで決めた組が
     // 結果画面から消える（連写の中身を選別する入口も一緒に消える）。
-    let mut members = previous.members;
-    members.extend(session.members);
-    session.members = members;
+    session.members = carry_members(previous.members, session.members, &in_round);
     Some(session)
+}
+
+/// 前のラウンドまでのまとまりに、新しいラウンドのまとまりを重ねる。
+///
+/// 新しい組が同じ代表を使うときは新しい方で上書きする（04 章）。ただし
+/// **新しい組に入った写真が前のラウンドで連れていた仲間は、新しい組に連れてくる。**
+/// 次のラウンドに出るのは代表だけなので、別々のまとまりの代表どうしが
+/// 隣になって畳まれることがある（間の写真を落としたとき）。そのまま上書きすると
+/// 前の仲間が代表から外れ、代表を選んでも仲間の星が動かない（INV-2 が破れる。U38・R15）。
+///
+/// 連れてくるのは、**このラウンドで組み直していない仲間だけ**（`in_round` に無いもの）。
+/// このラウンドに出ている写真は、新しい組み方の方を採る。
+/// 畳まれてもう代表でなくなった写真の記録は消す（1 枚が 2 つのまとまりに入らない）。
+fn carry_members(
+    previous: HashMap<String, Vec<String>>,
+    fresh: HashMap<String, Vec<String>>,
+    in_round: &std::collections::HashSet<String>,
+) -> HashMap<String, Vec<String>> {
+    let mut all = previous.clone();
+    for (rep, mates) in fresh {
+        let mut merged: Vec<String> = Vec::new();
+        for id in &mates {
+            let carried: Vec<String> = match previous.get(id) {
+                Some(old) if old.contains(id) => old
+                    .iter()
+                    .filter(|mate| *mate == id || !in_round.contains(*mate))
+                    .cloned()
+                    .collect(),
+                Some(old) => std::iter::once(id.clone())
+                    .chain(old.iter().filter(|mate| !in_round.contains(*mate)).cloned())
+                    .collect(),
+                None => vec![id.clone()],
+            };
+            for mate in carried {
+                if !merged.contains(&mate) {
+                    merged.push(mate);
+                }
+            }
+            if id != &rep {
+                all.remove(id);
+            }
+        }
+        all.insert(rep, merged);
+    }
+    all
 }
 
 pub fn next_round(
@@ -784,6 +840,8 @@ pub fn next_round(
     if remaining.len() < 2 {
         return None;
     }
+    let in_round: std::collections::HashSet<String> =
+        remaining.iter().map(|photo| photo.relative_path.clone()).collect();
 
     let mut session = start_round(
         remaining,
@@ -799,9 +857,8 @@ pub fn next_round(
     session.ratings = previous.ratings;
     // **まとまりも引き継ぐ。** 作り直すだけだと、前のラウンドで決めた組が
     // 結果画面から消える（連写の中身を選別する入口も一緒に消える）。
-    let mut members = previous.members;
-    members.extend(session.members);
-    session.members = members;
+    // 別々のまとまりの代表が畳まれたときは、前の仲間も連れてくる（R15）。
+    session.members = carry_members(previous.members, session.members, &in_round);
     // history は引き継がない。**戻すはラウンドをまたがない。**
     // またぐと、戻した先の round と target_star が合わなくなる。
     Some(session)
@@ -830,7 +887,9 @@ pub fn session_from_json(json: String) -> Option<Session> {
 // サイドカー（写真のフォルダに置く catalog.json）
 // ---------------------------------------------------------------------------
 //
-// **UDL には足さない。** Android は今の Kotlin（`Sidecar.kt`）のまま。
+// 形（`Sidecar`）と旧い判断（`sidecar_decide`）はここ。U33 で足した判断
+// （正規化・比較キー・未着手・`sidecar_plan`・混ぜ方・鍵の変換）は
+// `sidecar_sync` モジュールにあり、UDL にも足した（Android は U35 で切り替える）。
 // PC・Web は wasm 経由でここを直接呼ぶ（→ core-wasm）。
 // 中身と読み書きの形は `Sidecar.kt` と設計 03 章に合わせる。
 // 同じ NAS のファイルを Android と読み書きするので、**Android が書いた形を
@@ -849,7 +908,7 @@ fn default_updated_by_name() -> String {
     "別の端末".into()
 }
 
-/// 1 枚ぶんの記録。**いまは星だけ**（撮影時刻・指紋は端末側で作り直すので載せない）。
+/// 1 枚ぶんの記録。**いまは星だけ**（撮影時刻・ハッシュ値は端末側で作り直すので載せない）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SidecarPhoto {
     #[serde(default)]
@@ -888,6 +947,57 @@ pub struct Sidecar {
     /// 学習した連写の境目。学習していなければ無し。
     #[serde(rename = "burstDistance", skip_serializing_if = "Option::is_none", default)]
     pub burst_distance: Option<u32>,
+    // ---- v2（U33）で足した項目。**すべて省略できる。** ----
+    // 古い版（version なし・1）の catalog.json はこれらが無いまま読める。
+    // 古い版のアプリは知らない項目を無視する（serde も Kotlin の decode も
+    // 未知の項目で失敗しない）。型が違う値が入っていても、ここは読み捨てて
+    // 全体を読めないことにはしない（`sidecar_sync::lenient`）。
+    /// 書くたびに作る乱数。版の見分けはこれで行う（無ければ `legacy:<updatedAt>:<updatedBy>`）。
+    #[serde(
+        rename = "writeId",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "sidecar_sync::lenient"
+    )]
+    pub write_id: Option<String>,
+    /// 書いた端末が、その時点で見ていた版（`writeId` か `legacy:`）。
+    #[serde(
+        rename = "basedOn",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "sidecar_sync::lenient"
+    )]
+    pub based_on: Option<String>,
+    /// これまでの版の見分け（新しい順、`basedOn` が先頭）。早送りの判定に使う。
+    /// 古い版のアプリが一度でも書くと途切れる（途切れたら早送りと見なさない）。
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "sidecar_sync::lenient"
+    )]
+    pub lineage: Option<Vec<String>>,
+    /// やり直しの世代。やり直すたびに新しい乱数。
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "sidecar_sync::lenient"
+    )]
+    pub epoch: Option<String>,
+    /// 写真の鍵の基準。`"folder"` ＝ 選んだフォルダからの相対・`/` 区切り。
+    #[serde(
+        rename = "keyBase",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "sidecar_sync::lenient"
+    )]
+    pub key_base: Option<String>,
+    /// 判断と画面のための要約（Session から作り直せる値。判断には使わない）。
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "sidecar_sync::lenient"
+    )]
+    pub progress: Option<SidecarProgress>,
 }
 
 /// サイドカーを文字列にする。**形は core が持つ。** 各環境が独自に組み立てない。
@@ -2023,6 +2133,7 @@ mod tests {
             burst_overrides: vec![],
             sessions: SidecarSessions::default(),
             burst_distance: None,
+            write_id: None, based_on: None, lineage: None, epoch: None, key_base: None, progress: None,
         };
         let outcome = sidecar_decide(100, "device-a".into(), false, Some(theirs));
         assert!(matches!(outcome, SidecarSync::Settled));
@@ -2039,6 +2150,7 @@ mod tests {
             burst_overrides: vec![],
             sessions: SidecarSessions::default(),
             burst_distance: None,
+            write_id: None, based_on: None, lineage: None, epoch: None, key_base: None, progress: None,
         };
         let outcome = sidecar_decide(100, "device-a".into(), true, Some(theirs));
         assert!(matches!(outcome, SidecarSync::Push));
@@ -2055,6 +2167,7 @@ mod tests {
             burst_overrides: vec![],
             sessions: SidecarSessions::default(),
             burst_distance: None,
+            write_id: None, based_on: None, lineage: None, epoch: None, key_base: None, progress: None,
         };
         let outcome = sidecar_decide(100, "device-a".into(), false, Some(theirs));
         match outcome {
@@ -2074,6 +2187,7 @@ mod tests {
             burst_overrides: vec![],
             sessions: SidecarSessions::default(),
             burst_distance: None,
+            write_id: None, based_on: None, lineage: None, epoch: None, key_base: None, progress: None,
         };
         let outcome = sidecar_decide(100, "device-a".into(), true, Some(theirs));
         match outcome {
@@ -2094,6 +2208,7 @@ mod tests {
             burst_overrides: vec![],
             sessions: SidecarSessions::default(),
             burst_distance: None,
+            write_id: None, based_on: None, lineage: None, epoch: None, key_base: None, progress: None,
         };
         let outcome = sidecar_decide(100, "device-a".into(), true, Some(theirs));
         assert!(matches!(outcome, SidecarSync::Clash(_)));
@@ -2118,6 +2233,7 @@ mod tests {
                 tournament: Some(round(&["1", "2"], 2)),
             },
             burst_distance: Some(9),
+            write_id: None, based_on: None, lineage: None, epoch: None, key_base: None, progress: None,
         };
         let json = sidecar_to_json(sidecar.clone());
         let back = sidecar_from_json(json).expect("読み戻せるはず");
@@ -2168,5 +2284,153 @@ mod tests {
     fn サイドカー_壊れたjsonはnone() {
         assert!(sidecar_from_json("{ 壊れている".into()).is_none());
         assert!(sidecar_from_json("not json at all".into()).is_none());
+    }
+
+    // ---- U38（レビュー R15〜R17）の再現 ----
+
+    /// A1・A2 が連写、B は別物、A3 は単独（A4 があれば A3・A4 が連写）。
+    /// B を挟んで切れているが、**A1 と A3 だけを並べると基準では繋がる**。
+    fn split_by_b(with_a4: bool) -> Vec<PhotoRef> {
+        let mut photos = vec![
+            photo("A1", 0, "0000000000000000"),
+            photo("A2", 1000, "0000000000000000"),
+            photo("B", 2000, "ffffffffffffffff"),
+            photo("A3", 3000, "0000000000000000"),
+        ];
+        if with_a4 {
+            photos.push(photo("A4", 3500, "0000000000000000"));
+        }
+        photos
+    }
+
+    /// 1 ラウンド目: A1 と A3 を通し、B を落とす。
+    fn pass_a1_and_a3(photos: &[PhotoRef]) -> Session {
+        let session = start_round(photos.to_vec(), 3, 0, true, threshold(), vec![]);
+        assert_eq!(session.current, vec!["A1", "B", "A3"]);
+        let session = advance(session, vec!["A1".into(), "A3".into()]);
+        assert_eq!(session.survivors, vec!["A1", "A3"]);
+        session
+    }
+
+    #[test]
+    fn r15_次のラウンドで代表どうしが畳まれても前の仲間の星が追従する() {
+        let photos = split_by_b(false);
+        let first = pass_a1_and_a3(&photos);
+        assert_eq!(first.ratings["A2"], 1);
+
+        let second = next_round(first, photos, true, threshold(), vec![]).unwrap();
+        // A1 と A3 は 1 つのまとまりとして出る（畳み方は今のまま）。
+        assert_eq!(second.current, vec!["A1"]);
+
+        let after = advance(second, vec!["A1".into()]);
+        // INV-2: 仲間の星は常に代表と同じ。
+        assert_eq!(after.ratings["A1"], 2);
+        assert_eq!(after.ratings["A3"], 2);
+        assert_eq!(after.ratings["A2"], 2, "前のラウンドの仲間 A2 が追従していない");
+    }
+
+    #[test]
+    fn r15_畳まれた代表の仲間も追従し戻すと元に返る() {
+        let photos = split_by_b(true);
+        let first = pass_a1_and_a3(&photos);
+        assert_eq!(first.ratings["A4"], 1);
+
+        let second = next_round(first, photos, true, threshold(), vec![]).unwrap();
+        // 畳まれた A3 はもう代表ではない。**1 枚が 2 つのまとまりに入らない。**
+        assert!(!second.members.contains_key("A3"));
+        assert_eq!(second.members["A1"], vec!["A1", "A2", "A3", "A4"]);
+
+        let after = advance(second, vec!["A1".into()]);
+        for id in ["A1", "A2", "A3", "A4"] {
+            assert_eq!(after.ratings[id], 2, "{id} が代表に追従していない");
+        }
+        assert_eq!(after.ratings["B"], 0);
+
+        let back = undo(after);
+        for id in ["A1", "A2", "A3", "A4"] {
+            assert_eq!(back.ratings[id], 1, "{id} が戻っていない");
+        }
+    }
+
+    #[test]
+    fn r15_星を指定したラウンドでも畳まれた代表の仲間が追従する() {
+        let photos = split_by_b(false);
+        let mut first = pass_a1_and_a3(&photos);
+        // 人が A2 だけ星を直した（04 章: 手直しの差はその後の確定でも保たれる）。
+        first.ratings.insert("A2".into(), 3);
+
+        let again = round_for(first, photos, 1, true, threshold(), vec![]).unwrap();
+        assert_eq!(again.current, vec!["A1"]);
+        let after = advance(again, vec!["A1".into()]);
+        assert_eq!(after.ratings["A1"], 2);
+        assert_eq!(after.ratings["A3"], 2);
+        // 畳まれなかったとき（A1 が単独）と同じく、差分で動く。
+        assert_eq!(after.ratings["A2"], 4, "前の仲間 A2 が差分で追従していない");
+    }
+
+    #[test]
+    fn r15_次のラウンドで畳まれなければ前のまとまりはそのまま() {
+        // 既存の挙動の固定: 代表が単独のまま上がるなら、前の仲間をそのまま持つ。
+        let photos = split_by_b(false);
+        let session = start_round(photos.clone(), 3, 0, true, threshold(), vec![]);
+        let session = advance(session, vec!["A1".into(), "B".into()]);
+        let second = next_round(session, photos, true, threshold(), vec![]).unwrap();
+        assert_eq!(second.members["A1"], vec!["A1", "A2"]);
+        let after = advance(second, vec!["A1".into()]);
+        assert_eq!(after.ratings["A2"], 2);
+        assert_eq!(after.ratings["B"], 1);
+    }
+
+    #[test]
+    fn r16_同じidを2回渡しても星は1つだけ上がる() {
+        let session = round(&["1", "2", "3", "4"], 2);
+        let after = advance(session, vec!["1".into(), "1".into()]);
+        assert_eq!(after.ratings["1"], 1);
+        assert_eq!(after.survivors, vec!["1"]);
+        assert_eq!(after.history.last().unwrap().chosen, vec!["1"]);
+        // 戻すと元どおり。
+        let back = undo(after);
+        assert_eq!(back.ratings["1"], 0);
+        assert!(back.survivors.is_empty());
+    }
+
+    #[test]
+    fn r16_連写の代表を2回渡しても仲間の星は1つだけ上がる() {
+        let session = start_round(burst_photos(), 2, 0, true, threshold(), vec![]);
+        let after = advance(session, vec!["1.jpg".into(), "1.jpg".into()]);
+        assert_eq!(after.ratings["1.jpg"], 1);
+        assert_eq!(after.ratings["2.jpg"], 1);
+        assert_eq!(after.survivors, vec!["1.jpg"]);
+    }
+
+    #[test]
+    fn r16_終わったあとに確定しても履歴は増えない() {
+        let session = round(&["1", "2"], 2);
+        let done = advance(session, vec!["1".into()]);
+        assert!(done.finished);
+        let history = done.history.len();
+        let again = advance(done, vec!["1".into()]);
+        assert!(again.finished);
+        assert_eq!(again.history.len(), history, "空の判断が履歴に積まれた");
+        assert_eq!(again.ratings["1"], 1);
+        // 1 回の「戻す」で直前の判断が戻る（無駄押しが要らない）。
+        let back = undo(again);
+        assert_eq!(back.ratings["1"], 0);
+        assert_eq!(back.current, vec!["1", "2"]);
+    }
+
+    #[test]
+    fn r17_同じ2枚への手直しが重なったら先のものが効く() {
+        // 仕様（03・04 章）に重なりの決まりは無い。**今の挙動の固定**。
+        // sidecar_sync の canonical_overrides・merge_overrides もこの「先が勝つ」に
+        // 合わせてあるので、変えるならそちらと一緒に変える（PC の DB は後が勝つ）。
+        let photos = vec![
+            photo("1.jpg", 1000, "0000000000000000"),
+            photo("2.jpg", 2000, "0000000000000000"),
+        ];
+        let groups = group_bursts(photos.clone(), threshold(), vec![split("1.jpg", "2.jpg"), join("1.jpg", "2.jpg")]);
+        assert_eq!(groups.len(), 2);
+        let groups = group_bursts(photos, threshold(), vec![join("1.jpg", "2.jpg"), split("1.jpg", "2.jpg")]);
+        assert_eq!(groups.len(), 1);
     }
 }

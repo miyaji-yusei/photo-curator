@@ -173,6 +173,8 @@ object Photos {
      */
     suspend fun forSource(context: Context, source: Source): List<Photo> = try {
         list(context, source)
+    } catch (error: kotlinx.coroutines.CancellationException) {
+        throw error
     } catch (error: Exception) {
         // 画面から呼ばれる。**ここで落とさない。** 理由は準備の側（list）で残す。
         Log.w("Photos", "写真を読めなかった: ${source.kind}", error)
@@ -214,19 +216,24 @@ object Photos {
      * NAS のフォルダの写真。**撮影時刻は EXIF から取る。**
      *
      * 更新時刻はコピーしたときに変わってしまい、撮影順にならない。
-     * EXIF は原本の先頭 128KB に入っているので、そこだけ読む。
-     * 読めたぶんは指紋と一緒に控えるので、2 回目以降は網に行かない。
+     * EXIF は原本の先頭 64KB に入っているので、そこだけ読む。
+     * 読めたぶんはハッシュ値と一緒に控えるので、2 回目以降は網に行かない。
      */
     private suspend fun fromNas(context: Context, key: String): List<Photo> {
         val nasId = key.substringBefore("|")
         val deep = key.endsWith("|**")
         val folder = key.removeSuffix("|**").substringAfter("|")
-        val nas = NasStore.all(context).firstOrNull { it.id == nasId } ?: return emptyList()
-        val password = NasPasswords.password(context, nas) ?: return emptyList()
+        // **取れなかったことを「空」にしない。** 空として控えると、作り終えたハッシュ値まで
+        // 消えて、失敗が成功に見える（Amazon と同じく理由を投げる）。
+        val nas = NasStore.all(context).firstOrNull { it.id == nasId }
+            ?: throw IllegalStateException("NAS の登録が見つかりません")
+        val password = NasPasswords.password(context, nas)
+            ?: throw IllegalStateException("NAS のパスワードが要ります")
         // **「以下ぜんぶ」なら入れ子もたどる。** 印は鍵の末尾に付いている。
         val listed = if (deep) Smb.photosDeep(nas, password, folder)
         else Smb.photos(nas, password, folder)
-        if (listed !is SmbResult.Ok) return emptyList()
+        if (listed is SmbResult.Failed) throw IllegalStateException(listed.reason)
+        listed as SmbResult.Ok
         return listed.value.map { entry ->
             Photo(
                 // MediaStore の id は無いので、道筋から作る。**同じ道筋なら同じ値。**

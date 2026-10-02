@@ -72,7 +72,7 @@ object TakeNas {
         val answer = Smb.reading(nas, password) { reader ->
             for (photo in photos) {
                 val path = photo.smb?.path
-                if (path == null) { failed += 1; continue }
+                if (path == null) { failed += 1; onProgress(done + failed, photos.size); continue }
                 try {
                     // **1 枚ずつ読んで、1 枚ずつ書く。** まとめて持つと 6MB × 枚数の
                     // メモリを食う。途中で止まっても、書けた分は端末に残る。
@@ -80,6 +80,7 @@ object TakeNas {
                     if (bytes == null) {
                         failed += 1
                         if (reason == null) reason = "${photo.name} を読めませんでした"
+                        onProgress(done + failed, photos.size)
                         continue
                     }
                     val values = ContentValues().apply {
@@ -93,6 +94,7 @@ object TakeNas {
                     if (uri == null) {
                         failed += 1
                         if (reason == null) reason = "端末に書き込めませんでした"
+                        onProgress(done + failed, photos.size)
                         continue
                     }
                     context.contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
@@ -104,6 +106,8 @@ object TakeNas {
                         null, null
                     )
                     done += 1
+                } catch (error: kotlinx.coroutines.CancellationException) {
+                    throw error
                 } catch (error: Exception) {
                     failed += 1
                     Log.w(TAG, "保存できなかった: ${photo.name}", error)
@@ -168,6 +172,8 @@ object TakeNas {
                     }
                     is SmbResult.Ok -> done += 1
                 }
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
             } catch (error: Exception) {
                 failed += 1
                 Log.w(TAG, "分けられなかった: ${photo.name}", error)

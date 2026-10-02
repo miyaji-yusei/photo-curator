@@ -91,50 +91,92 @@ class SlideshowGestureTest {
         }
     }
 
-    // 枠 left=0, top=0, 幅 1000, 高さ 800 → 上の帯は y < 200（Web の tapDecision のテストと同じ値）
+    // 枠 left=0, top=0, 幅 1000, 高さ 800 → 上は y < 240、左は x < 300、右は x > 700（Web の tapDecision のテストと同じ値）
     private fun tap(x: Float, y: Float) = tapDecision(x, y, 0f, 0f, 1000f, 800f)
 
-    @Test fun タップは左半分が落とす右半分が残す() {
-        assertEquals(Drop, tap(100f, 400f))
-        assertEquals(Drop, tap(379f, 400f))
-        assertEquals(Keep, tap(621f, 400f))
-        assertEquals(Keep, tap(900f, 799f))
+    @Test fun 定数は0点3() {
+        assertEquals(0.3, SlideshowGesture.TOP_ZONE_RATIO, 1e-9)
+        assertEquals(0.3, SlideshowGesture.SIDE_ZONE_RATIO, 1e-9)
     }
 
-    // 枠 1000×800 → 中心 (500,400)、±120 × ±96、上の帯は y < 200（Web と同じ値）
-    @Test fun ほぼ中心は何もしない() {
-        assertEquals(0.12f, SlideshowGesture.CENTER_RATIO, eps)
-        assertNull(tap(500f, 400f))
-        assertNull(tap(450f, 350f))
-        assertNull(tap(550f, 450f))
+    @Test fun 上の30パーセント未満は左右中央を問わず星5() {
+        assertEquals(Top, tap(100f, 0f))
+        assertEquals(Top, tap(900f, 239f))
+        assertEquals(Top, tap(500f, 100f))
+        assertEquals(Top, tap(300f, 239f))
+        assertEquals(Top, tap(700f, 239f))
     }
 
-    @Test fun 中心の境目は含み1px外は左右で分ける() {
-        assertNull(tap(380f, 400f))
-        assertNull(tap(620f, 400f))
-        assertEquals(Drop, tap(379f, 400f))
-        assertEquals(Keep, tap(621f, 400f))
-        assertNull(tap(500f, 304f))
-        assertNull(tap(500f, 496f))
-        assertEquals(Keep, tap(500f, 497f))
-        assertEquals(Drop, tap(499f, 497f))
-        assertEquals(Keep, tap(500f, 303f))
-        assertEquals(Drop, tap(499f, 303f))
+    @Test fun 上の線から下は左右中央で分ける() {
+        assertEquals(Drop, tap(100f, 240f))
+        assertEquals(Keep, tap(900f, 240f))
+        assertNull(tap(500f, 240f))
     }
 
-    @Test fun 帯が優先で中心の長方形は帯の外() {
-        assertEquals(Top, tap(500f, 199f))
-        assertEquals(Keep, tap(500f, 200f))
-        // 低い枠では中心の長方形が帯にかかる。そのときも帯が先
-        assertEquals(Top, tapDecision(500f, 9f, 0f, 0f, 1000f, 40f))
-        assertNull(tapDecision(500f, 16f, 0f, 0f, 1000f, 40f))
+    @Test fun 左端は落とし右端は残す() {
+        assertEquals(Drop, tap(0f, 400f))
+        assertEquals(Drop, tap(299f, 400f))
+        assertEquals(Keep, tap(701f, 400f))
+        assertEquals(Keep, tap(999f, 799f))
+        assertEquals(Drop, tap(100f, 799f))
     }
 
-    @Test fun 中心は枠がずれていても枠の中心を基準にする() {
-        assertNull(tapDecision(400f, 300f, 200f, 100f, 400f, 400f))
-        assertNull(tapDecision(448f, 300f, 200f, 100f, 400f, 400f))
-        assertEquals(Keep, tapDecision(449f, 300f, 200f, 100f, 400f, 400f))
+    @Test fun ちょうど30パーセントと70パーセントの線は中央() {
+        assertNull(tap(300f, 400f))
+        assertNull(tap(700f, 400f))
+        assertNull(tap(300f, 799f))
+        assertNull(tap(700f, 240f))
     }
+
+    @Test fun 中央の縦帯は上の線の下から最下部まで何もしない() {
+        for (y in listOf(240f, 300f, 400f, 500f, 700f, 790f, 799f)) {
+            assertNull(tap(500f, y))
+            assertNull(tap(301f, y))
+            assertNull(tap(699f, y))
+        }
+    }
+
+    @Test fun 枠がずれていても枠を基準にする() {
+        // 枠 x=200..600, y=100..500 → 上は y<220、左は x<320、右は x>480
+        assertEquals(Top, tapDecision(400f, 219f, 200f, 100f, 400f, 400f))
+        assertEquals(Drop, tapDecision(319f, 300f, 200f, 100f, 400f, 400f))
+        assertNull(tapDecision(320f, 300f, 200f, 100f, 400f, 400f))
+        assertNull(tapDecision(480f, 499f, 200f, 100f, 400f, 400f))
+        assertEquals(Keep, tapDecision(481f, 300f, 200f, 100f, 400f, 400f))
+        assertNull(tapDecision(400f, 220f, 200f, 100f, 400f, 400f))
+    }
+
+    // 画面側（Slideshow.kt）と同じ手順: null（中央）の結果だけを二度タップの記録に使う
+    private fun runTaps(points: List<Triple<Long, Float, Float>>): Boolean {
+        var last: TapRecord? = null
+        var zoomed = false
+        for ((t, x, y) in points) {
+            if (tap(x, y) != null) { last = null; continue }
+            val now = TapRecord(t, x, y)
+            if (isDoubleTap(last, now)) { last = null; zoomed = true } else last = now
+        }
+        return zoomed
+    }
+
+    @Test fun 二度タップの拡大は中央の縦帯のどこでも成立する() {
+        assertTrue(runTaps(listOf(Triple(0L, 500f, 245f), Triple(200L, 500f, 250f))))
+        assertTrue(runTaps(listOf(Triple(0L, 500f, 400f), Triple(300L, 510f, 405f))))
+        assertTrue(runTaps(listOf(Triple(0L, 400f, 790f), Triple(100L, 420f, 795f))))
+        assertTrue(runTaps(listOf(Triple(0L, 301f, 500f), Triple(100L, 305f, 500f))))
+    }
+
+    @Test fun 左右と上の領域では二度タップしても拡大しない() {
+        assertTrue(!runTaps(listOf(Triple(0L, 100f, 500f), Triple(100L, 100f, 500f))))
+        assertTrue(!runTaps(listOf(Triple(0L, 900f, 500f), Triple(100L, 900f, 500f))))
+        assertTrue(!runTaps(listOf(Triple(0L, 500f, 100f), Triple(100L, 500f, 100f))))
+    }
+
+    @Test fun 間に別の領域が挟まれたり遅い遠い2回目は拡大しない() {
+        assertTrue(!runTaps(listOf(Triple(0L, 500f, 400f), Triple(50L, 100f, 400f), Triple(100L, 500f, 400f))))
+        assertTrue(!runTaps(listOf(Triple(0L, 500f, 400f), Triple(301L, 500f, 400f))))
+        assertTrue(!runTaps(listOf(Triple(0L, 400f, 400f), Triple(100L, 430f, 400f))))
+    }
+
 
     private fun at(time: Long, x: Float = 100f, y: Float = 100f) = TapRecord(time, x, y)
 
@@ -161,23 +203,6 @@ class SlideshowGestureTest {
         assertTrue(isDoubleTap(at(0, 100f, 100f), at(100, 116f, 116f)))
     }
 
-    @Test fun 上の帯は左右を問わず星5() {
-        assertEquals(Top, tap(100f, 0f))
-        assertEquals(Top, tap(900f, 199f))
-        assertEquals(Top, tap(500f, 100f))
-    }
-
-    @Test fun 帯の境目から下は左右で分ける() {
-        assertEquals(Drop, tap(100f, 200f))
-        assertEquals(Keep, tap(900f, 200f))
-    }
-
-    @Test fun 枠がずれていても枠を基準にする() {
-        assertEquals(Top, tapDecision(400f, 150f, 200f, 100f, 400f, 400f))
-        assertEquals(Keep, tapDecision(400f, 200f, 200f, 100f, 400f, 400f))
-        assertEquals(Drop, tapDecision(399f, 200f, 200f, 100f, 400f, 400f))
-    }
-
     @Test fun 飛んでいく先は枠の外() {
         assertTrue(flyTarget(Drop, 1000f, 600f).x < -1000f)
         assertTrue(flyTarget(Keep, 1000f, 600f).x > 1000f)
@@ -190,5 +215,32 @@ class SlideshowGestureTest {
         assertEquals(400f to 600f, fitContain(200f, 300f, 900f, 600f))
         assertEquals(50f to 50f, fitContain(10f, 10f, 100f, 50f))
         assertEquals(100f to 50f, fitContain(0f, 0f, 100f, 50f))
+    }
+
+    // U29: 実機で「中央を押したのに振り分けられる」と報告された状況。エミュレーターでは再現せず、
+    // 純関数の側で「指が少し動いても中心からは決定しない」ことを固定する（幅 411dp の折りたたみ閉じ）。
+    @Test fun 指が少し動いても決定にならない() {
+        val width = 411f
+        // 8dp 以上動いてドラッグ扱いになっても、決定量（幅の 18% = 約 74dp）に届かなければ戻すだけ
+        for (d in listOf(8f, 12f, 30f, 60f, 73f)) {
+            assertNull(judgeDrag(d, 0f, width))
+            assertNull(judgeDrag(-d, d / 2, width))
+            assertNull(judgeDrag(0f, -d, width))
+        }
+        assertTrue(isTap(7.9f, 0f))
+        assertTrue(!isTap(8f, 0f))
+    }
+
+    // 幅 411dp・高さ 781dp（Pixel 8 相当のステージ）: 上は 約 234dp、左右は 約 123dp ずつ、中央の縦帯は 約 164dp
+    @Test fun 領域の範囲をdpで確かめる() {
+        val w = 411f
+        val h = 781f
+        assertEquals(Top, tapDecision(w / 2, h * 0.3f - 0.01f, 0f, 0f, w, h))
+        assertNull(tapDecision(w / 2, h * 0.3f, 0f, 0f, w, h))
+        assertEquals(Drop, tapDecision(w * 0.3f - 0.01f, h / 2, 0f, 0f, w, h))
+        assertNull(tapDecision(w * 0.3f, h / 2, 0f, 0f, w, h))
+        assertNull(tapDecision(w * 0.7f, h / 2, 0f, 0f, w, h))
+        assertEquals(Keep, tapDecision(w * 0.7f + 0.01f, h / 2, 0f, 0f, w, h))
+        assertNull(tapDecision(w / 2, h - 1f, 0f, 0f, w, h))
     }
 }

@@ -93,7 +93,104 @@ export interface Sidecar {
   burstOverrides: PairOverride[]
   sessions: SidecarSessions
   burstDistance?: number
+  // ---- v2（U33）の項目。すべて省略できる（古い catalog.json には無い）。 ----
+  /** 書くたびに作る乱数。版の見分け。 */
+  writeId?: string | null
+  /** 書いた端末が見ていた版。 */
+  basedOn?: string | null
+  /** これまでの版（新しい順）。早送りの判定に使う。 */
+  lineage?: string[] | null
+  /** やり直しの世代。 */
+  epoch?: string | null
+  /** `"folder"` ＝ 写真の鍵が「選んだフォルダからの相対・`/` 区切り」。 */
+  keyBase?: string | null
+  /** 要約（判断には使わない）。 */
+  progress?: SidecarProgress | null
 }
+
+// ---- サイドカー同期（U33。core の sidecar_sync。形は core の serde のまま） ----
+
+/** 選別状況の要約（ダイアログの 1 行・catalog.json の `progress`）。 */
+export interface SidecarProgress {
+  started: boolean
+  round: number
+  finished: boolean
+  /** この ROUND で決めた組の数。 */
+  decided: number
+  /** まだ見ていない写真の数。 */
+  remaining: number
+  /** ★1 以上の数。 */
+  starred: number
+  total?: number | null
+  /** 手直しの数。 */
+  overrides: number
+  /** 連写の境目を学習したか。 */
+  learned: boolean
+}
+
+/** 選別状況の正規形（比べるための形。鍵はフォルダ形式）。中身は core に任せ、TS では触らない。 */
+export interface Judgement {
+  stars: { path: string, rating: number }[]
+  session: unknown | null
+  overrides: PairOverride[]
+  burst_distance: number | null
+  epoch: string | null
+}
+
+/** 端末の控え（最後に読んだ／書いた版）。一度も見ていなければ token は空。 */
+export interface SeenRecord {
+  token: string
+  key: string
+  epoch: string | null
+}
+
+export type SettledReason = 'Nothing' | 'Same' | 'NoChange' | 'Detached' | 'ReadOnly' | 'NewerVersion'
+export type PushReason = 'NoSidecar' | 'LocalChanged' | 'TheirsUntouched' | 'MineHasMore'
+export type PullReason = 'LocalUntouched' | 'FastForward' | 'TheirsHasMore'
+export type ClashReason = 'Diverged' | 'TheirsRestarted' | 'MineRestarted' | 'ExtrasConflict'
+/** この端末から見て（Ahead＝この端末の方が進んでいる）。 */
+export type ProgressOrder = 'Ahead' | 'Behind' | 'Even' | 'Unclear'
+export type MergeMode = 'Intersection' | 'Union'
+
+export interface MergePreview {
+  mine_starred: number
+  theirs_starred: number
+  intersection_starred: number
+  union_starred: number
+  undecided: number
+  mid_round: boolean
+}
+
+export interface MergeResult {
+  session: Session
+  ratings: Record<string, number>
+  overrides: PairOverride[]
+  burst_distance: number | null
+  epoch: string | null
+  starred: number
+  undecided: number
+}
+
+export interface KeyCoverage {
+  matched: number
+  total: number
+}
+
+/** 開き方の判断（設計書 §4.3）。 */
+export type SidecarPlan =
+  | { Settled: { seen: SeenRecord | null, reason: SettledReason } }
+  | { Push: { expected: string | null, aside_theirs: boolean, reason: PushReason } }
+  | { Pull: { theirs: Sidecar, aside_mine: boolean, seen: SeenRecord, reason: PullReason } }
+  | {
+    Clash: {
+      theirs: Sidecar
+      mine_progress: SidecarProgress
+      theirs_progress: SidecarProgress
+      order: ProgressOrder
+      reason: ClashReason
+      preview: MergePreview
+    }
+  }
 
 export type SidecarSync =
   | 'Settled'
@@ -292,4 +389,100 @@ export function sidecarDecide(
 ): SidecarSync {
   ensureReady()
   return wasm.sidecarDecide(seenAt, seenBy, localChanged, remote ?? null)
+}
+
+// ---- サイドカー同期（U33）。判断は core。ここは型を付けて呼ぶだけ。 ----
+
+/** 写真の鍵をそろえる（区切りを `/`、Unicode を NFC）。 */
+export function normalizeKey(key: string): string {
+  ensureReady()
+  return wasm.normalizeKey(key)
+}
+
+export function sidecarJudgement(sidecar: Sidecar): Judgement {
+  ensureReady()
+  return wasm.sidecarJudgement(sidecar)
+}
+
+export function judgementEquivalent(a: Judgement, b: Judgement): boolean {
+  ensureReady()
+  return wasm.judgementEquivalent(a, b)
+}
+
+/** 比較キー（`j1:` ＋ 16 進）。画像のハッシュ値とは関係が無い。 */
+export function judgementKey(judgement: Judgement): string {
+  ensureReady()
+  return wasm.judgementKey(judgement)
+}
+
+export function isUntouched(judgement: Judgement): boolean {
+  ensureReady()
+  return wasm.isUntouched(judgement)
+}
+
+export function judgementProgress(judgement: Judgement): SidecarProgress {
+  ensureReady()
+  return wasm.judgementProgress(judgement)
+}
+
+export function sidecarToken(sidecar: Sidecar): string {
+  ensureReady()
+  return wasm.sidecarToken(sidecar)
+}
+
+export function sidecarSeen(sidecar: Sidecar): SeenRecord {
+  ensureReady()
+  return wasm.sidecarSeen(sidecar)
+}
+
+/**
+ * 開き方の判断。`remote` は読めた catalog.json（鍵は `sidecarNormalizeKeys` 済み）か null。
+ * **つながらない・壊れているときは呼ばない。**
+ */
+export function sidecarPlan(
+  seen: SeenRecord, local: Judgement, remote: Sidecar | null, writable: boolean, detached: boolean
+): SidecarPlan {
+  ensureReady()
+  return wasm.sidecarPlan(seen, local, remote ?? null, writable, detached)
+}
+
+/** 書く直前に v2 の印（version・writeId・basedOn・lineage・keyBase・progress）を入れる。 */
+export function sidecarStamp(sidecar: Sidecar, writeId: string, base: Sidecar | null): Sidecar {
+  ensureReady()
+  return wasm.sidecarStamp(sidecar, writeId, base ?? null)
+}
+
+export function mergeJudgements(
+  mine: Judgement, theirs: Judgement, mode: MergeMode, groupSize: number, freshEpoch: string
+): MergeResult {
+  ensureReady()
+  return wasm.mergeJudgements(mine, theirs, mode, groupSize, freshEpoch)
+}
+
+export function mergePreview(mine: Judgement, theirs: Judgement): MergePreview {
+  ensureReady()
+  return wasm.mergePreview(mine, theirs)
+}
+
+/** 端末の鍵 → サイドカーの鍵（選んだフォルダからの相対・`/`・NFC）。PC・Web は prefix が空。 */
+export function sidecarKeysToFolder(sidecar: Sidecar, prefix: string): Sidecar {
+  ensureReady()
+  return wasm.sidecarKeysToFolder(sidecar, prefix)
+}
+
+/** サイドカーの鍵 → 端末の鍵。Windows の PC は separator を `\`。 */
+export function sidecarKeysFromFolder(sidecar: Sidecar, prefix: string, separator: string): Sidecar {
+  ensureReady()
+  return wasm.sidecarKeysFromFolder(sidecar, prefix, separator)
+}
+
+/** 読んだ直後に鍵をフォルダ形式にそろえる（古い Android の形は、選んだフォルダのパスから推定して外す）。 */
+export function sidecarNormalizeKeys(sidecar: Sidecar, folderHint: string): Sidecar {
+  ensureReady()
+  return wasm.sidecarNormalizeKeys(sidecar, folderHint)
+}
+
+export function sidecarKeyCoverage(sidecar: Sidecar, photoKeys: string[]): KeyCoverage {
+  ensureReady()
+  return wasm.sidecarKeyCoverage(sidecar, photoKeys)
 }

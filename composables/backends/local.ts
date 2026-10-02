@@ -6,12 +6,12 @@
  * - `store`     … プロジェクト・写真の行・Session・手直し（IndexedDB `photo-curator-mb`）
  * - `blobStore` … サムネイル・表示用画像の実体と object URL
  * - `sourceIO`  … 出所から原本のバイトを得る（ピッカー・フォルダ・開発用 HTTP）
- * - `fetcher`   … Amazon のバイト（指紋・ZIP 用。既定は中継サーバー。表示は素の `<img>` で足りる）
+ * - `fetcher`   … Amazon のバイト（ハッシュ値・ZIP 用。既定は中継サーバー。表示は素の `<img>` で足りる）
  *
  * - 写真の出所は 3 通り。ピッカーは**原本を保存しない**（iOS には永続的なファイルハンドルが無く、
  *   リロードすると参照が切れる）。フォルダは handle を保存して、次に開いたとき読み直す。
  *   どちらも 256px のサムネイルと表示用画像・星を残すので、リロード後も選別を続けられる。
- * - 解析（撮影日時・サムネイル・指紋）はブラウザの復号器で行う。Safari は HEIC も読める。
+ * - 解析（撮影日時・サムネイル・ハッシュ値）はブラウザの復号器で行う。Safari は HEIC も読める。
  * - **写真ライブラリは書き換えない。** 反映は共有シートや ZIP 書き出しなど、利用者の操作を経由する。
  */
 import type {
@@ -39,6 +39,7 @@ import { scanFolder } from '~/utils/folderScan'
 import {
   comparePhotos, filterPhotos, pagePhotos, summarizeRatings
 } from '~/utils/photoQuery'
+import { orderForAnalysis } from '~/utils/analysisOrder'
 import { uniquePaths } from '~/utils/uniquePath'
 import { randomUUID } from '~/utils/uuid'
 import type { Fetcher } from '~/composables/backends/web/fetcher'
@@ -80,10 +81,10 @@ function subPathOf(row: StoredPhoto): string {
 
 /** 共有が消えている（404）ときの理由。`lib/amazonShare.ts` の文と同じ。 */
 const LINK_GONE = 'このリンクは削除されたか、無効です。'
-/** サムネイルの長辺（08章 6「絵の 3 段」）。指紋もここから作る（PC と同じ）。 */
+/** サムネイルの長辺（08章 6「絵の 3 段」）。ハッシュ値もここから作る（PC と同じ）。 */
 const AMAZON_THUMB_EDGE = 160
 const SAMPLE_LIMIT = 12
-/** 指紋作りの並列。Amazon への通信は控えめに。 */
+/** ハッシュ値作りの並列。Amazon への通信は控えめに。 */
 const HASH_CONCURRENCY = 4
 /** 何枚ごとに行へ書くか。 */
 const HASH_SAVE_EVERY = 20
@@ -97,7 +98,7 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
   const store = parts.store ?? createIdbStore()
   const blobStore = parts.blobStore ?? createIdbBlobStore()
   const sourceIO = parts.sourceIO ?? createSourceIOSet()
-  // Amazon の指紋・ZIP が使う。既定は中継（Nitro）。無ければ null が返るだけ。
+  // Amazon のハッシュ値・ZIP が使う。既定は中継（Nitro）。無ければ null が返るだけ。
   const fetcher = parts.fetcher ?? relayFetcher
 
   const capabilities = capabilitiesFor('browser', { directoryPicker: hasDirectoryPicker() })
@@ -177,7 +178,7 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
   /**
    * Amazon の写真に URL を付ける。**画像は端末に置かず、URL をそのまま `<img>` に渡す**
    * （crossOrigin を付けない素の `<img>` なら、CORS の無い画像 CDN からも出せる）。
-   * サムネイルは指紋を作るときに取れていればその実体、無ければ `viewBox=160`。
+   * サムネイルはハッシュ値を作るときに取れていればその実体、無ければ `viewBox=160`。
    * 表示用は `viewBox=<長辺>`、原本（`path`）は tempLink そのもの。
    */
   async function decorateAmazon(rows: StoredPhoto[], links: Record<string, string>): Promise<Photo[]> {
@@ -197,10 +198,12 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
   }
 
   /** 行に URL を付けて画面が使える形にする。サムネイルは 1 枚ずつ読む。 */
-  async function decorate(rows: StoredPhoto[], projectId?: string): Promise<Photo[]> {
+  async function decorate(
+    rows: StoredPhoto[], projectId?: string, options?: { display?: boolean }
+  ): Promise<Photo[]> {
     const links = rows.length ? await linksOf(rows[0]!.projectId) : null
     if (links) return decorateAmazon(rows, links)
-    const urls = await blobStore.load(rows.map(row => row.id))
+    const urls = await blobStore.load(rows.map(row => row.id), options)
     const fallbacks = projectId ? await originalsOfUnprepared(rows, urls, projectId) : new Map<string, string>()
     return rows.map(row => {
       const found: PhotoUrls | undefined = urls.get(row.id)
@@ -271,7 +274,7 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
 
   /**
    * 解析を並列に回す。**1 枚終わるごとに、その写真の行だけ**を書く（配列を書き直さない）。
-   * 途中で閉じてもそこまでは残り、次は指紋の無い写真だけが対象になる。
+   * 途中で閉じてもそこまでは残り、次はハッシュ値の無い写真だけが対象になる。
    */
   /** このプロジェクトで表示用画像を作る長辺。プロジェクトの指定 → アプリの既定 → 既定値。 */
   async function displayEdgeOf(projectId: string): Promise<number> {
@@ -293,7 +296,7 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
       onResult: async (id, analyzed) => {
         processed += 1
         if (analyzed.error) failed += 1
-        // 画像を先に書く。行に指紋があるなら、画像もあるようにするため。
+        // 画像を先に書く。行にハッシュ値があるなら、画像もあるようにするため。
         await blobStore.put(id, { thumbnail: analyzed.thumbnail, display: analyzed.display })
         await store.patchPhoto(id, {
           capturedAt: analyzed.capturedAt,
@@ -310,18 +313,20 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
     await store.patchProject(projectId, {})
   }
 
-  /** 指紋がまだ無い（かつ失敗もしていない）写真の解析を、出所から読んで回す。 */
+  /** ハッシュ値がまだ無い（かつ失敗もしていない）写真の解析を、出所から読んで回す。 */
   async function analyzeBacklog(projectId: string, io: SourceIO): Promise<void> {
     const rows = await store.photosOfProject(projectId)
-    const jobs: AnalysisJob[] = rows
-      .filter(row => !row.isMissing && row.dHash === null && row.analysisError === null)
-      .map(row => ({ id: row.id, load: () => io.readFile(subPathOf(row), row.name) }))
+    // 撮影時刻の昇順（選別の順）。分からないものは最後に取り込み順（`orderForAnalysis`）。
+    const jobs: AnalysisJob[] = orderForAnalysis(
+      rows.filter(row => !row.isMissing && row.dHash === null && row.analysisError === null),
+      row => row
+    ).map(row => ({ id: row.id, load: () => io.readFile(subPathOf(row), row.name) }))
     if (!jobs.length) return
     await analyze(projectId, jobs)
   }
 
   /**
-   * フォルダの準備: 走査（行を作る）→ 解析（サムネイル・表示用・指紋）。
+   * フォルダの準備: 走査（行を作る）→ 解析（サムネイル・表示用・ハッシュ値）。
    * **走査が済んだ時点で `scan` を complete にする**ので、解析の途中でも選別を始められる。
    * 画面を移っても止まらない（走っているのは画面ではなくこのバックエンド）。
    */
@@ -353,7 +358,7 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
         return
       }
 
-      // 再走査でも同じ写真の行を使い回す（鍵は出所の中の相対パス）。星と指紋を失わない。
+      // 再走査でも同じ写真の行を使い回す（鍵は出所の中の相対パス）。星とハッシュ値を失わない。
       const existing = await store.photosOfProject(projectId)
       const byPath = new Map(existing.map(item => [item.relativePath, item]))
       const seen = new Set<string>()
@@ -394,7 +399,7 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
 
   /**
    * 準備: 一覧を読んで写真の行を作る（表示用・サムネイルは「URL で出せる」ので、これで準備済み）。
-   * そのあと裏で、中継からサムネイルを取って指紋を作る。**失敗したら自動でやり直し続けない**
+   * そのあと裏で、中継からサムネイルを取ってハッシュ値を作る。**失敗したら自動でやり直し続けない**
    * （リンクが消えていたら理由を出して `missing` にし、開くたびには読まない。利用者の「再試行」だけ）。
    */
   async function prepareAmazon(projectId: string): Promise<void> {
@@ -432,7 +437,7 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
         return
       }
 
-      // 鍵は node id。再読み込みでも同じ行を使い回し、星と指紋を失わない。
+      // 鍵は node id。再読み込みでも同じ行を使い回し、星とハッシュ値を失わない。
       const links: Record<string, string> = {}
       const existing = await store.photosOfProject(projectId)
       const byPath = new Map(existing.map(item => [item.relativePath, item]))
@@ -479,21 +484,24 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
   }
 
   /**
-   * 指紋のまだ無い写真のサムネイル（`viewBox=160`）を中継から取り、指紋を作る。
+   * ハッシュ値のまだ無い写真のサムネイル（`viewBox=160`）を中継から取り、ハッシュ値を作る。
    * 並列 4、20 枚ごとに行へ書く。**最初の 4 枚が全部取れなければ、中継は無いとみなして打ち切る**
-   * （指紋は無いまま。選別は始められる。連写が自動でまとまらないだけ）。
+   * （ハッシュ値は無いまま。選別は始められる。連写が自動でまとまらないだけ）。
    * 星は行の別の欄なので、書くのは 1 行ずつの `patchPhoto`（星を巻き戻さない）。
    */
   async function hashBacklog(projectId: string): Promise<void> {
     const links = await linksOf(projectId)
     if (!links) return
-    const rows = (await store.photosOfProject(projectId))
-      .filter(row => !row.isMissing && row.dHash === null && row.analysisError === null && links[row.relativePath])
+    const rows = orderForAnalysis(
+      (await store.photosOfProject(projectId))
+        .filter(row => !row.isMissing && row.dHash === null && row.analysisError === null && links[row.relativePath]),
+      row => row
+    )
     if (!rows.length) return
     const total = rows.length
     let processed = 0
     let failed = 0
-    emit(progressOf(projectId, 'background', 'hashing', 0, total, '写真の指紋を作っています'))
+    emit(progressOf(projectId, 'background', 'hashing', 0, total, '写真のハッシュ値を作っています'))
     let pending: { id: string, patch: Partial<StoredPhoto> }[] = []
     const flush = async () => {
       const batch = pending
@@ -515,13 +523,13 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
           if (!hash) failed += 1
           pending.push({
             id: row.id,
-            patch: { dHash: hash, analysisError: hash ? null : '指紋を作れませんでした。' }
+            patch: { dHash: hash, analysisError: hash ? null : 'ハッシュ値を作れませんでした。' }
           })
         } else {
           failed += 1
         }
         if (pending.length >= HASH_SAVE_EVERY) await flush()
-        emit(progressOf(projectId, 'background', 'hashing', processed, total, '写真の指紋を作っています', failed))
+        emit(progressOf(projectId, 'background', 'hashing', processed, total, '写真のハッシュ値を作っています', failed))
       }
     })
     await flush()
@@ -529,7 +537,7 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
       noRelay.add(projectId)
       emit({
         // 取れなかったのは中継が無いため。写真ごとの失敗としては数えない。
-        ...progressOf(projectId, 'background', 'complete', processed, total, '指紋は作りませんでした'),
+        ...progressOf(projectId, 'background', 'complete', processed, total, 'ハッシュ値は作りませんでした'),
         warning: NO_RELAY_WARNING
       })
     } else {
@@ -684,20 +692,20 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
       const rows = await store.photosOfProject(projectId)
       const matched = filterPhotos(rows.filter(row => !row.isMissing), rating).sort(comparePhotos(sort))
       // 画面に渡すのは 1 ページぶんだけ。全件を載せない。
-      return { photos: await decorate(pagePhotos(matched, offset, limit)), total: matched.length }
+      // 一覧のタイルはサムネイルしか使わない。表示用は読まない（拡大のときに 1 枚だけ作る）。
+      const photos = await decorate(pagePhotos(matched, offset, limit), undefined, { display: false })
+      return { photos, total: matched.length }
     },
 
     getPhotosByIds: async (projectId: string, photoIds: string[]) => {
-      const rows = await store.photosOfProject(projectId)
-      const byId = new Map(rows.map(row => [row.id, row]))
-      // 渡された順を保つ。まとめの代表が先頭に来る前提の画面がある。
-      const ordered = photoIds.map(id => byId.get(id)).filter((row): row is StoredPhoto => !!row)
+      // 主キーで読む（全行を読まない）。渡された順を保つ。まとめの代表が先頭に来る前提の画面がある。
+      const ordered = (await store.photosByIds(projectId, photoIds)).filter((row): row is StoredPhoto => !!row)
       return decorate(ordered, projectId)
     },
 
     getCoreInputs: async (projectId: string): Promise<Photo[]> => {
       const rows = await store.photosOfProject(projectId)
-      // 4,000 枚でもサムネイルの実体は読まない。core が要るのは鍵・時刻・指紋だけ。
+      // 4,000 枚でもサムネイルの実体は読まない。core が要るのは鍵・時刻・ハッシュ値だけ。
       return rows.filter(row => !row.isMissing).map(row => toPhoto(row, null, null, null))
     },
 
@@ -809,13 +817,29 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
       }
       await io.writeSidecar(json, fileName)
     },
+    writeSidecarChecked: async (projectId: string, json: string, expected: string | null) => {
+      const io = await sidecarIO(projectId)
+      if (!io || (await io.sidecarAccess()) !== 'readwrite') {
+        throw new Error('この出所にはサイドカーを書けません。フォルダへのアクセスを許可してください。')
+      }
+      return io.writeSidecarChecked(json, expected)
+    },
     loadSidecarState: (projectId: string): Promise<SidecarState> => store.readSidecarState(projectId),
     saveSidecarState: (projectId: string, state: SidecarState) => store.writeSidecarState(projectId, state),
     deviceIdentity: async (): Promise<DeviceIdentity> => ({ id: await store.deviceId(), name: 'ブラウザ' }),
 
     // ブラウザでは既に表示できる URL が入っている。
     photoUrl: (path: string) => path,
-    photoOriginalUrl: async (photo: Photo) => photo.path,
+    // 拡大のとき、その 1 枚の URL を**そのとき作る**。一覧を読んだときに持っていた URL は、
+    // 上限を超えて revoke されていることがある（W3）。
+    photoOriginalUrl: async (photo: Photo) => {
+      const file = originals.get(photo.id)
+      if (file) return blobStore.originalUrl(photo.id, file)
+      // Amazon（https）など、revoke されない URL はそのまま。
+      if (!photo.path.startsWith('blob:')) return photo.path
+      const found = (await blobStore.load([photo.id])).get(photo.id)
+      return found?.displayUrl ?? found?.thumbnailUrl ?? photo.path
+    },
     photoThumbnailUrl: (photo: Photo) => photo.thumbnailPath ?? photo.path,
     photoDisplayUrl: (photo: Photo) => photo.displayPath ?? photo.thumbnailPath ?? photo.path,
 

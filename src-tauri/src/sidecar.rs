@@ -1,27 +1,67 @@
 //! サイドカー（写真のフォルダ直下の `.photo-curator/catalog.json`）の読み書きと、
 //! 端末が覚える状態（設計 03 章）。
 //!
-//! **判断（4 通り）はここに持たない。** `sidecarDecide` は core（画面側の wasm）だけが呼ぶ。
-//! ここは「どこへ・どう安全に書くか」と、端末が覚える 3 つの値の保存だけ。
+//! **判断はここに持たない。** 開き方の判断（`sidecarPlan`）は core（画面側の wasm）だけが呼ぶ。
+//! ここは「どこへ・どう安全に書くか」（楽観ロックの書き込み。U34）と、端末が覚える値の保存だけ。
 //! 書けるのは `.photo-curator/` の中だけで、写真の原本には書かない。
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
-use std::{fs, path::{Path, PathBuf}};
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime},
+};
 use uuid::Uuid;
 
 pub const SIDECAR_DIR: &str = ".photo-curator";
 pub const SIDECAR_FILE: &str = "catalog.json";
+/// 書き込みの間だけ置く排他のロック（設計書 §4.4。書き終われば消える）。
+pub const LOCK_FILE: &str = "catalog.lock";
+/// これより古いロックは、書いた端末が途中で止まったものと見なして壊す。
+pub const LOCK_TTL: Duration = Duration::from_secs(60);
 
 const SETTING_DEVICE_ID: &str = "device_id";
 
-/// 端末が覚える、最後に読んだ／書いたサイドカーの印と、判断が変わったか。
+/// 端末が覚える、最後に読んだ／書いたサイドカーの控え。
+///
+/// U34 で `seen_token`・`seen_key`・`seen_epoch`・`local_epoch`・`detached` を足した。
+/// `seen_token` が None の行は古い形のまま（画面側が `seen_at`/`seen_by`/`local_changed`
+/// から `legacy:` の控えを作る）。古い 3 つも書き続ける（古い版のアプリに戻しても読める）。
 #[derive(Serialize, serde::Deserialize, Debug, PartialEq, Eq, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SidecarState {
     pub seen_at: i64,
     pub seen_by: String,
     pub local_changed: bool,
+    /// 最後に読んだ／書いた版の見分け（core の `sidecar_token`）。None は古い形。
+    #[serde(default)]
+    pub seen_token: Option<String>,
+    /// その版を読んだ／書いたときの、選別状況の比較キー。空は「分からない＝変更あり」。
+    #[serde(default)]
+    pub seen_key: String,
+    /// その版のやり直しの世代。
+    #[serde(default)]
+    pub seen_epoch: Option<String>,
+    /// この端末の選別状況のやり直しの世代（やり直すたびに新しい乱数）。
+    #[serde(default)]
+    pub local_epoch: Option<String>,
+    /// 食い違いで「この端末の状況を残す」を選んだあと（自動では書かない）。
+    #[serde(default)]
+    pub detached: bool,
+}
+
+/// 楽観ロックの書き込みの結果。
+#[derive(Serialize, Debug, PartialEq, Eq, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum CheckedWrite {
+    /// 書けて、読み戻しても同じだった。
+    Written,
+    /// 見た版と違っていた（書いていない）か、書いた直後に別の端末に置き換えられた。判定し直す。
+    Changed,
+    /// ほかの端末が書いている（ロックが新しい）。次の契機に回す。
+    Locked,
 }
 
 #[derive(Serialize, Debug, PartialEq, Eq, Clone)]
@@ -39,19 +79,47 @@ pub fn ensure_tables(conn: &Connection) -> Result<(), String> {
            local_changed INTEGER NOT NULL DEFAULT 0
          );",
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    // U34 の列。古い表には足す（値の無い行は古い形のまま読む）。
+    let columns: Vec<String> = conn
+        .prepare("PRAGMA table_info(sidecar_state)")
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|error| error.to_string())?;
+    for (name, definition) in [
+        ("seen_token", "TEXT"),
+        ("seen_key", "TEXT NOT NULL DEFAULT ''"),
+        ("seen_epoch", "TEXT"),
+        ("local_epoch", "TEXT"),
+        ("detached", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        if !columns.iter().any(|column| column == name) {
+            conn.execute_batch(&format!("ALTER TABLE sidecar_state ADD COLUMN {name} {definition};"))
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 pub fn load_state(conn: &Connection, project_id: &str) -> Result<SidecarState, String> {
     let row = conn
         .query_row(
-            "SELECT seen_at, seen_by, local_changed FROM sidecar_state WHERE project_id=?1",
+            "SELECT seen_at, seen_by, local_changed, seen_token, seen_key, seen_epoch, local_epoch, detached
+             FROM sidecar_state WHERE project_id=?1",
             params![project_id],
             |row| {
                 Ok(SidecarState {
                     seen_at: row.get(0)?,
                     seen_by: row.get(1)?,
                     local_changed: row.get::<_, i64>(2)? != 0,
+                    seen_token: row.get(3)?,
+                    seen_key: row.get(4)?,
+                    seen_epoch: row.get(5)?,
+                    local_epoch: row.get(6)?,
+                    detached: row.get::<_, i64>(7)? != 0,
                 })
             },
         )
@@ -62,10 +130,24 @@ pub fn load_state(conn: &Connection, project_id: &str) -> Result<SidecarState, S
 
 pub fn save_state(conn: &Connection, project_id: &str, state: &SidecarState) -> Result<(), String> {
     conn.execute(
-        "INSERT INTO sidecar_state (project_id, seen_at, seen_by, local_changed) VALUES (?1,?2,?3,?4)
+        "INSERT INTO sidecar_state
+           (project_id, seen_at, seen_by, local_changed, seen_token, seen_key, seen_epoch, local_epoch, detached)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
          ON CONFLICT(project_id) DO UPDATE SET
-           seen_at=excluded.seen_at, seen_by=excluded.seen_by, local_changed=excluded.local_changed",
-        params![project_id, state.seen_at, state.seen_by, state.local_changed as i64],
+           seen_at=excluded.seen_at, seen_by=excluded.seen_by, local_changed=excluded.local_changed,
+           seen_token=excluded.seen_token, seen_key=excluded.seen_key, seen_epoch=excluded.seen_epoch,
+           local_epoch=excluded.local_epoch, detached=excluded.detached",
+        params![
+            project_id,
+            state.seen_at,
+            state.seen_by,
+            state.local_changed as i64,
+            state.seen_token,
+            state.seen_key,
+            state.seen_epoch,
+            state.local_epoch,
+            state.detached as i64
+        ],
     )
     .map_err(|error| error.to_string())?;
     Ok(())
@@ -186,6 +268,85 @@ pub fn write(folder: &Path, file_name: &str, json: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 取ったロック。手放すとき（drop）にファイルを消す。
+struct LockGuard {
+    path: PathBuf,
+}
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn try_create_lock(path: &Path, holder: &str) -> std::io::Result<LockGuard> {
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+    let at = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or(0);
+    // 中身は人が見て分かるためだけ（判定には更新時刻だけを使う）。
+    let _ = write!(file, "{{\"holder\":{},\"at\":{at}}}", serde_json::Value::String(holder.to_string()));
+    Ok(LockGuard { path: path.to_path_buf() })
+}
+
+/// 排他のロックを取る。あれば、`ttl` より古いものだけ壊して取り直す。取れなければ None。
+fn acquire_lock(dir: &Path, holder: &str, ttl: Duration) -> Result<Option<LockGuard>, String> {
+    let path = dir.join(LOCK_FILE);
+    for _ in 0..2 {
+        match try_create_lock(&path, holder) {
+            Ok(guard) => return Ok(Some(guard)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = fs::metadata(&path)
+                    .and_then(|meta| meta.modified())
+                    .ok()
+                    .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+                    .is_some_and(|age| age > ttl);
+                if !stale {
+                    return Ok(None);
+                }
+                // 書いた端末が途中で止まった。壊して取り直す（同時に壊した端末があれば、どちらかが負ける）。
+                let _ = fs::remove_file(&path);
+            }
+            Err(error) => return Err(format!("サイドカーのロックを作れませんでした: {error}")),
+        }
+    }
+    Ok(None)
+}
+
+/// 楽観ロックの書き込み（設計書 §4.4）。
+///
+/// ロックを取る → `catalog.json` を読み、`expected`（画面が判断に使った中身。無かったなら None）と
+/// 同じことを確かめる → 一時ファイルに書いて rename → 読み戻して確かめる → ロックを放す。
+/// 見た版と違えば**書かずに** `Changed` を返す（画面が判定し直す）。
+pub fn write_checked(folder: &Path, json: &str, expected: Option<&str>, holder: &str) -> Result<CheckedWrite, String> {
+    write_checked_with(folder, json, expected, holder, LOCK_TTL)
+}
+
+fn write_checked_with(
+    folder: &Path,
+    json: &str,
+    expected: Option<&str>,
+    holder: &str,
+    ttl: Duration,
+) -> Result<CheckedWrite, String> {
+    let dir = sidecar_dir(folder);
+    fs::create_dir_all(&dir).map_err(|error| format!("サイドカーのフォルダを作れませんでした: {error}"))?;
+    let Some(_lock) = acquire_lock(&dir, holder, ttl)? else {
+        return Ok(CheckedWrite::Locked);
+    };
+    let current = read(folder)?;
+    if current.as_deref() != expected {
+        return Ok(CheckedWrite::Changed);
+    }
+    write(folder, SIDECAR_FILE, json)?;
+    // 古い版のアプリはロックを見ない。読み戻して、自分の書いたものが残っているかを確かめる。
+    if read(folder)?.as_deref() != Some(json) {
+        return Ok(CheckedWrite::Changed);
+    }
+    Ok(CheckedWrite::Written)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,7 +369,7 @@ mod tests {
     fn state_defaults_to_never_seen_and_round_trips() {
         let conn = memory();
         assert_eq!(load_state(&conn, "p1").unwrap(), SidecarState::default());
-        let state = SidecarState { seen_at: 1234, seen_by: "dev-a".into(), local_changed: true };
+        let state = SidecarState { seen_at: 1234, seen_by: "dev-a".into(), local_changed: true, ..SidecarState::default() };
         save_state(&conn, "p1", &state).unwrap();
         assert_eq!(load_state(&conn, "p1").unwrap(), state);
         let cleared = SidecarState { local_changed: false, ..state.clone() };
@@ -216,6 +377,127 @@ mod tests {
         assert_eq!(load_state(&conn, "p1").unwrap(), cleared);
         // 別のプロジェクトには影響しない。
         assert_eq!(load_state(&conn, "p2").unwrap(), SidecarState::default());
+    }
+
+    #[test]
+    fn new_fields_round_trip_and_default_to_the_old_form() {
+        let conn = memory();
+        let state = SidecarState {
+            seen_at: 5,
+            seen_by: "dev".into(),
+            local_changed: false,
+            seen_token: Some("w-1".into()),
+            seen_key: "j1:abc".into(),
+            seen_epoch: Some("e-1".into()),
+            local_epoch: Some("e-2".into()),
+            detached: true,
+        };
+        save_state(&conn, "p1", &state).unwrap();
+        assert_eq!(load_state(&conn, "p1").unwrap(), state);
+        // 一度も見ていない（空の token）と、古い形（None）は区別して残る。
+        let never = SidecarState { seen_token: Some(String::new()), ..SidecarState::default() };
+        save_state(&conn, "p2", &never).unwrap();
+        assert_eq!(load_state(&conn, "p2").unwrap().seen_token.as_deref(), Some(""));
+        // 画面から来る JSON に新しい項目が無くても読める（古い版の画面）。
+        let old: SidecarState =
+            serde_json::from_str(r#"{"seenAt":1,"seenBy":"x","localChanged":true}"#).unwrap();
+        assert_eq!(old.seen_token, None);
+        assert!(!old.detached);
+    }
+
+    #[test]
+    fn old_table_gets_the_new_columns_and_keeps_its_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE sidecar_state (
+               project_id TEXT PRIMARY KEY,
+               seen_at INTEGER NOT NULL DEFAULT 0,
+               seen_by TEXT NOT NULL DEFAULT '',
+               local_changed INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO sidecar_state VALUES ('p1', 777, 'pc', 1);",
+        )
+        .unwrap();
+        ensure_tables(&conn).unwrap();
+        let state = load_state(&conn, "p1").unwrap();
+        assert_eq!((state.seen_at, state.seen_by.as_str(), state.local_changed), (777, "pc", true));
+        assert_eq!(state.seen_token, None, "古い行は古い形のまま（画面が legacy: の控えを作る）");
+        assert_eq!(state.seen_key, "");
+        assert!(!state.detached);
+    }
+
+    fn lock_path(folder: &Path) -> PathBuf {
+        folder.join(SIDECAR_DIR).join(LOCK_FILE)
+    }
+
+    fn leftovers(folder: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(folder.join(SIDECAR_DIR))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn checked_write_creates_replaces_and_releases_the_lock() {
+        let folder = temp_dir("checked");
+        assert_eq!(write_checked(&folder, "v1", None, "pc").unwrap(), CheckedWrite::Written);
+        assert_eq!(write_checked(&folder, "v2", Some("v1"), "pc").unwrap(), CheckedWrite::Written);
+        assert_eq!(read(&folder).unwrap().as_deref(), Some("v2"));
+        // ロックも一時ファイルも残らない。
+        assert_eq!(leftovers(&folder), vec![SIDECAR_FILE.to_string()]);
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn checked_write_does_not_write_over_a_version_it_did_not_see() {
+        let folder = temp_dir("checked-changed");
+        write(&folder, SIDECAR_FILE, "android-progressed").unwrap();
+        // 画面は「無かった」と思って判断した → 書かない。
+        assert_eq!(write_checked(&folder, "pc-untouched", None, "pc").unwrap(), CheckedWrite::Changed);
+        // 画面は古い版を見て判断した → 書かない。
+        assert_eq!(write_checked(&folder, "pc-untouched", Some("old"), "pc").unwrap(), CheckedWrite::Changed);
+        assert_eq!(read(&folder).unwrap().as_deref(), Some("android-progressed"));
+        assert_eq!(leftovers(&folder), vec![SIDECAR_FILE.to_string()]);
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn checked_write_waits_for_a_fresh_lock_and_breaks_a_stale_one() {
+        let folder = temp_dir("checked-lock");
+        write(&folder, SIDECAR_FILE, "v1").unwrap();
+        fs::write(lock_path(&folder), "{\"holder\":\"android\"}").unwrap();
+        // 新しいロック → 書かない（ほかの端末が書いている）。ロックは残す。
+        assert_eq!(write_checked(&folder, "v2", Some("v1"), "pc").unwrap(), CheckedWrite::Locked);
+        assert_eq!(read(&folder).unwrap().as_deref(), Some("v1"));
+        assert!(lock_path(&folder).exists());
+        // 古いロック（TTL より前）→ 壊して書く。
+        let old = SystemTime::now() - Duration::from_secs(120);
+        fs::File::options().write(true).open(lock_path(&folder)).unwrap().set_modified(old).unwrap();
+        assert_eq!(write_checked(&folder, "v2", Some("v1"), "pc").unwrap(), CheckedWrite::Written);
+        assert_eq!(read(&folder).unwrap().as_deref(), Some("v2"));
+        assert!(!lock_path(&folder).exists());
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn checked_write_releases_the_lock_when_it_fails() {
+        let folder = temp_dir("checked-fail");
+        // catalog.json が読めない（フォルダになっている）→ 失敗。ロックは放し、何も書かない。
+        fs::create_dir_all(folder.join(SIDECAR_DIR).join(SIDECAR_FILE).join("inner")).unwrap();
+        assert!(write_checked(&folder, "v2", None, "pc").is_err());
+        assert!(!lock_path(&folder).exists());
+        assert_eq!(leftovers(&folder), vec![SIDECAR_FILE.to_string()]);
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn checked_write_result_is_sent_as_a_lowercase_word() {
+        assert_eq!(serde_json::to_string(&CheckedWrite::Written).unwrap(), "\"written\"");
+        assert_eq!(serde_json::to_string(&CheckedWrite::Changed).unwrap(), "\"changed\"");
+        assert_eq!(serde_json::to_string(&CheckedWrite::Locked).unwrap(), "\"locked\"");
     }
 
     #[test]
@@ -289,6 +571,7 @@ mod tests {
     /// 一般ユーザーで `cargo test -- --ignored` を実行すると確かめられる。
     #[test]
     #[ignore = "root ではパーミッションを無視して書けてしまう（一般ユーザーで --ignored を付けて実行する）"]
+    #[cfg(unix)]
     fn support_is_readonly_for_a_directory_without_write_permission() {
         use std::os::unix::fs::PermissionsExt;
         let folder = temp_dir("support-ro");

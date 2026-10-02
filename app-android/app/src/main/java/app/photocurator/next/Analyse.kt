@@ -12,7 +12,7 @@ import kotlinx.coroutines.withContext
 import uniffi.photo_curator_core.dHashFromGray
 
 /**
- * 連写のまとめに使う指紋（dHash）を作る。
+ * 連写のまとめに使うハッシュ値（dHash）を作る。
  *
  * **デコードと縮小は Android に任せる。** `loadThumbnail` は OS が持っている
  * 縮小画像を返すので、**原本を読まない**（実測 1 枚 3.5ms）。
@@ -43,10 +43,10 @@ object Analyse {
     }
 
     /**
-     * NAS の 1 枚。**先頭 128KB だけ読んで、指紋と撮影時刻を同時に取る。**
+     * NAS の 1 枚。**先頭 64KB だけ読んで、ハッシュ値と撮影時刻を同時に取る。**
      *
      * 原本 6MB を網越しに引くと 2,000 枚で 12GB になる。EXIF は先頭にあり、
-     * その中の縮小画像（160x120 程度）で指紋は十分に作れる。
+     * その中の縮小画像（160x120 程度）でハッシュ値は十分に作れる。
      */
     fun hashOverNetwork(
         context: Context,
@@ -57,13 +57,13 @@ object Analyse {
         val path = photo.smb?.path ?: return null
         val head = reader.head(path, SmbExifReader.HEAD_BYTES) ?: return null
         val exif = SmbExifReader.parse(head, fallbackAt)
-        // 縮小画像が無い写真は指紋を作らない。**原本を引きに行かない。**
+        // 縮小画像が無い写真はハッシュ値を作らない。**原本を引きに行かない。**
         // 連写のまとめに入らないだけで、選別には出る。
         val bytes = exif.thumbnail ?: return Fingerprint(VERSION, photo.size, "", exif.takenAt)
         return try {
             val decoded = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
                 ?: return Fingerprint(VERSION, photo.size, "", exif.takenAt)
-            // **向きを当ててから指紋を作る。** 回ったままだと、同じ連写でも
+            // **向きを当ててからハッシュ値を作る。** 回ったままだと、同じ連写でも
             // 縦横が混ざって距離が開き、まとまらなくなる。
             val bitmap = SmbExifReader.applyOrientation(decoded, exif.orientation)
             // **一度読んだ絵は捨てない。** 一覧を出すたびに網へ行かせない。
@@ -72,13 +72,13 @@ object Analyse {
             bitmap.recycle()
             Fingerprint(VERSION, photo.size, made ?: "", exif.takenAt)
         } catch (error: Exception) {
-            Log.w(TAG, "NAS の指紋を作れなかった: ${photo.name}", error)
+            Log.w(TAG, "NAS のハッシュ値を作れなかった: ${photo.name}", error)
             Fingerprint(VERSION, photo.size, "", exif.takenAt)
         }
     }
 
     /**
-     * Amazon の写真の指紋。**縮小して返してもらったサムネイルから作る。**
+     * Amazon の写真のハッシュ値。**縮小して返してもらったサムネイルから作る。**
      * 撮影時刻は一覧に入っていたものをそのまま控える（EXIF を読まない）。
      *
      * リンクが消えていたら**準備ごと止める**（つまずきとして出すため）。
@@ -103,7 +103,7 @@ object Analyse {
         return Fingerprint(VERSION, photo.size, made ?: "", photo.takenAt)
     }
 
-    /** 絵から指紋を作る。**元の Bitmap は片付けない**（呼んだ側の持ち物）。 */
+    /** 絵からハッシュ値を作る。**元の Bitmap は片付けない**（呼んだ側の持ち物）。 */
     fun hashOf(source: Bitmap): String? {
         // **縮小は core に任せる。** ここで createScaledBitmap を使うと、
         // 縮小率が大きいときに 2x2 しか読まず、同じ絵でも値が揃わない
@@ -124,13 +124,13 @@ object Analyse {
     }
 
     /**
-     * 指紋そのものが効いているかを確かめる。**まとまらない理由を切り分ける。**
+     * ハッシュ値そのものが効いているかを確かめる。**まとまらない理由を切り分ける。**
      *
-     * 「まとまらない」は「写真が本当に違う」でも起きるし「指紋が壊れている」でも
+     * 「まとまらない」は「写真が本当に違う」でも起きるし「ハッシュ値が壊れている」でも
      * 起きる。区別がつかないまま閾値をいじると、いつまでも直らない。
      *
      * 同じ絵を JPEG で作り直したものと比べる。中身は同じなので、
-     * **距離が 0 に近ければ指紋は効いている**。32 前後なら値が乱数と変わらない。
+     * **距離が 0 に近ければハッシュ値は効いている**。32 前後なら値が乱数と変わらない。
      */
     fun selfCheck(context: Context, photo: Photo) {
         val source = Photos.thumbnail(context, photo, edge = 64) ?: run {
@@ -146,14 +146,14 @@ object Analyse {
             val again = copy?.let { hashOf(it) }
             copy?.recycle()
             if (original == null || again == null) {
-                Log.w(TAG, "自己確認: 指紋を作れなかった")
+                Log.w(TAG, "自己確認: ハッシュ値を作れなかった")
                 return
             }
             Log.i(
                 TAG,
                 "自己確認: ${source.width}x${source.height} / $original vs $again / " +
                     "距離 ${uniffi.photo_curator_core.hashDistance(original, again)}" +
-                    "（0 に近ければ指紋は効いている）"
+                    "（0 に近ければハッシュ値は効いている）"
             )
         } catch (error: Exception) {
             Log.w(TAG, "自己確認に失敗", error)
@@ -169,6 +169,14 @@ object Analyse {
      *    同じ絵でも値が 5 ビット動いた。**古い値は比べられないので作り直す。**
      */
     const val VERSION = 3
+
+    /** 控えたハッシュ値が、いまの作り方・いまの原本のものか。 */
+    fun upToDate(known: Fingerprint?, photo: Photo): Boolean =
+        known != null && known.version == VERSION && known.size == photo.size
+
+    /** 全部の写真に、いまのハッシュ値（または「作れなかった」の印）があるか。 */
+    fun allUpToDate(photos: List<Photo>, prints: Map<String, Fingerprint>): Boolean =
+        photos.all { upToDate(prints[it.relativePath], it) }
 
     /**
      * まとめて作る。**すでにある分は作り直さない。**
@@ -191,16 +199,17 @@ object Analyse {
         nasAccess: Pair<Nas, String>? = null
     ): Map<String, Fingerprint> = withContext(Dispatchers.IO) {
         // **既に分かっている分から始める。** 途中で止まったときにここを空から
-        // 始めていると、まだ見ていない写真の指紋まで消してしまう。
+        // 始めていると、まだ見ていない写真のハッシュ値まで消してしまう。
         val out = HashMap(cached)
 
-        fun needsWork(photo: Photo): Boolean {
-            val known = cached[photo.relativePath]
-            return !(known != null && known.version == VERSION && known.size == photo.size)
-        }
+        fun needsWork(photo: Photo): Boolean = !upToDate(cached[photo.relativePath], photo)
 
         var done = 0
+        // **新しく作った（変わった）分だけを数える。** 準備済みの写真を通るだけで
+        // 50 回ごとにファイルを書き直さない（A4）。
+        val unsaved = PartialCounter(50)
         suspend fun record(photo: Photo, made: Fingerprint?) {
+            val changed = needsWork(photo)
             if (made != null) out[photo.relativePath] = made
             // 作れなかったものは控えない。**次に開いたときにもう一度試す。**
             // 古い（大きさの違う）値が残っていたら消す。
@@ -208,7 +217,7 @@ object Analyse {
             done += 1
             if (done % 10 == 0 || done == photos.size) onProgress(done, photos.size)
             // **途中でやめても、作った分は残す。**
-            if (done % 50 == 0) onPartial(HashMap(out))
+            if (unsaved.add(changed)) onPartial(HashMap(out))
         }
 
         suspend fun sweepLocal() {
@@ -239,7 +248,7 @@ object Analyse {
         }
 
         /**
-         * Amazon は縮小を向こうに頼む。**サムネを取って、そのまま指紋にする。**
+         * Amazon は縮小を向こうに頼む。**サムネを取って、そのままハッシュ値にする。**
          * 取ったサムネは一覧でも使うので置いておく（二度取らない）。
          */
         suspend fun sweepAmazon() = coroutineScope {
@@ -258,7 +267,12 @@ object Analyse {
             // **1 本の接続で全部読む。** 1 枚ごとに張り直すと、網の往復が
             // そのまま待ち時間になる（実測 50 枚で 40 秒）。
             val (nas, password) = nasAccess
-            Smb.reading(nas, password) { reader -> sweepNetwork(reader) }
+            val result = Smb.reading(nas, password) { reader -> sweepNetwork(reader) }
+            if (result is SmbResult.Failed) {
+                // **失敗を握りつぶさない。** ここまでに作った分は残してから、準備を失敗にする。
+                onPartial(HashMap(out))
+                throw IllegalStateException(result.reason)
+            }
         } else if (photos.any { it.amazon != null }) {
             sweepAmazon()
         } else {
@@ -267,13 +281,47 @@ object Analyse {
 
         // 最後まで来たときだけ、無くなったものを片付ける。
         // 途中で刈ると、まだ見ていない写真を「消えた」と誤解する。
-        val living = photos.mapTo(HashSet()) { it.relativePath }
-        out.keys.retainAll(living)
+        // **顔ぶれが空なら刈らない。** 取れなかっただけかもしれず、全部消えてしまう。
+        if (photos.isNotEmpty()) {
+            val living = photos.mapTo(HashSet()) { it.relativePath }
+            out.keys.retainAll(living)
+        }
         out
     }
 }
 
 object Prepare {
+    /**
+     * 準備（ハッシュ値・サムネイル・表示用画像）を進める順。**選別と同じ、撮影時刻の昇順
+     * （同時刻は相対パス）。** 先の写真から使えるようになるので、選別が始まる順に
+     * 用意する。NAS の一覧は名前順、Amazon は日付の昇順（同時刻の並びは不定）で
+     * 来るので、そのまま使わずここで並べる。並びだけで、中身は変えない。
+     */
+    fun inShootingOrder(photos: List<Photo>): List<Photo> =
+        photos.sortedWith(compareBy({ it.takenAt }, { it.relativePath }))
+
+    /** 新しく取った顔ぶれをどうするか。 */
+    enum class ListingDecision {
+        /** 控えを置き換える。 */
+        Replace,
+
+        /** 控えは書かない（元から無く、今回も空）。 */
+        Skip,
+
+        /** 前は写真があったのに空で返ってきた。**前の控えを残し、失敗として扱う。** */
+        KeepPrevious
+    }
+
+    /**
+     * 取り直した顔ぶれを控えに書いてよいか。**空で上書きしない。**
+     * 失敗が空に見える形（網の途切れなど）で、ハッシュ値まで失うのを防ぐ。
+     */
+    fun decideListing(previous: List<Photo>?, fresh: List<Photo>): ListingDecision = when {
+        fresh.isNotEmpty() -> ListingDecision.Replace
+        !previous.isNullOrEmpty() -> ListingDecision.KeepPrevious
+        else -> ListingDecision.Skip
+    }
+
     suspend fun run(
         context: android.content.Context,
         project: Project,
@@ -283,10 +331,18 @@ object Prepare {
     ): Pair<List<Photo>, List<uniffi.photo_curator_core.PhotoRef>> {
         // 顔ぶれは控えたものを使う。開くたびに数え直すと、NAS では
         // そのたびに網の往復が要る。
-        val known = if (rescan) null else Listing.load(context, project.source.key)
-        val photos = known ?: Photos.list(context, project.source).also {
-            Listing.save(context, project.source.key, it)
+        val previous = Listing.load(context, project.source.key)
+        val listed = if (!rescan && previous != null) previous else {
+            val fresh = Photos.list(context, project.source)
+            when (decideListing(previous, fresh)) {
+                ListingDecision.Replace -> Listing.save(context, project.source.key, fresh)
+                ListingDecision.Skip -> Unit
+                ListingDecision.KeepPrevious ->
+                    throw IllegalStateException("写真の一覧を取れませんでした（前の状態は残してあります）")
+            }
+            fresh
         }
+        val photos = inShootingOrder(listed)
         val cached = Fingerprints.load(context, project.source.key)
 
         // NAS のときだけ、つなぎ先とパスワードを渡す。
@@ -294,7 +350,7 @@ object Prepare {
             val nasId = project.source.key.substringBefore("|")
             NasStore.all(context).firstOrNull { it.id == nasId }?.let { nas ->
                 NasPasswords.password(context, nas)?.let { nas to it }
-            }
+            } ?: throw IllegalStateException("NAS につなぐ情報（登録かパスワード）がありません")
         } else null
 
         val prints = Analyse.fingerprints(
@@ -305,17 +361,68 @@ object Prepare {
         )
         if (prints != cached) Fingerprints.save(context, project.source.key, prints)
 
+        return assemble(context, project, photos, prints)
+    }
+
+    /**
+     * 選別・学習が使う入口。**準備を二重に走らせない**（A5）。
+     *
+     * 1. 控えだけで組めるなら、それを使う（準備済みなら一瞬。網へ行かず、何も書かない）。
+     * 2. 詳細画面の準備が走っているあいだは、その分が控えに出てくるのを待つ
+     *    （同じ NAS へ 2 本つなぎ、同じファイルに書くのを避ける）。
+     * 3. そうでなければ、これまでどおり [run] で足りない分だけ作る。
+     *
+     * **ハッシュ値が足りないまま始めることはしない**（連写のまとまりが変わるため）。
+     */
+    suspend fun ready(
+        context: android.content.Context,
+        project: Project,
+        onProgress: (done: Int, total: Int) -> Unit
+    ): Pair<List<Photo>, List<uniffi.photo_curator_core.PhotoRef>> {
+        loadReady(context, project)?.let { return it }
+        while (Preparations.of(project.id).running) {
+            val progress = Preparations.of(project.id).meta
+            onProgress(progress.first, progress.second)
+            kotlinx.coroutines.delay(500)
+            loadReady(context, project)?.let { return it }
+        }
+        return run(context, project, false, onProgress)
+    }
+
+    /**
+     * 控えだけで組めるなら、組んで返す（**網へ行かない・何も書き直さない**）。
+     * ハッシュ値が全部そろっていなければ null（作る側 [run] へ）。
+     * 選別・学習が、準備済みなのに準備を自前でもう一度回さないために使う（A5）。
+     */
+    suspend fun loadReady(
+        context: android.content.Context,
+        project: Project
+    ): Pair<List<Photo>, List<uniffi.photo_curator_core.PhotoRef>>? {
+        val listing = Listing.load(context, project.source.key)
+        if (listing.isNullOrEmpty()) return null
+        val prints = Fingerprints.load(context, project.source.key)
+        val photos = inShootingOrder(listing)
+        if (!Analyse.allUpToDate(photos, prints)) return null
+        return assemble(context, project, photos, prints)
+    }
+
+    private suspend fun assemble(
+        context: android.content.Context,
+        project: Project,
+        photos: List<Photo>,
+        prints: Map<String, Fingerprint>
+    ): Pair<List<Photo>, List<uniffi.photo_curator_core.PhotoRef>> {
         // **撮影時刻は EXIF のものを使う。**
         // NAS の更新時刻はコピーしたときに変わるので、撮影順にならない。
-        // 指紋と同じ読みで取れているので、ここで差し替えて並べ直す。
+        // ハッシュ値と同じ読みで取れているので、ここで差し替えて並べ直す。
         val dated = photos
             .map { photo ->
-                // Amazon は一覧の時刻が正（EXIF を読んでいない）。指紋に控えた古い値で
+                // Amazon は一覧の時刻が正（EXIF を読んでいない）。ハッシュ値に控えた古い値で
                 // 上書きすると、読み方を直しても直らない。
                 val takenAt = if (photo.amazon != null) null else prints[photo.relativePath]?.takenAt
                 if (takenAt != null && takenAt > 0) photo.copy(takenAt = takenAt) else photo
             }
-            .sortedWith(compareBy({ it.takenAt }, { it.relativePath }))
+            .let(::inShootingOrder)
 
         // 撮影時刻を当てたものを控え直す。**次に開いたときはここから始まる。**
         if (dated != photos) Listing.save(context, project.source.key, dated)
@@ -358,7 +465,7 @@ object Prepare {
             ?: return@withContext 0
         val password = NasPasswords.password(context, nas) ?: return@withContext 0
 
-        val missing = photos.filter { photo ->
+        val missing = Prepare.inShootingOrder(photos).filter { photo ->
             val path = photo.smb?.path ?: return@filter false
             when {
                 Renders.has(context, nasId, path, edge) -> false
@@ -372,7 +479,7 @@ object Prepare {
         if (missing.isEmpty()) return@withContext 0
 
         var made = 0
-        Smb.reading(nas, password) { reader ->
+        val result = Smb.reading(nas, password) { reader ->
             // **1 本の接続で通す。** 原本は大きいので、並べすぎると
             // 端末のメモリと NAS の両方を圧迫する。少しずつ重ねる。
             for (chunk in missing.chunked(3)) {
@@ -390,6 +497,8 @@ object Prepare {
                 onProgress(done, photos.size)
             }
         }
+        // **接続や認証の失敗を成功にしない。** 準備の側の「止まっています」に載せる。
+        if (result is SmbResult.Failed) throw IllegalStateException(result.reason)
         made
     }
 
@@ -407,7 +516,7 @@ object Prepare {
         onProgress: (done: Int, total: Int) -> Unit
     ): Int {
         val link = Amazon.linkOf(project.source.key)
-        val refs = photos.mapNotNull { it.amazon }
+        val refs = Prepare.inShootingOrder(photos).mapNotNull { it.amazon }
         if (refs.isEmpty()) return 0
         if (Prefs.amazonMaxEdge(context, link.shareId) == 0) {
             Amazon.measureMaxEdge(refs.first())?.let { Prefs.setAmazonMaxEdge(context, link.shareId, it) }
@@ -451,15 +560,15 @@ object Prepare {
      * EXIF に縮小画像が無かった写真を、**表示用画像から**埋める。
      *
      * 書き出し方によっては EXIF に縮小画像が入らない（実機の NAS にあった
-     * 「倉坂くるる」の 17 枚がそうで、指紋が全部空だった）。すると
+     * 「倉坂くるる」の 17 枚がそうで、ハッシュ値が全部空だった）。すると
      *
-     *   * 連写がまとまらない（指紋が無いので比べようがない）
+     *   * 連写がまとまらない（ハッシュ値が無いので比べようがない）
      *   * カバーが出ない（端末に小さい絵が 1 枚も無い）
      *
      * の 2 つが、何も言わずに起きる。表示用画像は準備で**もう落としてある**
      * ので、そこから作れば網へは行かない。
      *
-     * 指紋の元が EXIF の縮小画像か表示用画像かで、同じ写真でも値は少しずれる。
+     * ハッシュ値の元が EXIF の縮小画像か表示用画像かで、同じ写真でも値は少しずれる。
      * まとまりの判定は距離で見ているので、そこは吸収できる範囲に収まる。
      */
     suspend fun fillFromRenders(
@@ -473,14 +582,14 @@ object Prepare {
         val prints = Fingerprints.load(context, key)
         val filled = HashMap<String, Fingerprint>(prints)
         var made = 0
-        for (photo in photos) {
+        for (photo in Prepare.inShootingOrder(photos)) {
             val path = photo.smb?.path ?: continue
             val print = prints[photo.relativePath] ?: continue
             if (print.hash.isNotEmpty()) continue
             val file = Renders.file(context, nasId, path, edge)
             if (!file.exists() || file.length() == 0L) continue
             try {
-                // **指紋に要るのは形だけ。** 大きいまま読むと 17 枚でも重い。
+                // **ハッシュ値に要るのは形だけ。** 大きいまま読むと 17 枚でも重い。
                 val options = android.graphics.BitmapFactory.Options().apply { inSampleSize = 4 }
                 val bitmap = android.graphics.BitmapFactory.decodeFile(file.path, options)
                     ?: continue
@@ -501,7 +610,7 @@ object Prepare {
 /**
  * 連写がまとまらなかったときに、**どちらの条件で落ちたのか**を残す。
  *
- * 「まとまらない」には理由が 3 つある（指紋が無い・時間が離れている・
+ * 「まとまらない」には理由が 3 つある（ハッシュ値が無い・時間が離れている・
  * 見た目が違う）。区別できないと、直しようがない推測が始まる。
  */
 object Neighbours {
@@ -535,7 +644,7 @@ object Neighbours {
         }
         Log.i(
             TAG,
-            "隣どうし ${refs.size - 1} 組 / 両方に指紋 $bothHashed / " +
+            "隣どうし ${refs.size - 1} 組 / 両方にハッシュ値 $bothHashed / " +
                 "時間が近い $nearInTime / 見た目が近い $nearInLook / 両方 $both"
         )
         // **閾値を勘で決めないための材料。** 時間が近いペアだけの距離の散らばり。

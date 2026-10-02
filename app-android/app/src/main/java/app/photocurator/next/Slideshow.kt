@@ -32,16 +32,12 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import coil.compose.AsyncImage
-import coil.request.ImageRequest
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
@@ -87,7 +83,7 @@ internal fun SlideshowStage(
     var busy by remember(path) { mutableStateOf(false) }
     var look by remember(path) { mutableStateOf(SlideshowGesture.Feedback(null, 0f, 0f)) }
     val busyNow by rememberUpdatedState(busy)
-    // 直前の中心タップ（二度タップで拡大）。写真が変われば捨てる。
+    // 直前の中央タップ（二度タップで拡大）。写真が変われば捨てる。
     var lastCenterTap by remember(path) { mutableStateOf<SlideshowGesture.TapRecord?>(null) }
     val decideNow by rememberUpdatedState(onDecide)
     val zoomNow by rememberUpdatedState(onZoom)
@@ -153,8 +149,8 @@ internal fun SlideshowStage(
                         val dy = (change.position.y - startY) / density
                         if (!change.pressed) {
                             if (!moved) {
-                                // タップ。上の帯は★5、ほぼ中心は何もしない（二度タップで拡大）、
-                                // それ以外は左半分が落とす・右半分が残す（長押しの拡大はしない）。
+                                // タップ。上のほうは★5、左のほうは落とす、右のほうは残す、
+                                // 中央の縦帯は何もしない（二度タップで拡大。長押しの拡大はしない）。
                                 val result = SlideshowGesture.tapDecision(
                                     change.position.x, change.position.y, 0f, 0f,
                                     size.width.toFloat(), size.height.toFloat()
@@ -215,18 +211,12 @@ internal fun SlideshowStage(
                     Text("読めません", fontSize = 11.sp, color = Faint)
                 }
             } else {
-                AsyncImage(
-                    model = ImageRequest.Builder(LocalContext.current)
-                        .data(photo.displayModel(displayEdge))
-                        .size(1600)
-                        .build(),
-                    contentDescription = photo.name,
-                    imageLoader = Images.loader(LocalContext.current),
-                    contentScale = ContentScale.Fit,
-                    onSuccess = { state ->
-                        val size = state.painter.intrinsicSize
-                        if (size.width > 0f && size.height > 0f) natural = size.width to size.height
-                    },
+                // 表示用画像が読めるまでは、置いてあるサムネイルを先に出す（U26）。
+                DisplayImage(
+                    photo = photo,
+                    displayEdge = displayEdge,
+                    px = Prefetch.SLIDESHOW_PX,
+                    onSize = { w, h -> natural = w to h },
                     modifier = Modifier.fillMaxSize()
                 )
             }

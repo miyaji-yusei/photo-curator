@@ -83,8 +83,6 @@ object Learning {
 
     suspend fun save(context: Context, projectId: String, distance: Int) =
         withContext(Dispatchers.IO) {
-            // 人が答えて決めた基準も判断。**サイドカーへ渡すもの。**
-            SyncState.touch(context, projectId)
             try {
                 file(context, projectId)
                     .writeText(org.json.JSONObject().put("distance", distance).toString())
@@ -151,7 +149,8 @@ fun LearnScreen(
     onBack: () -> Unit
 ) {
     val context = LocalContext.current
-    val displayEdge = remember(context) { Prefs.displayEdge(context) }
+    // **プロジェクトの大きさ**で引く。アプリの既定を使うと、NAS では原本をその場で引くことになる（A8）。
+    val displayEdge = remember(context, project.id) { Prefs.projectEdge(context, project.id) }
     var at by remember { mutableStateOf(0) }
     var answers by remember { mutableStateOf<List<Pair<Int, Boolean>>>(emptyList()) }
 

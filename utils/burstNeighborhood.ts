@@ -4,7 +4,7 @@
  *
  * 選んだ写真が占める時間の幅（最小〜最大の撮影時刻）から前後 `windowMs` に
  * 入る写真を、渡された並びのまま返す。連写の判定に使えない写真
- * （撮影時刻か指紋が無い）は対象にしない。
+ * （撮影時刻かハッシュ値が無い）は対象にしない。
  */
 export interface NeighborhoodPhoto {
   relativePath: string

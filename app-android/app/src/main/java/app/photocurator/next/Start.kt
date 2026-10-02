@@ -164,10 +164,12 @@ fun StartSheet(
             }
 
             // **まだ作っている途中でも始められる。** そう言っておく。
+            // 始めると全部の写真が対象になる（準備が終わった分だけではない）。
+            // まだ作っていない写真は、表示に時間がかかるだけ。
             if (readyCount < photoCount) {
                 Spacer(Modifier.height(14.dp))
                 Text(
-                    "準備が終わった $readyCount 枚から始めます。残りは順次追加します",
+                    "準備の途中でも始められます。まだ作っていない写真は、表示に時間がかかります",
                     fontSize = 12.sp, color = Faint
                 )
             }

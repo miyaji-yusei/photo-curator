@@ -2,280 +2,181 @@ package app.photocurator.next
 
 import android.content.Context
 import android.util.Log
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import org.json.JSONArray
-import org.json.JSONObject
-import uniffi.photo_curator_core.PairOverride
-import uniffi.photo_curator_core.Session as CoreSession
-import uniffi.photo_curator_core.sessionFromJson
-import uniffi.photo_curator_core.sessionToJson
+import java.io.File
 
 /**
- * 写真のフォルダに置く、判断の控え。**端末を変えても選び直さないため。**
+ * 写真のフォルダに置く、判断の控え（`.photo-curator/catalog.json`）。**端末を変えても選び直さないため。**
  *
  * 星は人が時間をかけて付けたもので、作り直せない。それが端末の中にしか
  * 無いと、端末を変えた・アプリを消した時点で消える。写真の隣に置けば、
  * **写真と判断が一緒に移動する。**
  *
  * 原本のフォルダに増やすのは `.photo-curator/catalog.json` の 1 つだけ
- * （設計 CON-3）。サムネイルや表示用画像は置かない。数百 MB を NAS に
- * 書くことになるし、作り直せるものは端末で足りる。
+ * （設計 CON-3。書く間のロックと一時ファイル、退避の `catalog.<端末>.json` を除く）。
+ *
+ * **判断は core の `sidecarPlan`**（PC・Web と同じ規則）。列・楽観ロック・退避は [SidecarSync]。
+ * ここは Android とのつなぎ（NAS の接続・端末の保存場所・控え）だけを持つ（U35）。
  */
-data class Catalog(
-    val updatedAt: Long,
-    /** どの端末が書いたか。**競合したときに人が判断できるように。** */
-    val updatedBy: String,
-    val updatedByName: String,
-    /** 相対パス → 星。撮影時刻や指紋は端末側で作り直せるので、いまは星だけ。 */
-    val ratings: Map<String, Int>,
-    val overrides: List<PairOverride>,
-    /** 選別の途中。**core の Session をそのまま。** */
-    val session: CoreSession?,
-    /** 学習した「見た目が近い」の境目。人が答えて決めたものなので一緒に運ぶ。 */
-    val burstDistance: Int?
-) {
-    /** 食い違ったときに人が見比べる 1 行。 */
-    fun summary(): String {
-        val kept = ratings.values.count { it > 0 }
-        val round = session?.let {
-            "ROUND " + it.round + (if (it.finished) "（完了）" else " の途中")
-        } ?: "選別なし"
-        return "★1 以上 $kept 枚 · $round"
-    }
-}
-
-/** 開いたときにどうするか。 */
-sealed interface Sync {
-    /** 何も起きていない。 */
-    data object Settled : Sync
-
-    /** 端末の方が進んでいる。**書けばよい。** */
-    data object Push : Sync
-
-    /** サイドカーの方が進んでいる。**取り込めばよい。** */
-    data class Pull(val catalog: Catalog) : Sync
-
-    /** 両方が進んでいる。**人に選ばせる。** */
-    data class Clash(val catalog: Catalog) : Sync
-
-    /** つなげない・読めない。**選別は止めない。** */
-    data class Blocked(val reason: String) : Sync
-}
-
 object Sidecar {
     private const val TAG = "Sidecar"
-    private const val VERSION = 1
 
-    /**
-     * 画面が消えても書けるように、アプリの寿命で動く。
-     *
-     * **書く契機は 4 つ**（設計 03）: ラウンドが終わったとき／背面へ回るとき／
-     * プロジェクトを閉じるとき／明示の保存。どれも「端末側に変更があるとき
-     * だけ」。無いのに書くと updatedAt が動き、次に開いたとき自分の書き込みを
-     * 他人の変更と誤認する。
-     */
-    private val scope = kotlinx.coroutines.CoroutineScope(
-        kotlinx.coroutines.SupervisorJob() + Dispatchers.IO
-    )
+    /** 端末の退避（`filesDir/aside/`）をプロジェクトごとにいくつまで残すか。 */
+    private const val ASIDE_KEEP = 3
 
-    /**
-     * 変更があれば書く。**無ければ何もしない。**
-     * 画面が消えたあとでも走るので、戻るボタンや背面への移動から呼べる。
-     */
-    fun pushIfChanged(context: Context, project: Project) {
-        if (!supports(project)) return
-        if (!SyncState.changed(context, project.id)) return
+    /** 画面が消えても書き終えるように、アプリの寿命で動く。 */
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    @Volatile private var engine: SidecarSync? = null
+
+    private fun engine(context: Context): SidecarSync {
+        engine?.let { return it }
         val app = context.applicationContext
-        scope.launch {
-            val failed = push(app, project)
-            if (failed != null) Log.w(TAG, "サイドカーを書けなかった: " + failed)
+        return synchronized(this) {
+            engine ?: SidecarSync(
+                store = SyncState.store(app),
+                me = { Me(Device.id(app), Device.name()) },
+                scope = scope,
+                log = { message, error -> Log.w(TAG, message, error) }
+            ).also { engine = it }
         }
     }
-
-    /** 写真のフォルダの直下。**増やすのはこの 1 ファイルだけ。** */
-    private fun path(folder: String) = "$folder\\.photo-curator\\catalog.json"
-
-    /** 譲らなかった方を残す先。**黙って上書きしない。** */
-    private fun asidePath(folder: String, device: String) =
-        "$folder\\.photo-curator\\catalog.$device.json"
 
     fun supports(project: Project): Boolean = project.source.kind == SourceKind.Nas
 
-    private fun nasId(project: Project) = project.source.key.substringBefore("|")
-    private fun folder(project: Project) = project.source.folder
-
-    // ---- 形 ----
-
-    private fun encode(catalog: Catalog): ByteArray {
-        val photos = JSONObject()
-        for ((path, star) in catalog.ratings) {
-            photos.put(path, JSONObject().put("rating", star))
-        }
-        val overrides = JSONArray()
-        for (one in catalog.overrides) {
-            // **キー名は core の PairOverride と揃える**（設計 09 章 §5 #9）。
-            overrides.put(
-                JSONObject().put("left", one.left).put("right", one.right).put("decision", one.decision)
-            )
-        }
-        val sessions = JSONObject()
-        catalog.session?.let { sessions.put("tournament", JSONObject(sessionToJson(it))) }
-        val root = JSONObject()
-            .put("version", VERSION)
-            .put("updatedAt", catalog.updatedAt)
-            .put("updatedBy", catalog.updatedBy)
-            .put("updatedByName", catalog.updatedByName)
-            .put("photos", photos)
-            .put("burstOverrides", overrides)
-            .put("sessions", sessions)
-        catalog.burstDistance?.let { root.put("burstDistance", it) }
-        return root.toString(2).toByteArray()
-    }
-
-    private fun decode(bytes: ByteArray): Catalog? = try {
-        val root = JSONObject(String(bytes))
-        val photos = root.optJSONObject("photos") ?: JSONObject()
-        val ratings = HashMap<String, Int>()
-        for (key in photos.keys()) {
-            ratings[key] = photos.getJSONObject(key).optInt("rating", 0)
-        }
-        val overrides = ArrayList<PairOverride>()
-        val array = root.optJSONArray("burstOverrides") ?: JSONArray()
-        for (at in 0 until array.length()) {
-            val one = array.getJSONObject(at)
-            // **"l"/"r"/"d" は 2026-09-16 までの短い形。** 古い catalog.json が
-            // NAS に残っているので、読むときだけ両方に対応する。
-            overrides += if (one.has("left")) {
-                PairOverride(one.getString("left"), one.getString("right"), one.getString("decision"))
-            } else {
-                PairOverride(one.getString("l"), one.getString("r"), one.getString("d"))
-            }
-        }
-        val session = root.optJSONObject("sessions")?.optJSONObject("tournament")
-            ?.let { sessionFromJson(it.toString()) }
-        Catalog(
-            updatedAt = root.optLong("updatedAt", 0L),
-            updatedBy = root.optString("updatedBy", "?"),
-            updatedByName = root.optString("updatedByName", "別の端末"),
-            ratings = ratings,
-            overrides = overrides,
-            session = session,
-            burstDistance = if (root.has("burstDistance")) root.getInt("burstDistance") else null
-        )
-    } catch (error: Exception) {
-        // **壊れていても上書きしない。** 読めないことにして人に伝える。
-        Log.w(TAG, "catalog.json を読めなかった", error)
-        null
-    }
-
-    // ---- 出し入れ ----
-
-    private suspend fun credentials(context: Context, project: Project): Pair<Nas, String>? {
-        val nas = NasStore.all(context).firstOrNull { it.id == nasId(project) } ?: return null
-        val password = NasPasswords.password(context, nas) ?: return null
-        return nas to password
-    }
-
-    /**
-     * 開いたときの判定。**時刻の大小では決めない。**
-     *
-     * 端末ごとに時計はずれるので、「新しい方」を選ぼうとすると狂った端末が
-     * 常に勝つ。見るのは「**自分が最後に見た版と同じかどうか**」だけ。
-     */
-    suspend fun check(context: Context, project: Project): Sync = withContext(Dispatchers.IO) {
-        if (!supports(project)) return@withContext Sync.Settled
-        val (nas, password) = credentials(context, project)
-            ?: return@withContext Sync.Blocked("NAS のパスワードが要ります")
-
-        val answer = Smb.readIfExists(nas, password, path(folder(project)))
-        val bytes = when (answer) {
-            is SmbResult.Failed -> return@withContext Sync.Blocked(answer.reason)
-            is SmbResult.Ok -> answer.value
-        }
-
-        val mineChanged = SyncState.changed(context, project.id)
-        if (bytes == null) {
-            // まだ無い。**端末に何かあるなら置きに行く。**
-            return@withContext if (mineChanged) Sync.Push else Sync.Settled
-        }
-        val theirs = decode(bytes)
-            ?: return@withContext Sync.Blocked("NAS の記録を読めませんでした（壊れている可能性）")
-
-        val same = theirs.updatedAt == SyncState.seenAt(context, project.id) &&
-            theirs.updatedBy == SyncState.seenBy(context, project.id)
-        when {
-            same && !mineChanged -> Sync.Settled
-            same && mineChanged -> Sync.Push
-            !same && !mineChanged -> Sync.Pull(theirs)
-            else -> Sync.Clash(theirs)
-        }
-    }
-
-    /** 端末の中身を集めて 1 つにする。 */
-    private suspend fun mine(context: Context, project: Project): Catalog {
-        val session = Store.load(context, project.id)
-        return Catalog(
-            updatedAt = System.currentTimeMillis(),
-            updatedBy = Device.id(context),
-            updatedByName = Device.name(),
-            ratings = session?.ratings ?: emptyMap(),
-            overrides = Overrides.load(context, project.id),
-            session = session,
-            burstDistance = Learning.learned(context, project.id)
+    private fun target(context: Context, project: Project): SyncTarget {
+        val app = context.applicationContext
+        return SyncTarget(
+            projectId = project.id,
+            folder = project.source.folder,
+            io = SmbCatalogIO(app, project.source.key.substringBefore("|")),
+            local = DeviceLocal(app, project)
         )
     }
 
     /**
-     * 端末のものを NAS へ置く。**書けたときだけ「見た版」を進める。**
-     *
-     * 進め忘れると、次に開いたとき自分が書いたものを他人の変更と誤認する。
-     * 逆に失敗したのに進めると、書けていない内容を「共有済み」と思い込む。
+     * 開いたとき・選別から戻ったとき・選別を始める前に確かめる。**列の前の書き込みを待ってから読む。**
+     * 何をしたか（書いた・取り込んだ・確認が要る・つなげない）を返す。
      */
-    suspend fun push(context: Context, project: Project): String? = withContext(Dispatchers.IO) {
-        if (!supports(project)) return@withContext null
-        val (nas, password) = credentials(context, project)
-            ?: return@withContext "NAS のパスワードが要ります"
-        val catalog = mine(context, project)
-        val answer = Smb.write(nas, password, path(folder(project)), encode(catalog))
-        when (answer) {
-            is SmbResult.Failed -> answer.reason
-            is SmbResult.Ok -> {
-                SyncState.saw(context, project.id, catalog.updatedAt, catalog.updatedBy)
-                null
-            }
-        }
+    suspend fun check(context: Context, project: Project, mode: SyncMode = SyncMode.Open): SyncOutcome {
+        if (!supports(project)) return SyncOutcome.Settled()
+        return engine(context).check(target(context, project), mode)
     }
 
     /**
-     * NAS のものを端末に取り込む。**端末側の判断は上書きされる。**
-     * 呼ぶ前に、上書きしてよいことが決まっていること（Pull か、人が選んだ Clash）。
+     * 区切り（画面を離れる・ラウンドの終わり・背面へ回る）で書く。**列に積むだけで待たない。**
+     * 書くかどうかは中身で決まる（変更が無ければ何もしない）。取り込み・確認は次に開いたとき。
      */
-    suspend fun adopt(context: Context, project: Project, catalog: Catalog) =
-        withContext(Dispatchers.IO) {
-            catalog.session?.let { Store.save(context, project.id, it) }
-            Overrides.save(context, project.id, catalog.overrides)
-            catalog.burstDistance?.let { Learning.save(context, project.id, it) }
-            SyncState.saw(context, project.id, catalog.updatedAt, catalog.updatedBy)
-            // 取り込んだ直後は**端末に未共有の変更が無い**状態。
-            SyncState.clean(context, project.id)
+    fun pushIfChanged(context: Context, project: Project) {
+        if (!supports(project)) return
+        val pending = engine(context).pushIfChanged(target(context, project))
+        scope.launch {
+            val answer = pending.await()
+            if (answer is SyncOutcome.Blocked) Log.w(TAG, "サイドカーを書けなかった: " + answer.reason)
+        }
+    }
+
+    /** メニューの「NAS に保存」。**開いたときと同じ判断**（確かめずに上書きしない）。 */
+    suspend fun save(context: Context, project: Project): SyncOutcome =
+        check(context, project, SyncMode.Explicit)
+
+    /** 食い違いのダイアログの答え。 */
+    suspend fun resolve(context: Context, project: Project, clash: SidecarClash, choice: ClashChoice): SyncOutcome =
+        engine(context).resolve(target(context, project), clash, choice)
+
+    /** 切り離し（「この端末の状況を残す」）のあとの「NAS に書き込む」。 */
+    suspend fun writeNow(context: Context, project: Project): SyncOutcome =
+        engine(context).writeNow(target(context, project))
+
+    /** 「この端末の状況を残す」を選んだあとか。 */
+    fun detached(context: Context, project: Project): Boolean =
+        supports(project) && engine(context).detached(project.id)
+
+    /** 結果を 1 行にする。**黙って書かない、黙って失敗しない。** 何もしなかったときは null。 */
+    fun note(outcome: SyncOutcome): String? = when (outcome) {
+        is SyncOutcome.Settled -> outcome.note
+        is SyncOutcome.Pushed -> outcome.note
+        is SyncOutcome.Pulled -> outcome.note
+        is SyncOutcome.Blocked -> outcome.reason
+        is SyncOutcome.Asking, SyncOutcome.Deferred -> null
+    }
+
+    // ---- つなぎ ----
+
+    /** NAS（SMB）。**接続の情報は使うときに読む**（列に積むのはその場で、待たずに済ませるため）。 */
+    private class SmbCatalogIO(private val context: Context, private val nasId: String) : CatalogIO {
+        private var cached: Pair<Nas, String>? = null
+
+        private suspend fun credentials(): Pair<Nas, String>? {
+            cached?.let { return it }
+            val nas = NasStore.all(context).firstOrNull { it.id == nasId } ?: return null
+            val password = NasPasswords.password(context, nas) ?: return null
+            return (nas to password).also { cached = it }
         }
 
-    /**
-     * 端末のものを選んだとき。**譲られた方を捨てない。**
-     * `catalog.<端末名>.json` に退避してから、端末のもので上書きする。
-     */
-    suspend fun keepMine(context: Context, project: Project, theirs: Catalog): String? =
-        withContext(Dispatchers.IO) {
-            val (nas, password) = credentials(context, project)
-                ?: return@withContext "NAS のパスワードが要ります"
-            val aside = asidePath(folder(project), theirs.updatedBy.take(12))
-            // 退避に失敗したら**上書きしない。** 消してしまうより、次に持ち越す。
-            when (val kept = Smb.write(nas, password, aside, encode(theirs))) {
-                is SmbResult.Failed -> return@withContext kept.reason
-                is SmbResult.Ok -> Unit
-            }
-            push(context, project)
+        private suspend fun <T> with(work: suspend (Nas, String) -> SmbResult<T>): SmbResult<T> {
+            val (nas, password) = credentials() ?: return SmbResult.Failed("NAS のパスワードが要ります")
+            return work(nas, password)
         }
+
+        override suspend fun read(path: String) = with { nas, password -> Smb.readIfExists(nas, password, path) }
+        override suspend fun write(path: String, bytes: ByteArray) =
+            with { nas, password -> Smb.writeDirect(nas, password, path, bytes) }
+        override suspend fun rename(from: String, to: String) =
+            with { nas, password -> Smb.rename(nas, password, from, to) }
+        override suspend fun createExclusive(path: String, bytes: ByteArray) =
+            with { nas, password -> Smb.createExclusive(nas, password, path, bytes) }
+        override suspend fun delete(path: String) = with { nas, password -> Smb.delete(nas, password, path) }
+    }
+
+    /** 端末の選別状況（星とセッション・手直し・学習した境目・やり直しの世代）。 */
+    private class DeviceLocal(private val context: Context, private val project: Project) : LocalState {
+        private val id get() = project.id
+
+        override suspend fun flush() {
+            // 選別の確定・手直しは Persist の列で書く。**最後の 1 組まで書き終えてから読む。**
+            Persist.settle("session:$id")
+            Persist.settle("overrides:$id")
+        }
+
+        override suspend fun read() = LocalSnapshot(
+            session = Store.load(context, id),
+            overrides = Overrides.load(context, id),
+            burstDistance = Learning.learned(context, id),
+            epoch = SyncState.epoch(context, id)
+        )
+
+        override suspend fun apply(snapshot: LocalSnapshot) {
+            snapshot.session?.let { Store.save(context, id, it) } ?: Store.clear(context, id)
+            if (snapshot.overrides.isEmpty()) Overrides.clear(context, id)
+            else Overrides.save(context, id, snapshot.overrides)
+            snapshot.burstDistance?.let { Learning.save(context, id, it) } ?: Learning.forget(context, id)
+            SyncState.setEpoch(context, id, snapshot.epoch)
+        }
+
+        override suspend fun aside(json: String) = withContext(Dispatchers.IO) {
+            // 置き換える前の端末の選別状況。**書けなければ置き換えない**（例外のまま返す）。
+            val dir = File(context.filesDir, "aside").apply { mkdirs() }
+            File(dir, "$id-${System.currentTimeMillis()}.json").writeAtomically { it.writeText(json) }
+            // **最後の 3 つまで**残す（元に戻す手がかり）。片付けの失敗は止めない。
+            try {
+                dir.listFiles { file -> file.name.startsWith("$id-") && file.name.endsWith(".json") }
+                    ?.sortedByDescending { it.name.removePrefix("$id-").removeSuffix(".json").toLongOrNull() ?: 0L }
+                    ?.drop(ASIDE_KEEP)
+                    ?.forEach { it.delete() }
+            } catch (error: Exception) {
+                Log.w(TAG, "古い退避を片付けられなかった: $id", error)
+            }
+            Unit
+        }
+
+        override suspend fun photoKeys(): List<String> =
+            Listing.load(context, project.source.key)?.map { it.relativePath } ?: emptyList()
+
+        override fun groupSize(): Int = Prefs.groupSize(context)
+    }
 }

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { lumaFromRgba } from '~/utils/dhash'
 
-// 指紋そのもの（dHashFromGray）は core の試験（core-wasm-fixtures）が見る。
+// ハッシュ値そのもの（dHashFromGray）は core の試験（core-wasm-fixtures）が見る。
 
 describe('lumaFromRgba', () => {
   it('BT.709 の重みで輝度を出す', () => {

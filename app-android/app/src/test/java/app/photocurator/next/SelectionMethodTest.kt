@@ -80,6 +80,6 @@ class SelectionMethodTest {
         }
         val slideshow = selectionHelp(Method.Slideshow).sections.flatMap { it.items }
         assertTrue(slideshow.any { it.contains("長押しの拡大はありません") })
-        assertTrue(slideshow.any { it.contains("中心を二度タップ") })
+        assertTrue(slideshow.any { it.contains("中央を二度タップ") })
     }
 }

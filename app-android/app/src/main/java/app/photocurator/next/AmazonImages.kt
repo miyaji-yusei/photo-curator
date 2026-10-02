@@ -50,7 +50,10 @@ class AmazonFetcher(
      * 選別用。**準備で作ってあるはずのもの。** 無ければその場で頼んで置く。
      * 網に行けなければ、せめてサムネイルを出す（何も出さないよりは粗くても出す）。
      */
-    private suspend fun display(): FetchResult? {
+    private suspend fun display(): FetchResult? =
+        Renders.exclusive(cacheId, nodeId, image.edge) { displayLocked() }
+
+    private suspend fun displayLocked(): FetchResult? {
         Renders.read(context, cacheId, nodeId, image.edge)?.let {
             return bytesResult(it, DataSource.DISK)
         }

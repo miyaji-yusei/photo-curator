@@ -233,3 +233,170 @@
 - 変えていないもの: `next_round`・`round_for` の「通った写真が 2 枚未満なら終了」（ユーザー決定: 今のまま）。セッションの保存形式。`advance`・`undo`・`keep_and_top`・連写の扱い（グループの大きさに依存しない）。
 - テスト: `枚数は一枚を下回らない` に直し、group_size 1 の 4 点（1 枚ずつ出る・選ぶと★が上がり選ばないと据え置きで外れる・1 つ戻せる・連写の代表と仲間の★）を追加。`cargo test`（96 件）・`cargo check`（src-tauri）通過。
 - **影響**: Android の `.so` の作り直しはユーザーの作業（作り直すまで、group_size=1 のセッションを Android で開くと `resize` で 2 に直る可能性）。PC・Web は core-wasm の再ビルド（`pnpm core:wasm`）が要る。
+
+## U33 サイドカー同期で選別状況が消える不具合の根本対策（2026-10-02）
+設計書（「サイドカー（`.photo-curator/catalog.json`）同期の調査と直し方の設計」）の PR-3〜PR-5 に当たる。3 段に分ける。
+
+| 段 | 中身 | ブランチ | 状態 |
+| --- | --- | --- | --- |
+| U33 | core: 正規化・比較キー・未着手・`sidecar_plan`・混ぜ方（D・E）・鍵の変換・catalog.json v2 の項目。UDL と core-wasm に公開 | `fix/mb-u33-core-sidecar` | 済（push・PR はまだ。10章 §7 の U33） |
+| U34 | PC・Web: `useSidecarSync` を `sidecar_plan` と楽観ロック（lock → 読む → 確かめる → 一時ファイル → rename → 読み戻し）に切り替える。`sidecar_state` に `seen_token`・`seen_key`・`seen_epoch`・`detached`（移行: 古い seen_at/seen_by から `legacy:` の token、localChanged=true なら key を空に）。5 択のダイアログ・B の帯と「NAS に書き込む」・取り込みの「元に戻す」。`lib/core.ts` に新しい関数の型を足す。鍵は書くとき `sidecarKeysToFolder(…, '')`、読んだ直後に `sidecarNormalizeKeys(…, 選んだフォルダ)`、取り込むとき `sidecarKeysFromFolder(…, '', '\\')`（Windows） | `fix/mb-u34-pcweb-sidecar` | 済（push・PR はまだ。10章 §7 の U34・下の「U34」） |
+| U35 | Android: `Sidecar.kt` の判断を core の `sidecarPlan` に置き換える（`SyncState` を token・key・epoch・detached に）。鍵は prefix＝共有の根からのフォルダで変換。プロジェクトごとに 1 本の列・一時ファイル → rename・ON_STOP は開いているプロジェクトだけ・最初の確認が終わるまで「選別を開始」を押せない・5 択のダイアログ。**先に `node scripts/build-core.mjs` で `.so` と Kotlin の束ねを作り直す（ユーザー）** | `fix/mb-u35-android-sidecar` | 済（push・PR はまだ。下の「U35」の節。実機は未確認） |
+
+### U33 で足した core の公開 API（`core/src/sidecar_sync.rs`。UDL・core-wasm にも同名／camelCase）
+- 正規化・比較: `normalize_key`・`canonical_judgement`・`sidecar_judgement`・`judgement_equivalent`・`judgement_key`
+- 未着手・要約: `is_untouched`・`judgement_progress`・`progress_cmp`
+- 版: `sidecar_token`・`sidecar_seen`・`sidecar_stamp`（書く前に v2 の項目を入れる）
+- 判断: `sidecar_plan(seen, local, remote, writable, detached)` → `Settled{seen?,reason}`／`Push{expected,aside_theirs,reason}`／`Pull{theirs,aside_mine,seen,reason}`／`Clash{theirs,mine_progress,theirs_progress,order,reason,preview}`
+- 混ぜ方: `merge_stars`・`merge_overrides`・`merge_judgements`・`merge_preview`・`session_from_ratings`
+- 鍵: `sidecar_keys_to_folder`・`sidecar_keys_from_folder`・`sidecar_normalize_keys`・`sidecar_key_coverage`
+- UDL には `sidecar_to_json`・`sidecar_from_json` も足した（Android が core の形で読み書きできるように）
+- 型: `Sidecar` に `write_id`・`based_on`・`lineage`・`epoch`・`key_base`・`progress`（すべて省略可・型違いは読み捨て）。`SidecarProgress`・`Judgement`（と部品）・`SeenRecord`・`SidecarPlan`・各 Reason・`ProgressOrder`・`MergeMode`・`MergePreview`・`MergeResult`・`KeyCoverage`
+- 旧い `sidecar_decide` は互換のため残した（UDL には足さない）。新しい呼び出し側は `sidecar_plan` を使う
+
+### 呼び出し側の使い方（U34・U35 向けのメモ）
+1. NAS から読む（つながらない・壊れている → plan を呼ばない）→ `sidecar_normalize_keys(remote, 選んだフォルダ)`
+2. 端末の状態から `Sidecar` を組み、`sidecar_keys_to_folder(…, prefix)` → `sidecar_judgement` で `local`（または `canonical_judgement` に直接）
+3. `sidecar_plan(seen, local, remote, writable, detached)`
+   - `Settled{seen: Some}` → 控えをその値にする（警告は出さない）
+   - `Push{expected}` → lock を取り、読み直して `sidecar_token` が `expected` と同じか確かめる → `aside_theirs` なら相手を `catalog.<相手>.json` へ → `sidecar_stamp(local の Sidecar, 新しい乱数, Some(remote))` を書く → 控え `{writeId, 書いた写しの judgement_key, epoch}`
+   - `Pull{theirs, aside_mine, seen}` → 端末の分を退避（`aside_mine` なら NAS にも）→ `sidecar_keys_from_folder` で端末の形にして取り込む → 控え `seen`
+   - `Clash` → 5 択（A 取り込む／B 残す＝detached・控えは NAS の版／C 書き込む／D 積集合／E 和集合＝`merge_judgements`）。C・D・E は `sidecar_stamp(…, Some(theirs))` で書くので、相手の端末からは早送りになる
+4. 取り込む前に `sidecar_key_coverage` で一致が半分未満なら取り込まず理由を出す（設計書 §4.8）
+
+### 仮置きの判断（ユーザー未確認。設計書の推奨に無い細部を決めたもの）
+1. **早送りは `basedOn` だけでなく、新しい項目 `lineage`（これまでの版の見分け、新しい順に最大 32）でも見る**。PC がラウンドの終わりと窓を隠したときの 2 回書いても、Android から早送りになるように。古いアプリが 1 回でも書くと系統が途切れ、早送りと見なさない（確認になる）
+2. 手直しの同じ 2 枚の重複は**先に出た方**を採る（core の `group_bursts` が実際に使う方。設計書の表は「最後」）
+3. 星とセッションが同じで手直し・境目が違うとき、**片方だけが多いなら自動**（Q9）。両方に相手に無い分がある・食い違うときは確認（`ExtrasConflict`。和集合の自動はしない）
+4. 切り離し中（B のあと）は、#3 と #7 の自動の書き込みをしない。#5（NAS が未着手の版）は設計書どおり書く
+5. 見た版のままで端末がやり直した（未着手になった）とき、NAS の着手済みの版は退避してから書く（`aside_theirs=true`）
+6. やり直しの検出: 見た版の `epoch` と比べ、NAS 側が変えていれば `TheirsRestarted`、端末側なら `MineRestarted`（端末のやり直しは「未着手」と見なさないので、相手の進んだ版を黙って取り込まない）。一度も見ていない版では epoch で判断しない
+7. 両方とも未着手で中身だけ違う（写真の顔ぶれなど）ときは取り込む（#4。失うものが無い）
+8. `version > 2` の版には書かない（`NewerVersion`）。端末が未着手なら取り込みはする
+9. 書けない共有では、早送り・手直しだけの取り込みはする。それ以外は `ReadOnly`（この端末だけの結果）
+10. 進み具合の比べ: ROUND（終われば半歩）→ 同じ ROUND なら決めた組の数 → ★1 以上の数。食い違えば `Unclear`。全部同じなら手直しの数・境目の学習
+11. 未判定（積集合）: 途中のセッションの `current ＋ queue` とその連写の仲間。セッションが無く★0 も未判定（設計書どおり）。両方未判定は小さい方
+12. 混ぜた完了状態: ROUND と対象の★は両方の大きい方、`survivors` は対象を超え★5 未満、連写のまとまりは端末の分（無ければ NAS の分）、`group_size` は呼ぶ側が渡す。世代が違えば呼ぶ側が作った新しい `epoch`
+13. 古い形の鍵の推定: `keyBase` が無い版は、全部の鍵に共通の頭のフォルダが、この端末で選んだフォルダのパスの末尾と一致すれば外す（Android の `photo/x` にも PC の `\\NAS\share\photo\x` にも効く）。合わなければ外さない
+14. NFC にそろえるのはフォルダ形式へ変えるときだけ。端末の形へ戻すとき（`from_folder`）は NFC のまま（macOS 由来の NFD の名前だと端末の鍵と合わない可能性。U34・U35 で必要なら端末側の鍵も NFC にする）
+15. `progress` に `overrides`（手直しの数）・`learned`（境目の学習）を足した。`total` は `sidecar_stamp` のとき（`photos` と `session.ratings` の多い方）
+16. v2 の項目は型が違えば読み捨てる（catalog.json 全体は「壊れている」にしない）
+17. 比較キーは `j1:` ＋ SHA-256 の 16 進。正規形の作り方を変えたら `j2:` にする
+18. `Settled` の「控えを進めるか」は `seen: Option<SeenRecord>` で表し、`Pull` も控える値を返す
+19. 鍵の一致率の 50% の線引きは呼ぶ側（`sidecar_key_coverage` は数だけ返す）
+20. ロック・退避ファイル・壊れたファイルの扱い（`catalog.broken-<時刻>.json`）は呼ぶ側（U34・U35）
+
+### テストと設計書 §3 の表の対応
+core の `core/src/sidecar_sync/tests.rs` に、関数名の末尾「_3のn」で §3 の行を示した。1〜5・7・9・10・12・13・16 は判断の表どおり、6・8（壊れた・書きかけは読めないことにする）・11（同じフォルダの別プロジェクトも黙って上書きしない）・14（明示の保存も同じ判断）・15（取り込み後に落ち着く・書いた版は相手から早送り）・17（書いている間の判断は次に変更ありとして残る）は core で確かめられる範囲だけ。ロック・rename・保存の列・最初の確認が終わるまで開始させない、は U34・U35 の呼び出し側のテストで確かめる。
+
+### 再ビルド
+- PC・Web: `pnpm core:wasm`（`core-wasm/pkg` は gitignore）
+- **Android: `node scripts/build-core.mjs`（`.so` と uniffi の Kotlin。gitignore）はユーザーの作業**。U33 では `--debug` で通ることまで確かめた（arm64-v8a の `.so`・Kotlin に `sidecarPlan` などが出る）。今の Android の動きは変わらない（新しい関数はまだ呼ばない）
+
+## U35 Android のサイドカー同期を core の `sidecarPlan` に切り替える（2026-10-02）
+設計書の PR-5（PR-1 の応急処置の中身も含む）。**PC・Web の U34 と両方がそろって初めて、PC と Android を同じ NAS のフォルダで同時に使うのが安全になる**（片方だけだと、新しくない側が確かめずに上書きする。設計書 §4.9 の最後の行）。両方を同じ時期に入れること。
+
+### 切り替えた範囲
+- 新しい `SidecarSync.kt`（Android に依存しない）: 判断は core の `sidecarPlan`。NAS は `CatalogIO`、端末の控えは `SeenStore`、端末の選別状況は `LocalState` の interface 越し（JVM テストで偽物を渡す）
+- プロジェクトごとに 1 本の列（区切りの書き込みは積むだけ、確認はその完了を待つ）・楽観ロック（`catalog.lock` → 読んで見た版と同じか → `.catalog.<writeId>.tmp` → rename → 読み戻し。違えば最大 3 回判定し直す）・取り込む前の退避（端末 `filesDir/aside/<プロジェクト>-<時刻>.json` を最後の 3 つ、NAS `catalog.<端末>.json`）
+- `Sidecar.kt` はつなぎだけ。`SyncState` は `-seenToken`・`-seenKey`・`-seenEpoch`・`-detached`・`-epoch`（古い `-seenAt`/`-seenBy`/`-dirty` は最初に読んだときに移して消す）。`touch`（dirty の印）の呼び出しは消した
+- `Smb.write` は一時ファイル → rename。`rename`・`createExclusive`（`FILE_CREATE`）・`delete` を足し、書けるのは `.photo-curator` の下だけにした
+- プロジェクト画面: 確認が終わるまで「選別を開始」を押せない（「NAS を確認中…」。つながらなければ押せる）。始める・続ける前にも同期。メニュー「NAS に保存」も同じ判断。切り離し中は「この端末だけの結果（NAS とは別）」と「NAS に書き込む」
+- 5 択のダイアログ `SidecarDialog.kt`（文言は設計書 §4.6。定数は `SidecarSync` の companion）。ON_STOP は開いているプロジェクトだけ
+- 写真の鍵: 書くとき `sidecarKeysToFolder(…, 共有の根からのフォルダ)`、読んだ直後に `sidecarNormalizeKeys(…, フォルダ)`、取り込むとき `sidecarKeysFromFolder(…, フォルダ, "/")`。取り込む前に `sidecarKeyCoverage` で一致が半分未満なら取り込まない
+- テスト: `app-android/app/src/test/.../SidecarSyncTest.kt`（20 件）。`build.gradle.kts` で PC 向けの core（`core/target/debug` の cdylib）を UniFFI の `libraryOverride` で読ませる（`testDebugUnitTest` の前に `cargo build --lib`）
+
+### 仮置きの判断（ユーザー未確認）
+1. 書けるかどうか（`writable`）は常に true で渡す（書けない共有は、書いたときの失敗として出す）
+2. ロックの古さは中身の `at`（書いた端末の時計）で 60 秒。形は `{"device","name","at"}`（U34 と同じ名前 `catalog.lock`）
+3. 書き込みが「読んでから書くまでに変わった」なら最大 3 回まで判定し直し、それでもだめなら「あとでもう一度」
+4. 取り込みの退避: 端末が未着手なら退避しない。NAS への退避（`aside_mine`）に失敗しても、端末に退避できていれば取り込む。**端末への退避に失敗したら取り込まない**
+5. セッションが無く星だけある版を取り込むときは、その星の「完了した状態」（`session_from_ratings`、ROUND 1）にする（星を落とさない）
+6. 取り込んだあとの控えの比較キーは、取り込んだあとの端末の選別状況から作る（5 のように形が変わっても、次に「変更あり」と読まない）
+7. B（残す）の控えは NAS の版（比較キーも NAS の中身）。端末と違うので「変更あり」のまま、切り離し中は書かず、NAS の同じ版では聞き直さない。NAS の早送りでも黙って取り込まない（確認になる）
+8. 意味が同じ（Settled の Same）になったら切り離しを解く
+9. ダイアログを閉じた（外を押した・戻る）ときは何も変えず、選別を始める前にもう一度聞く（03 の「選ぶまで始めさせない」は、Q8 のとおり B が「先へ進む」役を持つ）
+10. ダイアログを出したあとで NAS が変わっていたら、答えを実行せずに判定し直す（新しい確認になることもある）
+11. D・E の手直し・境目・世代は core の `merge_judgements` のまま（食い違えば端末）。1 組の枚数は端末の設定（`Prefs.groupSize`）。混ぜた結果は端末に入れてから C と同じ書き込みをする（書けなかったら端末は混ぜたまま、次に開いたときにまた判断）
+12. 背面への移動（ON_STOP）・画面を離れる・ラウンドの終わりは「書くだけ」。取り込み・確認になる場合は何もしない（次に開いたとき）
+13. やり直しは新しい `epoch`（`e-` ＋乱数 16 文字）。初めて同期する前のやり直しは世代を見ない（core）
+14. 「元に戻す」（取り込みの直後）は見送り。端末の `aside/` に最後の 3 つが残る（手で戻す手がかり）
+15. 写真の場所の一致率は、端末の一覧（`Listing`）がまだ無ければ確かめない
+16. 書き込みの通知: 書いたら「この端末の結果を NAS に保存しました」（退避したら「（NAS にあった記録は catalog.<端末>.json に残しました）」）、取り込んだら「<端末名> の記録から続きを取り込みました」。意味が同じ・変更なしは何も出さない
+17. 文言で設計書に無いもの: 理由「この端末で最初からやり直しています」（MineRestarted）、「★と選別の進みは同じで、連写のまとまりの手直しか学習した境目が違います」（ExtrasConflict）、要約の「境目を学習済み」。「こちらが進んでいます」は名札の次の行
+
+### 確かめたこと・まだのこと
+- `./gradlew testDebugUnitTest`（92 件。新規 20）・`assembleDebug`・core の `cargo test`（core は変えていない）
+- 再現テストは、今までの規則（見た版と同じか × 変更があるか、列の待ちなし）に差し替えて**赤**（9 件失敗。テスト 2 は Pull＝今回の不具合、2b・2c は確認が出る、テスト 1 は確認が書き込みを追い越して読む）を確かめてから緑にした
+- エミュレーター（dev_pixel8）: ダイアログを一時的な差し込みで出し、縦（412dp。1 列）と横（左右 2 列）で崩れないこと・クラッシュしないことを見た（差し込みはコミットしていない）
+- **未確認**: NAS を使った実機の確かめ（設計書 §5 の末尾「実機での確かめ方」の 1〜9。U34 と合わせて行う）、smbj の `rename`・`FILE_CREATE` が実際の NAS で期待どおり動くか、ほかの ABI
+## U34 PC・Web のサイドカー同期を core の `sidecar_plan` に切り替える（2026-10-02）
+設計書の PR-4（PR-2 の応急処置の中身も含む）。core と `app-android/` は変えていない。
+
+### 切り替えた範囲
+- `composables/useSidecarSync.ts`: 判断は `core.sidecarPlan` だけ。読む → 鍵をそろえる → 判断 → 実行を、プロジェクトごとに 1 本の列で行う。変わったかは「見た版の比較キー ≠ 今の比較キー」（古い控えは `legacy:` に読み替え）
+- 書き込み: 楽観ロックの `writeSidecarChecked`（PC は `src-tauri/src/sidecar.rs` の `write_checked` と `lib.rs` の `write_sidecar_checked`、Web は `HandleFolderIO.writeSidecarChecked`）。退避（`catalog.<id>.json`）は従来の `writeSidecar`
+- 控え: `sidecar_state`（SQLite）と IndexedDB に `seenToken`・`seenKey`・`seenEpoch`・`localEpoch`・`detached`
+- 取り込み（`applyLocal`）: 鍵を端末の形に戻す・星は Session があれば Session から・相手に無い Session と境目は端末が未着手でない限り残す・鍵の一致が半分未満なら取り込まない
+- 5 択のダイアログ（`components/dialogs/SidecarConflictDialog.vue`）・プロジェクト画面の「この端末だけの結果（NAS とは別）」と「NAS に書き込む」・お知らせ（取り込んだ など）
+- タイミング（`composables/useCurator.ts`）: 開いたとき・「選別を開始」の前・選別／結果から戻ったとき＝全部の判断。ラウンドの終わり・ホームへ戻る・隠れる・窓を閉じる＝書くだけ。やり直しで `markRestarted`
+- `lib/core.ts` に U33 の型と関数（`sidecarPlan` ほか）
+
+### 仮置きの判断（ユーザー未確認。設計書の推奨に無い細部）
+1. 楽観ロックの「見た版」は、token ではなく**読んだ catalog.json の中身そのもの**で比べる（Rust に版の解釈を持たせない。token より厳しい）
+2. 書く直前に別の端末が書いた、が続いたら 3 回で諦め、何もせず次の契機に回す（設計書の「2 回、その後は確認」の確認は出さない）
+3. ロックは `catalog.lock`、60 秒より古いものは壊す。取れなければ書かずに「ほかの端末が書き込んでいた」。Web は「無いのを確かめて作り、読み直す」（原子的ではない。本命は読み戻し）
+4. 自動の書き込み（ラウンドの終わり・ホーム・隠れる・窓を閉じる）は**書くだけ**。取り込みと確認は次に開いたとき（設計書は背面だけ明記。残りも同じ扱いにした）
+5. 選別・結果からプロジェクト画面へ戻ったときに、全部の判断を走らせる（ラウンドの終わりで見つかった食い違いはここで出る）
+6. 「選別を開始」の前の確認で取り込んだら、**始めずにプロジェクト画面へ戻す**（そのまま始めると取り込んだ星を 0 にするため）。食い違えばダイアログで止まる
+7. 相手に Session が無い取り込みでは、端末が未着手でなければ Session を残し、星だけ取り込んだ値にそろえる（`utils/ratingEdit.ts` の `applyChanges`。開いたときの自己修復で戻されないように）。境目も相手に無ければ残す。A（取り込む）でも同じ
+8. 取り込んだあとの控えの比較キーは「取り込んだあとの端末」の値（設計書 §4.4 どおり）。残した Session・境目は、次に端末が変わったときに書かれる
+9. 鍵の一致が半分未満なら取り込まず、赤字で理由を出す（ダイアログにはしない）。A でも同じ
+10. 端末の中の退避（設計書の `aside/`）と「元に戻す」は**見送り**。退避は NAS の `catalog.<id>.json` だけ（A・早送りの端末の分、C と「NAS に書き込む」の NAS の分、D・E の両方）
+11. B（残す）の控えは NAS の版。意味が同じになったとき・取り込む／書く／混ぜるときに切り離しを解く
+12. 書けなかったときは、書けるかを取り直してダイアログを残す（書けない共有なら C・D・E を隠す）。何も変えない
+13. 「今すぐ保存」は開いたときと同じ判断（食い違えばダイアログ、取り込めば読み直す）。変更が無ければ「保存する変更はありません。」をお知らせ（赤字にしない）
+14. やり直しと「星を全部消してやり直す」（開始の確認）で、この端末の世代 `localEpoch` を `e-<乱数>` にする
+15. 古い控えのままで変わっていなければ（NoChange）、その場で新しい形に移す。古い `localChanged` は古い版のアプリ向けに書き続け、新しい控えがあるときは判断に使わない
+16. 端末の鍵の区切りは、行に `\` を含む写真があれば `\`、無ければ `/`
+17. 退避のファイル名は従来どおり `catalog.<id 先頭 12 文字>.json`（同じ端末の退避は上書き）
+18. D・E の `group_size` は端末の Session、無ければ NAS の Session、無ければ 4
+19. 取り込んだお知らせは「＜端末名＞ の記録を取り込みました。」、意味が同じときは何も出さない
+20. ダイアログの文言: 見出し「NAS の記録と、この端末の記録が違います」、理由の 1 行（設計書 §4.6）、両側の 1 行（★1 以上・ROUND と途中／完了・決めた組・残り・手直し・境目）、ボタンの下に短い説明、下に「どれを選んでも、元の記録は消しません。…」（端末の中には控えないので、設計書の「この端末にも控えます」は書かない）
+
+### 既存テストの期待を変えたもの（理由）
+- `sidecarSync.test.mjs` の「記録に Session が無ければ、Session と距離を空にする」→ **反転**（ユーザーの決定・設計書 PR-2 の 1。テストにコメント）
+- 「readonly: 端末に変更があっても取り込む」→ 取り込まない（設計書 §4.3 の #8）
+- 「Pull（端末に判断があるのに取り込む）」「時刻の大小」の入力 → 端末を未着手にした（両方着手で違えば確認、のユーザー決定）。古い fixture は photos と Session の星が食い違っていたので、そろえた
+- 「食い違いの選択」「書けなければ読むだけとして取り込む」→ 5 択と「決めつけない」に置き換え（設計書 PR-2 の 5）
+- 「markChanged のあと書く」など → 印だけでは書かないので、端末に実際の判断を入れる形に。状態の比較は項目が増えたので `toMatchObject`
+- src-tauri の `state_defaults_to_never_seen_and_round_trips` は構造体に項目が増えたので `..Default::default()`。`tests/folderScan.test.ts` は `SourceIO` の口が増えたので空の実装を足した
+
+### テスト
+- `tests/sidecarSync.test.mjs` 48 件（2 台が 1 つのファイルを共有する偽物。PC 視点・Android 視点の再現、楽観ロック、`markChanged`、書いている最中の変更、5 択それぞれ、出し直し、書けないとき、鍵の `\`／古い Android 形式、やり直し）。**旧実装で 30 件の失敗を確かめてから実装した**
+- `tests/curatorSidecar.test.ts` 3 件（ラウンドの終わりで書く・開始の前に取り込んで始めない・食い違えば開始で止まる）
+- src-tauri `cargo test --lib` 97 件（sidecar 16 件。新規 7: 新しい列の往復・古い表への列の追加・楽観ロックの作成と置き換え・見ていない版には書かない・新しいロックで待ち古いロックを壊す・失敗してもロックを放す・結果の文字列）
+
+### 実機での確かめ方（PC と Web の 2 台。Android は U35 のあと）
+準備: 試験用のフォルダ（数十枚）を、PC（`pnpm tauri:dev`）と Chrome（Web 版・「フォルダを選ぶ」で書き込みを許可）の両方でプロジェクトにする。毎回 `.photo-curator/` を消してから始め、`catalog.json` の `updatedByName`・`writeId`・`basedOn`・`keyBase`・`progress` と、`catalog.*.json` の有無を控える。
+1. **未着手の版で上書きしない**: Web で 3 組選んでホームへ戻る（書かれる）→ PC で「選別を開始」まで進む。**期待**: 開始の前に Web の続きを取り込み、プロジェクト画面に戻って「ブラウザ の記録を取り込みました。」。星は 0 にならない
+2. **意味が同じ**: `catalog.json` をエディタで開き、並びと空白を変え、`updatedAt` を書き換えて保存 → PC で開き直す。**期待**: 何も出ない・書かない
+3. **早送り**: 1 のあと PC で 3 組 → ホームへ戻る → Web で開き直す。**期待**: 確認なしに取り込む。`catalog.<Web の id>.json` に Web の分が残る
+4. **両方で進める**: 3 のあと両方で 2 組ずつ進めて、Web → PC の順にホームへ戻り、PC で開き直す。**期待**: 5 択。A〜E を 1 つずつ（毎回 4 からやり直して）選び、端末の星・`catalog.json`・`catalog.*.json`・もう一方で開いたときの挙動（C・D・E は確認なしに取り込む）を見る。B のあとは「この端末だけの結果（NAS とは別）」と「NAS に書き込む」が出て、自動では書かない
+5. **開いている間に相手が書いた**: PC でプロジェクトを開いたまま、Web で選別して書く → PC で選別してホームへ戻る。**期待**: PC は書かない（Web の版のまま）。開き直すと 5 択
+6. **ロック**: `.photo-curator/catalog.lock` を手で作っておき、PC でホームへ戻る → 書かない（「ほかの端末が書き込んでいた」）。1 分後なら壊して書く
+7. **やり直し**: PC で「選別を最初からやり直す」→ ホームへ戻る → Web で（その前に Web で 1 組進めておいて）開き直す。**期待**: 「この PC の名前 で最初からやり直されています」の 5 択。Web で何も進めていなければ確認なしに空になる（core の早送りが先に当たる。下の「迷った点」）
+8. **鍵**: 入れ子のフォルダを含む写真で 1〜3 をやり、PC の `catalog.json` の鍵が `sub/IMG.JPG`（`/` 区切り・`keyBase: "folder"`）になっていること
+9. **古い catalog.json**: U34 より前の PC か Android が書いた `catalog.json`（`version` なし・Android はフォルダ名付きの鍵）を置いて、未着手のプロジェクトで開く → 確認なしに取り込み、★の数が合う（Web の開発用フォルダで確認済み）
+
+### 見送り
+- 端末の中の退避と、取り込みの「元に戻す」（仮置き 10）
+- 同じフォルダのプロジェクトが端末に 2 つあるとき（設計書 §3 の #11・Q11）・壊れた catalog.json の `catalog.broken-<時刻>.json` への移動（今は今までどおり理由を出して何もしない）
+
+### 迷った点
+- core の判断では、相手が**やり直した**版でも、この端末が見た版のあと何も変えていなければ早送り（#6）が先に当たり、確認なしに空になる（端末の分は NAS の `catalog.<自分>.json` に退避される）。設計書 §4.3 では #9 で確認。core は変えない決まりなので、そのままにした（必要なら core の順番を変える）
+- 自動の書き込みで「取り込み」を後回しにしたので、窓を隠しただけでは取り込まない（次に開いたとき・戻ったときに取り込む）
+
+### 未確認
+- Tauri の実機（ロック・rename・NAS 越しの読み戻し）、Web の書き込み（File System Access。偽物でだけ確かめた）、ダイアログの実画面（書ける 2 台を用意できなかった）
+- Android は U35（今の Android は旧い判断のまま。PC が U34 で書いた v2 の catalog.json を読んでも壊れないことは U33 のテストで固定済み）

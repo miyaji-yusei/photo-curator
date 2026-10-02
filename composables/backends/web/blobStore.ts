@@ -20,8 +20,12 @@ export interface PhotoUrls {
 export interface BlobStore {
   /** 渡したものだけ書く（null・省略は書かない）。 */
   put: (photoId: string, images: PhotoImages) => Promise<void>
-  /** 写真ごとの URL。保存された画像が無ければ null。 */
-  load: (photoIds: string[]) => Promise<Map<string, PhotoUrls>>
+  /**
+   * 写真ごとの URL。保存された画像が無ければ null。
+   * `display: false` のときは表示用を読まず、URL も作らない（一覧のタイルはサムネイルしか使わない。
+   * 表示用を 80〜120 枚ぶん作ると、上限を超えて**自分の URL を revoke してしまう**）。
+   */
+  load: (photoIds: string[], options?: { display?: boolean }) => Promise<Map<string, PhotoUrls>>
   /** セッション中だけ手元にある原本（ピッカー）の URL。 */
   originalUrl: (photoId: string, file: File) => string
   remove: (photoIds: string[]) => Promise<void>
@@ -32,8 +36,11 @@ interface BlobRow { photoId: string, blob: Blob }
 export function createIdbBlobStore(): BlobStore {
   const thumbnailUrls = new ObjectUrlCache()
   const originalUrls = new ObjectUrlCache(64)
-  /** 表示用は 1 枚 87KB 前後。選別中に見る範囲だけを持てば足りる。 */
-  const displayUrls = new ObjectUrlCache(64)
+  /**
+   * 表示用は 1 枚 87KB 前後。選別中に見る範囲（今の組＋先読み 2 組＝最大 20 枚、まとめ編集の近傍）
+   * を持てば足りるが、1 回の `load` が上限を超えて自分の分を revoke しないよう余裕を持たせる。
+   */
+  const displayUrls = new ObjectUrlCache(160)
 
   return {
     put: async (photoId, images) => {
@@ -49,15 +56,18 @@ export function createIdbBlobStore(): BlobStore {
       })
     },
 
-    load: async photoIds => {
+    load: async (photoIds, options) => {
+      const withDisplay = options?.display !== false
       const blobs = await withStores([STORE_THUMBNAILS, STORE_DISPLAYS], 'readonly', async transaction => {
-        const result = new Map<string, { thumb?: Blob, display?: Blob }>()
-        for (const id of photoIds) {
-          const thumb = await getOne<BlobRow>(transaction, STORE_THUMBNAILS, id)
-          const display = await getOne<BlobRow>(transaction, STORE_DISPLAYS, id)
-          result.set(id, { thumb: thumb?.blob, display: display?.blob })
-        }
-        return result
+        // リクエストを先に全部出してから待つ（1 件ずつ往復しない。W12）。
+        const found = await Promise.all(photoIds.map(async id => {
+          const [thumb, display] = await Promise.all([
+            getOne<BlobRow>(transaction, STORE_THUMBNAILS, id),
+            withDisplay ? getOne<BlobRow>(transaction, STORE_DISPLAYS, id) : undefined
+          ])
+          return [id, { thumb: thumb?.blob, display: display?.blob }] as const
+        }))
+        return new Map<string, { thumb?: Blob, display?: Blob }>(found)
       })
       const urls = new Map<string, PhotoUrls>()
       for (const [id, found] of blobs) {

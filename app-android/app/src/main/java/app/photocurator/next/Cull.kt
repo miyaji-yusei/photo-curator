@@ -26,14 +26,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import coil.compose.AsyncImage
-import coil.request.ImageRequest
 import kotlinx.coroutines.launch
 import uniffi.photo_curator_core.BurstThreshold
 import uniffi.photo_curator_core.PhotoRef
@@ -92,7 +89,7 @@ fun CullScreen(
     var holdZooms by remember { mutableStateOf(false) }
     var note by remember { mutableStateOf("読み込み中…") }
     var stageSize by remember { mutableStateOf(0 to 0) }
-    // 連写のまとめに使う指紋。**出来た分だけで始められる。**
+    // 連写のまとめに使うハッシュ値。**出来た分だけで始められる。**
     var prepared by remember { mutableStateOf(0 to 0) }
     // 大きく見ている並びと、その何枚目か。**左右で前後に送れる**ので
     // 1 枚ではなく並びで持つ。拡大からは「残す」だけができる。
@@ -120,10 +117,18 @@ fun CullScreen(
 
     LaunchedEffect(project.id) {
         note = "写真を読み込んでいます…"
-        // 指紋は OS の縮小画像から作るので**原本を読まない**（1 枚 3ms）。
+        // ハッシュ値は OS の縮小画像から作るので**原本を読まない**（1 枚 3ms）。
         // **前に作った分は作り直さない。**
         note = "似た写真を調べています…"
-        val prepared0 = Prepare.run(context, project) { done, total -> prepared = done to total }
+        val prepared0 = try {
+            Prepare.ready(context, project) { done, total -> prepared = done to total }
+        } catch (error: kotlinx.coroutines.CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            // **準備の失敗で落とさない。** 理由を出して、戻れるようにしておく。
+            note = "準備が止まっています: " + Smb.describe(error)
+            return@LaunchedEffect
+        }
         photos = prepared0.first
         refs = prepared0.second
         // **読んだ値はその場の変数で使う。**
@@ -138,7 +143,10 @@ fun CullScreen(
         holdZooms = Prefs.holdZooms(context)
         // **大きさはプロジェクトごと。** 設定の値はその既定。
         edge = Prefs.projectEdge(context, project.id)
-        Neighbours.log(refs, loadedThreshold)
+        // 診断のログ。**全隣接ペアで距離を計算する**ので、開発用のビルドでだけ走らせる（A4）。
+        if (context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+            Neighbours.log(refs, loadedThreshold)
+        }
 
         // **途中があれば続きから。** 無ければ新しく始める。
         val saved = Store.load(context, project.id)
@@ -227,6 +235,17 @@ fun CullScreen(
     // **スライドショーは「1 グループ 1 枚」。** 同じセッション・同じ core の
     // 処理で、違いは 1 組が 1 枚かどうかだけ（トーナメントは 2 枚以上）。
     val slideshow = live.groupSize.toInt() == Prefs.SLIDESHOW_SIZE
+
+    // **次に出す写真を先に読んでおく**（U26）。終わったラウンドでは対象が空になり、
+    // この画面を離れれば止まる。拡大中も続ける（戻ったときに間に合う）。
+    if (!live.finished) {
+        val ahead = Prefetch.targets(live.queue, live.groupSize.toInt(), slideshow)
+            .mapNotNull { byPath[it] }
+        PrefetchAhead(
+            ahead, displayEdge,
+            if (slideshow) Prefetch.SLIDESHOW_PX else Prefetch.TILE_PX
+        )
+    }
 
     /** 確定して次へ。**確定のたびに保存する。どこで止めても失わない。** */
     fun commit(picked: Set<String>) {
@@ -778,20 +797,15 @@ internal fun Tile(
                 Text("読めません", fontSize = 11.sp, color = Faint)
             }
         } else {
-            AsyncImage(
-                model = ImageRequest.Builder(LocalContext.current)
-                    // **ここは大きく出すので原本を読む。**
-                    // EXIF の縮小画像は 160x120 しかなく、選別の判断には足りない。
-                    // 一度読めば端末に残るので、2 回目からは網に行かない。
-                    .data(photo.displayModel(displayEdge))
-                    .size(1280)
-                    .build(),
-                contentDescription = photo.name,
-                // **このアプリの読み込み器を通す。** 既定の Coil は NAS の
-                // 写真の読み方を知らないので、渡し忘れると何も出ない。
-                imageLoader = Images.loader(LocalContext.current),
-                // 切らずに全部見せる。縦横比が合わなくても黒帯にしない。
-                contentScale = ContentScale.Fit,
+            // **ここは大きく出すので表示用画像を読む。**
+            // EXIF の縮小画像は 160x120 しかなく、選別の判断には足りない。
+            // 一度読めば端末に残るので、2 回目からは網に行かない。読めるまでは
+            // 置いてあるサムネイルを出す。読み込み器はこのアプリのもの
+            // （既定の Coil は NAS の写真の読み方を知らない）。
+            DisplayImage(
+                photo = photo,
+                displayEdge = displayEdge,
+                px = Prefetch.TILE_PX,
                 modifier = Modifier.fillMaxSize()
             )
         }

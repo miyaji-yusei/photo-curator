@@ -1,8 +1,8 @@
 //! core の判断を PC・Web の画面（Nuxt）から呼ぶための橋。
 //!
-//! **判断そのものはここに書かない。** UDL の関数全部と、サイドカーの 3 つ
-//! （`sidecar_to_json` / `sidecar_from_json` / `sidecar_decide`）を、
-//! wasm-bindgen で JS から呼べる形にして出すだけ。
+//! **判断そのものはここに書かない。** UDL の関数全部と、旧いサイドカーの判断
+//! （`sidecar_decide`。UDL には無い）を、wasm-bindgen で JS から呼べる形にして出すだけ。
+//! サイドカー同期の新しい判断（U33: `sidecar_plan` など）も同じく包むだけ。
 //!
 //! 複雑な型（`PhotoRef` や `Session` など）は JsValue で受け渡す。
 //! フィールド名は Rust のまま（スネークケース）。core の JSON（`session_to_json` の
@@ -230,4 +230,160 @@ pub fn sidecar_decide(
         Some(de(remote)?)
     };
     ser(&core::sidecar_decide(seen_at as i64, seen_by, local_changed, remote))
+}
+
+// ---------------------------------------------------------------------------
+// サイドカー同期（U33）。判断は core の sidecar_sync。ここは包むだけ。
+// 型の形は core の serde のまま（Judgement などはスネークケース、Sidecar は catalog.json と
+// 同じ camelCase、enum は "Intersection" のような文字列、SidecarPlan は { Settled: {...} } の形）。
+// ---------------------------------------------------------------------------
+
+/// null / undefined なら None。
+fn de_option<T: serde::de::DeserializeOwned>(value: JsValue) -> Result<Option<T>, JsValue> {
+    if value.is_null() || value.is_undefined() {
+        Ok(None)
+    } else {
+        Ok(Some(de(value)?))
+    }
+}
+
+#[wasm_bindgen(js_name = normalizeKey)]
+pub fn normalize_key(key: String) -> String {
+    core::normalize_key(key)
+}
+
+#[wasm_bindgen(js_name = canonicalJudgement)]
+pub fn canonical_judgement(
+    session: JsValue,
+    photos: JsValue,
+    overrides: JsValue,
+    burst_distance: Option<u32>,
+    epoch: Option<String>,
+) -> Result<JsValue, JsValue> {
+    let session: Option<core::Session> = de_option(session)?;
+    let photos: std::collections::HashMap<String, i32> = de_option(photos)?.unwrap_or_default();
+    let overrides: Vec<core::PairOverride> = de_option(overrides)?.unwrap_or_default();
+    ser(&core::canonical_judgement(session, photos, overrides, burst_distance, epoch))
+}
+
+#[wasm_bindgen(js_name = sidecarJudgement)]
+pub fn sidecar_judgement(sidecar: JsValue) -> Result<JsValue, JsValue> {
+    ser(&core::sidecar_judgement(de(sidecar)?))
+}
+
+#[wasm_bindgen(js_name = judgementEquivalent)]
+pub fn judgement_equivalent(a: JsValue, b: JsValue) -> Result<bool, JsValue> {
+    Ok(core::judgement_equivalent(de(a)?, de(b)?))
+}
+
+#[wasm_bindgen(js_name = judgementKey)]
+pub fn judgement_key(judgement: JsValue) -> Result<String, JsValue> {
+    Ok(core::judgement_key(de(judgement)?))
+}
+
+#[wasm_bindgen(js_name = isUntouched)]
+pub fn is_untouched(judgement: JsValue) -> Result<bool, JsValue> {
+    Ok(core::is_untouched(de(judgement)?))
+}
+
+#[wasm_bindgen(js_name = judgementProgress)]
+pub fn judgement_progress(judgement: JsValue) -> Result<JsValue, JsValue> {
+    ser(&core::judgement_progress(de(judgement)?))
+}
+
+#[wasm_bindgen(js_name = progressCmp)]
+pub fn progress_cmp(a: JsValue, b: JsValue) -> Result<JsValue, JsValue> {
+    ser(&core::progress_cmp(de(a)?, de(b)?))
+}
+
+#[wasm_bindgen(js_name = sidecarToken)]
+pub fn sidecar_token(sidecar: JsValue) -> Result<String, JsValue> {
+    Ok(core::sidecar_token(de(sidecar)?))
+}
+
+#[wasm_bindgen(js_name = sidecarSeen)]
+pub fn sidecar_seen(sidecar: JsValue) -> Result<JsValue, JsValue> {
+    ser(&core::sidecar_seen(de(sidecar)?))
+}
+
+/// `seen` は `{ token, key, epoch }`。一度も見ていなければ `{ token: '', key: '', epoch: null }`。
+/// `remote` は読めた catalog.json（`sidecarFromJson` の結果。鍵は `sidecarNormalizeKeys` 済み）か null。
+#[wasm_bindgen(js_name = sidecarPlan)]
+pub fn sidecar_plan(
+    seen: JsValue,
+    local: JsValue,
+    remote: JsValue,
+    writable: bool,
+    detached: bool,
+) -> Result<JsValue, JsValue> {
+    let seen: core::SeenRecord = de_option(seen)?.unwrap_or_default();
+    let local: core::Judgement = de(local)?;
+    let remote: Option<core::Sidecar> = de_option(remote)?;
+    ser(&core::sidecar_plan(seen, local, remote, writable, detached))
+}
+
+#[wasm_bindgen(js_name = sidecarStamp)]
+pub fn sidecar_stamp(sidecar: JsValue, write_id: String, base: JsValue) -> Result<JsValue, JsValue> {
+    let sidecar: core::Sidecar = de(sidecar)?;
+    let base: Option<core::Sidecar> = de_option(base)?;
+    ser(&core::sidecar_stamp(sidecar, write_id, base))
+}
+
+/// `mode` は "Intersection"（積集合）か "Union"（和集合）。
+#[wasm_bindgen(js_name = mergeStars)]
+pub fn merge_stars(mine: JsValue, theirs: JsValue, mode: JsValue) -> Result<JsValue, JsValue> {
+    ser(&core::merge_stars(de(mine)?, de(theirs)?, de(mode)?))
+}
+
+#[wasm_bindgen(js_name = mergeOverrides)]
+pub fn merge_overrides(mine: JsValue, theirs: JsValue) -> Result<JsValue, JsValue> {
+    ser(&core::merge_overrides(de(mine)?, de(theirs)?))
+}
+
+#[wasm_bindgen(js_name = sessionFromRatings)]
+pub fn session_from_ratings(
+    ratings: JsValue,
+    round: u32,
+    target_star: i32,
+    group_size: u32,
+    members: JsValue,
+) -> Result<JsValue, JsValue> {
+    let members: std::collections::HashMap<String, Vec<String>> = de_option(members)?.unwrap_or_default();
+    ser(&core::session_from_ratings(de(ratings)?, round, target_star, group_size, members))
+}
+
+#[wasm_bindgen(js_name = mergeJudgements)]
+pub fn merge_judgements(
+    mine: JsValue,
+    theirs: JsValue,
+    mode: JsValue,
+    group_size: u32,
+    fresh_epoch: String,
+) -> Result<JsValue, JsValue> {
+    ser(&core::merge_judgements(de(mine)?, de(theirs)?, de(mode)?, group_size, fresh_epoch))
+}
+
+#[wasm_bindgen(js_name = mergePreview)]
+pub fn merge_preview(mine: JsValue, theirs: JsValue) -> Result<JsValue, JsValue> {
+    ser(&core::merge_preview(de(mine)?, de(theirs)?))
+}
+
+#[wasm_bindgen(js_name = sidecarKeysToFolder)]
+pub fn sidecar_keys_to_folder(sidecar: JsValue, prefix: String) -> Result<JsValue, JsValue> {
+    ser(&core::sidecar_keys_to_folder(de(sidecar)?, prefix))
+}
+
+#[wasm_bindgen(js_name = sidecarKeysFromFolder)]
+pub fn sidecar_keys_from_folder(sidecar: JsValue, prefix: String, separator: String) -> Result<JsValue, JsValue> {
+    ser(&core::sidecar_keys_from_folder(de(sidecar)?, prefix, separator))
+}
+
+#[wasm_bindgen(js_name = sidecarNormalizeKeys)]
+pub fn sidecar_normalize_keys(sidecar: JsValue, folder_hint: String) -> Result<JsValue, JsValue> {
+    ser(&core::sidecar_normalize_keys(de(sidecar)?, folder_hint))
+}
+
+#[wasm_bindgen(js_name = sidecarKeyCoverage)]
+pub fn sidecar_key_coverage(sidecar: JsValue, photo_keys: Vec<String>) -> Result<JsValue, JsValue> {
+    ser(&core::sidecar_key_coverage(de(sidecar)?, photo_keys))
 }

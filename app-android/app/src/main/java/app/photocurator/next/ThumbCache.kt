@@ -10,7 +10,7 @@ import java.io.File
 /**
  * NAS の写真の縮小画像を、端末に置いておく。
  *
- * **準備のときに一度読んだものを捨てない。** 指紋を作るために先頭 64KB を
+ * **準備のときに一度読んだものを捨てない。** ハッシュ値を作るために先頭 64KB を
  * 読んでいて、その中に EXIF の縮小画像が入っている。捨てると、一覧を出す
  * たびに同じものをもう一度網から取ることになる。
  *
@@ -22,9 +22,12 @@ object ThumbCache {
 
     private fun dir(context: Context) = File(context.filesDir, "thumbs").apply { mkdirs() }
 
+    /** 置き場そのもの（更新時刻を見て、変わったかを知るため）。 */
+    fun dirOf(context: Context): File = dir(context)
+
     /** 道筋から決まる名前。**同じ写真なら同じファイル。** */
     private fun name(cacheId: String, path: String): String =
-        "${cacheId}_${path.hashCode().toUInt().toString(16)}.jpg"
+        "${cacheId}_${CacheName.of(path)}.jpg"
 
     fun file(context: Context, cacheId: String, path: String) =
         File(dir(context), name(cacheId, path))
