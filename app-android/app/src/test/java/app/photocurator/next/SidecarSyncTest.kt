@@ -57,6 +57,23 @@ class SidecarSyncTest {
         @Volatile var afterRead: (suspend (String) -> Unit)? = null
         /** true を返した書き込みは、半分だけ書いて例外にする（途中で切れた）。 */
         @Volatile var breakWrite: (String) -> Boolean = { false }
+        /** true を返した書き込み・作成は Failed にする（書けない）。 */
+        @Volatile var refuse: (String) -> Boolean = { false }
+        /** 更新時刻（NAS の時計）。書いた・作った・名前を変えたときに [nasNow] を入れる。無いものは 0（とても古い）。 */
+        val mtimes = java.util.concurrent.ConcurrentHashMap<String, Long>()
+        @Volatile var nasNow: Long = 0L
+
+        override suspend fun list(folder: String): SmbResult<List<CatalogEntry>> {
+            val head = folder + "\\"
+            val names = synchronized(files) { files.keys.toList() }
+            return SmbResult.Ok(
+                names.filter { it.startsWith(head) && !it.substring(head.length).contains('\\') }
+                    .map { CatalogEntry(it.substring(head.length), mtimes[it] ?: 0L) }
+            )
+        }
+
+        /** どのファイルでも、読んだあと返す前に呼ぶ（読んだ中身はもう決まっている）。 */
+        @Volatile var afterAnyRead: (suspend (String) -> Unit)? = null
 
         override suspend fun read(path: String): SmbResult<ByteArray?> {
             val bytes = files[path]
@@ -64,36 +81,45 @@ class SidecarSyncTest {
                 reads.incrementAndGet()
                 afterRead?.invoke(path)
             }
+            afterAnyRead?.invoke(path)
             return SmbResult.Ok(bytes)
         }
 
         override suspend fun write(path: String, bytes: ByteArray): SmbResult<Unit> {
             beforeWrite?.invoke(path)
+            if (refuse(path)) return SmbResult.Failed("書けない: $path")
             if (breakWrite(path)) {
                 files[path] = bytes.copyOf(bytes.size / 2)
                 throw IOException("書いている途中で切れた")
             }
             files[path] = bytes
+            mtimes[path] = nasNow
             return SmbResult.Ok(Unit)
         }
 
         override suspend fun rename(from: String, to: String): SmbResult<Unit> {
             val bytes = files.remove(from) ?: return SmbResult.Failed("無い: $from")
             files[to] = bytes
+            mtimes.remove(from)
+            mtimes[to] = nasNow
             return SmbResult.Ok(Unit)
         }
 
-        override suspend fun createExclusive(path: String, bytes: ByteArray): SmbResult<Boolean> =
-            synchronized(files) {
+        override suspend fun createExclusive(path: String, bytes: ByteArray): SmbResult<Boolean> {
+            if (refuse(path)) return SmbResult.Failed("書けない: $path")
+            return synchronized(files) {
                 if (files.containsKey(path)) SmbResult.Ok(false)
                 else {
                     files[path] = bytes
+                    mtimes[path] = nasNow
                     SmbResult.Ok(true)
                 }
             }
+        }
 
         override suspend fun delete(path: String): SmbResult<Unit> {
             files.remove(path)
+            mtimes.remove(path)
             return SmbResult.Ok(Unit)
         }
 
@@ -112,8 +138,13 @@ class SidecarSyncTest {
 
     class FakeLocal(var snapshot: LocalSnapshot, private val keys: List<String> = emptyList()) : LocalState {
         val asides = ArrayList<String>()
+        /** null でなければ、端末のファイルが読めない（形が合わない）ことにする。 */
+        @Volatile var broken: String? = null
         override suspend fun flush() = Unit
-        override suspend fun read() = snapshot
+        override suspend fun read(): LocalSnapshot {
+            broken?.let { throw LocalUnreadable(it) }
+            return snapshot
+        }
         override suspend fun apply(snapshot: LocalSnapshot) {
             this.snapshot = snapshot
         }
@@ -206,6 +237,17 @@ class SidecarSyncTest {
         nas.files[catalog] = bytes
         return bytes
     }
+
+    /** その端末の印の、NAS の時刻つきの退避（パス。新しい順）。 */
+    private fun asides(nas: FakeNas, device: String): List<String> {
+        val head = SidecarSync.sidecarDir(folder) + "\\"
+        return synchronized(nas.files) { nas.files.keys.toList() }
+            .filter { it.startsWith(head) && SidecarSync.isAsideOf(it.substring(head.length), device) }
+            .sortedDescending()
+    }
+
+    /** その端末の印の、いちばん新しい退避の中身。 */
+    private fun aside(nas: FakeNas, device: String): ByteArray? = asides(nas, device).firstOrNull()?.let { nas.files[it] }
 
     /** NAS の catalog.json の選別状況（鍵はフォルダ形式にそろえる）。 */
     private fun remote(nas: FakeNas): Sidecar =
@@ -303,7 +345,7 @@ class SidecarSyncTest {
         assertTrue("NAS は端末の分", sameJudgement(local, remote(nas)))
         assertArrayEquals(
             "PC の版は catalog.<PC>.json に残る",
-            p1Bytes, nas.files[SidecarSync.asidePath(folder, SidecarSync.tag(pc.id))]
+            p1Bytes, aside(nas, SidecarSync.tag(pc.id))
         )
         assertEquals(remote(nas).writeId, seen.load("project-1").seen.token)
     }
@@ -395,11 +437,11 @@ class SidecarSyncTest {
         assertTrue("$answer", answer is SyncOutcome.Pulled)
         assertEquals(theirsAdvanced(), c.local.snapshot.session)
         assertEquals("端末に退避", 1, c.local.asides.size)
-        val aside = c.nas.text(SidecarSync.asidePath(folder, SidecarSync.tag(android.id)))
-        assertNotNull("NAS に catalog.<自分>.json", aside)
+        val kept = aside(c.nas, SidecarSync.tag(android.id))?.let { String(it, Charsets.UTF_8) }
+        assertNotNull("NAS に catalog.<自分>.json", kept)
         assertTrue(
             judgementEquivalent(
-                sidecarJudgement(sidecarFromJson(aside!!)!!),
+                sidecarJudgement(sidecarFromJson(kept!!)!!),
                 sidecarJudgement(written(mineAdvanced(), android, "x"))
             )
         )
@@ -439,7 +481,7 @@ class SidecarSyncTest {
         assertTrue(sameJudgement(c.local, remote(c.nas)))
         assertArrayEquals(
             "NAS の分は catalog.<相手>.json に",
-            c.theirsBytes, c.nas.files[SidecarSync.asidePath(folder, SidecarSync.tag(fold.id))]
+            c.theirsBytes, aside(c.nas, SidecarSync.tag(fold.id))
         )
         assertEquals(remote(c.nas).writeId, c.seen.load("project-1").seen.token)
 
@@ -463,8 +505,8 @@ class SidecarSyncTest {
         // ★5 は相手ではまだ見ていない → この端末の★を採る。
         assertEquals(mapOf(p(5) to 1), session.ratings.filterValues { it > 0 })
         assertTrue(sameJudgement(c.local, remote(c.nas)))
-        assertNotNull(c.nas.files[SidecarSync.asidePath(folder, SidecarSync.tag(fold.id))])
-        assertNotNull(c.nas.files[SidecarSync.asidePath(folder, SidecarSync.tag(android.id))])
+        assertNotNull(aside(c.nas, SidecarSync.tag(fold.id)))
+        assertNotNull(aside(c.nas, SidecarSync.tag(android.id)))
         assertEquals(1, c.local.asides.size)
     }
 
@@ -477,8 +519,8 @@ class SidecarSyncTest {
         assertTrue(session.finished)
         assertEquals(setOf(p(1), p(2), p(3), p(5)), session.ratings.filterValues { it > 0 }.keys)
         assertTrue(sameJudgement(c.local, remote(c.nas)))
-        assertNotNull(c.nas.files[SidecarSync.asidePath(folder, SidecarSync.tag(fold.id))])
-        assertNotNull(c.nas.files[SidecarSync.asidePath(folder, SidecarSync.tag(android.id))])
+        assertNotNull(aside(c.nas, SidecarSync.tag(fold.id)))
+        assertNotNull(aside(c.nas, SidecarSync.tag(android.id)))
     }
 
     @Test fun ダイアログのあとでNASが変わっていたら実行せず聞き直す() = run {
@@ -510,7 +552,7 @@ class SidecarSyncTest {
         assertTrue("$answer", answer is SyncOutcome.Pulled)
         assertEquals(further, local.snapshot.session)
         assertEquals(1, local.asides.size)
-        assertNotNull(nas.files[SidecarSync.asidePath(folder, SidecarSync.tag(android.id))])
+        assertNotNull(aside(nas, SidecarSync.tag(android.id)))
     }
 
     // ---- そのほか ----
@@ -593,6 +635,321 @@ class SidecarSyncTest {
         val answer = syncFor(android, seen).check(target(local, nas))
         assertTrue("$answer", answer is SyncOutcome.Settled)
         assertFalse(seen.load("project-1").keyFromLocal)
+    }
+
+    // ---- U44 D2: 端末の選別状況を読めなかったとき ----
+
+    @Test fun 端末の記録を読めなければ判断も書き込みもせず理由を出す() = run {
+        val nas = FakeNas()
+        val a1 = written(mineAdvanced(), android, "a1")
+        val before = put(nas, a1)
+        val seen = FakeSeen().apply { save("project-1", seenAt(a1)) }
+        val local = FakeLocal(snapshot(mineAdvanced())).apply { broken = "session-project-1.json の形が違う" }
+
+        val answer = syncFor(android, seen).check(target(local, nas))
+
+        assertTrue("$answer", answer is SyncOutcome.Blocked)
+        assertTrue((answer as SyncOutcome.Blocked).reason, answer.reason.contains("この端末の選別の記録を読めませんでした"))
+        assertArrayEquals("NAS はそのまま", before, nas.files[catalog])
+        assertEquals("NAS に何も増やさない", setOf(catalog), nas.files.keys.toSet())
+        assertTrue("読めなかった印が残る", seen.load("project-1").localBroken)
+        assertEquals("a1", seen.load("project-1").seen.token)
+        assertTrue(local.asides.isEmpty())
+    }
+
+    @Test fun 読めなかったあとは見た版のままでも端末の分で自動に上書きせず確認する() = run {
+        val nas = FakeNas()
+        val a1 = written(mineAdvanced(), android, "a1")
+        val before = put(nas, a1)
+        val seen = FakeSeen().apply { save("project-1", seenAt(a1)) }
+        val local = FakeLocal(snapshot(mineAdvanced())).apply { broken = "形が違う" }
+        val sync = syncFor(android, seen)
+        val t = target(local, nas)
+        assertTrue(sync.check(t) is SyncOutcome.Blocked)
+
+        // アプリの更新で Session を読めなくなり、端末には学習した境目だけが残った（Session は作り直し前）。
+        local.broken = null
+        local.snapshot = LocalSnapshot(null, emptyList(), 9, null)
+        val background = sync.pushIfChanged(t).await()
+        assertEquals("背面では書かない", SyncOutcome.Deferred, background)
+        val answer = sync.check(t)
+
+        assertTrue("見た版のままでも上書きせず確認: $answer", answer is SyncOutcome.Asking)
+        assertArrayEquals("NAS の Session は残る", before, nas.files[catalog])
+    }
+
+    @Test fun 読めなかったあと端末が空ならNASから取り込み印を下ろす() = run {
+        val nas = FakeNas()
+        val a1 = written(mineAdvanced(), android, "a1")
+        put(nas, a1)
+        val seen = FakeSeen().apply { save("project-1", seenAt(a1).copy(localBroken = true)) }
+        val local = FakeLocal(snapshot(null))
+
+        val answer = syncFor(android, seen).check(target(local, nas))
+
+        assertTrue("$answer", answer is SyncOutcome.Pulled)
+        assertEquals(mineAdvanced(), local.snapshot.session)
+        assertFalse(seen.load("project-1").localBroken)
+    }
+
+    // ---- U44 D4: 退避を上書きしない・最新の 5 つを残す・退避できてから変える ----
+
+    @Test fun NASの退避は書くたびに別の名前で残り最新の5つまで() = run {
+        val nas = FakeNas()
+        val pc = Me("pc-desktop-1", "DESKTOP-ABC")
+        val seen = FakeSeen()
+        val local = FakeLocal(snapshot(mineAdvanced()))
+        val sync = syncFor(android, seen)
+        val versions = ArrayList<ByteArray>()
+        // PC が「選別を開始」を押しただけの版で、7 回上書きした（そのたびに Android が退避して書く）。
+        repeat(7) { i ->
+            clock += 5_000
+            val bytes = put(nas, written(untouched(), pc, "pc-$i", updatedAt = 1_789_000_000_000L + i))
+            versions += bytes
+            val answer = sync.check(target(local, nas))
+            assertTrue("$i: $answer", answer is SyncOutcome.Pushed)
+        }
+
+        val kept = asides(nas, SidecarSync.tag(pc.id))
+        assertEquals("最新の 5 つ", 5, kept.size)
+        assertEquals(
+            "残るのは新しい 5 つの中身",
+            versions.takeLast(5).reversed().map { String(it, Charsets.UTF_8) },
+            kept.map { nas.text(it) }
+        )
+    }
+
+    @Test fun 時刻の無い古い退避と別の端末の退避は片付けない() {
+        val names = listOf(
+            "catalog.pc-desktop-1.json",
+            "catalog.fold-0000002.20261001000000.json",
+            "catalog.pc-desktop-1.20261001000001.json",
+            "catalog.pc-desktop-1.20261001000002.json",
+            "catalog.pc-desktop-1.20261001000002-2.json",
+            "catalog.json"
+        )
+        assertEquals(
+            listOf("catalog.pc-desktop-1.20261001000002.json", "catalog.pc-desktop-1.20261001000001.json"),
+            SidecarSync.asidesToDrop(names, "pc-desktop-1", 1)
+        )
+    }
+
+    @Test fun 取り込む前にNASへ退避できなければ取り込まない() = run {
+        val c = clashed()
+        c.nas.refuse = { SidecarSync.isAsideOf(it.substringAfterLast('\\'), SidecarSync.tag(android.id)) }
+
+        val answer = syncFor(android, c.seen).resolve(target(c.local, c.nas), c.clash, ClashChoice.TakeTheirs)
+
+        assertTrue("$answer", answer is SyncOutcome.Blocked)
+        assertEquals("端末はそのまま", mineAdvanced(), c.local.snapshot.session)
+        assertArrayEquals(c.theirsBytes, c.nas.files[catalog])
+        assertEquals("控えは進めない", "", c.seen.load("project-1").seen.token)
+    }
+
+    @Test fun 書く前に相手の版を退避できなければ書かない() = run {
+        val c = clashed()
+        c.nas.refuse = { SidecarSync.isAsideOf(it.substringAfterLast('\\'), SidecarSync.tag(fold.id)) }
+
+        val answer = syncFor(android, c.seen).resolve(target(c.local, c.nas), c.clash, ClashChoice.WriteMine)
+
+        assertTrue("$answer", answer is SyncOutcome.Blocked)
+        assertArrayEquals("NAS はそのまま", c.theirsBytes, c.nas.files[catalog])
+        assertNull("ロックは放す", c.nas.files[SidecarSync.lockPath(folder)])
+    }
+
+    // ---- U44 D5: ロックを壊しすぎない・他人のロックを消さない ----
+
+    private val lock = SidecarSync.lockPath(folder)
+
+    @Test fun 中身が空のロックは更新時刻が新しければ壊さない() = run {
+        val nas = FakeNas().apply { nasNow = clock }
+        nas.files[lock] = ByteArray(0)
+        nas.mtimes[lock] = clock - 1_000
+        val local = FakeLocal(snapshot(mineAdvanced()))
+
+        val answer = syncFor(android, FakeSeen()).check(target(local, nas))
+
+        assertTrue("書かない: $answer", answer is SyncOutcome.Blocked)
+        assertNotNull("ロックはそのまま", nas.files[lock])
+        assertNull(nas.files[catalog])
+    }
+
+    @Test fun 中身が空のロックでも更新時刻が古ければ壊して書く() = run {
+        val nas = FakeNas().apply { nasNow = clock }
+        nas.files[lock] = ByteArray(0)
+        nas.mtimes[lock] = clock - 120_000
+        val local = FakeLocal(snapshot(mineAdvanced()))
+
+        val answer = syncFor(android, FakeSeen()).check(target(local, nas))
+
+        assertTrue("$answer", answer is SyncOutcome.Pushed)
+        assertNull(nas.files[lock])
+    }
+
+    @Test fun 中のatが古くても更新時刻が新しければ壊さない() = run {
+        val nas = FakeNas().apply { nasNow = clock }
+        nas.files[lock] = "{\"holder\":\"pc\",\"at\":${clock - 600_000}}".toByteArray()
+        nas.mtimes[lock] = clock - 1_000
+        val local = FakeLocal(snapshot(mineAdvanced()))
+
+        val answer = syncFor(android, FakeSeen()).check(target(local, nas))
+
+        assertTrue("時計がずれていても生きているロックは壊さない: $answer", answer is SyncOutcome.Blocked)
+        assertNotNull(nas.files[lock])
+    }
+
+    @Test fun 自分のロックが置き換わっていたら放すときに消さない() = run {
+        val nas = FakeNas()
+        val local = FakeLocal(snapshot(mineAdvanced()))
+        val theirLock = "{\"holder\":\"pc\",\"at\":${clock}}".toByteArray()
+        // 書いている途中で、ほかの端末がこの端末のロックを古いと見なして取り直した。
+        nas.beforeWrite = { path -> if (path.endsWith(".tmp")) nas.files[lock] = theirLock }
+
+        syncFor(android, FakeSeen()).check(target(local, nas))
+
+        assertArrayEquals("ほかの端末のロックは残す", theirLock, nas.files[lock])
+    }
+
+    @Test fun 古いロックを壊す前に読み直して変わっていれば壊さない() = run {
+        val nas = FakeNas()
+        nas.files[lock] = "{\"holder\":\"pc\",\"at\":${clock - 120_000}}".toByteArray()
+        val fresh = "{\"holder\":\"fold\",\"at\":${clock}}".toByteArray()
+        val lockReads = AtomicInteger()
+        // 古いロックを読んだ直後に、ほかの端末がそれを壊して自分のロックを取った。
+        nas.afterAnyRead = { path ->
+            if (path == lock && lockReads.incrementAndGet() == 1) {
+                nas.files[lock] = fresh
+                nas.mtimes[lock] = clock
+            }
+        }
+        nas.nasNow = clock
+        val local = FakeLocal(snapshot(mineAdvanced()))
+
+        val answer = syncFor(android, FakeSeen()).check(target(local, nas))
+
+        assertTrue("$answer", answer is SyncOutcome.Blocked)
+        assertArrayEquals("取り直したロックは消さない", fresh, nas.files[lock])
+        assertNull(nas.files[catalog])
+    }
+
+    @Test fun ロックの形はPCと同じholderとat() = run {
+        val nas = FakeNas()
+        var seenLock: String? = null
+        nas.beforeWrite = { path -> if (path.endsWith(".tmp")) seenLock = nas.text(lock) }
+        syncFor(android, FakeSeen()).check(target(FakeLocal(snapshot(mineAdvanced())), nas))
+        assertTrue("$seenLock", seenLock!!.contains("\"holder\":\"${android.id}\"") && Regex("\"at\":\\d+").containsMatchIn(seenLock!!))
+    }
+
+    // ---- U44 D7: 混ぜた版は NAS に書けてから端末に入れる ----
+
+    @Test fun 混ぜた版をNASに書けなければ端末は元のまま() = run {
+        val c = clashed()
+        // ほかの端末が書いている（新しいロック）。
+        c.nas.files[lock] = "{\"holder\":\"pc\",\"at\":${clock}}".toByteArray()
+        c.nas.mtimes[lock] = clock
+        c.nas.nasNow = clock
+
+        val answer = syncFor(android, c.seen).resolve(target(c.local, c.nas), c.clash, ClashChoice.Intersection)
+
+        assertTrue("$answer", answer is SyncOutcome.Blocked)
+        assertEquals("端末は混ぜないまま", mineAdvanced(), c.local.snapshot.session)
+        assertArrayEquals("NAS もそのまま", c.theirsBytes, c.nas.files[catalog])
+        assertEquals("控えは進めない", "", c.seen.load("project-1").seen.token)
+        assertEquals("退避は済んでいる", 1, c.local.asides.size)
+    }
+
+    @Test fun 混ぜた版を書いている途中で切れても端末は元のまま() = run {
+        val c = clashed()
+        c.nas.breakWrite = { it.endsWith(".tmp") }
+
+        val answer = syncFor(android, c.seen).resolve(target(c.local, c.nas), c.clash, ClashChoice.Union)
+
+        assertTrue("$answer", answer is SyncOutcome.Blocked)
+        assertEquals(mineAdvanced(), c.local.snapshot.session)
+        assertArrayEquals(c.theirsBytes, c.nas.files[catalog])
+    }
+
+    @Test fun 混ぜた版を書けたら端末に入れて控えを書いた版にする() = run {
+        val c = clashed()
+        val answer = syncFor(android, c.seen).resolve(target(c.local, c.nas), c.clash, ClashChoice.Union)
+
+        assertTrue("$answer", answer is SyncOutcome.Pushed)
+        val state = c.seen.load("project-1")
+        assertEquals(remote(c.nas).writeId, state.seen.token)
+        assertEquals("控えの比較キーは端末に入れたあとの値", judgementKey(sidecarJudgement(localSidecar(c.local))), state.seen.key)
+        // もう一度開いても何もしない（混ぜた版で落ち着く）。
+        assertEquals(SyncOutcome.Settled(null), syncFor(android, c.seen).check(target(c.local, c.nas)))
+    }
+
+    // ---- U44 D11: 書きかけの残りかすを、開いたときに古いものだけ片付ける ----
+
+    private fun leftoverNas(): Pair<FakeNas, Sidecar> {
+        val nas = FakeNas()
+        val a1 = written(mineAdvanced(), android, "a1")
+        put(nas, a1)
+        val head = SidecarSync.sidecarDir(folder) + "\\"
+        val old = clock - 2 * 60 * 60 * 1000L
+        for (name in listOf(".catalog.w9old.tmp", ".catalog.json.0f3a.tmp", "catalog.json.1a2b3c4d.writing", "catalog.x.tmp")) {
+            nas.files[head + name] = "half".toByteArray()
+            nas.mtimes[head + name] = old
+        }
+        nas.files[head + ".catalog.w9new.tmp"] = "writing now".toByteArray()
+        nas.mtimes[head + ".catalog.w9new.tmp"] = clock - 10_000
+        nas.files[head + "catalog.pc-desktop-1.20261001000000.json"] = "aside".toByteArray()
+        nas.mtimes[head + "catalog.pc-desktop-1.20261001000000.json"] = old
+        nas.mtimes[catalog] = old
+        nas.nasNow = clock
+        return nas to a1
+    }
+
+    @Test fun 開いたときに古い書きかけだけ片付ける() = run {
+        val (nas, a1) = leftoverNas()
+        val head = SidecarSync.sidecarDir(folder) + "\\"
+        val seen = FakeSeen().apply { save("project-1", seenAt(a1)) }
+
+        val answer = syncFor(android, seen).check(target(FakeLocal(snapshot(mineAdvanced())), nas))
+
+        assertTrue("$answer", answer is SyncOutcome.Settled)
+        assertEquals(
+            "残るのは catalog.json・退避・進行中の一時ファイル",
+            setOf(catalog, head + ".catalog.w9new.tmp", head + "catalog.pc-desktop-1.20261001000000.json"),
+            nas.files.keys.toSet()
+        )
+    }
+
+    @Test fun ほかの端末が書いている間と背面では片付けない() = run {
+        val (nas, a1) = leftoverNas()
+        val seen = FakeSeen().apply { save("project-1", seenAt(a1)) }
+        val before = nas.files.keys.toSet()
+        val local = FakeLocal(snapshot(mineAdvanced()))
+        val sync = syncFor(android, seen)
+
+        assertTrue(sync.pushIfChanged(target(local, nas)).await() is SyncOutcome.Settled)
+        assertEquals("背面では片付けない", before, nas.files.keys.toSet())
+
+        nas.files[lock] = "{\"holder\":\"pc\",\"at\":${clock}}".toByteArray()
+        nas.mtimes[lock] = clock
+        sync.check(target(local, nas))
+        assertEquals("ロックがあれば片付けない", before + lock, nas.files.keys.toSet())
+    }
+
+    @Test fun 片付ける名前は書きかけだけ() {
+        val now = 10_000_000_000L
+        val old = now - 2 * 60 * 60 * 1000L
+        val entries = listOf(
+            CatalogEntry(".catalog.abc.tmp", old),
+            CatalogEntry(".catalog.json.0f3a.tmp", old),
+            CatalogEntry("catalog.json.1a2b3c4d.writing", old),
+            CatalogEntry("catalog.json", old),
+            CatalogEntry("catalog.lock", old),
+            CatalogEntry("catalog.pc.20261001000000.json", old),
+            CatalogEntry("catalog.json.broken-20261001000000.json", old),
+            CatalogEntry(".catalog.fresh.tmp", now - 60_000)
+        )
+        assertEquals(
+            listOf(".catalog.abc.tmp", ".catalog.json.0f3a.tmp", "catalog.json.1a2b3c4d.writing"),
+            SidecarSync.leftoversToClean(entries, now)
+        )
     }
 
     @Test fun 文言はPCと同じ形() {

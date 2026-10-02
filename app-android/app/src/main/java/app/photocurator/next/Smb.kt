@@ -351,6 +351,19 @@ object Smb {
             if (share.fileExists(path)) share.rm(path)
         }
 
+    /**
+     * `.photo-curator` の中のファイルの名前と更新時刻（NAS の時計、epoch ミリ秒）。**フォルダが無ければ空。**
+     * 退避の片付け・ロックの古さ・残りかすの片付けに使う（U44）。
+     */
+    suspend fun listSidecar(nas: Nas, password: String, folder: String): SmbResult<List<Pair<String, Long>>> =
+        connect(nas, password) { share ->
+            requireSidecar(folder)
+            if (!share.folderExists(folder)) return@connect emptyList()
+            share.list(folder)
+                .filter { it.fileName != "." && it.fileName != ".." && !isFolder(it) }
+                .map { it.fileName to it.lastWriteTime.toEpochMillis() }
+        }
+
     /** 書いてよいのは `.photo-curator` の下だけ（設計 CON-3）。**原本には触らない。** */
     private fun requireSidecar(path: String) {
         require(path.split('\\', '/').contains(".photo-curator")) { "サイドカーの外には書かない: $path" }
