@@ -195,3 +195,33 @@ fn sidecar_sync_はフィクスチャの期待値と一致する() {
         assert_eq!(next.ratings.get("e.jpg").copied(), Some(1), "{mode:?} の続き");
     }
 }
+
+/// U48: catalog.json の settings（pairRawJpeg）の同期。wasm 側（tests/core-wasm-sidecar.test.mjs）も同じ答え。
+#[test]
+fn settings_resolve_はフィクスチャの期待値と一致する() {
+    use photo_curator_core::{
+        judgement_key, settings_resolve, sidecar_from_json, sidecar_judgement, sidecar_to_json, SettingsRecord,
+    };
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/settings_resolve.json")).expect("fixture を読める");
+    let record = |value: &serde_json::Value| -> Option<SettingsRecord> {
+        if value.is_null() {
+            None
+        } else {
+            Some(serde_json::from_value(value.clone()).expect("settings として読める"))
+        }
+    };
+    for case in fixture["cases"].as_array().expect("cases") {
+        let plan = settings_resolve(record(&case["local"]), record(&case["remote"]));
+        assert_eq!(serde_json::to_value(plan).unwrap(), case["expected"], "{}", case["name"]);
+    }
+
+    // settings の有無は比較キーを変えない。書き戻しても settings（未知の設定も）を保つ。
+    let without = sidecar_from_json(fixture["catalog_without_settings"].to_string()).expect("読める");
+    let with = sidecar_from_json(fixture["catalog_with_settings"].to_string()).expect("読める");
+    assert_eq!(judgement_key(sidecar_judgement(without.clone())), judgement_key(sidecar_judgement(with.clone())));
+    let back: serde_json::Value = serde_json::from_str(&sidecar_to_json(with)).unwrap();
+    assert_eq!(back["settings"], fixture["catalog_with_settings"]["settings"]);
+    let back: serde_json::Value = serde_json::from_str(&sidecar_to_json(without)).unwrap();
+    assert_eq!(back, fixture["catalog_without_settings"]);
+}

@@ -1011,6 +1011,14 @@ pub struct Sidecar {
         deserialize_with = "sidecar_sync::lenient"
     )]
     pub progress: Option<SidecarProgress>,
+    /// プロジェクトの設定（U48。今は `pairRawJpeg`）。**選別状況ではない**ので、比較キー・
+    /// 「意味が同じか」には入れない。知らない設定も読んで書き戻す（`SettingsRecord`）。
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "sidecar_sync::lenient"
+    )]
+    pub settings: Option<SettingsRecord>,
 }
 
 /// サイドカーを文字列にする。**形は core が持つ。** 各環境が独自に組み立てない。
@@ -2146,7 +2154,7 @@ mod tests {
             burst_overrides: vec![],
             sessions: SidecarSessions::default(),
             burst_distance: None,
-            write_id: None, based_on: None, lineage: None, epoch: None, key_base: None, progress: None,
+            write_id: None, based_on: None, lineage: None, epoch: None, key_base: None, progress: None, settings: None,
         };
         let outcome = sidecar_decide(100, "device-a".into(), false, Some(theirs));
         assert!(matches!(outcome, SidecarSync::Settled));
@@ -2163,7 +2171,7 @@ mod tests {
             burst_overrides: vec![],
             sessions: SidecarSessions::default(),
             burst_distance: None,
-            write_id: None, based_on: None, lineage: None, epoch: None, key_base: None, progress: None,
+            write_id: None, based_on: None, lineage: None, epoch: None, key_base: None, progress: None, settings: None,
         };
         let outcome = sidecar_decide(100, "device-a".into(), true, Some(theirs));
         assert!(matches!(outcome, SidecarSync::Push));
@@ -2180,7 +2188,7 @@ mod tests {
             burst_overrides: vec![],
             sessions: SidecarSessions::default(),
             burst_distance: None,
-            write_id: None, based_on: None, lineage: None, epoch: None, key_base: None, progress: None,
+            write_id: None, based_on: None, lineage: None, epoch: None, key_base: None, progress: None, settings: None,
         };
         let outcome = sidecar_decide(100, "device-a".into(), false, Some(theirs));
         match outcome {
@@ -2200,7 +2208,7 @@ mod tests {
             burst_overrides: vec![],
             sessions: SidecarSessions::default(),
             burst_distance: None,
-            write_id: None, based_on: None, lineage: None, epoch: None, key_base: None, progress: None,
+            write_id: None, based_on: None, lineage: None, epoch: None, key_base: None, progress: None, settings: None,
         };
         let outcome = sidecar_decide(100, "device-a".into(), true, Some(theirs));
         match outcome {
@@ -2221,7 +2229,7 @@ mod tests {
             burst_overrides: vec![],
             sessions: SidecarSessions::default(),
             burst_distance: None,
-            write_id: None, based_on: None, lineage: None, epoch: None, key_base: None, progress: None,
+            write_id: None, based_on: None, lineage: None, epoch: None, key_base: None, progress: None, settings: None,
         };
         let outcome = sidecar_decide(100, "device-a".into(), true, Some(theirs));
         assert!(matches!(outcome, SidecarSync::Clash(_)));
@@ -2246,7 +2254,7 @@ mod tests {
                 tournament: Some(round(&["1", "2"], 2)),
             },
             burst_distance: Some(9),
-            write_id: None, based_on: None, lineage: None, epoch: None, key_base: None, progress: None,
+            write_id: None, based_on: None, lineage: None, epoch: None, key_base: None, progress: None, settings: None,
         };
         let json = sidecar_to_json(sidecar.clone());
         let back = sidecar_from_json(json).expect("読み戻せるはず");

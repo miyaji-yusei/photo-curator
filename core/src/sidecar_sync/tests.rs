@@ -69,6 +69,7 @@ fn sidecar(session: Option<Session>, write_id: Option<&str>, by: &str, at: i64) 
         epoch: None,
         key_base: Some(KEY_BASE_FOLDER.into()),
         progress: None,
+        settings: None,
     }
 }
 
@@ -1509,4 +1510,155 @@ fn 刻印_古い形の版の上に書くとlegacyの見分けを控える_系統
     let lineage = capped.lineage.unwrap();
     assert_eq!(lineage.len(), 32);
     assert_eq!(lineage[0], "w-top");
+}
+
+// ---------------------------------------------------------------------------
+// プロジェクトの設定の同期（U48）: settings.pairRawJpeg
+// ---------------------------------------------------------------------------
+
+fn pair(value: bool, at: i64) -> Option<SettingsRecord> {
+    Some(SettingsRecord { pair_raw_jpeg: Some(SettingValueBool { value, at }), other: HashMap::new() })
+}
+
+#[test]
+fn 設定_どちらかが無ければある方を採る_u48() {
+    assert_eq!(settings_resolve(None, None), SettingsPlan::Keep);
+    assert_eq!(settings_resolve(None, pair(false, 5)), SettingsPlan::AdoptRemote { value: false, at: 5 });
+    assert_eq!(settings_resolve(pair(false, 5), None), SettingsPlan::PushLocal);
+    // settings はあっても pairRawJpeg が無いのは、無いのと同じ。
+    let empty = Some(SettingsRecord::default());
+    assert_eq!(settings_resolve(pair(true, 0), empty.clone()), SettingsPlan::PushLocal);
+    assert_eq!(settings_resolve(empty, pair(true, 0)), SettingsPlan::AdoptRemote { value: true, at: 0 });
+}
+
+#[test]
+fn 設定_値が同じなら時刻が違っても何もしない_u48() {
+    assert_eq!(settings_resolve(pair(true, 0), pair(true, 99)), SettingsPlan::Keep);
+    assert_eq!(settings_resolve(pair(false, 99), pair(false, 1)), SettingsPlan::Keep);
+}
+
+#[test]
+fn 設定_値が違えば新しく切り替えた方_同じ時刻ならnas_u48() {
+    assert_eq!(settings_resolve(pair(false, 20), pair(true, 10)), SettingsPlan::PushLocal);
+    assert_eq!(settings_resolve(pair(false, 10), pair(true, 20)), SettingsPlan::AdoptRemote { value: true, at: 20 });
+    // 作ったまま（時刻 0）の端末は、切り替えた記録に合わせる。
+    assert_eq!(settings_resolve(pair(true, 0), pair(false, 1)), SettingsPlan::AdoptRemote { value: false, at: 1 });
+    assert_eq!(settings_resolve(pair(true, 7), pair(false, 7)), SettingsPlan::AdoptRemote { value: false, at: 7 });
+}
+
+/// 古い版（settings なし）の catalog.json は読めて、書き戻しても他が変わらず、settings も足さない。
+#[test]
+fn 設定_settingsなしの古い版を読んで書き戻しても不変_u48() {
+    let text = r#"{"version":2,"updatedAt":5,"updatedBy":"pc","updatedByName":"PC","photos":{"a.jpg":{"rating":1}},
+        "burstOverrides":[{"left":"a.jpg","right":"b.jpg","decision":"split"}],"sessions":{},"burstDistance":9,
+        "writeId":"w-1","basedOn":"w-0","lineage":["w-0"],"epoch":"e-1","keyBase":"folder"}"#;
+    let sidecar = sidecar_from_json(text.into()).expect("読める");
+    assert!(sidecar.settings.is_none());
+    let back: serde_json::Value = serde_json::from_str(&sidecar_to_json(sidecar)).unwrap();
+    let original: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(back, original);
+    assert!(back.get("settings").is_none());
+}
+
+#[test]
+fn 設定_読み書きの形と未知の設定を保つ_u48() {
+    let text = r#"{"version":2,"updatedAt":5,"updatedBy":"pc","updatedByName":"PC","photos":{},"burstOverrides":[],
+        "sessions":{},"settings":{"pairRawJpeg":{"value":false,"at":1790955613101},"futureThing":{"value":3,"at":4,"x":[1]}}}"#;
+    let sidecar = sidecar_from_json(text.into()).expect("読める");
+    let settings = sidecar.settings.clone().expect("settings");
+    assert_eq!(settings.pair_raw_jpeg, Some(SettingValueBool { value: false, at: 1790955613101 }));
+    assert!(settings.other.contains_key("futureThing"));
+    let back: serde_json::Value = serde_json::from_str(&sidecar_to_json(sidecar)).unwrap();
+    let original: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(back["settings"], original["settings"]);
+}
+
+#[test]
+fn 設定_型の違う値は読み捨てて全体は読める_u48() {
+    let base = r#""version":2,"updatedAt":5,"updatedBy":"pc","updatedByName":"PC","photos":{"a.jpg":{"rating":2}},"burstOverrides":[],"sessions":{}"#;
+    let broken = sidecar_from_json(format!(r#"{{{base},"settings":5}}"#)).expect("settings が数でも読める");
+    assert!(broken.settings.is_none());
+    assert_eq!(broken.photos["a.jpg"].rating, 2);
+    let odd = sidecar_from_json(format!(r#"{{{base},"settings":{{"pairRawJpeg":"yes","other":{{"value":1}}}}}}"#))
+        .expect("pairRawJpeg の型が違っても読める");
+    let settings = odd.settings.expect("settings");
+    assert!(settings.pair_raw_jpeg.is_none());
+    assert!(settings.other.contains_key("other"));
+    // at が無ければ 0（一度も切り替えていない）。
+    let no_at = sidecar_from_json(format!(r#"{{{base},"settings":{{"pairRawJpeg":{{"value":true}}}}}}"#)).unwrap();
+    assert_eq!(no_at.settings.unwrap().pair_raw_jpeg, Some(SettingValueBool { value: true, at: 0 }));
+}
+
+#[test]
+fn 設定_書く前の刻印で置き換える版の未知の設定と端末に無い設定を引き継ぐ_u48() {
+    let mut base = sidecar(None, Some("w-1"), "android", 5);
+    let mut other = HashMap::new();
+    other.insert("futureThing".to_string(), r#"{"value":3}"#.to_string());
+    base.settings = Some(SettingsRecord { pair_raw_jpeg: Some(SettingValueBool { value: false, at: 9 }), other });
+
+    // 端末に設定が無い（古い書き手）→ NAS の分をそのまま引き継ぐ。
+    let kept = sidecar_stamp(sidecar(None, None, "me", 6), "w-2".into(), Some(base.clone()));
+    let settings = kept.settings.expect("引き継ぐ");
+    assert_eq!(settings.pair_raw_jpeg, Some(SettingValueBool { value: false, at: 9 }));
+    assert!(settings.other.contains_key("futureThing"));
+
+    // 端末に設定がある → 端末の値を書き、未知の設定は残す。
+    let mut mine = sidecar(None, None, "me", 6);
+    mine.settings = pair(true, 12);
+    let stamped = sidecar_stamp(mine, "w-3".into(), Some(base));
+    let settings = stamped.settings.clone().expect("settings");
+    assert_eq!(settings.pair_raw_jpeg, Some(SettingValueBool { value: true, at: 12 }));
+    assert_eq!(settings.other.get("futureThing").map(String::as_str), Some(r#"{"value":3}"#));
+    let json: serde_json::Value = serde_json::from_str(&sidecar_to_json(stamped)).unwrap();
+    assert_eq!(json["settings"]["futureThing"]["value"], 3);
+    assert_eq!(json["settings"]["pairRawJpeg"], serde_json::json!({ "value": true, "at": 12 }));
+}
+
+#[test]
+fn 設定_比較キーと意味が同じかの判断に入れない_u48() {
+    let plain = sidecar(Some(progressed()), Some("w-1"), "pc", 5);
+    let mut with = plain.clone();
+    with.settings = pair(false, 123);
+    let mut other_value = plain.clone();
+    other_value.settings = pair(true, 456);
+    for candidate in [&with, &other_value] {
+        assert!(judgement_equivalent(sidecar_judgement(plain.clone()), sidecar_judgement(candidate.clone())));
+        assert_eq!(judgement_key(sidecar_judgement(plain.clone())), judgement_key(sidecar_judgement(candidate.clone())));
+        assert_eq!(sidecar_seen(plain.clone()), sidecar_seen(candidate.clone()));
+    }
+}
+
+/// 設定だけを書き直した版（writeId は新しい・選別状況は見た版のまま）は、確認も「早送りの取り込み」も起こさない。
+#[test]
+fn 計画_設定だけ書き直された版の上には端末の変更をそのまま書く_u48() {
+    let a1 = sidecar(Some(progressed()), Some("w-a1"), "android", 10);
+    let seen = seen_of(&a1);
+    // PC が設定だけ変えて書いた版。
+    let mut p2 = a1.clone();
+    p2.updated_by = "pc".into();
+    p2.settings = pair(false, 99);
+    let p2 = sidecar_stamp(p2, "w-p2".into(), Some(a1.clone()));
+
+    // 端末が変わっていなければ「意味が同じ」で何もしない（控えだけ進める）。
+    assert!(matches!(
+        sidecar_plan(seen.clone(), judge(Some(progressed())), Some(p2.clone()), true, false),
+        SidecarPlan::Settled { reason: SettledReason::Same, .. }
+    ));
+    // 端末が進んでいれば、確認せずに書く（NAS の選別状況は見た版から変わっていない）。
+    let changed = advance(progressed(), names(&["e.jpg"]));
+    match sidecar_plan(seen.clone(), judge(Some(changed.clone())), Some(p2.clone()), true, false) {
+        SidecarPlan::Push { expected, aside_theirs: false, reason: PushReason::LocalChanged } => {
+            assert_eq!(expected.as_deref(), Some("w-p2"));
+        }
+        other => panic!("書くはず: {other:?}"),
+    }
+    // 切り離し中・書けない共有なら書かない（#3 と同じ）。
+    assert!(matches!(
+        sidecar_plan(seen.clone(), judge(Some(changed.clone())), Some(p2.clone()), true, true),
+        SidecarPlan::Settled { reason: SettledReason::Detached, .. }
+    ));
+    assert!(matches!(
+        sidecar_plan(seen, judge(Some(changed)), Some(p2), false, false),
+        SidecarPlan::Settled { reason: SettledReason::ReadOnly, .. }
+    ));
 }
