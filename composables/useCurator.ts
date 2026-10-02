@@ -22,7 +22,6 @@ import type { CardState, CardStatus, PrepareLine } from '~/utils/projectStatus'
 import type { RatingChange, SavedSelection } from '~/utils/selectionFlow'
 import { SLIDESHOW_GROUP_SIZE, clampGroupSize, groupSizeLimits, isSlideshowSize, tournamentGroupSize } from '~/utils/groupSize'
 import { registerAutoPush, useSidecarSync } from '~/composables/useSidecarSync'
-import type { ClashChoice } from '~/composables/useSidecarSync'
 import type { View } from '~/composables/curator/types'
 import { useExport } from '~/composables/curator/useExport'
 import { useResults } from '~/composables/curator/useResults'
@@ -33,6 +32,7 @@ import { useProjectCreate } from '~/composables/curator/useProjectCreate'
 import { useBurstReview } from '~/composables/curator/useBurstReview'
 import { useBurstEdit } from '~/composables/curator/useBurstEdit'
 import { usePreviewGrid } from '~/composables/curator/usePreviewGrid'
+import { useSidecarActions } from '~/composables/curator/useSidecarActions'
 
 /**
  * 行の星を**読む・消す・動かす**メソッド。選別の 1 タップは行の星の書き込みを待たずに次の組を出す（W1）ので、
@@ -587,68 +587,15 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     }
   }
 
-  /** 開いたときのサイドカーの確認。書く・取り込むは片付け、食い違いだけダイアログを出す。 */
-  async function runSidecarCheck(project: Project) {
-    await core.init()
-    return sidecar.checkOnOpen(project)
-  }
-
-  /**
-   * 選別画面から戻ったとき・選別を始める前の確認（設計書 §4.5）。保存の列を書き終えてから読む。
-   * 取り込んだら画面を読み直して true を返す。
-   */
-  async function syncAtBreak(project: Project): Promise<boolean> {
-    await ratingsQueue.flush()
-    await saveQueue.flush()
-    const outcome = await runSidecarCheck(project)
-    if (outcome?.kind !== 'pulled') return false
-    await reloadAfterSidecar(project.id)
-    return true
-  }
-
-  /** 取り込んだあとに、画面が持っている分を読み直す。 */
-  async function reloadAfterSidecar(projectId: string) {
-    if (activeProject.value?.id !== projectId) return
-    await saveQueue.flush()
-    const value = await desktop.loadSession(projectId)
-    if (value) value.core = markRaw(value.core)
-    session.value = value
-    coreInputs.value = null
-    pairOverrides = []
-    await refreshProjects().catch(() => undefined)
-    activeProject.value = projects.value.find(item => item.id === projectId) ?? activeProject.value
-    await loadPreview(projectId).catch(() => undefined)
-    await loadSummary()
-  }
-
-  /**
-   * 食い違いのダイアログの答え（5 択）。選ぶまで選別は始められない（「この端末の状況を残す」が先へ進む役）。
-   * 端末の選別状況が変わる答え（取り込む・混ぜる）のあとは、画面が持っている分を読み直す。
-   */
-  async function resolveSidecarClash(choice: ClashChoice) {
-    const projectId = sidecarClash.value?.projectId
-    if (!projectId) return
-    await ratingsQueue.flush()
-    await saveQueue.flush()
-    if (await sidecar.resolve(choice)) await reloadAfterSidecar(projectId)
-  }
-
-  /** 「今すぐ保存」。開いたときと同じ判断（取り込んだら読み直す）。 */
-  async function saveSidecarNow() {
-    await ratingsQueue.flush()
-    await saveQueue.flush()
-    const project = activeProject.value
-    if (!project) return
-    const outcome = await sidecar.saveNow(project)
-    if (outcome?.kind === 'pulled') await reloadAfterSidecar(project.id)
-  }
-
-  /** 切り離し中（「この端末の状況を残す」のあと）の「NAS に書き込む」。 */
-  async function writeSidecarToNas() {
-    await ratingsQueue.flush()
-    await saveQueue.flush()
-    if (activeProject.value) await sidecar.writeToNas(activeProject.value)
-  }
+  // ---- サイドカーを呼ぶ側の薄い層（`composables/curator/useSidecarActions.ts`） ----
+  // `loadSummary` は下（useResults）で作るので、呼ぶ関数として渡す（呼ばれるのは作ったあと）。
+  const {
+    runSidecarCheck, syncAtBreak, reloadAfterSidecar, resolveSidecarClash, saveSidecarNow, writeSidecarToNas
+  } = useSidecarActions({
+    desktop, sidecar, sidecarClash, ratingsQueue, saveQueue, projects, activeProject, session, coreInputs,
+    setPairOverrides: (overrides) => { pairOverrides = overrides },
+    refreshProjects, loadPreview, loadSummary: () => loadSummary()
+  })
 
   /** 開く処理の世代。新しい呼び出しが来たら古い呼び出しは、以降の結果を捨てて終わる（W6）。 */
   let openToken = 0
