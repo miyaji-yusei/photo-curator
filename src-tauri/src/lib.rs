@@ -4208,11 +4208,12 @@ fn replace_pair_overrides(
     )
     .map_err(|error| error.to_string())?;
     for item in overrides {
-        // 同じ組が重ねて来ても、後のものが勝つ。
+        // 同じ組が重ねて来たら、**先に出たものが勝つ**（core の `group_bursts` と同じ。U41。
+        // 以前は後のものが勝ち、core と食い違っていた）。
         tx.execute(
             "INSERT INTO pair_overrides (project_id,left_path,right_path,decision)
              VALUES (?1,?2,?3,?4)
-             ON CONFLICT(project_id,left_path,right_path) DO UPDATE SET decision=excluded.decision",
+             ON CONFLICT(project_id,left_path,right_path) DO NOTHING",
             params![project_id, item.left, item.right, item.decision],
         )
         .map_err(|error| error.to_string())?;
@@ -7252,6 +7253,28 @@ mod tests {
         replace_pair_overrides(&mut conn, "p1", &[]).expect("clear p1");
         assert!(read(&conn, "p1").is_empty());
 
+        drop(conn);
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn duplicate_pair_overrides_keep_the_first_one_like_core() {
+        let directory = test_directory("pair-overrides-first");
+        let mut conn = open_database(&directory.join("overrides.sqlite3")).expect("open database");
+        let row = |decision: &str| PairOverrideRow {
+            left: "a.jpg".to_string(),
+            right: "b.jpg".to_string(),
+            decision: decision.to_string(),
+        };
+        replace_pair_overrides(&mut conn, "p1", &[row("join"), row("split")]).expect("save");
+        let decision: String = conn
+            .query_row(
+                "SELECT decision FROM pair_overrides WHERE project_id=?1 AND left_path='a.jpg' AND right_path='b.jpg'",
+                params!["p1"],
+                |r| r.get(0),
+            )
+            .expect("read");
+        assert_eq!(decision, "join", "同じ組が重なったら先のものが残る（core と同じ）");
         drop(conn);
         fs::remove_dir_all(&directory).expect("remove test directory");
     }
