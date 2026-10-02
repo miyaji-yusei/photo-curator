@@ -1,12 +1,38 @@
 package app.photocurator.next
 
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
 import java.io.File
 
 class HomeCardsTest {
+    // 実機の不具合: 共有の計算を誰も使わないと、ホームのカードが読み込み中のまま固まった。
+    @Test fun 共有の計算を誰も使わなくても終わる() = runBlocking {
+        var computed = 0
+        val result = withTimeout(2_000) {
+            withSharedLazy({ computed += 1; 42 }) { _ ->
+                (1..5).map { async { it } }.awaitAll().sum()
+            }
+        }
+        assertEquals(15, result)
+        assertEquals(0, computed)
+    }
+
+    @Test fun 共有の計算は使う人が何人いても1回だけ() = runBlocking {
+        var computed = 0
+        val result = withTimeout(2_000) {
+            withSharedLazy({ computed += 1; 7 }) { shared ->
+                (1..5).map { async { shared() } }.awaitAll().sum()
+            }
+        }
+        assertEquals(35, result)
+        assertEquals(1, computed)
+    }
+
     @Test fun 署名が同じなら作り直さず違えば作り直す() = runBlocking {
         val memo = Memo<String, List<Long>, Int>()
         var computed = 0
