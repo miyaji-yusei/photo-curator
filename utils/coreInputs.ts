@@ -9,7 +9,7 @@ import type { Photo } from '~/types/photo'
 
 /** 連写と見なす時間の窓（core の `BurstThreshold.window_ms`）。 */
 export const BURST_WINDOW_MS = 4000
-/** 連写の指紋（dHash）の版。core は版が違うものを比べない。 */
+/** 連写のハッシュ値（dHash）の版。core は版が違うものを比べない。 */
 export const D_HASH_VERSION = 2
 /** 学習していないときに使う距離（core `learn_distance` の fallback）。 */
 export const DEFAULT_BURST_DISTANCE = 9

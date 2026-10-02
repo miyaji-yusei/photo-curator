@@ -3,7 +3,7 @@
 // Web からは画像 CDN が CORS 非対応でバイトを読めない（lib/amazonShare.ts 冒頭）。
 // このサーバー（Nitro）はブラウザではないので CORS を受けない。ここで代わりに
 // 取得し、自分のオリジンから返せば、ブラウザの fetch・canvas から普通に読める
-// （指紋作り・ZIP化に使う）。
+// （ハッシュ値作り・ZIP化に使う）。
 //
 // **自分は静的サイトとしても配信する**（GitHub Pages。scripts/build-pages.mjs）。
 // そちらではこの経路自体が存在しない。呼ぶ側（lib/backends/amazonWeb.ts）は

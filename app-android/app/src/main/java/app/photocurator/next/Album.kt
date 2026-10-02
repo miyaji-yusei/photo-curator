@@ -160,7 +160,7 @@ fun ProjectScreen(
             // 準備は**アプリが持つ**（Preparations）。画面を離れても止まらないので、
             // 別のプロジェクトを選別しているあいだにも進む。
             Preparations.ensure(context, project, rescan, displayEdge) {
-                // 終わったら顔ぶれと指紋を読み直す。
+                // 終わったら顔ぶれとハッシュ値を読み直す。
                 scope.launch {
                     photos = Listing.load(context, project.source.key) ?: photos
                     prints = Fingerprints.load(context, project.source.key)
@@ -382,8 +382,8 @@ fun ProjectScreen(
                     Spacer(Modifier.height(10.dp))
                     PrepRow("写真の走査", if (scanned) photos.size else 0, photos.size, scanned)
                     // Tauri 版の「表示用画像」に当たる段。ネイティブでは OS の縮小画像を
-                    // そのまま使うので、実際に作るのは連写のまとめに使う指紋だけ。
-                    // 指紋は撮影時刻と同じ 1 回の読みで取れるので、同じ行に畳む。
+                    // そのまま使うので、実際に作るのは連写のまとめに使うハッシュ値だけ。
+                    // ハッシュ値は撮影時刻と同じ 1 回の読みで取れるので、同じ行に畳む。
                     PrepRow(
                         "撮影時刻・サムネイル",
                         maxOf(prints.size, preparing.first),
@@ -514,7 +514,7 @@ fun ProjectScreen(
                             mutableStateOf(
                                 when {
                                     format != null -> Preview.Unsupported
-                                    // 指紋が出来ていれば、その 1 回の読みで
+                                    // ハッシュ値が出来ていれば、その 1 回の読みで
                                     // サムネイルも取れている。
                                     prints.containsKey(photo.relativePath) -> Preview.Ready
                                     preparing.second > 0 -> Preview.Generating
@@ -756,7 +756,7 @@ fun ProjectScreen(
                     """
                         ID: ${project.id}
                         出所: ${project.source.technical}
-                        写真: ${photos.size} 枚 / 指紋 ${prints.size} 枚
+                        写真: ${photos.size} 枚 / ハッシュ値 ${prints.size} 枚
                         表示用画像: ${rendering.first} / ${rendering.second}（${displayEdge}px）
                     """.trimIndent(),
                     fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,

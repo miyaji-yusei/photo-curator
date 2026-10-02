@@ -854,7 +854,7 @@ fn default_updated_by_name() -> String {
     "別の端末".into()
 }
 
-/// 1 枚ぶんの記録。**いまは星だけ**（撮影時刻・指紋は端末側で作り直すので載せない）。
+/// 1 枚ぶんの記録。**いまは星だけ**（撮影時刻・ハッシュ値は端末側で作り直すので載せない）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SidecarPhoto {
     #[serde(default)]

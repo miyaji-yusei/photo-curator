@@ -32,7 +32,7 @@ describe('burstNeighborhood', () => {
     expect(burstNeighborhood(run, ['c'], 2500).map(item => item.relativePath)).toEqual(['c', 'd'])
   })
 
-  it('撮影時刻か指紋の無い写真は対象にしない', () => {
+  it('撮影時刻かハッシュ値の無い写真は対象にしない', () => {
     const mixed = [photo('a', 0), photo('x', 1000, null), photo('y', null), photo('b', 2000)]
     expect(burstNeighborhood(mixed, ['a']).map(item => item.relativePath)).toEqual(['a', 'b'])
   })

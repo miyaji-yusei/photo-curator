@@ -694,7 +694,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     if (session.value) session.value.core = markRaw(next)
   }
 
-  /** 判断（星・連写の手直し・学習した距離・やり直し）が変わった印。準備（指紋・画像）では呼ばない。 */
+  /** 判断（星・連写の手直し・学習した距離・やり直し）が変わった印。準備（ハッシュ値・画像）では呼ばない。 */
   function noteJudgementChanged(projectId = activeProject.value?.id) {
     if (projectId && projectId !== deletingProjectId) sidecar.markChanged(projectId)
   }
@@ -1795,7 +1795,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     try {
       current.settings = { ...current.settings, groupBursts: on }
       if (on) {
-        // 距離が決まっていなければ、学習済み（無ければ既定）を使う。指紋は裏で作っておく。
+        // 距離が決まっていなければ、学習済み（無ければ既定）を使う。ハッシュ値は裏で作っておく。
         current.burstDistance ??= project.burstThreshold ?? DEFAULT_BURST_DISTANCE
         desktop.startBurstAnalysis(project.id).catch(() => undefined)
       }
@@ -1886,7 +1886,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   }
 
   /**
-   * 星を全部 0 に戻して最初からやり直す。解析結果（指紋・サムネイル）は消えない。
+   * 星を全部 0 に戻して最初からやり直す。解析結果（ハッシュ値・サムネイル）は消えない。
    * 消す判断の中身（星・連写の手直し・学習した距離・選別の途中）は、ここ 1 か所に集める。
    */
   async function restartFromScratch() {
