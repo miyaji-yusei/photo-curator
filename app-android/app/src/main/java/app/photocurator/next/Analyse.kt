@@ -31,7 +31,10 @@ object Analyse {
      * 読めない写真どうしが同一に見えて誤ってまとまる。
      */
     fun hash(context: Context, photo: Photo): String? {
-        val source = Photos.thumbnail(context, photo, edge = 64) ?: return null
+        // U49: RAW は OS が縮小画像を作れないことがある。**そのときは中のプレビューから作る。**
+        val source = Photos.thumbnail(context, photo, edge = 64)
+            ?: (if (photo.isRaw) RawImages.localThumbBitmap(context, photo.uri, 64) else null)
+            ?: return null
         return try {
             hashOf(source)
         } catch (error: Exception) {
@@ -55,6 +58,7 @@ object Analyse {
         fallbackAt: Long
     ): Fingerprint? {
         val path = photo.smb?.path ?: return null
+        if (photo.isRaw) return hashRawOverNetwork(context, reader, photo, path, fallbackAt)
         val head = reader.head(path, SmbExifReader.HEAD_BYTES) ?: return null
         val exif = SmbExifReader.parse(head, fallbackAt)
         // 縮小画像が無い写真はハッシュ値を作らない。**原本を引きに行かない。**
@@ -74,6 +78,35 @@ object Analyse {
         } catch (error: Exception) {
             Log.w(TAG, "NAS のハッシュ値を作れなかった: ${photo.name}", error)
             Fingerprint(VERSION, photo.size, "", exif.takenAt)
+        }
+    }
+
+    /**
+     * NAS の RAW（U49）。**IFD をたどって、小さいプレビューと撮影時刻だけを読む。**
+     * 25MB の原本は引かない。プレビューが無ければハッシュ値は空（連写のまとめに入らないだけ）。
+     */
+    private fun hashRawOverNetwork(
+        context: Context,
+        reader: Smb.Reader,
+        photo: Photo,
+        path: String,
+        fallbackAt: Long
+    ): Fingerprint? {
+        val got = reader.ranged(path) { RawImages.extract(it, thumb = true) }
+            ?: return Fingerprint(VERSION, photo.size, "", fallbackAt)
+        val takenAt = got.takenAt ?: fallbackAt
+        return try {
+            val bitmap = RawImages.decode(got.jpeg, got.orientation, 256)
+                ?: return Fingerprint(VERSION, photo.size, "", takenAt)
+            val small = RawImages.shrink(bitmap, RawImages.THUMB_STORE)
+            if (small !== bitmap) bitmap.recycle()
+            photo.smb?.let { ThumbCache.write(context, it.nasId, it.path, small) }
+            val made = hashOf(small)
+            small.recycle()
+            Fingerprint(VERSION, photo.size, made ?: "", takenAt)
+        } catch (error: Exception) {
+            Log.w(TAG, "NAS の RAW のハッシュ値を作れなかった: ${photo.name}", error)
+            Fingerprint(VERSION, photo.size, "", takenAt)
         }
     }
 
@@ -494,6 +527,12 @@ object Prepare {
                     chunk.map { photo ->
                         async {
                             val path = photo.smb?.path ?: return@async false
+                            // U49: RAW は**中の大きいプレビューだけ**を読む（原本 25MB は引かない）。
+                            if (photo.isRaw) {
+                                val got = reader.ranged(path) { RawImages.extract(it, thumb = false) }
+                                    ?: return@async false
+                                return@async Renders.write(context, nasId, path, edge, got.jpeg, got.orientation)
+                            }
                             val whole = reader.whole(path) ?: return@async false
                             val orientation = SmbExifReader.parse(whole, 0L).orientation
                             Renders.write(context, nasId, path, edge, whole, orientation)

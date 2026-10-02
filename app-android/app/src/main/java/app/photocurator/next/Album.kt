@@ -537,7 +537,7 @@ fun ProjectScreen(
                                     zooming = shown to shown.indexOf(photo)
                                 }
                         ) {
-                            EmptyTile(state, format)
+                            EmptyTile(state, format, raw = photo.isRaw)
                             if (state != Preview.Unsupported) {
                                 AsyncImage(
                                     model = ImageRequest.Builder(LocalContext.current)

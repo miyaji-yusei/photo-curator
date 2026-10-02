@@ -78,11 +78,20 @@ data class Photo(
     val uri get() = ContentUris.withAppendedId(COLLECTION, id)
 
     /**
+     * RAW か（U49）。**Amazon は除く**（名前が .cr2 でも中身は JPEG で、縮小も向こうがする）。
+     * RAW の絵は、中のプレビュー JPEG を取り出して出す（[RawImage]）。
+     */
+    val isRaw: Boolean get() = remote !is AmazonRef && RawFiles.isRaw(name)
+
+    private fun raw(size: ImageSize, edge: Int = 1024): RawImage? = if (!isRaw) null else
+        RawImage(if (remote == null) uri else null, remote as? SmbRef, size, edge)
+
+    /**
      * 小さく並べるときの絵。**EXIF の縮小画像（160x120）。**
      * 詳細の一覧と、まとまりの確認だけ。選別には使わない。
      */
     val thumbModel: Any
-        get() = when (val r = remote) {
+        get() = raw(ImageSize.Thumb) ?: when (val r = remote) {
             is SmbRef -> SmbImage(r.nasId, r.path, ImageSize.Thumb)
             is AmazonRef -> AmazonImage(r, ImageSize.Thumb)
             null -> uri
@@ -95,7 +104,7 @@ data class Photo(
      * 要求した大きさでデコードすれば足りる。NAS は網越しなので、
      * 準備のときに作って置いたものを使う。
      */
-    fun displayModel(edge: Int): Any = when (val r = remote) {
+    fun displayModel(edge: Int): Any = raw(ImageSize.Display, edge) ?: when (val r = remote) {
         is SmbRef -> SmbImage(r.nasId, r.path, ImageSize.Display, edge)
         is AmazonRef -> AmazonImage(r, ImageSize.Display, edge)
         null -> uri
@@ -103,7 +112,7 @@ data class Photo(
 
     /** 拡大して見るときの絵。原本。 */
     val fullModel: Any
-        get() = when (val r = remote) {
+        get() = raw(ImageSize.Full) ?: when (val r = remote) {
             is SmbRef -> SmbImage(r.nasId, r.path, ImageSize.Full)
             is AmazonRef -> AmazonImage(r, ImageSize.Full)
             null -> uri

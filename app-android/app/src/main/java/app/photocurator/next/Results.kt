@@ -417,7 +417,7 @@ fun ResultsScreen(
                                 if (format != null) Preview.Unsupported else Preview.Generating
                             )
                         }
-                        EmptyTile(state, format)
+                        EmptyTile(state, format, raw = photo.isRaw)
                         if (state != Preview.Unsupported) {
                             AsyncImage(
                                 model = ImageRequest.Builder(LocalContext.current)
