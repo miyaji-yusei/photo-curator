@@ -1270,3 +1270,66 @@ describe('U52 D13: 一時的に欠けた写真の星を、セッションの無�
     expect(backend.writes).toEqual([])
   })
 })
+
+describe('U52 D15: 写真の鍵の Unicode・大文字小文字・ドライブの割り当て', () => {
+  const NFD = 'か\u3099めら.JPG' // 「がめら」の濁点を分けた形（Mac で作った名前など）
+  const NFC = NFD.normalize('NFC')
+
+  /** 古い Android（U35 より前）の形: 共有の根からの相対・keyBase なし。 */
+  function legacyAndroid(head) {
+    const session = core.advance(
+      core.startRound(refs(6, refs(6).map(ref => `${head}/${ref.relative_path}`)), 2, 0, false, threshold, []),
+      [`${head}/IMG_0.JPG`]
+    )
+    return JSON.stringify({
+      version: 1, updatedAt: 10, updatedBy: ANDROID.id, updatedByName: 'Pixel',
+      photos: {}, burstOverrides: [], sessions: { tournament: session }
+    })
+  }
+
+  it('端末の写真の名前が NFD でも、取り込んだ星とセッションの鍵は端末の行の名前に合う', async () => {
+    const nas = sharedNas()
+    const names = [NFD, 'IMG_1.JPG', 'IMG_2.JPG', 'IMG_3.JPG', 'IMG_4.JPG', 'IMG_5.JPG']
+    const android = fakeBackend({ nas, identity: ANDROID, names: names.map(name => name.normalize('NFC')) })
+    const pc = fakeBackend({ nas, names })
+    play(android, [[NFC], ['IMG_2.JPG']])
+    await createSidecarSync(android, nextClock).pushIfChanged(project)
+    // NAS の鍵は NFC。
+    expect(Object.keys(nasCatalog(pc).sessions.tournament.ratings)).toContain(NFC)
+    const pcSync = createSidecarSync(pc, nextClock)
+    expect((await pcSync.checkOnOpen(project)).kind).toBe('pulled')
+    expect(ratingsOf(pc)).toEqual([1, 0, 1, 0, 0, 0])
+    expect(Object.keys(pc.session.core.ratings)).toContain(NFD)
+    expect(Object.keys(pc.session.core.ratings)).not.toContain(NFC)
+    // 取り込んだあとは落ち着いている（鍵の食い違いで「変更あり」にならない）。
+    expect((await pcSync.checkOnOpen(project)).kind).toBe('settled')
+  })
+
+  it('古い Android の記録の頭は、選んだフォルダのパスと大文字小文字が違っても外せる（Windows のパス）', async () => {
+    const pc = fakeBackend({ folderPath: 'l:\\photos\\2021' })
+    pc.files.set('catalog.json', legacyAndroid('Photos/2021'))
+    const outcome = await createSidecarSync(pc, nextClock).checkOnOpen(project)
+    expect(outcome.kind).toBe('pulled')
+    expect(ratingsOf(pc)[0]).toBe(1)
+  })
+
+  for (const folderPath of ['L:\\2021', '\\\\NAS\\Share\\2021']) {
+    it(`ドライブの割り当て（${folderPath}）に関係なく、古い Android の記録の頭を外せる`, async () => {
+      const pc = fakeBackend({ folderPath })
+      pc.files.set('catalog.json', legacyAndroid('2021'))
+      expect((await createSidecarSync(pc, nextClock).checkOnOpen(project)).kind).toBe('pulled')
+      expect(ratingsOf(pc)[0]).toBe(1)
+    })
+  }
+
+  it('PC が書く鍵は選んだフォルダからの相対なので、ドライブの割り当てで変わらない', async () => {
+    const written = []
+    for (const folderPath of ['L:\\2021', '\\\\NAS\\Share\\2021']) {
+      const pc = fakeBackend({ folderPath })
+      play(pc, [['IMG_0.JPG']])
+      await createSidecarSync(pc, nextClock).pushIfChanged(project)
+      written.push(Object.keys(nasCatalog(pc).sessions.tournament.ratings).sort())
+    }
+    expect(written[0]).toEqual(written[1])
+  })
+})

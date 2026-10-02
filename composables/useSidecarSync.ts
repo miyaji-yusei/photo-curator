@@ -29,7 +29,7 @@ import type {
 import type { PhotoBackend, SidecarAccess, SidecarState } from '~/composables/photoBackend'
 import type { SavedSelection } from '~/utils/selectionFlow'
 import { applyChanges } from '~/utils/ratingEdit'
-import { asideTag } from '~/utils/sidecarAside'
+import { alignFolderHint, asideTag, relocalizeKeys } from '~/utils/sidecarAside'
 
 /** 新しく書くサイドカーの `version`（core の `SIDECAR_VERSION` と同じ）。 */
 export const SIDECAR_VERSION = 2
@@ -164,6 +164,20 @@ export function seenOf(state: SidecarState, localKey: string): SeenRecord {
     key: state.localChanged ? '' : localKey,
     epoch: null
   }
+}
+
+/**
+ * core の鍵の推定（`sidecarNormalizeKeys`）に渡す「選んだフォルダのパス」（U52 D15）。古い形（keyBase が
+ * folder でない）の記録だけ、鍵の頭と大文字小文字・正規化だけが違えば鍵の綴りに合わせる。
+ */
+function folderHint(sidecar: Sidecar, folderPath: string): string {
+  if (sidecar.keyBase === 'folder') return folderPath
+  const keys = [
+    ...Object.keys(sidecar.photos),
+    ...Object.keys(sidecar.sessions.tournament?.ratings ?? {}),
+    ...sidecar.burstOverrides.flatMap(item => [item.left, item.right])
+  ]
+  return alignFolderHint(folderPath, keys)
 }
 
 interface ProjectRef { id: string }
@@ -322,7 +336,7 @@ export function createSidecarSync(backend: SidecarBackend, now: () => number = D
       localPair: built.pair,
       access: level,
       text,
-      remote: parsed ? core.sidecarNormalizeKeys(parsed, built.folderPath) : null,
+      remote: parsed ? core.sidecarNormalizeKeys(parsed, folderHint(parsed, built.folderPath)) : null,
       mineRaw: built.sidecar,
       mine,
       local,
@@ -386,14 +400,16 @@ export function createSidecarSync(backend: SidecarBackend, now: () => number = D
   }
 
   /** 端末の鍵の Sidecar を、端末の選別状況に入れる（星・Session・手直し・距離）。 */
-  async function applyLocal(project: ProjectRef, incoming: Sidecar, untouched: boolean) {
+  async function applyLocal(project: ProjectRef, received: Sidecar, untouched: boolean) {
     const projectId = project.id
+    const rows = await backend.getCoreInputs(projectId)
+    // 鍵の Unicode の正規化だけが違う端末の行の名前に合わせる（U52 D15。NAS の鍵は NFC）。
+    const incoming = relocalizeKeys(received, rows.map(row => row.relativePath))
     const tournament = incoming.sessions.tournament ?? null
     // 星の出どころは core の正規形と同じ: Session があれば Session の星、無ければ行の星（photos）。
     const stars: Record<string, number> = {}
     if (tournament) for (const [path, rating] of Object.entries(tournament.ratings)) stars[path] = rating
     else for (const [path, photo] of Object.entries(incoming.photos)) stars[path] = photo.rating
-    const rows = await backend.getCoreInputs(projectId)
     if (tournament) {
       await backend.saveSession(projectId, envelopeFromSidecar(incoming, tournament))
     } else if (untouched) {
@@ -539,7 +555,7 @@ export function createSidecarSync(backend: SidecarBackend, now: () => number = D
     await serialized(project.id, async () => {
       const snap = await snapshot(project, await access(project.id))
       const built = await buildWith(project)
-      const theirs = core.sidecarNormalizeKeys(sidecar, built.folderPath)
+      const theirs = core.sidecarNormalizeKeys(sidecar, folderHint(sidecar, built.folderPath))
       await pull(project, snap, theirs, core.sidecarToken(theirs), true)
     })
   }

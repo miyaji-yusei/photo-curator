@@ -57,3 +57,69 @@ export function nextAsideNumber(names: string[], tag: string, stamp: string): nu
   }
   return max + 1
 }
+
+// ---------------------------------------------------------------------------
+// 写真の鍵の食い違い（U52 D15）
+// ---------------------------------------------------------------------------
+
+/**
+ * 取り込む記録（端末の形の鍵）の鍵を、Unicode の正規化（NFC/NFD）だけが違う**端末の行の名前**に合わせる。
+ *
+ * core は鍵を NFC にそろえて NAS に書き、端末の形へ戻すときも NFC のまま（core は変えない）。端末の行の名前が
+ * NFD（Mac で作った名前など）だと、取り込んだ星が行に当たらず 0 になり、セッションの鍵も行と食い違う。
+ * 置き換えるのは、端末の行の名前を NFC にしたものと**完全に一致する**オブジェクトの鍵と文字列だけ。
+ * NFC と違う名前の行が無ければ、何もせずにそのまま返す。
+ */
+export function relocalizeKeys<T>(value: T, localPaths: string[]): T {
+  const map = new Map<string, string>()
+  for (const path of localPaths) {
+    const nfc = path.normalize('NFC')
+    if (nfc !== path) map.set(nfc, path)
+  }
+  if (!map.size) return value
+  const walk = (node: unknown): unknown => {
+    if (typeof node === 'string') return map.get(node) ?? node
+    if (Array.isArray(node)) return node.map(walk)
+    if (node && typeof node === 'object') {
+      const out: Record<string, unknown> = {}
+      for (const [key, inner] of Object.entries(node as Record<string, unknown>)) out[map.get(key) ?? key] = walk(inner)
+      return out
+    }
+    return node
+  }
+  return walk(value) as T
+}
+
+/**
+ * 古い Android の記録（keyBase なし。共有の根からの相対）の頭を外すための「選んだフォルダのパス」を、
+ * 鍵の頭と**大文字小文字・正規化だけが違う**ときに鍵の綴りへ合わせる（U52 D15）。
+ *
+ * core の推定（`sidecarNormalizeKeys`）は頭とパスの末尾を大文字小文字を区別して比べる。Windows のパスは
+ * 大文字小文字を区別しないので、`l:\\photos\\2021`（`\` 区切り）と `Photos/2021/…` は同じフォルダ。合わせないと頭を外せず、
+ * 一致率が半分を下回って、ずっと取り込めない。合わなければパスをそのまま返す。
+ */
+export function alignFolderHint(folderPath: string, keys: string[]): string {
+  let common: string[] | null = null
+  for (const key of keys) {
+    const parts = key.replace(/\\/g, '/').split('/')
+    parts.pop()
+    if (common === null) {
+      common = parts
+    } else {
+      let length = 0
+      while (length < common.length && length < parts.length && common[length] === parts[length]) length++
+      common = common.slice(0, length)
+    }
+  }
+  if (!common?.length) return folderPath
+  const hint = folderPath.split(/[\\/]/).filter(part => part.length > 0)
+  const fold = (text: string) => text.normalize('NFC').toLowerCase()
+  for (let length = Math.min(common.length, hint.length); length >= 1; length--) {
+    const head = common.slice(0, length)
+    const tail = hint.slice(hint.length - length)
+    if (head.every((part, index) => fold(part) === fold(tail[index]!))) {
+      return [...hint.slice(0, hint.length - length), ...head].join('\\')
+    }
+  }
+  return folderPath
+}
