@@ -1,6 +1,8 @@
 package app.photocurator.next
 
 import android.content.Context
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -8,6 +10,25 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * 全員で 1 回だけ計算を共有する。**誰も使わなくても、終わるのを待たない。**
+ *
+ * 以前は `async(start = LAZY)` を `coroutineScope` の中に置いたまま、誰も `await` しないと、
+ * 始まっていない子を親が待ち続けて**ホームのカードが読み込み中のまま固まった**（実機で発覚）。
+ * 使い終わったら共有の計算を必ず取り消す。
+ */
+internal suspend fun <T, R> withSharedLazy(
+    compute: suspend () -> T,
+    use: suspend CoroutineScope.(suspend () -> T) -> R
+): R = coroutineScope {
+    val shared = async(start = CoroutineStart.LAZY) { compute() }
+    try {
+        use(this) { shared.await() }
+    } finally {
+        shared.cancel()
+    }
+}
 
 /**
  * 「署名が同じなら前の答えを返す」記憶（メモリの中だけ）。
@@ -47,11 +68,9 @@ object HomeCards {
         if (file.exists()) listOf(file.lastModified(), file.length()) else listOf(-1L, -1L)
 
     suspend fun load(context: Context, projects: List<Project>): Map<String, Card> =
-        coroutineScope {
-            // renders の数え上げは全プロジェクトで 1 回だけ。要るときだけ。
-            val tally = async(start = kotlinx.coroutines.CoroutineStart.LAZY) { Renders.tally(context) }
+        withSharedLazy({ Renders.tally(context) }) { tally ->
             projects.map { project ->
-                async(Dispatchers.IO) { project.id to cardOf(context, project) { tally.await() } }
+                async(Dispatchers.IO) { project.id to cardOf(context, project, tally) }
             }.awaitAll().toMap()
         }
 

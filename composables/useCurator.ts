@@ -41,6 +41,7 @@ import {
 } from '~/utils/shareExport'
 import { createStoredZip } from '~/utils/zip'
 import { registerAutoPush, useSidecarSync } from '~/composables/useSidecarSync'
+import type { ClashChoice } from '~/composables/useSidecarSync'
 
 type View = 'home' | 'project' | 'method' | 'settings' | 'app-settings' | 'burst-threshold' | 'burst-preview' | 'tournament' | 'result' | 'results' | 'burst-review'
 
@@ -91,11 +92,11 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   )
   const desktop = withRatingsBarrier(backend, () => ratingsQueue.flush())
   const { notify } = useNotice()
-  // サイドカー（写真のフォルダの `.photo-curator/catalog.json`）。4 通りの判断は core が行う。
+  // サイドカー（写真のフォルダの `.photo-curator/catalog.json`）。開き方の判断は core の sidecarPlan が行う。
   const sidecar = useSidecarSync(desktop)
   const {
     access: sidecarAccess, clash: sidecarClash, busy: sidecarBusy,
-    message: sidecarMessage, savedAt: sidecarSavedAt
+    message: sidecarMessage, notice: sidecarNotice, detached: sidecarDetached, savedAt: sidecarSavedAt
   } = sidecar
   /** 写真の行がまだ無いまま開いたプロジェクト。走査が済んでから確かめる。 */
   let sidecarCheckPending: string | null = null
@@ -693,7 +694,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     if (session.value) session.value.core = markRaw(next)
   }
 
-  /** 判断（星・連写の手直し・学習した距離・やり直し）が変わった印。準備（指紋・画像）では呼ばない。 */
+  /** 判断（星・連写の手直し・学習した距離・やり直し）が変わった印。準備（ハッシュ値・画像）では呼ばない。 */
   function noteJudgementChanged(projectId = activeProject.value?.id) {
     if (projectId && projectId !== deletingProjectId) sidecar.markChanged(projectId)
   }
@@ -762,10 +763,23 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     }
   }
 
-  /** 開いたときのサイドカーの確認。Push・Pull は片付け、食い違いだけダイアログを出す。 */
+  /** 開いたときのサイドカーの確認。書く・取り込むは片付け、食い違いだけダイアログを出す。 */
   async function runSidecarCheck(project: Project) {
     await core.init()
     return sidecar.checkOnOpen(project)
+  }
+
+  /**
+   * 選別画面から戻ったとき・選別を始める前の確認（設計書 §4.5）。保存の列を書き終えてから読む。
+   * 取り込んだら画面を読み直して true を返す。
+   */
+  async function syncAtBreak(project: Project): Promise<boolean> {
+    await ratingsQueue.flush()
+    await saveQueue.flush()
+    const outcome = await runSidecarCheck(project)
+    if (outcome?.kind !== 'pulled') return false
+    await reloadAfterSidecar(project.id)
+    return true
   }
 
   /** 取り込んだあとに、画面が持っている分を読み直す。 */
@@ -783,17 +797,33 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     await loadSummary()
   }
 
-  /** 食い違いのダイアログの答え。選ぶまで選別は始められない。 */
-  async function resolveSidecarClash(choice: 'mine' | 'theirs') {
+  /**
+   * 食い違いのダイアログの答え（5 択）。選ぶまで選別は始められない（「この端末の状況を残す」が先へ進む役）。
+   * 端末の選別状況が変わる答え（取り込む・混ぜる）のあとは、画面が持っている分を読み直す。
+   */
+  async function resolveSidecarClash(choice: ClashChoice) {
     const projectId = sidecarClash.value?.projectId
     if (!projectId) return
+    await ratingsQueue.flush()
+    await saveQueue.flush()
     if (await sidecar.resolve(choice)) await reloadAfterSidecar(projectId)
   }
 
-  /** 「今すぐ保存」。 */
+  /** 「今すぐ保存」。開いたときと同じ判断（取り込んだら読み直す）。 */
   async function saveSidecarNow() {
+    await ratingsQueue.flush()
     await saveQueue.flush()
-    if (activeProject.value) await sidecar.saveNow(activeProject.value)
+    const project = activeProject.value
+    if (!project) return
+    const outcome = await sidecar.saveNow(project)
+    if (outcome?.kind === 'pulled') await reloadAfterSidecar(project.id)
+  }
+
+  /** 切り離し中（「この端末の状況を残す」のあと）の「NAS に書き込む」。 */
+  async function writeSidecarToNas() {
+    await ratingsQueue.flush()
+    await saveQueue.flush()
+    if (activeProject.value) await sidecar.writeToNas(activeProject.value)
   }
 
   /** 開く処理の世代。新しい呼び出しが来たら古い呼び出しは、以降の結果を捨てて終わる（W6）。 */
@@ -1120,6 +1150,17 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   // 未解析が残っていても選別画面へ進む。残りはバックグラウンドで進み続ける。
   async function beginTournament() {
     if (!activeProject.value || taskDialog.value || sidecarClash.value) return
+    // 始める前にサイドカーを確かめる（設計書 §4.5）。この端末が未着手で、別の端末が進めていれば、
+    // ここで確認なしに取り込む。取り込んだら始めずにプロジェクトの画面へ戻し、続きから再開してもらう
+    // （このまま始めると、取り込んだ星を全部 0 にしてしまう）。食い違えばダイアログを出して止める。
+    if (await syncAtBreak(activeProject.value)) {
+      view.value = 'project'
+      return
+    }
+    if (sidecarClash.value) {
+      view.value = 'project'
+      return
+    }
     // 星が 1 つでも付いている（取り込んだ星を含む）と、開始は星を全部 0 にする。
     // 「最初からやり直す」と同じ確認を先に出す。「キャンセル」なら何もしない。
     await loadSummary()
@@ -1135,6 +1176,8 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   async function confirmRestartDialog() {
     if (!restartForStart.value) return restartFromScratch()
     restartDialog.value = false
+    // 星を全部消して始め直すのも「やり直し」。ほかの端末に黙って埋め戻されないよう世代を変える。
+    if (activeProject.value) await sidecar.markRestarted(activeProject.value.id)
     await startTournament()
   }
 
@@ -1752,7 +1795,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     try {
       current.settings = { ...current.settings, groupBursts: on }
       if (on) {
-        // 距離が決まっていなければ、学習済み（無ければ既定）を使う。指紋は裏で作っておく。
+        // 距離が決まっていなければ、学習済み（無ければ既定）を使う。ハッシュ値は裏で作っておく。
         current.burstDistance ??= project.burstThreshold ?? DEFAULT_BURST_DISTANCE
         desktop.startBurstAnalysis(project.id).catch(() => undefined)
       }
@@ -1843,7 +1886,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   }
 
   /**
-   * 星を全部 0 に戻して最初からやり直す。解析結果（指紋・サムネイル）は消えない。
+   * 星を全部 0 に戻して最初からやり直す。解析結果（ハッシュ値・サムネイル）は消えない。
    * 消す判断の中身（星・連写の手直し・学習した距離・選別の途中）は、ここ 1 か所に集める。
    */
   async function restartFromScratch() {
@@ -1858,6 +1901,8 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
       await desktop.clearBurstThreshold(project.id)
       project.burstThreshold = null
       noteJudgementChanged()
+      // やり直しの世代を変える（ほかの端末は、黙って空にせず確認する。設計書 §4.3 の #9）。
+      await sidecar.markRestarted(project.id)
       session.value = null
       // 途中の選別も消す。残すと、リロードで星の無い写真に古い Session が戻る。
       saveQueue.enqueue(project.id, null)
@@ -2713,6 +2758,12 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   // プロジェクトを閉じる（ホームへ戻る）とき、変更があれば書く。
   watch(view, (next, previous) => {
     if (next === 'home' && previous !== 'home') void flushThenPush()
+    // 選別・結果からプロジェクトの画面へ戻ったら、保存を書き終えてから確かめる（設計書 §4.5）。
+    // ラウンドの終わりの書き込みで食い違いが見つかっていれば、ここでダイアログになる。
+    if (next === 'project' && (previous === 'tournament' || previous === 'result')) {
+      const project = pushableProject()
+      if (project && !sidecarClash.value) void syncAtBreak(project).catch(() => undefined)
+    }
     // 選別のあとに戻ったとき、行の状態・点を今の値にする。
     // ただし home -> project（プロジェクトを開く）は読み直さない。開く処理が同じ DB を使っている最中で、
     // 点・見本は直前のホームの値のまま使える（W4）。
@@ -3067,7 +3118,10 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     sidecarBusy,
     sidecarMessage,
     sidecarSavedAt,
+    sidecarNotice,
+    sidecarDetached,
     saveSidecarNow,
+    writeSidecarToNas,
     resolveSidecarClash,
     askDeleteProject,
     confirmDeleteProject,

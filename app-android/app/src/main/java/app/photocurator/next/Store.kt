@@ -80,9 +80,9 @@ object Store {
 }
 
 /**
- * 1 枚ぶんの指紋と、それが**いつの原本のものか**。
+ * 1 枚ぶんのハッシュ値と、それが**いつの原本のものか**。
  *
- * 大きさを控えるのは、写真が差し替わったときに古い指紋を使わないため。
+ * 大きさを控えるのは、写真が差し替わったときに古いハッシュ値を使わないため。
  * 版を控えるのは、作り方を変えたときに黙って混ざらないため。
  */
 data class Fingerprint(
@@ -92,13 +92,13 @@ data class Fingerprint(
     /**
      * 撮影時刻。**NAS のときだけ入る。**
      * 端末は MediaStore が持っているが、NAS は EXIF を読まないと分からない。
-     * 指紋と同じ 1 回の読みで取れるので、一緒に控える。
+     * ハッシュ値と同じ 1 回の読みで取れるので、一緒に控える。
      */
     val takenAt: Long? = null
 )
 
 /**
- * 指紋の置き場。**一度作ったものは作り直さない。**
+ * ハッシュ値の置き場。**一度作ったものは作り直さない。**
  *
  * Tauri 版はプロジェクトを開くたびに解析し直していて、
  * 何が起きているのか誰にも分からなかった。作った結果は必ず残す。
@@ -133,7 +133,7 @@ object Fingerprints {
                 out
             } catch (error: Exception) {
                 // 読めないものは無かったことにして作り直す。**部分的に読まない。**
-                Log.w(TAG, "指紋を読めなかった: $sourceKey", error)
+                Log.w(TAG, "ハッシュ値を読めなかった: $sourceKey", error)
                 emptyMap()
             }
         }
@@ -154,7 +154,7 @@ object Fingerprints {
                 }
                 file(context, sourceKey).writeAtomically { it.writeText(root.toString()) }
             } catch (error: Exception) {
-                Log.w(TAG, "指紋を保存できなかった: $sourceKey", error)
+                Log.w(TAG, "ハッシュ値を保存できなかった: $sourceKey", error)
             }
         }
 }

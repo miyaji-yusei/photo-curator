@@ -268,13 +268,22 @@ export function createIdbStore(): WebStore {
 
     readSidecarState: async projectId => {
       const row = await withStores([STORE_STATES], 'readonly', transaction =>
-        getOne<{ seenAt?: number, seenBy?: string, localChanged?: boolean }>(
-          transaction, STORE_STATES, sidecarStateKey(projectId)
-        ))
+        getOne<{
+          seenAt?: number, seenBy?: string, localChanged?: boolean
+          seenToken?: string | null, seenKey?: string, seenEpoch?: string | null
+          localEpoch?: string | null, detached?: boolean
+        }>(transaction, STORE_STATES, sidecarStateKey(projectId)))
+      const text = (value: unknown) => (typeof value === 'string' ? value : null)
       return {
         seenAt: typeof row?.seenAt === 'number' ? row.seenAt : 0,
         seenBy: typeof row?.seenBy === 'string' ? row.seenBy : '',
-        localChanged: row?.localChanged === true
+        localChanged: row?.localChanged === true,
+        // U34 の項目。無い行（古い形）は null のまま返し、画面が legacy: の控えを作る。
+        seenToken: text(row?.seenToken),
+        seenKey: text(row?.seenKey) ?? '',
+        seenEpoch: text(row?.seenEpoch),
+        localEpoch: text(row?.localEpoch),
+        detached: row?.detached === true
       }
     },
 
@@ -285,6 +294,11 @@ export function createIdbStore(): WebStore {
           seenAt: state.seenAt,
           seenBy: state.seenBy,
           localChanged: state.localChanged,
+          seenToken: state.seenToken ?? null,
+          seenKey: state.seenKey ?? '',
+          seenEpoch: state.seenEpoch ?? null,
+          localEpoch: state.localEpoch ?? null,
+          detached: state.detached === true,
           updatedAt: Date.now()
         }))
     },

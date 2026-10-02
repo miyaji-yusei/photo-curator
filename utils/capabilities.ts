@@ -80,7 +80,7 @@ export function capabilitiesFor(
         fullResolution: false,
         exportFolders: false,
         writeMetadata: false,
-        // 表示は素の <img> で出せる。バイトが要る指紋・ZIP は中継があるときだけ（呼んだ成否で決める）。
+        // 表示は素の <img> で出せる。バイトが要るハッシュ値・ZIP は中継があるときだけ（呼んだ成否で決める）。
         amazon: true
       }
   }

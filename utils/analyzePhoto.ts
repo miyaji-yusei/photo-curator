@@ -7,9 +7,9 @@
  * できるので、`createImageBitmap` に任せれば JPEG/HEIC/PNG/WebP が無償で入る。
  *
  * 手順はデスクトップと同じ順序にしてある:
- * 長辺 256px へ縮小 → JPEG に符号化 → **その JPEG から指紋**。
+ * 長辺 256px へ縮小 → JPEG に符号化 → **その JPEG からハッシュ値**。
  * 生成直後とキャッシュ読み出しで必ず同じ値になるようにするため。
- * 指紋は、保存したサムネイルをそのまま輝度にして core の `dHashFromGray` に渡す
+ * ハッシュ値は、保存したサムネイルをそのまま輝度にして core の `dHashFromGray` に渡す
  * （9×8 への縮小も core がする。設計 04 章「縮小も core で」）。
  */
 import type { CaptureTime, TimestampSource } from '~/utils/captureTime'
@@ -98,7 +98,7 @@ async function readCaptureTime(file: File): Promise<CaptureTime | null> {
 }
 
 /**
- * 保存したサムネイルの画素から指紋を出す。**縮小はしない**（core がする）。
+ * 保存したサムネイルの画素からハッシュ値を出す。**縮小はしない**（core がする）。
  * 作れないとき（小さすぎる画像）は null。
  */
 export async function hashThumbnail(thumbnail: Blob): Promise<string | null> {
@@ -117,7 +117,7 @@ export async function hashThumbnail(thumbnail: Blob): Promise<string | null> {
 }
 
 /**
- * 撮影日時・サムネイル・指紋を求める。
+ * 撮影日時・サムネイル・ハッシュ値を求める。
  * **例外は投げない**。1 枚失敗しても取り込み全体を止めないため、
  * 理由を `error` に入れて返す。
  */
@@ -159,9 +159,9 @@ export async function analyzePhotoFile(
     displaySurface.context.drawImage(bitmap, 0, 0, displaySize.width, displaySize.height)
     const display = await displaySurface.toBlob('image/jpeg', THUMBNAIL_QUALITY)
     const dHash = await hashThumbnail(thumbnail)
-    // 指紋だけ作れなかった写真も、サムネイルと表示用はあるので選別には使える。
+    // ハッシュ値だけ作れなかった写真も、サムネイルと表示用はあるので選別には使える。
     // 理由を残しておかないと「解析待ち」に数え続けてしまう。
-    return { ...base, thumbnail, display, dHash, error: dHash ? null : '指紋を作れませんでした（画像が小さすぎます）。' }
+    return { ...base, thumbnail, display, dHash, error: dHash ? null : 'ハッシュ値を作れませんでした（画像が小さすぎます）。' }
   } catch (cause) {
     // 非対応の形式・壊れたファイル・メモリ不足がここに来る。
     const message = cause instanceof Error ? cause.message : '画像を読み込めませんでした。'

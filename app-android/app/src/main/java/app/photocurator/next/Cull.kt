@@ -89,7 +89,7 @@ fun CullScreen(
     var holdZooms by remember { mutableStateOf(false) }
     var note by remember { mutableStateOf("読み込み中…") }
     var stageSize by remember { mutableStateOf(0 to 0) }
-    // 連写のまとめに使う指紋。**出来た分だけで始められる。**
+    // 連写のまとめに使うハッシュ値。**出来た分だけで始められる。**
     var prepared by remember { mutableStateOf(0 to 0) }
     // 大きく見ている並びと、その何枚目か。**左右で前後に送れる**ので
     // 1 枚ではなく並びで持つ。拡大からは「残す」だけができる。
@@ -117,7 +117,7 @@ fun CullScreen(
 
     LaunchedEffect(project.id) {
         note = "写真を読み込んでいます…"
-        // 指紋は OS の縮小画像から作るので**原本を読まない**（1 枚 3ms）。
+        // ハッシュ値は OS の縮小画像から作るので**原本を読まない**（1 枚 3ms）。
         // **前に作った分は作り直さない。**
         note = "似た写真を調べています…"
         val prepared0 = try {

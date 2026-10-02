@@ -16,7 +16,7 @@ object ProjectData {
 
     /**
      * 消す。**選別の結果も一緒に消える。写真そのものには触らない。**
-     * 指紋・顔ぶれ・つまずきは出所についての事実なので残す（別のプロジェクトでも使える）。
+     * ハッシュ値・顔ぶれ・つまずきは出所についての事実なので残す（別のプロジェクトでも使える）。
      */
     suspend fun remove(context: Context, project: Project) {
         Projects.remove(context, project.id)
@@ -35,7 +35,7 @@ object ProjectData {
         }
     }
 
-    /** やり直す。**星・履歴・手直し・基準・時間を消す。** 顔ぶれ・指紋・絵・サイドカーは残す。 */
+    /** やり直す。**星・履歴・手直し・基準・時間を消す。** 顔ぶれ・ハッシュ値・絵・サイドカーは残す。 */
     suspend fun restart(context: Context, projectId: String) {
         Store.clear(context, projectId)
         // **基準と手直しも消す。** ここを残すと、やり直しても

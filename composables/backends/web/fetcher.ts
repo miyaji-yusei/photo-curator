@@ -5,7 +5,7 @@
  * `createLocalBackend` に差し込めるようにしてある。
  *
  * **表示は別**。画像 CDN は CORS が無く `fetch` では読めないが、crossOrigin を付けない素の
- * `<img src>` なら出せる。ここが要るのは、バイトが要るとき（指紋・ZIP）だけ。
+ * `<img src>` なら出せる。ここが要るのは、バイトが要るとき（ハッシュ値・ZIP）だけ。
  */
 import { fetchAmazonBytes, viewBoxUrl } from '~/lib/amazonShare'
 

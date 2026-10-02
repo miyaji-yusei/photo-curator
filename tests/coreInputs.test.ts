@@ -17,7 +17,7 @@ describe('sortForCore', () => {
 })
 
 describe('toPhotoRef / buildCoreInputs', () => {
-  it('鍵は relativePath、指紋の版は 2', () => {
+  it('鍵は relativePath、ハッシュ値の版は 2', () => {
     expect(toPhotoRef(photo('a.jpg', 5))).toEqual({
       relative_path: 'a.jpg', captured_at: 5, d_hash: '00ff00ff00ff00ff', d_hash_version: 2
     })
