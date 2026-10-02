@@ -100,10 +100,19 @@ object Preparations {
                     Trouble.clear(app, project.source.key)
                 }
                 // **網へ行く仕事だけ 1 本に並べる。** 相手ごとに別の列。
-                when (kind) {
-                    SourceKind.Nas -> network.withLock { work() }
-                    SourceKind.Amazon -> amazonLine.withLock { work() }
-                    SourceKind.Album -> work()
+                // 一時的な失敗（Wi-Fi・NAS が起きる前）は少し待って自動でやり直す（U43）。
+                // 開いたときも「再試行」もここを通る。待つ間は列を空ける（他の準備を止めない）。
+                Retrying.run(
+                    worthRetrying = { Retrying.worthRetrying(Smb.describe(it)) },
+                    onRetry = { attempt, error ->
+                        Log.w(TAG, "準備をやり直す（${attempt} 回目）: ${project.name}: ${error.message}")
+                    }
+                ) {
+                    when (kind) {
+                        SourceKind.Nas -> network.withLock { work() }
+                        SourceKind.Amazon -> amazonLine.withLock { work() }
+                        SourceKind.Album -> work()
+                    }
                 }
                 put(project.id) { it.copy(running = false) }
                 onFinished()

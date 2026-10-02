@@ -263,7 +263,7 @@ object Analyse {
             }
         }
 
-        if (nasAccess != null) {
+        if (nasAccess != null && photos.any(::needsWork)) {
             // **1 本の接続で全部読む。** 1 枚ごとに張り直すと、網の往復が
             // そのまま待ち時間になる（実測 50 枚で 40 秒）。
             val (nas, password) = nasAccess
@@ -322,6 +322,10 @@ object Prepare {
         else -> ListingDecision.Skip
     }
 
+    /** ハッシュ値を作り直す写真があるか。**無ければ NAS へつながない**（U43）。 */
+    fun needsNetwork(photos: List<Photo>, cached: Map<String, Fingerprint>): Boolean =
+        photos.any { !Analyse.upToDate(cached[it.relativePath], it) }
+
     suspend fun run(
         context: android.content.Context,
         project: Project,
@@ -345,8 +349,10 @@ object Prepare {
         val photos = inShootingOrder(listed)
         val cached = Fingerprints.load(context, project.source.key)
 
-        // NAS のときだけ、つなぎ先とパスワードを渡す。
-        val nasAccess = if (project.source.kind == SourceKind.Nas) {
+        // NAS のときだけ、つなぎ先とパスワードを渡す。**作るものが無ければつながない**（U43）。
+        // 準備済みのプロジェクトを開くたびに NAS へつないでいると、Wi-Fi・NAS が起きる前に
+        // 開いただけで「止まっています」になる（A1 で接続の失敗を出すようにしたため）。
+        val nasAccess = if (project.source.kind == SourceKind.Nas && needsNetwork(photos, cached)) {
             val nasId = project.source.key.substringBefore("|")
             NasStore.all(context).firstOrNull { it.id == nasId }?.let { nas ->
                 NasPasswords.password(context, nas)?.let { nas to it }

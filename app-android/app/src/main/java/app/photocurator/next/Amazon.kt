@@ -6,7 +6,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 /**
@@ -232,11 +231,16 @@ object Amazon {
         0L
     }
 
-    /** 取り直した tempLink。**使えなかったときだけ**ここに入る。node id → URL */
-    private val fresh = ConcurrentHashMap<String, String>()
-
-    /** 最後に一覧を取り直した時刻。**失敗が続いても叩き続けない。** */
-    private val relisted = ConcurrentHashMap<String, Long>()
+    /**
+     * 取り直した tempLink と、取り直しの間隔。**同時に何本失敗しても取り直しは 1 回**で、
+     * 待っていた全員が新しいリンクを使う（U43）。
+     */
+    private val links = LinkRefresher(relist = { key ->
+        when (val again = photos(linkOf(key))) {
+            is SmbResult.Failed -> again
+            is SmbResult.Ok -> SmbResult.Ok(again.value.associate { it.nodeId to it.tempLink })
+        }
+    })
 
     /**
      * 写真を 1 枚。`box` が null なら原本、あれば長辺をその大きさにした JPEG。
@@ -246,25 +250,28 @@ object Amazon {
      */
     suspend fun image(ref: AmazonRef, box: Int?): SmbResult<ByteArray> =
         withContext(Dispatchers.IO) {
-            val first = fresh[ref.nodeId] ?: ref.tempLink
+            val first = links.current(ref.nodeId) ?: ref.tempLink
             try {
                 SmbResult.Ok(getPolitely(sized(first, box)))
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
             } catch (error: Exception) {
                 val stale = error is Http && error.code in setOf(403, 404, 410)
-                val now = System.currentTimeMillis()
-                val last = relisted[ref.shareKey] ?: 0L
-                if (stale && now - last > 60_000) {
-                    relisted[ref.shareKey] = now
-                    when (val again = photos(linkOf(ref.shareKey))) {
-                        is SmbResult.Failed -> return@withContext again
-                        is SmbResult.Ok -> again.value.forEach { fresh[it.nodeId] = it.tempLink }
-                    }
-                    val next = fresh[ref.nodeId]
-                    if (next != null && next != first) {
-                        return@withContext try {
-                            SmbResult.Ok(getPolitely(sized(next, box)))
-                        } catch (retry: Exception) {
-                            SmbResult.Failed(describe(retry))
+                if (stale) {
+                    when (val next = links.replace(ref.shareKey, ref.nodeId, first)) {
+                        // 一覧も取れない（リンクが消えた・網が無い）。その理由を返す。
+                        is SmbResult.Failed -> return@withContext next
+                        is SmbResult.Ok -> {
+                            next.value?.let { link ->
+                                return@withContext try {
+                                    SmbResult.Ok(getPolitely(sized(link, box)))
+                                } catch (retry: kotlinx.coroutines.CancellationException) {
+                                    throw retry
+                                } catch (retry: Exception) {
+                                    Log.w(TAG, "取り直したリンクでも取れなかった: ${ref.nodeId}", retry)
+                                    SmbResult.Failed(describe(retry))
+                                }
+                            }
                         }
                     }
                 }
@@ -298,5 +305,57 @@ object Amazon {
         android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
         val longest = maxOf(bounds.outWidth, bounds.outHeight)
         return longest.takeIf { it > 0 }
+    }
+}
+
+/**
+ * tempLink の取り直し（U43）。**Android に依存しない**（JVM のテストで確かめる）。
+ *
+ * 控えた一覧の tempLink は時間が経つと使えなくなる。アプリを開き直した直後に準備が
+ * 8 本並べて取りに行くと、8 本とも同時に失敗する。これまでは最初の 1 本だけが一覧を
+ * 取り直し、**残りは新しいリンクを使わずに失敗のまま返していた**（404 は「リンクが
+ * 削除されています」になり、準備ごと止まる。少し後の「再試行」では新しいリンクが
+ * 手元にあるので通っていた）。
+ *
+ * ここでは取り直しを 1 本に並べ、待っていた側は**取り直し済みのリンクをそのまま使う**。
+ * 一覧を叩くのは同じ共有につき 1 分に 1 回まで（前と同じ）。
+ */
+internal class LinkRefresher(
+    private val relist: suspend (shareKey: String) -> SmbResult<Map<String, String>>,
+    private val now: () -> Long = System::currentTimeMillis,
+    private val gapMs: Long = 60_000
+) {
+    /** 取り直した tempLink。node id → URL */
+    private val fresh = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /** 最後に一覧を取り直した時刻。**失敗が続いても叩き続けない。** */
+    private val relisted = HashMap<String, Long>()
+
+    private val lock = kotlinx.coroutines.sync.Mutex()
+
+    fun current(nodeId: String): String? = fresh[nodeId]
+
+    /**
+     * `failed` のリンクが使えなかった。代わりのリンクを返す（無ければ Ok(null)）。
+     * 一覧も取れなければ、その理由（Failed）。
+     */
+    suspend fun replace(shareKey: String, nodeId: String, failed: String): SmbResult<String?> {
+        lock.lock()
+        try {
+            // **待っている間に、誰かがもう取り直していた。** それを使う。
+            fresh[nodeId]?.takeIf { it != failed }?.let { return SmbResult.Ok(it) }
+            val last = relisted[shareKey]
+            if (last != null && now() - last <= gapMs) return SmbResult.Ok(null)
+            relisted[shareKey] = now()
+            return when (val again = relist(shareKey)) {
+                is SmbResult.Failed -> again
+                is SmbResult.Ok -> {
+                    fresh.putAll(again.value)
+                    SmbResult.Ok(fresh[nodeId]?.takeIf { it != failed })
+                }
+            }
+        } finally {
+            lock.unlock()
+        }
     }
 }
