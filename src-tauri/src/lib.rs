@@ -3725,6 +3725,8 @@ struct ExportReport {
     processed: usize,
     skipped: usize,
     failed: usize,
+    /// 組の RAW の `.xmp` に書けた数（U47。`processed` には含めない。失敗は `failed`）。
+    paired_raw_processed: usize,
     /// 失敗と、その理由。全部は返さず先頭だけ。
     errors: Vec<String>,
 }
@@ -3957,8 +3959,8 @@ fn export_amazon_copy(
 }
 
 /// JPEG の XMP パケットを組み立てる。`xmp:Rating` は 0〜5 をそのまま持てる。
-fn xmp_packet(rating: i64) -> Vec<u8> {
-    let body = format!(
+fn xmp_body(rating: i64) -> String {
+    format!(
         r#"<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/">
  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
@@ -3966,7 +3968,11 @@ fn xmp_packet(rating: i64) -> Vec<u8> {
  </rdf:RDF>
 </x:xmpmeta>
 <?xpacket end="w"?>"#
-    );
+    )
+}
+
+fn xmp_packet(rating: i64) -> Vec<u8> {
+    let body = xmp_body(rating);
     let mut packet = b"http://ns.adobe.com/xap/1.0/\0".to_vec();
     packet.extend_from_slice(body.as_bytes());
     packet
@@ -4068,20 +4074,340 @@ fn verify_image_file(path: &Path) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-fn write_ratings_to_photos_blocking(
-    app: AppHandle,
-    project_id: String,
-    photo_ids: Vec<String>,
-) -> Result<ExportReport, String> {
-    let conn = connection(&app)?;
-    // Amazon の写真の原本は書き換えられない。
-    if amazon_source_of(&conn, &project_id)?.is_some() {
-        return Err(AMAZON_UNSUPPORTED.into());
+// ---- 組の RAW の .xmp（U47）----------------------------------------------
+
+/// XML のタグ 1 つの位置（`text` 内のバイト位置。`end` は `>` の次）。
+struct XmlTag {
+    start: usize,
+    end: usize,
+    name: String,
+    is_end: bool,
+    self_closing: bool,
+}
+
+/// XML のタグを前から拾う。コメント・処理命令・CDATA・DOCTYPE は読み飛ばす。
+/// タグの入れ子が合っていなければ（`.xmp` が壊れている）Err。**XML として読めるかの検証を兼ねる。**
+fn scan_xml_tags(text: &str) -> Result<Vec<XmlTag>, String> {
+    let bytes = text.as_bytes();
+    let mut tags = Vec::new();
+    let mut stack: Vec<String> = Vec::new();
+    let mut index = 0usize;
+    let skip_to = |from: usize, needle: &str| -> Result<usize, String> {
+        text[from..]
+            .find(needle)
+            .map(|offset| from + offset + needle.len())
+            .ok_or_else(|| "XML が途中で終わっています".to_string())
+    };
+    while index < bytes.len() {
+        if bytes[index] != b'<' {
+            index += 1;
+            continue;
+        }
+        let rest = &text[index..];
+        if rest.starts_with("<!--") {
+            index = skip_to(index + 4, "-->")?;
+        } else if rest.starts_with("<?") {
+            index = skip_to(index + 2, "?>")?;
+        } else if rest.starts_with("<![CDATA[") {
+            index = skip_to(index + 9, "]]>")?;
+        } else if rest.starts_with("<!") {
+            index = skip_to(index + 2, ">")?;
+        } else {
+            // 開始タグ・終了タグ。属性の値の中の `>` は無視する。
+            let mut cursor = index + 1;
+            let mut quote: Option<u8> = None;
+            let mut close = None;
+            while cursor < bytes.len() {
+                let byte = bytes[cursor];
+                match quote {
+                    Some(q) => {
+                        if byte == q {
+                            quote = None;
+                        }
+                    }
+                    None => {
+                        if byte == b'"' || byte == b'\'' {
+                            quote = Some(byte);
+                        } else if byte == b'>' {
+                            close = Some(cursor);
+                            break;
+                        }
+                    }
+                }
+                cursor += 1;
+            }
+            let close = close.ok_or_else(|| "タグが閉じていません".to_string())?;
+            let inner = &text[index + 1..close];
+            let is_end = inner.starts_with('/');
+            let self_closing = !is_end && inner.ends_with('/');
+            let name_source = inner.trim_start_matches('/');
+            let name: String = name_source
+                .chars()
+                .take_while(|c| !c.is_whitespace() && *c != '/' && *c != '>')
+                .collect();
+            if name.is_empty() {
+                return Err("タグの名前がありません".into());
+            }
+            if is_end {
+                match stack.pop() {
+                    Some(open) if open == name => {}
+                    _ => return Err(format!("タグの対応が合っていません: {name}")),
+                }
+            } else if !self_closing {
+                stack.push(name.clone());
+            }
+            tags.push(XmlTag { start: index, end: close + 1, name, is_end, self_closing });
+            index = close + 1;
+        }
     }
-    let targets = photos_for_export(&conn, &project_id, &photo_ids)?;
+    if !stack.is_empty() {
+        return Err("閉じていないタグがあります".into());
+    }
+    if tags.is_empty() {
+        return Err("XML のタグがありません".into());
+    }
+    Ok(tags)
+}
+
+/// 開始タグの属性（名前・値の範囲。範囲は `text` 内のバイト位置で、引用符の内側）。
+fn tag_attributes(text: &str, tag: &XmlTag) -> Vec<(String, std::ops::Range<usize>)> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let limit = tag.end - 1;
+    let mut cursor = tag.start + 1;
+    // タグの名前を飛ばす。
+    while cursor < limit && !bytes[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+    loop {
+        while cursor < limit && (bytes[cursor].is_ascii_whitespace() || bytes[cursor] == b'/') {
+            cursor += 1;
+        }
+        if cursor >= limit {
+            break;
+        }
+        let name_start = cursor;
+        while cursor < limit && bytes[cursor] != b'=' && !bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        let name = text[name_start..cursor].to_string();
+        while cursor < limit && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= limit || bytes[cursor] != b'=' {
+            continue;
+        }
+        cursor += 1;
+        while cursor < limit && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= limit || (bytes[cursor] != b'"' && bytes[cursor] != b'\'') {
+            break;
+        }
+        let quote = bytes[cursor];
+        let value_start = cursor + 1;
+        let Some(length) = bytes[value_start..limit].iter().position(|b| *b == quote) else {
+            break;
+        };
+        out.push((name, value_start..value_start + length));
+        cursor = value_start + length + 1;
+    }
+    out
+}
+
+/// `.xmp` の中の `xmp:Rating`（属性・要素）の値を、見つけた順に返す。読めなければ Err。
+fn xmp_ratings_of_document(text: &str) -> Result<Vec<String>, String> {
+    let tags = scan_xml_tags(text)?;
+    let mut found = Vec::new();
+    for (position, tag) in tags.iter().enumerate() {
+        if tag.is_end {
+            continue;
+        }
+        for (name, range) in tag_attributes(text, tag) {
+            if name == "xmp:Rating" {
+                found.push(text[range].trim().to_string());
+            }
+        }
+        if tag.name == "xmp:Rating" && !tag.self_closing {
+            if let Some(next) = tags.get(position + 1) {
+                if next.is_end && next.name == "xmp:Rating" {
+                    found.push(text[tag.end..next.start].trim().to_string());
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// 既にある `.xmp` の星（`xmp:Rating`）だけを書き換える。ほかの内容は 1 バイトも変えない。
+/// `xmp:Rating` が無ければ、最初の `rdf:Description` に属性として足す。
+/// 読めない・`rdf:Description` が無いときは Err（呼び出し側は何も書かない）。
+fn xmp_with_rating(existing: &str, rating: i64) -> Result<String, String> {
+    let tags = scan_xml_tags(existing)?;
+    let value = rating.to_string();
+    // (差し替える範囲, 入れる文字列)
+    let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    for (position, tag) in tags.iter().enumerate() {
+        if tag.is_end {
+            continue;
+        }
+        for (name, range) in tag_attributes(existing, tag) {
+            if name == "xmp:Rating" {
+                edits.push((range, value.clone()));
+            }
+        }
+        if tag.name == "xmp:Rating" && !tag.self_closing {
+            if let Some(next) = tags.get(position + 1) {
+                if next.is_end && next.name == "xmp:Rating" {
+                    edits.push((tag.end..next.start, value.clone()));
+                }
+            }
+        }
+    }
+    if edits.is_empty() {
+        let description = tags
+            .iter()
+            .find(|tag| !tag.is_end && tag.name == "rdf:Description")
+            .ok_or_else(|| "rdf:Description が見つかりません".to_string())?;
+        let has_namespace = tag_attributes(existing, description)
+            .iter()
+            .any(|(name, _)| name == "xmlns:xmp");
+        let insert_at = description.end - if description.self_closing { 2 } else { 1 };
+        let mut addition = String::new();
+        if !has_namespace {
+            addition.push_str(" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\"");
+        }
+        addition.push_str(&format!(" xmp:Rating=\"{value}\""));
+        edits.push((insert_at..insert_at, addition));
+    }
+    edits.sort_by_key(|(range, _)| range.start);
+    let mut out = existing.to_string();
+    for (range, replacement) in edits.into_iter().rev() {
+        out.replace_range(range, &replacement);
+    }
+    Ok(out)
+}
+
+/// 新しく作る `.xmp` の中身（最小の XMP パケット）。
+fn new_sidecar_xmp(rating: i64) -> String {
+    xmp_body(rating)
+}
+
+/// JPEG（`.jpg`・`.jpeg`）の組の RAW を、同じフォルダの一覧から選ぶ純関数。
+/// 拡張子を除いた名前が大文字小文字を無視して一致し、拡張子が RAW の一覧にあるもの。
+/// フォルダが違うものは組ではない。並びはパス順。
+fn paired_raw_files(jpeg: &Path, siblings: &[PathBuf]) -> Vec<PathBuf> {
+    let Some(stem) = jpeg.file_stem().map(|v| v.to_string_lossy().to_lowercase()) else {
+        return Vec::new();
+    };
+    let folder = jpeg.parent();
+    let mut found: Vec<PathBuf> = siblings
+        .iter()
+        .filter(|candidate| {
+            candidate.parent() == folder
+                && candidate
+                    .file_stem()
+                    .is_some_and(|v| v.to_string_lossy().to_lowercase() == stem)
+                && extension_lower(candidate).is_some_and(|ext| RAW_EXTENSIONS.contains(&ext.as_str()))
+        })
+        .cloned()
+        .collect();
+    found.sort();
+    found
+}
+
+/// JPEG と同じフォルダのファイルを列挙して、組の RAW を返す（読めなければ空）。
+fn find_paired_raws(jpeg: &Path) -> Vec<PathBuf> {
+    let Some(folder) = jpeg.parent() else {
+        return Vec::new();
+    };
+    let siblings: Vec<PathBuf> = match fs::read_dir(folder) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file())
+            .collect(),
+        Err(_) => return Vec::new(),
+    };
+    paired_raw_files(jpeg, &siblings)
+}
+
+/// RAW の隣の `.xmp` に星を書く。**RAW 本体は読みも書きもしない。**
+/// 既にあれば（名前の大文字小文字は問わない）`xmp:Rating` だけを更新し、無ければ新しく作る。
+/// 同じフォルダの一時ファイルへ書き、XML として読めて星が期待どおりか確かめてから置き換える。
+/// 読み取り専用の `.xmp`・UTF-8 でない `.xmp`・構造が読めない `.xmp` には触らず Err。
+fn write_sidecar_xmp_for_raw(raw: &Path, rating: i64) -> Result<PathBuf, String> {
+    let folder = raw.parent().ok_or("RAW のフォルダが分かりません")?;
+    let stem = raw.file_stem().ok_or("RAW の名前が分かりません")?;
+    let wanted = format!("{}.xmp", stem.to_string_lossy().to_lowercase());
+    let existing: Option<PathBuf> = fs::read_dir(folder)
+        .map_err(|error| error.to_string())?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().to_lowercase() == wanted)
+        });
+
+    let (target, content) = match &existing {
+        Some(path) => {
+            let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+            if metadata.permissions().readonly() {
+                return Err("既存の .xmp が読み取り専用のため書きませんでした".into());
+            }
+            let bytes = fs::read(path).map_err(|error| error.to_string())?;
+            let text = String::from_utf8(bytes)
+                .map_err(|_| "既存の .xmp が UTF-8 ではないため書きませんでした".to_string())?;
+            let updated = xmp_with_rating(&text, rating)
+                .map_err(|reason| format!("既存の .xmp を読めないため書きませんでした: {reason}"))?;
+            (path.clone(), updated)
+        }
+        None => {
+            let mut name = stem.to_os_string();
+            name.push(".xmp");
+            (folder.join(name), new_sidecar_xmp(rating))
+        }
+    };
+
+    let mut temporary_name = target.file_name().unwrap_or_default().to_os_string();
+    temporary_name.push(".photocurator-tmp");
+    let temporary = folder.join(temporary_name);
+    if let Err(error) = fs::write(&temporary, content.as_bytes()) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
+    let expected = rating.to_string();
+    let verified = fs::read_to_string(&temporary)
+        .map_err(|error| error.to_string())
+        .and_then(|text| xmp_ratings_of_document(&text))
+        .and_then(|ratings| {
+            if !ratings.is_empty() && ratings.iter().all(|value| *value == expected) {
+                Ok(())
+            } else {
+                Err("星が期待どおりに書けていません".to_string())
+            }
+        });
+    if let Err(reason) = verified {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("検証に失敗したため .xmp は変更していません: {reason}"));
+    }
+    match fs::rename(&temporary, &target) {
+        Ok(()) => Ok(target),
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(error.to_string())
+        }
+    }
+}
+
+/// 対象の写真（id・パス・星）に星を書く。JPEG は中の XMP に、
+/// `pair_raw` がオンなら組の RAW の隣の `.xmp` にも。JPEG の書き込みが失敗したら RAW 側は書かない。
+fn write_ratings_to_targets(targets: &[(String, String, i64)], pair_raw: bool) -> ExportReport {
     let mut report = ExportReport::default();
 
-    for (_id, path, rating) in &targets {
+    for (_id, path, rating) in targets {
         let source = Path::new(path);
         let is_jpeg = matches!(
             source
@@ -4132,10 +4458,42 @@ fn write_ratings_to_photos_blocking(
             Err(error) => {
                 let _ = fs::remove_file(&temporary);
                 report.fail(path, error);
+                continue;
+            }
+        }
+
+        // 組の RAW の隣の .xmp（U47）。オフのときは RAW が自分の行で扱われるので何もしない。
+        // 同じ名前の RAW が複数あっても `.xmp` は 1 つなので、1 回だけ書く。
+        if pair_raw {
+            let mut written: HashSet<PathBuf> = HashSet::new();
+            for raw in find_paired_raws(source) {
+                let key = raw.with_extension("").to_string_lossy().to_lowercase();
+                if !written.insert(PathBuf::from(key)) {
+                    continue;
+                }
+                match write_sidecar_xmp_for_raw(&raw, *rating) {
+                    Ok(_) => report.paired_raw_processed += 1,
+                    Err(reason) => report.fail(&raw.to_string_lossy(), reason),
+                }
             }
         }
     }
-    Ok(report)
+    report
+}
+
+fn write_ratings_to_photos_blocking(
+    app: AppHandle,
+    project_id: String,
+    photo_ids: Vec<String>,
+) -> Result<ExportReport, String> {
+    let conn = connection(&app)?;
+    // Amazon の写真の原本は書き換えられない。
+    if amazon_source_of(&conn, &project_id)?.is_some() {
+        return Err(AMAZON_UNSUPPORTED.into());
+    }
+    let targets = photos_for_export(&conn, &project_id, &photo_ids)?;
+    let pair_raw = project_pair_raw(&conn, &project_id);
+    Ok(write_ratings_to_targets(&targets, pair_raw))
 }
 
 /// 結果の CSV を、保存ダイアログで選ばれた場所へ書く。**書けるのは `.csv` だけ**
@@ -8714,6 +9072,212 @@ mod tests {
         let rebuilt = hash_one_amazon(&book, &thumbnails, 0, &old);
         assert!(rebuilt.error.is_none() && !rebuilt.hash_reused);
         assert_eq!(rebuilt.d_hash, expected);
+        fs::remove_dir_all(&directory).ok();
+    }
+    // ---- 組の RAW の .xmp（U47）-----------------------------------------
+
+    fn rating_target(path: &Path, rating: i64) -> (String, String, i64) {
+        ("id".to_string(), path.to_string_lossy().to_string(), rating)
+    }
+
+    fn jpeg_ratings(path: &Path) -> Vec<String> {
+        xmp_ratings_in(&fs::read(path).expect("read jpeg"))
+    }
+
+    const RAW_BYTES: &[u8] = b"II*\0 not a real raw but must never change \xFF\xD8\x00";
+
+    #[test]
+    fn rating_a_jpeg_also_writes_the_xmp_next_to_its_paired_raw() {
+        let directory = test_directory("u47-basic");
+        let jpeg = directory.join("IMG_1.JPG");
+        let raw = directory.join("IMG_1.CR2");
+        fs::write(&jpeg, jpeg_bytes(32, 24, 7)).unwrap();
+        fs::write(&raw, RAW_BYTES).unwrap();
+
+        let report = write_ratings_to_targets(&[rating_target(&jpeg, 3)], true);
+
+        assert_eq!((report.processed, report.paired_raw_processed, report.failed), (1, 1, 0));
+        assert_eq!(jpeg_ratings(&jpeg), vec!["3"]);
+        let xmp = fs::read_to_string(directory.join("IMG_1.xmp")).expect("xmp is created");
+        assert_eq!(xmp_ratings_of_document(&xmp).unwrap(), vec!["3"]);
+        assert_eq!(fs::read(&raw).unwrap(), RAW_BYTES, "RAW 本体は不変");
+        let leftovers: Vec<_> = fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains("photocurator-tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "一時ファイルを残さない");
+        fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn existing_xmp_only_has_its_rating_updated() {
+        let directory = test_directory("u47-existing");
+        let jpeg = directory.join("IMG_2.jpg");
+        let raw = directory.join("IMG_2.CR2");
+        fs::write(&jpeg, jpeg_bytes(32, 24, 7)).unwrap();
+        fs::write(&raw, RAW_BYTES).unwrap();
+        let existing = "<?xpacket begin=\"\" id=\"x\"?>\n<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n  <rdf:Description rdf:about=\"\" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" xmlns:crs=\"http://ns.adobe.com/camera-raw-settings/1.0/\" xmp:Rating=\"1\" crs:Exposure2012=\"+0.50\">\n   <crs:ToneCurve><rdf:Seq><rdf:li>0, 0</rdf:li></rdf:Seq></crs:ToneCurve>\n  </rdf:Description>\n </rdf:RDF>\n</x:xmpmeta>\n<?xpacket end=\"w\"?>";
+        fs::write(directory.join("IMG_2.xmp"), existing).unwrap();
+
+        let report = write_ratings_to_targets(&[rating_target(&jpeg, 5)], true);
+
+        assert_eq!((report.paired_raw_processed, report.failed), (1, 0));
+        let after = fs::read_to_string(directory.join("IMG_2.xmp")).unwrap();
+        assert_eq!(after, existing.replace("xmp:Rating=\"1\"", "xmp:Rating=\"5\""), "Rating 以外は 1 文字も変わらない");
+        assert!(after.contains("crs:Exposure2012=\"+0.50\"") && after.contains("<rdf:li>0, 0</rdf:li>"));
+        assert_eq!(fs::read(&raw).unwrap(), RAW_BYTES);
+        fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn existing_xmp_with_rating_element_or_without_rating_is_handled() {
+        let element = "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"r\"><rdf:Description xmlns:xmp=\"n\"><xmp:Rating>2</xmp:Rating><a:b xmlns:a=\"a\">keep</a:b></rdf:Description></rdf:RDF></x:xmpmeta>";
+        let updated = xmp_with_rating(element, 4).unwrap();
+        assert_eq!(updated, element.replace("<xmp:Rating>2<", "<xmp:Rating>4<"));
+
+        let none = "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"r\"><rdf:Description rdf:about=\"\" xmlns:crs=\"c\" crs:Exposure=\"1\"/></rdf:RDF></x:xmpmeta>";
+        let added = xmp_with_rating(none, 3).unwrap();
+        assert_eq!(xmp_ratings_of_document(&added).unwrap(), vec!["3"]);
+        assert!(added.contains("crs:Exposure=\"1\"") && added.contains("xmlns:xmp="));
+
+        // 読めない XML・Description の無い XML は Err（何も書かせない）。
+        assert!(xmp_with_rating("<a><b></a>", 1).is_err());
+        assert!(xmp_with_rating("not xml", 1).is_err());
+        assert!(xmp_with_rating("<a/>", 1).is_err());
+        // 値の中の `>` や、コメントの中の偽のタグに惑わされない。
+        let tricky = "<x><!-- <xmp:Rating>9</xmp:Rating> --><rdf:Description a=\"1>2\" xmp:Rating=\"1\"/></x>";
+        assert_eq!(xmp_with_rating(tricky, 2).unwrap(), tricky.replace("Rating=\"1\"", "Rating=\"2\""));
+    }
+
+    #[test]
+    fn a_jpeg_without_a_paired_raw_creates_no_xmp() {
+        let directory = test_directory("u47-nopair");
+        let jpeg = directory.join("IMG_3.jpg");
+        fs::write(&jpeg, jpeg_bytes(32, 24, 7)).unwrap();
+        fs::write(directory.join("IMG_30.CR2"), RAW_BYTES).unwrap();
+        fs::write(directory.join("IMG_3.png"), b"x").unwrap();
+
+        let report = write_ratings_to_targets(&[rating_target(&jpeg, 2)], true);
+
+        assert_eq!((report.processed, report.paired_raw_processed, report.failed), (1, 0, 0));
+        assert!(!directory.join("IMG_3.xmp").exists());
+        assert!(!directory.join("IMG_30.xmp").exists());
+        fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn a_raw_in_another_folder_is_not_a_pair() {
+        let directory = test_directory("u47-folders");
+        fs::create_dir_all(directory.join("a")).unwrap();
+        fs::create_dir_all(directory.join("b")).unwrap();
+        let jpeg = directory.join("a").join("IMG_4.jpg");
+        fs::write(&jpeg, jpeg_bytes(32, 24, 7)).unwrap();
+        fs::write(directory.join("b").join("IMG_4.CR2"), RAW_BYTES).unwrap();
+
+        let report = write_ratings_to_targets(&[rating_target(&jpeg, 2)], true);
+
+        assert_eq!(report.paired_raw_processed, 0);
+        assert!(!directory.join("b").join("IMG_4.xmp").exists());
+        assert!(!directory.join("a").join("IMG_4.xmp").exists());
+
+        // 純関数の側でも同じ。
+        let found = paired_raw_files(
+            &jpeg,
+            &[directory.join("b").join("IMG_4.CR2"), directory.join("a").join("IMG_4.CR2"), directory.join("a").join("IMG_4.png")],
+        );
+        assert_eq!(found, vec![directory.join("a").join("IMG_4.CR2")]);
+        fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn pairing_ignores_case_of_names_and_extensions() {
+        let directory = test_directory("u47-case");
+        let jpeg = directory.join("img_5.jpg");
+        let raw = directory.join("IMG_5.CR2");
+        fs::write(&jpeg, jpeg_bytes(32, 24, 7)).unwrap();
+        fs::write(&raw, RAW_BYTES).unwrap();
+
+        let report = write_ratings_to_targets(&[rating_target(&jpeg, 4)], true);
+
+        assert_eq!((report.processed, report.paired_raw_processed, report.failed), (1, 1, 0));
+        let xmp = fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name.to_lowercase().ends_with(".xmp"))
+            .collect::<Vec<_>>();
+        assert_eq!(xmp.len(), 1, "大文字小文字違いの .xmp を 2 つ作らない");
+        assert_eq!(fs::read(&raw).unwrap(), RAW_BYTES);
+        fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn nothing_is_written_next_to_raw_when_pairing_is_off() {
+        let directory = test_directory("u47-off");
+        let jpeg = directory.join("IMG_6.jpg");
+        let raw = directory.join("IMG_6.CR2");
+        fs::write(&jpeg, jpeg_bytes(32, 24, 7)).unwrap();
+        fs::write(&raw, RAW_BYTES).unwrap();
+
+        let report = write_ratings_to_targets(&[rating_target(&jpeg, 3)], false);
+
+        assert_eq!((report.processed, report.paired_raw_processed, report.failed), (1, 0, 0));
+        assert!(!directory.join("IMG_6.xmp").exists());
+        // RAW が自分の行で渡されても、今までどおり飛ばす（RAW は書き換えない）。
+        let report = write_ratings_to_targets(&[rating_target(&raw, 3)], false);
+        assert_eq!((report.processed, report.skipped), (0, 1));
+        assert_eq!(fs::read(&raw).unwrap(), RAW_BYTES);
+        fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn zero_stars_writes_rating_zero() {
+        let directory = test_directory("u47-zero");
+        let jpeg = directory.join("IMG_7.jpg");
+        fs::write(&jpeg, jpeg_bytes(32, 24, 7)).unwrap();
+        fs::write(directory.join("IMG_7.NEF"), RAW_BYTES).unwrap();
+        fs::write(directory.join("IMG_7.xmp"), new_sidecar_xmp(4)).unwrap();
+
+        let report = write_ratings_to_targets(&[rating_target(&jpeg, 0)], true);
+
+        assert_eq!((report.processed, report.paired_raw_processed, report.failed), (1, 1, 0));
+        let xmp = fs::read_to_string(directory.join("IMG_7.xmp")).unwrap();
+        assert_eq!(xmp_ratings_of_document(&xmp).unwrap(), vec!["0"]);
+        assert_eq!(jpeg_ratings(&jpeg), vec!["0"]);
+        assert!(new_sidecar_xmp(0).contains("xmp:Rating=\"0\""));
+        fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn a_failing_xmp_is_reported_while_the_jpeg_write_still_counts() {
+        let directory = test_directory("u47-fail");
+        let jpeg = directory.join("IMG_8.jpg");
+        fs::write(&jpeg, jpeg_bytes(32, 24, 7)).unwrap();
+        fs::write(directory.join("IMG_8.CR2"), RAW_BYTES).unwrap();
+        let xmp = directory.join("IMG_8.xmp");
+        let original_xmp = new_sidecar_xmp(1);
+        fs::write(&xmp, &original_xmp).unwrap();
+        let mut permissions = fs::metadata(&xmp).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&xmp, permissions).unwrap();
+
+        let report = write_ratings_to_targets(&[rating_target(&jpeg, 5)], true);
+
+        assert_eq!((report.processed, report.paired_raw_processed, report.failed), (1, 0, 1));
+        assert!(report.errors[0].contains("IMG_8.CR2"));
+        assert_eq!(jpeg_ratings(&jpeg), vec!["5"], "JPEG の書き込みは成功のまま");
+        assert_eq!(fs::read_to_string(&xmp).unwrap(), original_xmp, "既存の .xmp は変わらない");
+
+        let mut permissions = fs::metadata(&xmp).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&xmp, permissions).unwrap();
+
+        // 壊れた .xmp も触らない。
+        fs::write(&xmp, "<broken><x></broken>").unwrap();
+        let report = write_ratings_to_targets(&[rating_target(&jpeg, 2)], true);
+        assert_eq!((report.processed, report.paired_raw_processed, report.failed), (1, 0, 1));
+        assert_eq!(fs::read_to_string(&xmp).unwrap(), "<broken><x></broken>");
         fs::remove_dir_all(&directory).ok();
     }
 }

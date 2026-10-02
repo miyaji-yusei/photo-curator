@@ -43,6 +43,8 @@ export interface ExportReport {
   processed: number
   skipped: number
   failed: number
+  /** 組の RAW の .xmp に書けた数（メタデータへの書き込みだけ。無ければ 0 扱い）。 */
+  pairedRawProcessed?: number
   errors: string[]
 }
 
