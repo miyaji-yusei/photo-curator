@@ -415,36 +415,69 @@ class SidecarSync(
     }
 
     private sealed interface Lock {
-        data object Taken : Lock
+        /** [body] は書いた中身。放すときに、まだ自分のロックかを確かめるのに使う。 */
+        class Taken(val body: ByteArray) : Lock
         data object Busy : Lock
         data class Failed(val reason: String) : Lock
     }
 
-    /** 書く間だけ、ほかの端末と取り合わないための印。60 秒より古いものは捨てて取り直す。 */
+    /**
+     * 書く間だけ、ほかの端末と取り合わないための印。形は PC と同じ `{"holder":…,"at":ms}`
+     * （見分けのために name と nonce も入れる。PC は中身を読まない）。
+     *
+     * 古いものは捨てて取り直す。**古いと見なすのは、次のときだけ**（U44 D5）:
+     * - 中身に `at` がある: `at`（書いた端末の時計）と NAS の更新時刻の**両方**が [LOCK_TTL_MS] より古い
+     *   （PC は更新時刻で古さを見るので、どちらの時計がずれていても生きているロックを壊さない）
+     * - 中身が空・読めない（作った直後でまだ書いていない、など）: NAS の更新時刻が古い
+     * - 更新時刻が分からなければ古いと見なさない
+     * 捨てる前にもう一度読み、中身が変わっていれば（ほかの端末が取り直した）捨てない。
+     */
     private suspend fun lock(target: SyncTarget): Lock {
         val path = lockPath(target.folder)
         val who = me()
-        val body = "{\"device\":\"" + escape(who.id) + "\",\"name\":\"" + escape(who.name) +
-            "\",\"at\":" + now() + "}"
+        val body = ("{\"holder\":\"" + escape(who.id) + "\",\"at\":" + now() + ",\"name\":\"" + escape(who.name) +
+            "\",\"nonce\":\"" + java.util.UUID.randomUUID().toString().replace("-", "").take(16) + "\"}")
+            .toByteArray(Charsets.UTF_8)
         repeat(2) {
-            when (val made = target.io.createExclusive(path, body.toByteArray(Charsets.UTF_8))) {
+            when (val made = target.io.createExclusive(path, body)) {
                 is SmbResult.Failed -> return Lock.Failed(made.reason)
-                is SmbResult.Ok -> if (made.value) return Lock.Taken
+                is SmbResult.Ok -> if (made.value) return Lock.Taken(body)
             }
             // 先にある。古ければ（書いた端末が途中で止まった）捨てて取り直す。
-            val existing = target.io.read(path)
-            val text = (existing as? SmbResult.Ok)?.value?.let { String(it, Charsets.UTF_8) }
-            val at = text?.let { LOCK_AT.find(it)?.groupValues?.get(1)?.toLongOrNull() }
-            val stale = text == null || at == null || now() - at > LOCK_TTL_MS
-            if (!stale) return Lock.Busy
+            val first = when (val read = target.io.read(path)) {
+                is SmbResult.Failed -> return Lock.Busy
+                is SmbResult.Ok -> read.value ?: return@repeat // 読む前に消えた → 取り直す
+            }
+            if (!lockStale(target, first)) return Lock.Busy
+            val again = target.io.read(path)
+            if (again !is SmbResult.Ok || again.value == null || !again.value.contentEquals(first)) return Lock.Busy
             target.io.delete(path)
         }
         return Lock.Busy
     }
 
-    private suspend fun unlock(target: SyncTarget) {
+    private suspend fun lockStale(target: SyncTarget, bytes: ByteArray): Boolean {
+        val modified = (target.io.list(dir(target.folder)) as? SmbResult.Ok)?.value
+            ?.firstOrNull { it.name == LOCK_NAME }?.modifiedAt
+            ?: return false
+        val current = now()
+        if (current - modified <= LOCK_TTL_MS) return false
+        val at = LOCK_AT.find(String(bytes, Charsets.UTF_8))?.groupValues?.get(1)?.toLongOrNull()
+        return at == null || current - at > LOCK_TTL_MS
+    }
+
+    /** 放す。**まだ自分のロックのときだけ消す**（ほかの端末が古いと見なして取り直していたら残す）。 */
+    private suspend fun unlock(target: SyncTarget, body: ByteArray) {
         try {
-            target.io.delete(lockPath(target.folder))
+            val path = lockPath(target.folder)
+            val current = target.io.read(path)
+            if (current is SmbResult.Ok && current.value != null && current.value.contentEquals(body)) {
+                target.io.delete(path)
+            } else if (current !is SmbResult.Ok || current.value != null) {
+                log("ロックを放さなかった（ほかの端末のロックか、読めなかった）", null)
+            }
+        } catch (error: kotlinx.coroutines.CancellationException) {
+            throw error
         } catch (error: Exception) {
             log("ロックを消せなかった", error)
         }
@@ -463,10 +496,10 @@ class SidecarSync(
         expected: String?,
         asideTheirs: Boolean
     ): Pushed {
-        when (val taken = lock(target)) {
+        val held = when (val taken = lock(target)) {
             is Lock.Failed -> return Pushed.Failed(taken.reason)
             is Lock.Busy -> return Pushed.Failed("ほかの端末が NAS に書いています。あとでもう一度試します")
-            is Lock.Taken -> Unit
+            is Lock.Taken -> taken.body
         }
         try {
             val current = when (val read = readRemote(target)) {
@@ -522,7 +555,7 @@ class SidecarSync(
                     (aside?.let { "（NAS にあった記録は $it に残しました）" } ?: "")
             )
         } finally {
-            unlock(target)
+            unlock(target, held)
         }
     }
 
@@ -726,7 +759,8 @@ class SidecarSync(
 
         /** 写真のフォルダの直下。**増やすのはこの 1 ファイルだけ**（書く間のロックと一時ファイルを除く）。 */
         fun catalogPath(folder: String) = dir(folder) + "\\catalog.json"
-        fun lockPath(folder: String) = dir(folder) + "\\catalog.lock"
+        private const val LOCK_NAME = "catalog.lock"
+        fun lockPath(folder: String) = dir(folder) + "\\" + LOCK_NAME
         /** `.photo-curator` のフォルダ（共有の根から `\` 区切り）。 */
         fun sidecarDir(folder: String) = dir(folder)
 

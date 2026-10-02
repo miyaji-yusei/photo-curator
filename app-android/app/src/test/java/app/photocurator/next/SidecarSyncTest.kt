@@ -72,12 +72,16 @@ class SidecarSyncTest {
             )
         }
 
+        /** どのファイルでも、読んだあと返す前に呼ぶ（読んだ中身はもう決まっている）。 */
+        @Volatile var afterAnyRead: (suspend (String) -> Unit)? = null
+
         override suspend fun read(path: String): SmbResult<ByteArray?> {
             val bytes = files[path]
             if (path.endsWith("catalog.json")) {
                 reads.incrementAndGet()
                 afterRead?.invoke(path)
             }
+            afterAnyRead?.invoke(path)
             return SmbResult.Ok(bytes)
         }
 
@@ -751,6 +755,89 @@ class SidecarSyncTest {
         assertTrue("$answer", answer is SyncOutcome.Blocked)
         assertArrayEquals("NAS はそのまま", c.theirsBytes, c.nas.files[catalog])
         assertNull("ロックは放す", c.nas.files[SidecarSync.lockPath(folder)])
+    }
+
+    // ---- U44 D5: ロックを壊しすぎない・他人のロックを消さない ----
+
+    private val lock = SidecarSync.lockPath(folder)
+
+    @Test fun 中身が空のロックは更新時刻が新しければ壊さない() = run {
+        val nas = FakeNas().apply { nasNow = clock }
+        nas.files[lock] = ByteArray(0)
+        nas.mtimes[lock] = clock - 1_000
+        val local = FakeLocal(snapshot(mineAdvanced()))
+
+        val answer = syncFor(android, FakeSeen()).check(target(local, nas))
+
+        assertTrue("書かない: $answer", answer is SyncOutcome.Blocked)
+        assertNotNull("ロックはそのまま", nas.files[lock])
+        assertNull(nas.files[catalog])
+    }
+
+    @Test fun 中身が空のロックでも更新時刻が古ければ壊して書く() = run {
+        val nas = FakeNas().apply { nasNow = clock }
+        nas.files[lock] = ByteArray(0)
+        nas.mtimes[lock] = clock - 120_000
+        val local = FakeLocal(snapshot(mineAdvanced()))
+
+        val answer = syncFor(android, FakeSeen()).check(target(local, nas))
+
+        assertTrue("$answer", answer is SyncOutcome.Pushed)
+        assertNull(nas.files[lock])
+    }
+
+    @Test fun 中のatが古くても更新時刻が新しければ壊さない() = run {
+        val nas = FakeNas().apply { nasNow = clock }
+        nas.files[lock] = "{\"holder\":\"pc\",\"at\":${clock - 600_000}}".toByteArray()
+        nas.mtimes[lock] = clock - 1_000
+        val local = FakeLocal(snapshot(mineAdvanced()))
+
+        val answer = syncFor(android, FakeSeen()).check(target(local, nas))
+
+        assertTrue("時計がずれていても生きているロックは壊さない: $answer", answer is SyncOutcome.Blocked)
+        assertNotNull(nas.files[lock])
+    }
+
+    @Test fun 自分のロックが置き換わっていたら放すときに消さない() = run {
+        val nas = FakeNas()
+        val local = FakeLocal(snapshot(mineAdvanced()))
+        val theirLock = "{\"holder\":\"pc\",\"at\":${clock}}".toByteArray()
+        // 書いている途中で、ほかの端末がこの端末のロックを古いと見なして取り直した。
+        nas.beforeWrite = { path -> if (path.endsWith(".tmp")) nas.files[lock] = theirLock }
+
+        syncFor(android, FakeSeen()).check(target(local, nas))
+
+        assertArrayEquals("ほかの端末のロックは残す", theirLock, nas.files[lock])
+    }
+
+    @Test fun 古いロックを壊す前に読み直して変わっていれば壊さない() = run {
+        val nas = FakeNas()
+        nas.files[lock] = "{\"holder\":\"pc\",\"at\":${clock - 120_000}}".toByteArray()
+        val fresh = "{\"holder\":\"fold\",\"at\":${clock}}".toByteArray()
+        val lockReads = AtomicInteger()
+        // 古いロックを読んだ直後に、ほかの端末がそれを壊して自分のロックを取った。
+        nas.afterAnyRead = { path ->
+            if (path == lock && lockReads.incrementAndGet() == 1) {
+                nas.files[lock] = fresh
+                nas.mtimes[lock] = clock
+            }
+        }
+        nas.nasNow = clock
+        val local = FakeLocal(snapshot(mineAdvanced()))
+
+        val answer = syncFor(android, FakeSeen()).check(target(local, nas))
+
+        assertTrue("$answer", answer is SyncOutcome.Blocked)
+        assertArrayEquals("取り直したロックは消さない", fresh, nas.files[lock])
+        assertNull(nas.files[catalog])
+    }
+
+    @Test fun ロックの形はPCと同じholderとat() = run {
+        val nas = FakeNas()
+        var seenLock: String? = null
+        nas.beforeWrite = { path -> if (path.endsWith(".tmp")) seenLock = nas.text(lock) }
+        syncFor(android, FakeSeen()).check(target(FakeLocal(snapshot(mineAdvanced())), nas))
+        assertTrue("$seenLock", seenLock!!.contains("\"holder\":\"${android.id}\"") && Regex("\"at\":\\d+").containsMatchIn(seenLock!!))
     }
 
     @Test fun 文言はPCと同じ形() {
