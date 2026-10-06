@@ -22,7 +22,7 @@ pub(crate) fn metadata_one(index: usize, job: &MetadataJob) -> PhotoWork {
             result.timestamp_source = Some(capture.source);
         }
         None => {
-            result.error = Some("撮影時刻を読み取れませんでした。".into());
+            result.fail(PhotoFailure::NoCaptureTime);
         }
     }
     result
@@ -95,13 +95,7 @@ pub(crate) fn hash_one(thumbnails: &Path, index: usize, record: &HashRecord) -> 
     if result.d_hash.is_none() {
         // 非対応にするのは「全部読めたのに復号できない」ときだけ（U58）。
         // 読めない・サムネイルを作れない・理由が分からないは一時的（安全側）。
-        let undecodable = current.is_some() && analysed.failure == Some(DecodeFailure::Undecodable);
-        result.error = Some(if undecodable {
-            "画像を読み取れませんでした（破損または非対応の形式）。".into()
-        } else {
-            "ファイルを開けませんでした（移動・削除・権限）。".into()
-        });
-        result.error_unsupported = undecodable;
+        result.fail(PhotoFailure::from_decode(analysed.failure, current.is_some()));
     }
     result
 }
@@ -137,16 +131,16 @@ pub(crate) fn hash_one_amazon(
     let bytes = match book.fetch(&record.path, Some(AMAZON_THUMBNAIL_EDGE)) {
         Ok(bytes) => bytes,
         Err(message) => {
-            result.error = Some(message);
+            result.fail(PhotoFailure::Fetch(message));
             return result;
         }
     };
     let Some(image) = image::load_from_memory(&bytes).ok() else {
-        result.error = Some("画像を読み取れませんでした（破損または非対応の形式）。".into());
+        result.fail(PhotoFailure::RemoteUndecodable);
         return result;
     };
     let Some(thumbnail) = encode_thumbnail(&scale_for_thumbnail(&image)) else {
-        result.error = Some("画像を読み取れませんでした（破損または非対応の形式）。".into());
+        result.fail(PhotoFailure::RemoteUndecodable);
         return result;
     };
     result.d_hash = hash_thumbnail_bytes(&thumbnail);
@@ -155,7 +149,7 @@ pub(crate) fn hash_one_amazon(
         result.thumbnail_source = Some("amazon");
     }
     if result.d_hash.is_none() {
-        result.error = Some("画像を読み取れませんでした（破損または非対応の形式）。".into());
+        result.fail(PhotoFailure::RemoteUndecodable);
     }
     result
 }
