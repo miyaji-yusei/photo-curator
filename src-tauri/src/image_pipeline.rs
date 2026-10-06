@@ -153,6 +153,16 @@ pub(crate) fn scaled_jpeg_decode_bytes(bytes: &[u8]) -> Option<DynamicImage> {
 /// **①は先頭 64KB しか読まない。**②③に落ちたときだけ全体を取る。
 /// 実データでは 97.4% が①なので、読む量は 1 枚あたり 26KB で収まる。
 pub(crate) fn decode_hash_source_from(source: &dyn PhotoSource) -> Option<(DynamicImage, DecodeSource)> {
+    decode_hash_source_with(source, true)
+}
+
+/// `pixel_fallback` が false のときは、EXIF のサムネイルが取れなければここで諦める
+/// （生の画素の読み込みへ進まない）。RAW 用: `image` は RAW を開けないので、
+/// 25MB 前後の本体を丸ごと読んでから失敗するのは、ネットワークでは時間の無駄でしかない。
+pub(crate) fn decode_hash_source_with(
+    source: &dyn PhotoSource,
+    pixel_fallback: bool,
+) -> Option<(DynamicImage, DecodeSource)> {
     let head = source.head(EXIF_HEAD_PROBE)?;
     // 先頭が上限いっぱいなら、APP1 がまだ続いている可能性がある。
     let maybe_truncated = head.len() >= EXIF_HEAD_PROBE;
@@ -164,7 +174,7 @@ pub(crate) fn decode_hash_source_from(source: &dyn PhotoSource) -> Option<(Dynam
             DecodeSource::ExifThumbnail,
         ));
     }
-    if maybe_truncated {
+    if maybe_truncated && pixel_fallback {
         // APP1 が 64KB に収まらないカメラ。全体を読み直して一度だけ試す。
         full = source.all();
         if let Some((image, orientation)) = full.as_deref().and_then(exif_thumbnail_image_bytes) {
@@ -175,6 +185,9 @@ pub(crate) fn decode_hash_source_from(source: &dyn PhotoSource) -> Option<(Dynam
         }
     }
 
+    if !pixel_fallback {
+        return None;
+    }
     // ここから先は生の画素なので、本体（IFD0）の Orientation をそのまま当てる。
     // IFD0 は TIFF ブロックの先頭近くなので、先頭だけで読める。
     let orientation = exif_orientation_bytes(&head);
@@ -194,7 +207,8 @@ pub(crate) fn decode_hash_source_from(source: &dyn PhotoSource) -> Option<(Dynam
 }
 
 pub(crate) fn decode_hash_source(path: &Path) -> Option<(DynamicImage, DecodeSource)> {
-    decode_hash_source_from(&LocalPhoto(path))
+    let is_raw = extension_lower(path).is_some_and(|ext| RAW_EXTENSIONS.contains(&ext.as_str()));
+    decode_hash_source_with(&LocalPhoto(path), !is_raw)
 }
 
 /// 選べる長辺に丸める。設定ファイルや古いセッションから変な値が来ても、

@@ -32,6 +32,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
@@ -253,8 +254,12 @@ fun ProjectScreen(
             verticalAlignment = Alignment.CenterVertically
         ) {
             IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, "ホームへ") }
-            Text(project.name, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
-            Spacer(Modifier.weight(1f))
+            // **名前は残りの幅で省略する。** 閉じた幅だと名前がボタンを押しつぶし、文字が縦に折れた。
+            Text(
+                project.name, fontSize = 18.sp, fontWeight = FontWeight.SemiBold,
+                maxLines = 1, overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
+            )
             IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, "その他") }
             Spacer(Modifier.width(8.dp))
             Button(
@@ -283,7 +288,8 @@ fun ProjectScreen(
                         live.finished -> "結果を見る"
                         else -> "選別を続ける"
                     },
-                    fontWeight = FontWeight.Bold, fontSize = 14.sp
+                    fontWeight = FontWeight.Bold, fontSize = 14.sp,
+                    maxLines = 1, softWrap = false
                 )
             }
         }
