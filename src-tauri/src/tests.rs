@@ -4262,3 +4262,325 @@ fn analysing_a_raw_makes_a_thumbnail_and_a_hash() {
     assert!(outcome.thumbnail_path.is_some());
     fs::remove_dir_all(&directory).ok();
 }
+
+// -----------------------------------------------------------------------
+// U58: 非対応の形式は、原本が変わるまで再試行しない・数に含めない・選別の対象から外す
+// -----------------------------------------------------------------------
+
+/// 読めない `PhotoSource`（先頭が読めない／先頭は読めるが全体が読めない）。
+struct FlakySource {
+    bytes: Vec<u8>,
+    head_ok: bool,
+}
+
+impl PhotoSource for FlakySource {
+    fn head(&self, want: usize) -> Option<Vec<u8>> {
+        self.head_ok
+            .then(|| self.bytes[..want.min(self.bytes.len())].to_vec())
+    }
+    fn all(&self) -> Option<Vec<u8>> {
+        None
+    }
+    fn read_range(&self, _offset: u64, _length: usize) -> Option<Vec<u8>> {
+        None
+    }
+    fn fingerprint(&self) -> Option<(i64, i64)> {
+        None
+    }
+    fn name(&self) -> Option<String> {
+        Some("photo.jpg".into())
+    }
+}
+
+#[test]
+fn decode_failures_tell_unreadable_from_undecodable() {
+    // 読めたのに復号できない（中身が JPEG でない .jpg）。
+    let garbage = CountingSource::new(vec![7u8; 5000], "garbage.jpg");
+    assert_eq!(
+        try_decode_hash_source_with(&garbage, true).err(),
+        Some(DecodeFailure::Undecodable)
+    );
+    // RAW でプレビューが取れない。
+    let raw = CountingSource::new(vec![0u8; 4096], "IMG_0001.CR2");
+    assert_eq!(
+        try_decode_hash_source_with(&raw, false).err(),
+        Some(DecodeFailure::Undecodable)
+    );
+    // 先頭が読めない。
+    let closed = FlakySource { bytes: vec![0; 10], head_ok: false };
+    assert_eq!(
+        try_decode_hash_source_with(&closed, true).err(),
+        Some(DecodeFailure::Unreadable)
+    );
+    // 先頭は読めたが全体を読む途中で切れた（NAS の瞬断）。
+    let cut = FlakySource { bytes: vec![7; 5000], head_ok: true };
+    assert_eq!(
+        try_decode_hash_source_with(&cut, true).err(),
+        Some(DecodeFailure::Unreadable)
+    );
+}
+
+fn hash_record_of(conn: &Connection, id: &str) -> HashRecord {
+    load_hash_records(conn, "project-1", false)
+        .expect("records")
+        .into_iter()
+        .find(|record| record.id == id)
+        .expect("record")
+}
+
+/// 1 枚を解析して、本番と同じ書き方（`apply_hash`）で DB に書く。
+fn analyse_and_store(conn: &Connection, thumbnails: &Path, id: &str) -> PhotoWork {
+    let record = hash_record_of(conn, id);
+    let work = hash_one(thumbnails, 0, &record);
+    apply_hash(conn, &work, false).expect("apply");
+    work
+}
+
+fn put_photo(conn: &Connection, id: &str, path: &Path, captured_at: i64) {
+    conn.execute(
+        "INSERT INTO photos (id,project_id,path,relative_path,name,captured_at,timestamp_source,d_hash,rating,is_missing)
+         VALUES (?1,'project-1',?2,?3,?3,?4,'exif',NULL,0,0)",
+        params![
+            id,
+            path.to_string_lossy().to_string(),
+            path.file_name().unwrap().to_string_lossy().to_string(),
+            captured_at
+        ],
+    )
+    .expect("insert");
+}
+
+fn kind_of(conn: &Connection, id: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT analysis_error_kind FROM photos WHERE id=?1",
+        params![id],
+        |row| row.get(0),
+    )
+    .expect("kind")
+}
+
+#[test]
+fn an_unsupported_original_is_not_read_again_until_it_changes() {
+    let directory = test_directory("u58-retry");
+    let conn = database_with_photos(&directory, 0);
+    let thumbnails = directory.join("thumbs");
+    let broken = directory.join("broken.jpg"); // 中身が JPEG でない
+    let good = directory.join("good.jpg");
+    let raw = directory.join("IMG_0001.CR2"); // プレビューの無い RAW
+    let missing = directory.join("gone.jpg"); // 開けない
+    fs::write(&broken, vec![9u8; 6000]).unwrap();
+    fs::write(&good, real_jpeg(320, 240)).unwrap();
+    fs::write(&raw, vec![0u8; 8192]).unwrap();
+    for (index, (id, path)) in [("broken", &broken), ("good", &good), ("raw", &raw), ("gone", &missing)]
+        .into_iter()
+        .enumerate()
+    {
+        put_photo(&conn, id, path, 1_000 + index as i64);
+    }
+
+    // 1 回目: 全部読まれる。
+    assert_eq!(load_hash_records(&conn, "project-1", true).unwrap().len(), 4);
+    for id in ["broken", "good", "raw", "gone"] {
+        analyse_and_store(&conn, &thumbnails, id);
+    }
+    assert_eq!(kind_of(&conn, "broken").as_deref(), Some("unsupported"));
+    assert_eq!(kind_of(&conn, "raw").as_deref(), Some("unsupported"));
+    assert_eq!(kind_of(&conn, "gone").as_deref(), Some("transient"), "開けないのは一時的");
+    assert_eq!(kind_of(&conn, "good"), None);
+
+    // 2 回目: 非対応の 2 枚は対象に入らない（読まない）。一時的な失敗と成功済みは入る。
+    let second: Vec<String> = load_hash_records(&conn, "project-1", true)
+        .unwrap()
+        .into_iter()
+        .map(|record| record.id)
+        .collect();
+    assert!(!second.contains(&"broken".to_string()));
+    assert!(!second.contains(&"raw".to_string()));
+    assert!(second.contains(&"gone".to_string()), "一時的な失敗は再試行する");
+    assert!(second.contains(&"good".to_string()));
+    // 撮影時刻の段も同じ。
+    conn.execute("UPDATE photos SET captured_at=NULL", []).unwrap();
+    let metadata: Vec<String> = load_metadata_records(&conn, "project-1")
+        .unwrap()
+        .into_iter()
+        .map(|record| record.0)
+        .collect();
+    assert!(!metadata.contains(&"broken".to_string()));
+    assert!(metadata.contains(&"gone".to_string()));
+
+    // 原本が変わったら（大きさが違う）もう一度試す。
+    fs::write(&broken, vec![9u8; 6001]).unwrap();
+    let third: Vec<String> = load_hash_records(&conn, "project-1", false)
+        .unwrap()
+        .into_iter()
+        .map(|record| record.id)
+        .collect();
+    assert!(third.contains(&"broken".to_string()), "原本が変わったら再試行する");
+    assert!(!third.contains(&"raw".to_string()), "変わっていない方は読まない");
+
+    // 直った（本物の JPEG に差し替わった）ら成功して種類が消える。
+    fs::write(&broken, real_jpeg(200, 100)).unwrap();
+    analyse_and_store(&conn, &thumbnails, "broken");
+    assert_eq!(kind_of(&conn, "broken"), None);
+    assert!(conn
+        .query_row("SELECT d_hash FROM photos WHERE id='broken'", [], |row| row.get::<_, Option<String>>(0))
+        .unwrap()
+        .is_some());
+    drop(conn);
+    fs::remove_dir_all(&directory).ok();
+}
+
+#[test]
+fn a_legacy_failure_without_a_kind_is_retried_once_then_classified() {
+    let directory = test_directory("u58-legacy");
+    let conn = database_with_photos(&directory, 0);
+    let thumbnails = directory.join("thumbs");
+    let broken = directory.join("old.jpg");
+    fs::write(&broken, vec![1u8; 3000]).unwrap();
+    put_photo(&conn, "old", &broken, 5);
+    // U58 より前の失敗（理由はあるが種類が無い）。
+    conn.execute(
+        "UPDATE photos SET analysis_error='画像を読み取れませんでした（破損または非対応の形式）。',analysis_error_at=1,
+           fingerprint_mtime=1,fingerprint_size=3000 WHERE id='old'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(load_hash_records(&conn, "project-1", true).unwrap().len(), 1, "1 回は試す");
+    analyse_and_store(&conn, &thumbnails, "old");
+    assert_eq!(kind_of(&conn, "old").as_deref(), Some("unsupported"));
+    assert!(load_hash_records(&conn, "project-1", true).unwrap().is_empty(), "分類されたら読まない");
+    drop(conn);
+    fs::remove_dir_all(&directory).ok();
+}
+
+#[test]
+fn unsupported_rows_stay_in_the_table_but_leave_the_counts() {
+    let directory = test_directory("u58-counts");
+    let conn = database_with_photos(&directory, 0);
+    for (id, index) in [("a", 1_000_000i64), ("b", 1_000_500), ("c", 1_001_000)] {
+        conn.execute(
+            "INSERT INTO photos (id,project_id,path,relative_path,name,captured_at,timestamp_source,rating,is_missing)
+             VALUES (?1,'project-1',?2,?1,?1,?3,'exif_original',0,0)",
+            params![id, format!("C:/p/{id}.jpg"), index],
+        )
+        .unwrap();
+    }
+    conn.execute("INSERT INTO projects (id,name,folder_path,photo_count,status,created_at,updated_at) VALUES ('project-1','n','C:/p',3,'ready',0,0)", []).unwrap();
+    conn.execute("UPDATE photos SET rating=3 WHERE id='b'", []).unwrap();
+
+    // 3 枚とも未処理（連写の候補になる近さ）。
+    let before = analysis_backlog(&conn, "project-1", false).unwrap();
+    assert_eq!(before, 3);
+    let edge = 1536u32;
+    assert_eq!(display_backlog_count(&conn, "project-1", edge).unwrap(), 3);
+
+    // b を非対応にする。
+    conn.execute(
+        "UPDATE photos SET analysis_error='x',analysis_error_at=1,analysis_error_kind='unsupported' WHERE id='b'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(analysis_backlog(&conn, "project-1", false).unwrap(), 2, "準備の分母から外れる");
+    assert_eq!(display_backlog_count(&conn, "project-1", edge).unwrap(), 2, "表示用画像も作りに行かない");
+    assert_eq!(recount_photos(&conn, "project-1").unwrap(), 2, "枚数から外れる");
+
+    // 行は消えず、★も残る。core に渡す行（get_core_inputs の SELECT）には印付きで載る。
+    let rows: Vec<Photo> = conn
+        .prepare(&format!(
+            "SELECT {PHOTO_COLUMNS} FROM photos WHERE project_id=?1 AND is_missing=0 ORDER BY id"
+        ))
+        .unwrap()
+        .query_map(params!["project-1"], photo_from_row)
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    let b = rows.iter().find(|photo| photo.id == "b").unwrap();
+    assert_eq!(b.rating, 3);
+    assert_eq!(b.analysis_error_kind.as_deref(), Some("unsupported"));
+    assert_eq!(rows.iter().find(|photo| photo.id == "a").unwrap().analysis_error_kind, None);
+    drop(conn);
+    fs::remove_dir_all(&directory).ok();
+}
+
+#[test]
+fn the_failure_list_has_names_reasons_and_kinds() {
+    let directory = test_directory("u58-list");
+    let conn = database_with_photos(&directory, 3);
+    conn.execute(
+        "UPDATE photos SET analysis_error='壊れている',analysis_error_at=5,analysis_error_kind='unsupported' WHERE id='photo-1'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE photos SET analysis_error='開けない',analysis_error_at=6,analysis_error_kind='transient' WHERE id='photo-0'",
+        [],
+    )
+    .unwrap();
+    // 種類が無い古い失敗は一時的として出す。
+    conn.execute(
+        "UPDATE photos SET analysis_error='古い失敗',analysis_error_at=7 WHERE id='photo-2'",
+        [],
+    )
+    .unwrap();
+    // 欠損の行は出さない。
+    conn.execute("UPDATE photos SET is_missing=1 WHERE id='photo-2'", []).unwrap();
+    let list = analysis_failures(&conn, "project-1").unwrap();
+    assert_eq!(
+        list,
+        vec![
+            AnalysisFailure {
+                relative_path: "0.jpg".into(),
+                name: "0.jpg".into(),
+                kind: "transient".into(),
+                reason: "開けない".into(),
+                at: Some(6),
+            },
+            AnalysisFailure {
+                relative_path: "1.jpg".into(),
+                name: "1.jpg".into(),
+                kind: "unsupported".into(),
+                reason: "壊れている".into(),
+                at: Some(5),
+            },
+        ]
+    );
+    conn.execute("UPDATE photos SET is_missing=0 WHERE id='photo-2'", []).unwrap();
+    let list = analysis_failures(&conn, "project-1").unwrap();
+    assert_eq!(list.len(), 3);
+    assert_eq!(list[2].kind, "transient", "種類の無い古い失敗は一時的");
+    drop(conn);
+    fs::remove_dir_all(&directory).ok();
+}
+
+#[test]
+fn a_rescan_clears_the_kind_only_when_the_original_changed() {
+    let directory = test_directory("u58-rescan");
+    let conn = database_with_photos(&directory, 0);
+    conn.execute(
+        "INSERT INTO photos (id,project_id,path,relative_path,name,captured_at,rating,fingerprint_mtime,fingerprint_size,is_missing,analysis_error,analysis_error_at,analysis_error_kind)
+         VALUES ('p','project-1','C:/p/a.jpg','a.jpg','a.jpg',1,0,10,20,0,'x',1,'unsupported')",
+        [],
+    )
+    .unwrap();
+    upsert_photo(&conn, "project-1", "C:/p/a.jpg", "a.jpg", "a.jpg", Some(10), Some(20)).unwrap();
+    assert_eq!(kind_of(&conn, "p").as_deref(), Some("unsupported"), "変わっていなければ残る");
+    upsert_photo(&conn, "project-1", "C:/p/a.jpg", "a.jpg", "a.jpg", Some(11), Some(20)).unwrap();
+    assert_eq!(kind_of(&conn, "p"), None, "更新時刻が変わったら消えて再試行になる");
+    let error: Option<String> = conn
+        .query_row("SELECT analysis_error FROM photos WHERE id='p'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(error, None);
+    drop(conn);
+    fs::remove_dir_all(&directory).ok();
+}
+
+#[test]
+fn timeouts_and_unresponsive_workers_are_transient() {
+    let mut work = PhotoWork::new(0, "p");
+    work.error = Some("解析が 15 秒以内に終わりませんでした。".into());
+    assert_eq!(work.error_kind(), Some("transient"), "既定は一時的（迷ったら安全側）");
+    work.error_unsupported = true;
+    assert_eq!(work.error_kind(), Some("unsupported"));
+    assert_eq!(PhotoWork::new(1, "q").error_kind(), None, "失敗が無ければ種類も無い");
+}

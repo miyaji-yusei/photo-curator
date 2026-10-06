@@ -164,6 +164,9 @@ struct Photo {
     /// 選別画面に出す表示用画像の絶対パス。**まだ作っていなければ None**。
     /// 画面はここが無いときだけ原本へ落ちる。
     display_path: Option<String>,
+    /// 解析できなかった理由の種類（U58）。'unsupported'＝非対応（選別の対象から外す）、
+    /// 'transient'＝一時的、None＝失敗なし。行そのものは消さない（途中の選別・★を引くため）。
+    analysis_error_kind: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -273,11 +276,12 @@ fn photo_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Photo> {
         rating: row.get(7)?,
         thumbnail_path: row.get(8)?,
         display_path: row.get(9)?,
+        analysis_error_kind: row.get(10)?,
     })
 }
 
 const PHOTO_COLUMNS: &str =
-    "id,project_id,path,relative_path,name,captured_at,d_hash,rating,thumbnail_path,display_path";
+    "id,project_id,path,relative_path,name,captured_at,d_hash,rating,thumbnail_path,display_path,analysis_error_kind";
 /// 星の上限。1ラウンド通過ごとに +1 で、ここで頭打ちになる。「確定」も同じ値。
 const MAX_RATING: i64 = 5;
 
@@ -561,6 +565,7 @@ fn analysis_backlog(conn: &Connection, project_id: &str, is_amazon: bool) -> Res
                      OR thumbnail_path IS NULL OR thumbnail_version IS NULL OR thumbnail_version <> ?3)
              FROM photos
              WHERE project_id=?1 AND is_missing=0
+               AND COALESCE(analysis_error_kind,'')<>'unsupported'
              ORDER BY captured_at IS NULL, captured_at, path",
         )
         .map_err(|error| error.to_string())?;
@@ -597,6 +602,54 @@ fn analysis_backlog(conn: &Connection, project_id: &str, is_amazon: bool) -> Res
         })
         .count();
     Ok(pending as i64)
+}
+
+/// 解析できなかった写真 1 枚（U58）。警告の「一覧を見る」に出す。
+#[derive(Serialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct AnalysisFailure {
+    relative_path: String,
+    name: String,
+    /// 'unsupported'（対応していない形式）／'transient'（一時的に読めなかった）。
+    kind: String,
+    reason: String,
+    at: Option<i64>,
+}
+
+fn analysis_failures(conn: &Connection, project_id: &str) -> Result<Vec<AnalysisFailure>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT relative_path,name,analysis_error_kind,analysis_error,analysis_error_at
+             FROM photos
+             WHERE project_id=?1 AND is_missing=0 AND analysis_error IS NOT NULL
+             ORDER BY relative_path",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params![project_id], |row| {
+            let kind: Option<String> = row.get(2)?;
+            Ok(AnalysisFailure {
+                relative_path: row.get(0)?,
+                name: row.get(1)?,
+                // 種類が無い（U58 より前の失敗）は一時的として扱う。
+                kind: if kind.as_deref() == Some(ERROR_KIND_UNSUPPORTED) {
+                    ERROR_KIND_UNSUPPORTED.to_string()
+                } else {
+                    ERROR_KIND_TRANSIENT.to_string()
+                },
+                reason: row.get(3)?,
+                at: row.get(4)?,
+            })
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+/// 解析できなかった写真の一覧（名前・理由・種類）。
+#[tauri::command(async)]
+fn get_analysis_failures(app: AppHandle, project_id: String) -> Result<Vec<AnalysisFailure>, String> {
+    analysis_failures(&connection(&app)?, &project_id)
 }
 
 /// プロジェクトを削除する。**写真原本には一切触れない。**
@@ -1345,15 +1398,7 @@ fn save_project_display_edge(
 #[tauri::command(async)]
 fn get_display_backlog(app: AppHandle, project_id: String) -> Result<i64, String> {
     let edge = resolve_display_edge(&app, &project_id)?;
-    connection(&app)?
-        .query_row(
-            "SELECT COUNT(*) FROM photos
-             WHERE project_id=?1 AND is_missing=0
-               AND (display_path IS NULL OR display_edge IS NULL OR display_edge <> ?2)",
-            params![project_id, edge as i64],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())
+    display_backlog_count(&connection(&app)?, &project_id, edge)
 }
 
 #[tauri::command]
@@ -1771,6 +1816,7 @@ pub fn run() {
             create_amazon_project,
             amazon_original,
             get_analysis_backlog,
+            get_analysis_failures,
             get_project_photo_page,
             get_photos_by_ids,
             save_selection_results,

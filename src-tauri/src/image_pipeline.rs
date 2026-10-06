@@ -155,6 +155,7 @@ pub(crate) fn scaled_jpeg_decode_bytes(bytes: &[u8]) -> Option<DynamicImage> {
 ///
 /// **①は先頭 64KB しか読まない。**②③に落ちたときだけ全体を取る。
 /// 実データでは 97.4% が①なので、読む量は 1 枚あたり 26KB で収まる。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn decode_hash_source_from(source: &dyn PhotoSource) -> Option<(DynamicImage, DecodeSource)> {
     decode_hash_source_with(source, true)
 }
@@ -162,17 +163,38 @@ pub(crate) fn decode_hash_source_from(source: &dyn PhotoSource) -> Option<(Dynam
 /// `pixel_fallback` が false のときは、EXIF のサムネイルが取れなければここで諦める
 /// （生の画素の読み込みへ進まない）。RAW 用: `image` は RAW を開けないので、
 /// 25MB 前後の本体を丸ごと読んでから失敗するのは、ネットワークでは時間の無駄でしかない。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn decode_hash_source_with(
     source: &dyn PhotoSource,
     pixel_fallback: bool,
 ) -> Option<(DynamicImage, DecodeSource)> {
-    let head = source.head(EXIF_HEAD_PROBE)?;
+    try_decode_hash_source_with(source, pixel_fallback).ok()
+}
+
+/// 復号できなかった理由（U58）。**種類を分けるのは「やり直して直るか」を決めるため。**
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeFailure {
+    /// 読めなかった（開けない・読みの途中で切れた）。次に試せば直りうる＝一時的。
+    Unreadable,
+    /// 読めたのに復号できなかった（壊れている・非対応の形式・RAW でプレビューが取れない）。
+    /// 原本が変わらない限り何度やっても同じ＝非対応。
+    Undecodable,
+}
+
+/// `decode_hash_source_with` の、失敗の理由が分かる版。
+pub(crate) fn try_decode_hash_source_with(
+    source: &dyn PhotoSource,
+    pixel_fallback: bool,
+) -> Result<(DynamicImage, DecodeSource), DecodeFailure> {
+    let head = source
+        .head(EXIF_HEAD_PROBE)
+        .ok_or(DecodeFailure::Unreadable)?;
     // 先頭が上限いっぱいなら、APP1 がまだ続いている可能性がある。
     let maybe_truncated = head.len() >= EXIF_HEAD_PROBE;
     let mut full: Option<Vec<u8>> = None;
 
     if let Some((image, orientation)) = exif_thumbnail_image_bytes(&head) {
-        return Some((
+        return Ok((
             apply_orientation(image, orientation),
             DecodeSource::ExifThumbnail,
         ));
@@ -181,7 +203,7 @@ pub(crate) fn decode_hash_source_with(
         // APP1 が 64KB に収まらないカメラ。全体を読み直して一度だけ試す。
         full = source.all();
         if let Some((image, orientation)) = full.as_deref().and_then(exif_thumbnail_image_bytes) {
-            return Some((
+            return Ok((
                 apply_orientation(image, orientation),
                 DecodeSource::ExifThumbnail,
             ));
@@ -192,24 +214,25 @@ pub(crate) fn decode_hash_source_with(
         // RAW: 本体の中に埋め込まれたプレビュー JPEG を、範囲読みで取り出して使う（U57）。
         // 向きは RAW 本体の Orientation（decode_preview が焼き込む）。取り出せない RAW だけが失敗になる。
         return decode_preview(source, &head, Want::Thumb)
-            .map(|image| (image, DecodeSource::RawPreview));
+            .map(|image| (image, DecodeSource::RawPreview))
+            .ok_or(DecodeFailure::Undecodable);
     }
     // ここから先は生の画素なので、本体（IFD0）の Orientation をそのまま当てる。
     // IFD0 は TIFF ブロックの先頭近くなので、先頭だけで読める。
     let orientation = exif_orientation_bytes(&head);
     let bytes = match full {
         Some(bytes) => bytes,
-        None => source.all()?,
+        None => source.all().ok_or(DecodeFailure::Unreadable)?,
     };
     if let Some(image) = scaled_jpeg_decode_bytes(&bytes) {
-        return Some((
+        return Ok((
             apply_orientation(image, orientation),
             DecodeSource::JpegScaled,
         ));
     }
     image::load_from_memory(&bytes)
-        .ok()
         .map(|image| (apply_orientation(image, orientation), DecodeSource::FullDecode))
+        .map_err(|_| DecodeFailure::Undecodable)
 }
 
 /// ファイル名の拡張子が RAW か。
@@ -218,8 +241,14 @@ pub(crate) fn is_raw_name(name: &str) -> bool {
 }
 
 pub(crate) fn decode_hash_source(path: &Path) -> Option<(DynamicImage, DecodeSource)> {
+    try_decode_hash_source(path).ok()
+}
+
+pub(crate) fn try_decode_hash_source(
+    path: &Path,
+) -> Result<(DynamicImage, DecodeSource), DecodeFailure> {
     let is_raw = extension_lower(path).is_some_and(|ext| RAW_EXTENSIONS.contains(&ext.as_str()));
-    decode_hash_source_with(&LocalPhoto(path), !is_raw)
+    try_decode_hash_source_with(&LocalPhoto(path), !is_raw)
 }
 
 /// 選べる長辺に丸める。設定ファイルや古いセッションから変な値が来ても、
@@ -390,6 +419,8 @@ pub struct AnalysisOutcome {
     pub thumbnail_state: ThumbnailState,
     /// DB に書き戻す必要すらなかった（ハッシュもサムネイルも据え置き）。
     pub hash_reused: bool,
+    /// 原本の復号に失敗したときの理由（U58）。サムネイルを保存できなかっただけなら None。
+    pub failure: Option<DecodeFailure>,
 }
 
 pub(crate) fn thumbnail_file(dir: &Path, photo_id: &str) -> PathBuf {
@@ -411,11 +442,12 @@ pub(crate) fn analyse_photo(
 ) -> AnalysisOutcome {
     let file = thumbnail_file(thumbnail_dir, photo_id);
     let stored = file.to_string_lossy().to_string();
-    let failed = || AnalysisOutcome {
+    let failed = |failure: Option<DecodeFailure>| AnalysisOutcome {
         d_hash: None,
         thumbnail_path: None,
         thumbnail_state: ThumbnailState::Failed,
         hash_reused: false,
+        failure,
     };
 
     let usable = match current {
@@ -440,6 +472,7 @@ pub(crate) fn analyse_photo(
                 thumbnail_path: Some(stored),
                 thumbnail_state: ThumbnailState::Hit,
                 hash_reused: true,
+                failure: None,
             };
         }
         // サムネイルは使えるがハッシュが旧方式。原本には戻らず作り直す。
@@ -453,15 +486,17 @@ pub(crate) fn analyse_photo(
                 thumbnail_path: Some(stored),
                 thumbnail_state: ThumbnailState::Hit,
                 hash_reused: false,
+                failure: None,
             };
         }
     }
 
-    let Some((image, decode_source)) = decode_hash_source(source) else {
-        return failed();
+    let (image, decode_source) = match try_decode_hash_source(source) {
+        Ok(decoded) => decoded,
+        Err(failure) => return failed(Some(failure)),
     };
     let Some(bytes) = encode_thumbnail(&scale_for_thumbnail(&image)) else {
-        return failed();
+        return failed(None);
     };
     // サムネイルを保存できなくてもハッシュは出せる。次回また作り直すだけで、
     // 解析全体を止める理由にはならない。
@@ -471,6 +506,7 @@ pub(crate) fn analyse_photo(
             thumbnail_path: None,
             thumbnail_state: ThumbnailState::Failed,
             hash_reused: false,
+            failure: None,
         };
     }
     AnalysisOutcome {
@@ -478,6 +514,7 @@ pub(crate) fn analyse_photo(
         thumbnail_path: Some(stored),
         thumbnail_state: ThumbnailState::Generated(decode_source),
         hash_reused: false,
+        failure: None,
     }
 }
 
