@@ -1,5 +1,5 @@
 import type {
-  BurstGroup, Photo, Project, ProjectProgress,
+  AnalysisFailure, BurstGroup, Photo, Project, ProjectProgress,
   SelectionResult, TournamentSettings
 } from '~/types/photo'
 import { MAX_RATING } from '~/types/photo'
@@ -148,6 +148,29 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   // 連写解析は前面をブロックしない。ダイアログではなく帯で知らせるだけにする。
   const analysisProgress = ref<ProjectProgress | null>(null)
   const analysisFailures = ref(0)
+  /** 解析できなかった写真の一覧（名前・理由・種類）。警告の「一覧を見る」で出す（U58）。 */
+  const analysisFailureList = ref<AnalysisFailure[]>([])
+  const analysisFailuresDialog = ref(false)
+
+  /**
+   * 解析できなかった写真を DB から読み直す。**件数はここで決める**（進みのイベントだけに頼ると、
+   * プロジェクトを替えても前の件数が残った。B6）。
+   */
+  async function refreshAnalysisFailures(projectId = activeProject.value?.id) {
+    if (!projectId) return
+    try {
+      const list = (await desktop.getAnalysisFailures(projectId)) ?? []
+      if (activeProject.value?.id !== projectId) return
+      analysisFailureList.value = list
+      analysisFailures.value = list.length
+    } catch {
+      // 一覧が読めなくても、選別も解析も止めない。
+    }
+  }
+  async function openAnalysisFailures() {
+    await refreshAnalysisFailures()
+    analysisFailuresDialog.value = true
+  }
   // 選別画面に出す表示用画像の設定（`composables/curator/useDisplayImages.ts`）。
   // 先読みの表は下で作るので、捨てる関数として渡す（呼ばれるのは作ったあと）。
   const {
@@ -607,6 +630,11 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     previewPhotos.value = []
     previewTotal.value = 0
     analysisBacklog.value = 0
+    // 前のプロジェクトの警告・進みを持ち越さない（B6）。
+    analysisFailures.value = 0
+    analysisFailureList.value = []
+    analysisFailuresDialog.value = false
+    analysisProgress.value = null
     prefetched.clear()
     coreInputs.value = null
     pairOverrides = []
@@ -655,7 +683,9 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
       // プロジェクトの画面の「フォルダへのアクセスを許可」を押してもらう。
       // リンクが消えた Amazon のプロジェクトは、開くたびに読みにいかない（「写真を再読み込み」で試す）。
       const linkGone = project.sourceKind === 'amazon' && project.status === 'missing'
-      if (!project.photoCount && !importsByPicker.value && !scanRunning.value && project.folderAccess !== 'needs-permission' && !linkGone) {
+      // 「0 枚なら走査」は状態で判定する。全部が非対応の形式だと枚数は 0 になるが、走査は済んでいる（U58）。
+      const neverScanned = !project.photoCount && project.status !== 'ready'
+      if (neverScanned && !importsByPicker.value && !scanRunning.value && project.folderAccess !== 'needs-permission' && !linkGone) {
         await startScan()
         return
       }
@@ -671,6 +701,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
       ])
       if (stale()) return
       analysisBacklog.value = backlog
+      void refreshAnalysisFailures(project.id)
       if (backlog > 0) desktop.startBackgroundAnalysis(project.id).catch(cause => warnPrepareNotStarted('解析', cause))
       // 表示用画像は走査とは別に溜める。**走査に混ぜると解析が桁で遅くなる**
       // （EXIF サムネイル経路 1.72ms/枚 に対しフルデコード 132ms/枚）。
@@ -1552,6 +1583,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
               activeProject.value = projects.value.find(project => project.id === activeProject.value?.id) ?? activeProject.value
             })
           }
+          if (progress.phase === 'complete' || progress.phase === 'cancelled') void refreshAnalysisFailures(progress.projectId)
           void refreshPrepareCounts(progress.projectId, progress.phase === 'complete')
           if (progress.task === 'background') void refreshDuringPreparation(progress)
           return
@@ -1664,6 +1696,9 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     taskDialog,
     analysisProgress,
     analysisFailures,
+    analysisFailureList,
+    analysisFailuresDialog,
+    openAnalysisFailures,
     displaySettings,
     displayEdge,
     displayBacklog,

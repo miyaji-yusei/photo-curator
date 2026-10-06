@@ -240,6 +240,9 @@ pub(crate) struct PhotoWork {
     /// デコード失敗・非対応形式・権限エラー・timeout。
     /// **値が入っていても解析は続く。**
     pub(crate) error: Option<String>,
+    /// `error` が「非対応」（読めたのに復号できない。原本が変わるまで再試行しない）か（U58）。
+    /// false（既定）は一時的。**迷ったら false。**
+    pub(crate) error_unsupported: bool,
     pub(crate) duration_ms: u64,
 }
 
@@ -257,10 +260,25 @@ impl PhotoWork {
             fingerprint: None,
             hash_reused: false,
             error: None,
+            error_unsupported: false,
             duration_ms: 0,
         }
     }
+
+    /// `analysis_error_kind` 列に書く値。失敗が無ければ NULL。
+    pub(crate) fn error_kind(&self) -> Option<&'static str> {
+        self.error.as_ref().map(|_| {
+            if self.error_unsupported {
+                ERROR_KIND_UNSUPPORTED
+            } else {
+                ERROR_KIND_TRANSIENT
+            }
+        })
+    }
 }
+
+pub(crate) const ERROR_KIND_UNSUPPORTED: &str = "unsupported";
+pub(crate) const ERROR_KIND_TRANSIENT: &str = "transient";
 
 /// 並列に流せる仕事。timeout した1枚を writer が単独で確定させるために、
 /// 仕事そのものから写真の id を取れる必要がある。

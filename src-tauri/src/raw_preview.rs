@@ -50,6 +50,9 @@ const MAX_BLOCKS: usize = 16;
 pub(crate) struct BlockCache<'a> {
     source: &'a dyn PhotoSource,
     blocks: RefCell<HashMap<u64, Vec<u8>>>,
+    /// 範囲読みの I/O が失敗した（ファイルの大きさの内側なのに読めない・短く返った）。
+    /// 立っていれば、プレビューが取れなかった理由は「壊れている」ではなく「読めなかった」（U58）。
+    io_failed: std::cell::Cell<bool>,
 }
 
 impl<'a> BlockCache<'a> {
@@ -63,14 +66,38 @@ impl<'a> BlockCache<'a> {
         Self {
             source,
             blocks: RefCell::new(blocks),
+            io_failed: std::cell::Cell::new(false),
         }
+    }
+
+    pub(crate) fn io_failed(&self) -> bool {
+        self.io_failed.get()
+    }
+
+    /// `read_range` を呼び、ファイルの大きさの内側で失敗・短い返りだったら印を立てる。
+    /// 大きさの外（壊れた値が指す先）が読めないのは、普通の「無い」。
+    fn read_checked(&self, offset: u64, length: usize) -> Option<Vec<u8>> {
+        let data = self.source.read_range(offset, length);
+        let size = self.source.fingerprint().map(|(_, size)| size.max(0) as u64);
+        let failed = match size {
+            None => true,
+            Some(size) if offset >= size => false,
+            Some(size) => {
+                let expected = (size - offset).min(length as u64) as usize;
+                data.as_ref().is_none_or(|bytes| bytes.len() < expected)
+            }
+        };
+        if failed {
+            self.io_failed.set(true);
+        }
+        data
     }
 
     fn block(&self, index: u64) -> Option<Vec<u8>> {
         if let Some(data) = self.blocks.borrow().get(&index) {
             return Some(data.clone());
         }
-        let data = self.source.read_range(index.checked_mul(BLOCK as u64)?, BLOCK)?;
+        let data = self.read_checked(index.checked_mul(BLOCK as u64)?, BLOCK)?;
         let mut blocks = self.blocks.borrow_mut();
         if blocks.len() >= MAX_BLOCKS {
             blocks.retain(|key, _| *key == 0);
@@ -83,7 +110,7 @@ impl<'a> BlockCache<'a> {
 impl RangeSource for BlockCache<'_> {
     fn read(&self, offset: u64, length: usize) -> Option<Vec<u8>> {
         if length > BLOCK * 4 {
-            return self.source.read_range(offset, length);
+            return self.read_checked(offset, length);
         }
         let end = offset.checked_add(length as u64)?;
         let mut out = Vec::with_capacity(length);
@@ -538,14 +565,38 @@ pub(crate) fn decode_preview(
     head: &[u8],
     want: Want,
 ) -> Option<DynamicImage> {
+    try_decode_preview(source, head, want).ok()
+}
+
+/// `decode_preview` の、失敗の理由が分かる版（U58）。範囲読みが途中で失敗した・短く返ったなら
+/// `Unreadable`（一時的。NAS の瞬断など）、最後まで読めたのにプレビューが無い・復号できないなら
+/// `Undecodable`（非対応）。
+pub(crate) fn try_decode_preview(
+    source: &dyn PhotoSource,
+    head: &[u8],
+    want: Want,
+) -> Result<DynamicImage, DecodeFailure> {
     let cache = BlockCache::new(source, Some(head));
+    let failure = || {
+        if cache.io_failed() {
+            DecodeFailure::Unreadable
+        } else {
+            DecodeFailure::Undecodable
+        }
+    };
     let info = inspect(&cache);
     let region = match want {
         Want::Thumb => for_thumb(&info, THUMBNAIL_MAX_EDGE),
         Want::Largest => largest(&info),
-    }?;
-    let bytes = bytes_of(&cache, &region)?;
-    let image = image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg).ok()?;
+    }
+    .ok_or_else(failure)?;
+    let bytes = bytes_of(&cache, &region).ok_or_else(failure)?;
+    // 読みが欠けたまま JPEG が（途中までで）開けてしまっても、欠けた絵は使わない。
+    if cache.io_failed() {
+        return Err(DecodeFailure::Unreadable);
+    }
+    let image = image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg)
+        .map_err(|_| failure())?;
     let orientation = info.orientation.unwrap_or_else(|| exif_orientation_bytes(head));
-    Some(apply_orientation(image, orientation))
+    Ok(apply_orientation(image, orientation))
 }

@@ -45,19 +45,26 @@ export function toPhotoRef(photo: Photo): PhotoRef {
 
 /** 全写真の行と、core に渡す列（撮影順）と、対応表。 */
 export interface CoreInputs {
-  /** 撮影順の行。 */
+  /** 撮影順の行（非対応の形式も含む）。 */
   photos: Photo[]
-  /** `photos` と同じ並びの core の入力。 */
+  /** 撮影順の core の入力。非対応の形式（U58）は含まない。 */
   refs: PhotoRef[]
   byPath: Map<string, Photo>
   byId: Map<string, Photo>
 }
 
+/**
+ * 全部読めたのに復号できない写真（U58）。選別の対象にしない。
+ * 行・対応表・サイドカーの `photos` からは外さない（途中のセッションの写真を引けるように・★を消さないように）。
+ */
+export const isUnsupported = (photo: Photo) => photo.analysisErrorKind === 'unsupported'
+
 export function buildCoreInputs(rows: Photo[]): CoreInputs {
   const photos = sortForCore(rows)
   return {
     photos,
-    refs: photos.map(toPhotoRef),
+    // 選別から外すのは core に渡す `refs` だけ。
+    refs: photos.filter(photo => !isUnsupported(photo)).map(toPhotoRef),
     byPath: new Map(photos.map(photo => [photo.relativePath, photo])),
     byId: new Map(photos.map(photo => [photo.id, photo]))
   }

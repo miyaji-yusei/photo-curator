@@ -3,6 +3,22 @@
 
 use super::*;
 
+/// 表示用画像がまだ要る写真の条件（`?1`＝プロジェクト、`?2`＝長辺）。
+/// 非対応の形式（U58）は、何度やっても作れないので含めない（開くたびに原本を丸読みして失敗しないように）。
+pub(crate) const DISPLAY_PENDING_WHERE: &str = "project_id=?1 AND is_missing=0
+       AND COALESCE(analysis_error_kind,'')<>'unsupported'
+       AND (display_path IS NULL OR display_edge IS NULL OR display_edge <> ?2)";
+
+/// まだ表示用画像が要る枚数。
+pub(crate) fn display_backlog_count(conn: &Connection, project_id: &str, edge: u32) -> Result<i64, String> {
+    conn.query_row(
+        &format!("SELECT COUNT(*) FROM photos WHERE {DISPLAY_PENDING_WHERE}"),
+        params![project_id, edge as i64],
+        |row| row.get(0),
+    )
+    .map_err(|error| error.to_string())
+}
+
 /// 表示用画像を作る 1 枚。
 #[derive(Clone, Debug)]
 pub(crate) struct DisplayJob {
@@ -54,10 +70,11 @@ pub(crate) fn run_display_generation(
         let conn = connection(&app)?;
         let mut statement = conn
             .prepare(
-                "SELECT id,path,display_path,display_edge FROM photos
-                 WHERE project_id=?1 AND is_missing=0
-                   AND (display_path IS NULL OR display_edge IS NULL OR display_edge <> ?2)
-                 ORDER BY captured_at IS NULL, captured_at",
+                &format!(
+                    "SELECT id,path,display_path,display_edge FROM photos
+                     WHERE {DISPLAY_PENDING_WHERE}
+                     ORDER BY captured_at IS NULL, captured_at"
+                ),
             )
             .map_err(|error| error.to_string())?;
         let rows = statement

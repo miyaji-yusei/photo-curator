@@ -192,6 +192,7 @@ pub(crate) fn upsert_photo(
            thumbnail_version=CASE WHEN photos.fingerprint_mtime IS excluded.fingerprint_mtime AND photos.fingerprint_size IS excluded.fingerprint_size THEN photos.thumbnail_version ELSE NULL END,
            analysis_error=CASE WHEN photos.fingerprint_mtime IS excluded.fingerprint_mtime AND photos.fingerprint_size IS excluded.fingerprint_size THEN photos.analysis_error ELSE NULL END,
            analysis_error_at=CASE WHEN photos.fingerprint_mtime IS excluded.fingerprint_mtime AND photos.fingerprint_size IS excluded.fingerprint_size THEN photos.analysis_error_at ELSE NULL END,
+           analysis_error_kind=CASE WHEN photos.fingerprint_mtime IS excluded.fingerprint_mtime AND photos.fingerprint_size IS excluded.fingerprint_size THEN photos.analysis_error_kind ELSE NULL END,
            fingerprint_mtime=excluded.fingerprint_mtime, fingerprint_size=excluded.fingerprint_size",
         params![Uuid::new_v4().to_string(), project_id, absolute, relative, name, mtime, size],
     )
@@ -471,6 +472,7 @@ pub(crate) fn upsert_amazon_photo(
            display_edge=CASE WHEN photos.fingerprint_size IS excluded.fingerprint_size THEN photos.display_edge ELSE NULL END,
            analysis_error=CASE WHEN photos.fingerprint_size IS excluded.fingerprint_size THEN photos.analysis_error ELSE NULL END,
            analysis_error_at=CASE WHEN photos.fingerprint_size IS excluded.fingerprint_size THEN photos.analysis_error_at ELSE NULL END,
+           analysis_error_kind=CASE WHEN photos.fingerprint_size IS excluded.fingerprint_size THEN photos.analysis_error_kind ELSE NULL END,
            fingerprint_size=excluded.fingerprint_size",
         params![
             Uuid::new_v4().to_string(),
