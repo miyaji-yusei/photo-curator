@@ -78,6 +78,7 @@
 | B3 | PC: フォルダの再走査で原本が変わっても表示用画像が残り、差し替え前の絵が選別画面に出る件を、Amazon 版と同じく作り直しの対象に戻す（`11-ユーザーフロー.md` §4 B3） | S | `src-tauri/src/scan.rs`（`upsert_photo`）・`tests.rs` | 済（`fix/mb-b3-b9`。実アプリでは未確認） |
 | B9 | PC・Web: 「写真を再読み込み」の走査中は「選別を開始／再開」を押せなくする（設計書 01 章。Android と同じ。`11-ユーザーフロー.md` §4 B9） | S | `utils/selectionGate.ts`・`useSelectionStart.ts`・`ProjectView.vue` | 済（`fix/mb-b3-b9`。実アプリでは未確認） |
 | R9 | サイドカーの組み立て（`buildWith`・`buildSidecar`）に写真の行を渡せるように（渡さなければ今どおり読む。渡すのは `adopt` の 2 回目の組み立てだけ。挙動不変。`11-ユーザーフロー.md` §2.5） | S | `composables/useSidecarSync.ts`・`tests/sidecarSync.test.mjs` | 済（`refactor/mb-r9-sidecar-rows`。10 章 §7 の R9 の行） |
+| W17 | `useCurator()` の戻り値の未使用キーを外す（`selectedCount`・`onKeydown`） | S | `composables/useCurator.ts` | 済（push 済み） |
 
 ---
 
