@@ -72,6 +72,7 @@
 | R7 | 連写の学習・確認を `composables/curator/useBurstLearning.ts` へ（挙動不変。`11-ユーザーフロー.md` §2.5） | S | `composables/` | 済（`refactor/mb-r7-burst-learning`。10 章 §7 の R7 の行） |
 | U58 | 解析できなかった写真の一覧・非対応形式は再試行しない・準備の分母と選別の対象から外す（PC・Web。Android は別担当）。`photos.analysis_error_kind` を 1 列追加 | M | `src-tauri/`（`analysis.rs`・`image_pipeline.rs`・`display.rs`・`lib.rs`）・`composables/`・`utils/analysisFailures.ts`・`PhotoFailuresDialog.vue` | 済（PC・Web。Android は未着手。詳細は 10 章 §7 の U58 の行） |
 | R2 | 解析の失敗の理由を `PhotoFailure`（`message()`・`kind()`）に集約（PC。挙動・文言は不変） | S | `src-tauri/src/parallel.rs`・`analysis.rs`・`display.rs` | 済（`refactor/mb-r2-analysis-failure`） |
+| R1 | 写真の候補にする名前・組の RAW の規則を共通のフィクスチャで試験に縛る（`11-ユーザーフロー.md` §2.5） | S | `core/tests/fixtures/photo-names.json`・`tests/`・Android の `test/` | 済（`test/mb-r1-photo-name-fixture`。10 章 §7 の R1 の行。既知の差は表の `known_differences`） |
 
 ---
 
