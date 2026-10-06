@@ -16,8 +16,7 @@ import {
 import type { CoreInputs } from '~/utils/coreInputs'
 import { applyChanges } from '~/utils/ratingEdit'
 import { healRatings, syncRatings } from '~/utils/selectionFlow'
-import { prepareProgress, projectStatus } from '~/utils/projectStatus'
-import type { CardState, CardStatus, PrepareLine } from '~/utils/projectStatus'
+import type { CardStatus } from '~/utils/projectStatus'
 import type { RatingChange, SavedSelection } from '~/utils/selectionFlow'
 import { clampGroupSize, groupSizeLimits, isSlideshowSize, tournamentGroupSize } from '~/utils/groupSize'
 import { registerAutoPush, useSidecarSync } from '~/composables/useSidecarSync'
@@ -35,6 +34,8 @@ import { useSidecarActions } from '~/composables/curator/useSidecarActions'
 import { useKeyboard } from '~/composables/curator/useKeyboard'
 import { useSelectionStart } from '~/composables/curator/useSelectionStart'
 import { useBurstLearning } from '~/composables/curator/useBurstLearning'
+import { useProjectOpen } from '~/composables/curator/useProjectOpen'
+import { useProgressEvents } from '~/composables/curator/useProgressEvents'
 
 /**
  * 行の星を**読む・消す・動かす**メソッド。選別の 1 タップは行の星の書き込みを待たずに次の組を出す（W1）ので、
@@ -358,83 +359,31 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   /** いま開いているプロジェクトは Amazon Photos の共有リンクか。 */
   const isAmazon = computed(() => activeProject.value?.sourceKind === 'amazon')
 
-  async function refreshProjects() {
-    // デスクトップは PC の DB、ブラウザは端末内の DB。どちらも一覧を返す。
-    projects.value = await desktop.listProjects()
-    void refreshProjectCards()
-  }
-
-  /** 開いたときの準備（解析・表示用画像）が始められなかったとき。黙らず、通知に出す。 */
-  function warnPrepareNotStarted(what: string, cause: unknown) {
-    console.warn(`${what}を始められませんでした`, cause)
-    taskWarning.value = `${what}を始められませんでした。${cause instanceof Error ? cause.message : ''}`.trim()
-  }
-
-  let cardsToken = 0
-  /** 各プロジェクトの状態と見本を読み直す（網へは行かない）。新しい呼び出しがあれば古い結果は捨てる。 */
-  async function refreshProjectCards() {
-    const token = ++cardsToken
-    // 書き途中の選別を先に書き終える（行の状態は保存したものから読む）。
-    await saveQueue.flush()
-    const list = projects.value
-    const entries = await Promise.all(list.map(async (project) => {
-      try {
-        // 状態を決める 4 つのどれかが読めなかったら、状態を作らない（0・null にして
-        // 「準備完了」「選別なし」と誤表示しない）。見本だけは読めなくても状態に関係しない。
-        const [analysis, display, saved, summary, first] = await Promise.all([
-          desktop.getAnalysisBacklog(project.id),
-          desktop.getDisplayBacklog(project.id),
-          desktop.loadSession(project.id),
-          desktop.getSelectionSummary(project.id),
-          desktop.getProjectPhotoPage(project.id, 0, 1).catch(() => null)
-        ])
-        const status = projectStatus({
-          project, analysisBacklog: analysis, displayBacklog: display,
-          session: saved?.core ?? null,
-          keptCount: summary ? summary.counts.slice(1).reduce((sum, count) => sum + count, 0) : 0
-        })
-        const photo = first?.photos[0]
-        return [project.id, { status, thumbnailUrl: photo ? desktop.photoThumbnailUrl(photo) : null }] as const
-      } catch (cause) {
-        // 前に読めた値があればそのまま残す（無ければ状態の行を出さない）。
-        console.warn('プロジェクトの状態を読めませんでした', project.id, cause)
-        const previous = projectCards.value[project.id]
-        return previous ? [project.id, previous] as const : null
-      }
-    }))
-    if (token !== cardsToken) return
-    projectCards.value = Object.fromEntries(entries.filter(entry => entry !== null))
-  }
-
-  /** 準備の進み 3 行。開いているプロジェクトの、走査の途中は走査の進みを使う。 */
-  const prepareLines = computed<PrepareLine[]>(() => {
-    const project = activeProject.value
-    if (!project) return []
-    const progress = taskProgress.value
-    const scanning = scanRunning.value && progress?.projectId === project.id
-    return prepareProgress({
-      project: scanning ? { ...project, status: 'scanning', photoCount: progress!.processed } : project,
-      analysisBacklog: analysisBacklog.value,
-      displayBacklog: displayBacklog.value,
-      session: null,
-      keptCount: 0
-    })
+  // ---- 開く・カード・準備の数・削除（`composables/curator/useProjectOpen.ts`） ----
+  // 再代入される `let`（`openToken`・`sidecarCheckPending`・`deletingProjectId`・`pairOverrides`）は関数で渡す。
+  // あとで作られるもの（`loadSummary`・`runSidecarCheck`・`enterMethod` など）は呼ぶ関数として渡す（呼ばれるのは作ったあと）。
+  /** 開く処理の世代。新しい呼び出しが来たら古い呼び出しは、以降の結果を捨てて終わる（W6）。 */
+  let openToken = 0
+  const {
+    refreshProjects, refreshProjectCards, prepareLines, refreshPrepareCounts, openProject, openProjectAction,
+    askDeleteProject, confirmDeleteProject
+  } = useProjectOpen({
+    desktop, projects, projectCards, activeProject, session, view, loading, error, coreInputs, previewPhotos,
+    previewTotal, tournamentPhotos, taskProgress, taskWarning, scanRunning, analysisBacklog, displayBacklog,
+    analysisFailures, analysisFailureList, analysisFailuresDialog, analysisProgress, deleteTarget, deleteDialog,
+    deleteBusy, saveQueue, sidecar,
+    nextOpenToken: () => ++openToken,
+    currentOpenToken: () => openToken,
+    setSidecarCheckPending: (projectId) => { sidecarCheckPending = projectId },
+    setDeletingProjectId: (projectId) => { deletingProjectId = projectId },
+    setPairOverrides: (overrides) => { pairOverrides = overrides },
+    clearPrefetched: () => prefetched.clear(),
+    importsByPicker: () => importsByPicker.value,
+    loadPreview, loadSummary: () => loadSummary(), refreshDisplayState, refreshAnalysisFailures,
+    runSidecarCheck: (project) => runSidecarCheck(project), healRowRatings,
+    startScan: () => startScan(), enterMethod: () => enterMethod(), resumeSession: () => resumeSession(),
+    openResults: () => openResults()
   })
-
-  /** 準備の未処理の数を読み直す（進捗のイベントごとには 1 秒に 1 回まで）。 */
-  let prepareCountsAt = 0
-  async function refreshPrepareCounts(projectId: string, force = false) {
-    const now = Date.now()
-    if (!force && now - prepareCountsAt < 1000) return
-    prepareCountsAt = now
-    const [analysis, display] = await Promise.all([
-      desktop.getAnalysisBacklog(projectId).catch(() => 0),
-      desktop.getDisplayBacklog(projectId).catch(() => 0)
-    ])
-    if (activeProject.value?.id !== projectId) return
-    analysisBacklog.value = analysis
-    displayBacklog.value = display
-  }
 
   async function loadCurrentPhotos(ids = currentGroup.value) {
     if (!activeProject.value || !ids.length) {
@@ -621,101 +570,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     setPairOverrides: (overrides) => { pairOverrides = overrides },
     refreshProjects, loadPreview, loadSummary: () => loadSummary()
   })
-
-  /** 開く処理の世代。新しい呼び出しが来たら古い呼び出しは、以降の結果を捨てて終わる（W6）。 */
-  let openToken = 0
-  async function openProject(project: Project) {
-    const token = ++openToken
-    const stale = () => token !== openToken
-    activeProject.value = project
-    previewPhotos.value = []
-    previewTotal.value = 0
-    analysisBacklog.value = 0
-    // 前のプロジェクトの警告・進みを持ち越さない（B6）。
-    analysisFailures.value = 0
-    analysisFailureList.value = []
-    analysisFailuresDialog.value = false
-    analysisProgress.value = null
-    prefetched.clear()
-    coreInputs.value = null
-    pairOverrides = []
-    view.value = 'project'
-    loading.value = true
-    sidecarCheckPending = null
-    try {
-      // 前に開いていたプロジェクトの書き途中を、読む前に書き終える。
-      await saveQueue.flush()
-      if (stale()) return
-      // プレビュー格子は星を出さないのでサイドカーの結果に依存しない。確認と並べて読み始める（W9）。
-      // サイドカーが取り込んだときは reloadAfterSidecar がもう一度読むので、最後は新しい値になる。
-      const preview = loadPreview(project.id)
-      preview.catch(() => undefined) // 待つのは下。ここでは未処理の拒否にしない
-      // 記録の取り込みは、選別の途中を読み込む前に済ませる（取り込んだ分が画面に出るように）。
-      // 写真の行がまだ無いときは、走査のあとで確かめる（星を写す行が要る）。
-      if (project.photoCount > 0) await runSidecarCheck(project)
-      else {
-        sidecarCheckPending = project.id
-        await sidecar.refreshAccess(project.id)
-      }
-      if (stale()) return
-      await Promise.all([
-        preview,
-        desktop.loadSession(project.id).then(value => {
-          // 遅れて届いた前のプロジェクトの封筒で、今のプロジェクトの session を上書きしない。
-          if (stale()) return
-          if (value) value.core = markRaw(value.core)
-          session.value = value
-        })
-      ])
-      if (stale()) return
-      await healRowRatings(project.id)
-      if (stale()) return
-      // 開いた時点から少しずつ解析を進めておく。「選別を開始」で待たされないように。
-      // ただし**やることが無いなら起動しない**。以前は無条件に呼んでいたため、
-      // 解析済みのプロジェクトを開くたびに進捗イベントだけが飛び、解析中の帯が
-      // 一瞬表示されていた。
-      // まだ一枚も読み込んでいないプロジェクトは、開いた時点で読み込みを始める。
-      // 利用者がボタンを押すのを待つ理由が無い。
-      //
-      // **フォルダを走査できる環境だけ。** ブラウザには走査するフォルダが無く、
-      // `startProjectScan` は何もしないので、進捗イベントも来ない。それを待つ
-      // ダイアログが閉じられなくなり、リロードしないと戻れなくなっていた。
-      // フォルダの許可が切れているときは、ここで求めても通らない（許可は利用者の操作の中でだけ）。
-      // プロジェクトの画面の「フォルダへのアクセスを許可」を押してもらう。
-      // リンクが消えた Amazon のプロジェクトは、開くたびに読みにいかない（「写真を再読み込み」で試す）。
-      const linkGone = project.sourceKind === 'amazon' && project.status === 'missing'
-      // 「0 枚なら走査」は状態で判定する。全部が非対応の形式だと枚数は 0 になるが、走査は済んでいる（U58）。
-      const neverScanned = !project.photoCount && project.status !== 'ready'
-      if (neverScanned && !importsByPicker.value && !scanRunning.value && project.folderAccess !== 'needs-permission' && !linkGone) {
-        await startScan()
-        return
-      }
-      if (linkGone) {
-        await loadSummary()
-        return
-      }
-      // 未解析数・表示用の状態・集計は互いに依存しないので、並べて読む（W9）。
-      const [backlog] = await Promise.all([
-        desktop.getAnalysisBacklog(project.id).catch(() => 0),
-        refreshDisplayState(),
-        loadSummary()
-      ])
-      if (stale()) return
-      analysisBacklog.value = backlog
-      void refreshAnalysisFailures(project.id)
-      if (backlog > 0) desktop.startBackgroundAnalysis(project.id).catch(cause => warnPrepareNotStarted('解析', cause))
-      // 表示用画像は走査とは別に溜める。**走査に混ぜると解析が桁で遅くなる**
-      // （EXIF サムネイル経路 1.72ms/枚 に対しフルデコード 132ms/枚）。
-      if (displayBacklog.value > 0) {
-        desktop.startDisplayGeneration(project.id).catch(cause => warnPrepareNotStarted('表示用画像の作成', cause))
-      }
-    } catch (cause) {
-      if (!stale()) error.value = cause instanceof Error ? cause.message : 'プロジェクトを開けませんでした。'
-    } finally {
-      // 古い呼び出しが、新しい呼び出しの「読み込み中」を落とさない。
-      if (!stale()) loading.value = false
-    }
-  }
 
   /**
    * 写真ライブラリから取り込める環境か。ブラウザはフォルダを走査できないので、
@@ -1157,49 +1011,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     showNextPair, refreshBurstPreview
   })
 
-  /** ホームの行の「次の一手」。プロジェクトを開いてから、状態に合う画面へ進む。 */
-  async function openProjectAction(project: Project, state: CardState) {
-    await openProject(project)
-    if (error.value || activeProject.value?.id !== project.id) return
-    if (state === 'error') await startScan()
-    else if (state === 'culling') await resumeSession()
-    else if (state === 'done') await openResults()
-    else enterMethod()
-  }
-
-  function askDeleteProject(project: Project) {
-    deleteTarget.value = project
-    deleteDialog.value = true
-  }
-
-  async function confirmDeleteProject() {
-    const target = deleteTarget.value
-    if (!target) return
-    deleteBusy.value = true
-    deletingProjectId = target.id
-    try {
-      // 消す前に、そのプロジェクトの未書き込みの封筒を捨てる（消したあとに書かれないように）。
-      await saveQueue.drop(target.id)
-      await desktop.deleteProject(target.id)
-      if (activeProject.value?.id === target.id) {
-        activeProject.value = null
-        coreInputs.value = null
-        session.value = null
-        previewPhotos.value = []
-        tournamentPhotos.value = []
-        view.value = 'home'
-      }
-      await refreshProjects()
-      deleteDialog.value = false
-      deleteTarget.value = null
-    } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : 'プロジェクトを削除できませんでした。'
-    } finally {
-      deletingProjectId = null
-      deleteBusy.value = false
-    }
-  }
-
   function openGroupSizeDialog() {
     const size = clampGroupSize(session.value?.settings.groupSize ?? groupLimits.default, groupLimits)
     pendingSlideshow.value = isSlideshowSize(size)
@@ -1239,20 +1050,16 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     answerPair, undoChoice, confirmChoices, confirmPhoto, toggleChoice, saveSession
   })
 
-  /** 準備の途中で、格子のサムネイルを少しずつ埋める（ブラウザだけ。PC は元から原本が見える）。 */
-  let previewRefreshedAt = 0
-  async function refreshDuringPreparation(progress: ProjectProgress) {
-    if (desktop.kind !== 'local' || view.value !== 'project') return
-    const finished = progress.phase === 'complete' || progress.phase === 'cancelled'
-    const now = Date.now()
-    if (!finished && now - previewRefreshedAt < 3000) return
-    previewRefreshedAt = now
-    await (finished ? loadPreview(progress.projectId) : refreshPreviewThumbnails(progress.projectId))
-      .catch(() => undefined)
-    if (!finished) return
-    await refreshProjects().catch(() => undefined)
-    await loadCoreInputs(progress.projectId).catch(() => undefined)
-  }
+  // ---- 進みのイベントの受け取り（`composables/curator/useProgressEvents.ts`） ----
+  // `sidecarCheckPending` は開く処理（useProjectOpen）と共有するので、ここ（useCurator）に置いて関数で渡す。
+  const { listenProgress } = useProgressEvents({
+    desktop, projects, activeProject, view, error, taskProgress, taskWarning, taskDialog, analysisProgress,
+    analysisFailures, sidecar,
+    getSidecarCheckPending: () => sidecarCheckPending,
+    setSidecarCheckPending: (projectId) => { sidecarCheckPending = projectId },
+    refreshProjects, refreshAnalysisFailures, refreshPrepareCounts, loadPreview, refreshPreviewThumbnails,
+    loadCoreInputs, startDisplayAfterScan, runSidecarCheck, reloadAfterSidecar
+  })
 
   // プロジェクトを閉じる（ホームへ戻る）とき、変更があれば書く。
   watch(view, (next, previous) => {
@@ -1286,54 +1093,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
       error.value = cause instanceof Error ? cause.message : 'プロジェクトを読み込めませんでした。'
     }
     try {
-      stopProgressListener = await desktop.onProjectProgress(async (progress) => {
-        if (!activeProject.value || progress.projectId !== activeProject.value.id) return
-        // 連写解析（前面・事前生成とも）は待たせない。帯で状況だけ伝える。
-        if (progress.task !== 'scan') {
-          analysisProgress.value = progress
-          analysisFailures.value = progress.failed
-          // 警告は解析中の1イベントにしか乗らないので、別に保持して出し続ける。
-          if (progress.warning) taskWarning.value = progress.warning
-          if (progress.phase === 'error') {
-            error.value = progress.message
-            void refreshProjects().then(() => {
-              activeProject.value = projects.value.find(project => project.id === activeProject.value?.id) ?? activeProject.value
-            })
-          }
-          if (progress.phase === 'complete' || progress.phase === 'cancelled') void refreshAnalysisFailures(progress.projectId)
-          void refreshPrepareCounts(progress.projectId, progress.phase === 'complete')
-          if (progress.task === 'background') void refreshDuringPreparation(progress)
-          return
-        }
-        taskProgress.value = progress
-        if (progress.warning) taskWarning.value = progress.warning
-        if (progress.phase === 'complete') {
-          taskDialog.value = false
-          await refreshProjects()
-          activeProject.value = projects.value.find(project => project.id === activeProject.value?.id) ?? activeProject.value
-          await loadPreview(progress.projectId)
-          void refreshPrepareCounts(progress.projectId, true)
-          await loadCoreInputs(progress.projectId).catch(() => undefined)
-          // 表示用画像は走査のあとに溜める（開き直さないと始まらなかった）。
-          await startDisplayAfterScan(progress.projectId)
-          await sidecar.refreshAccess(progress.projectId)
-          if (sidecarCheckPending === progress.projectId && activeProject.value) {
-            // 写真の行ができたので、開いたときの確認をここで行う（取り込んだ星を行へ写せる）。
-            sidecarCheckPending = null
-            const outcome = await runSidecarCheck(activeProject.value)
-            if (outcome?.kind === 'pulled') await reloadAfterSidecar(progress.projectId)
-          }
-        }
-        if (progress.phase === 'cancelled' || progress.phase === 'error') {
-          taskDialog.value = false
-          if (progress.phase === 'error') {
-            error.value = progress.message
-            // リンクが消えたときなど、状態が変わっているので取り直す。
-            await refreshProjects()
-            activeProject.value = projects.value.find(project => project.id === activeProject.value?.id) ?? activeProject.value
-          }
-        }
-      })
+      stopProgressListener = await listenProgress()
     } catch (cause) {
       error.value = cause instanceof Error ? cause.message : '進み具合を受け取れませんでした。'
     }
