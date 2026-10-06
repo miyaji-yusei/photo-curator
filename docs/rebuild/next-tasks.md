@@ -274,6 +274,7 @@
 | U33 | core: 正規化・比較キー・未着手・`sidecar_plan`・混ぜ方（D・E）・鍵の変換・catalog.json v2 の項目。UDL と core-wasm に公開 | `fix/mb-u33-core-sidecar` | 済（#45 に含む。10章 §7 の U33） |
 | U34 | PC・Web: `useSidecarSync` を `sidecar_plan` と楽観ロック（lock → 読む → 確かめる → 一時ファイル → rename → 読み戻し）に切り替える。`sidecar_state` に `seen_token`・`seen_key`・`seen_epoch`・`detached`（移行: 古い seen_at/seen_by から `legacy:` の token、localChanged=true なら key を空に）。5 択のダイアログ・B の帯と「NAS に書き込む」・取り込みの「元に戻す」。`lib/core.ts` に新しい関数の型を足す。鍵は書くとき `sidecarKeysToFolder(…, '')`、読んだ直後に `sidecarNormalizeKeys(…, 選んだフォルダ)`、取り込むとき `sidecarKeysFromFolder(…, '', '\\')`（Windows） | `fix/mb-u34-pcweb-sidecar` | 済（#45 に含む。10章 §7 の U34・下の「U34」） |
 | U35 | Android: `Sidecar.kt` の判断を core の `sidecarPlan` に置き換える（`SyncState` を token・key・epoch・detached に）。鍵は prefix＝共有の根からのフォルダで変換。プロジェクトごとに 1 本の列・一時ファイル → rename・ON_STOP は開いているプロジェクトだけ・最初の確認が終わるまで「選別を開始」を押せない・5 択のダイアログ。**先に `node scripts/build-core.mjs` で `.so` と Kotlin の束ねを作り直す（ユーザー）** | `fix/mb-u35-android-sidecar` | 済（#45 に含む。下の「U35」の節。実機は未確認） |
+| B4・B7 | Web: 走査を拡張子で絞る（B4）／Android: ホームの表示用画像の数をプロジェクトの顔ぶれで数える（B7） | `fix/mb-b4-b7` | 実装済み（2026-10-07）。B8（rw2・pef・srw・HEIC の扱い）は未着手 |
 
 ### U33 で足した core の公開 API（`core/src/sidecar_sync.rs`。UDL・core-wasm にも同名／camelCase）
 - 正規化・比較: `normalize_key`・`canonical_judgement`・`sidecar_judgement`・`judgement_equivalent`・`judgement_key`
