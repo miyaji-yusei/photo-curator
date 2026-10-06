@@ -81,6 +81,8 @@ object HomeCards {
     ): Card {
         val key = project.source.key
         val edge = Prefs.projectEdge(context, project.id)
+        // 古い名前の控えの引き継ぎを先に済ませる（B2）。済ませずに印を作ると、初回だけ「控え無し」で数える。
+        SourceFiles.adopt(context, key)
         // 状態を決める材料のファイルと設定。**どれかが変われば作り直す。**
         val signature = buildList {
             addAll(stamp(Store.file(context, project.id)))

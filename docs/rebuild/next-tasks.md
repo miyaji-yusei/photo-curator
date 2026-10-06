@@ -66,6 +66,7 @@
 | U57 | PC の RAW（CR2 など）を解析・選別できるようにする。RAW に埋め込まれたプレビュー JPEG を取り出してサムネイル・dHash・表示用画像の元にする（Android の U49 と同じ規則） | M | `src-tauri/src/raw_preview.rs`・`image_pipeline.rs`・`capture.rs` | 済（PC。Web 版は未対応） |
 | U58-A | Android: 解析できなかったファイルの一覧・非対応は再試行しない・準備の分母と選別の対象に含めない（`11-ユーザーフロー.md` §5.3） | M | `app-android/`（`Analyse.kt`・`Failures.kt`・`FailuresDialog.kt`・`Album.kt`・`Home.kt`） | 済（`feat/mb-u58-unsupported-android`。実機・NAS は未確認。PC・Web は別ブランチ） |
 | U58 | 解析できなかった写真の一覧・非対応形式は再試行しない・準備の分母と選別の対象から外す（PC・Web。Android は別担当）。`photos.analysis_error_kind` を 1 列追加 | M | `src-tauri/`（`analysis.rs`・`image_pipeline.rs`・`display.rs`・`lib.rs`）・`composables/`・`utils/analysisFailures.ts`・`AnalysisFailuresDialog.vue` | 済（PC・Web。Android は未着手。詳細は 10 章 §7 の U58 の行） |
+| B2 | Android: 出所ごとの控え（顔ぶれ・ハッシュ値・つまずき）のファイル名が同じ文字数の日本語のフォルダで衝突する件を、SHA-256 の名前にする。古い名前の控えは中身で確かめられたときだけ引き継ぎ、消さない（`11-ユーザーフロー.md` §4 B2・DB-3） | S〜M | `app-android/`（`SourceFiles.kt`・`Store.kt`・`HomeCards.kt`） | 済（`fix/mb-b2-android-cache-names`。実機・NAS は未確認。古い名前のファイルの片付けは後の版） |
 
 ---
 
