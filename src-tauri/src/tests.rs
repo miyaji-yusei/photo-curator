@@ -4638,3 +4638,31 @@ fn a_raw_range_read_that_fails_midway_is_transient_not_unsupported() {
         Some(DecodeFailure::Undecodable)
     );
 }
+
+/// R2: 失敗の理由 → 画面の文言・DB の種類の表。ここを変えると利用者に見える文言が変わる。
+#[test]
+fn analysis_failure_messages_and_kinds_are_fixed() {
+    let table: Vec<(PhotoFailure, String, &str)> = vec![
+        (PhotoFailure::NoCaptureTime, "撮影時刻を読み取れませんでした。".into(), "transient"),
+        (PhotoFailure::Unreadable, "ファイルを開けませんでした（移動・削除・権限）。".into(), "transient"),
+        (PhotoFailure::Undecodable, "画像を読み取れませんでした（破損または非対応の形式）。".into(), "unsupported"),
+        (PhotoFailure::RemoteUndecodable, "画像を読み取れませんでした（破損または非対応の形式）。".into(), "transient"),
+        (PhotoFailure::Fetch("取得に失敗".into()), "取得に失敗".into(), "transient"),
+        (PhotoFailure::Timeout(15), "解析が 15 秒以内に終わりませんでした。".into(), "transient"),
+        (PhotoFailure::Stalled, "読み込みが応答しないため、解析できませんでした。".into(), "transient"),
+        (PhotoFailure::DisplayFailed, "表示用の画像を作れませんでした。".into(), "transient"),
+    ];
+    for (failure, message, kind) in table {
+        assert_eq!(failure.message(), message, "{failure:?}");
+        assert_eq!(failure.kind(), kind, "{failure:?}");
+        let mut work = PhotoWork::new(0, "x");
+        work.fail(failure.clone());
+        assert_eq!(work.error.as_deref(), Some(message.as_str()));
+        assert_eq!(work.error_kind(), Some(kind));
+    }
+    // 復号の失敗 → 解析の失敗（U58 と同じ決め方）
+    assert_eq!(PhotoFailure::from_decode(Some(DecodeFailure::Undecodable), true), PhotoFailure::Undecodable);
+    assert_eq!(PhotoFailure::from_decode(Some(DecodeFailure::Undecodable), false), PhotoFailure::Unreadable);
+    assert_eq!(PhotoFailure::from_decode(Some(DecodeFailure::Unreadable), true), PhotoFailure::Unreadable);
+    assert_eq!(PhotoFailure::from_decode(None, true), PhotoFailure::Unreadable);
+}

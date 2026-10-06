@@ -46,7 +46,7 @@ pub(crate) fn display_one(dir: &Path, edge: u32, index: usize, job: &DisplayJob)
     let file = display_file(dir, &job.id);
     let saved = built.and_then(|bytes| fs::write(&file, &bytes).ok());
     if saved.is_none() {
-        work.error = Some("表示用の画像を作れませんでした。".into());
+        work.fail(PhotoFailure::DisplayFailed);
     }
     work
 }

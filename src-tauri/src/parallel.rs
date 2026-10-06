@@ -265,6 +265,12 @@ impl PhotoWork {
         }
     }
 
+    /// 失敗の理由を記録する（文言と種類は `PhotoFailure` が決める）。
+    pub(crate) fn fail(&mut self, failure: PhotoFailure) {
+        self.error = Some(failure.message());
+        self.error_unsupported = failure.kind() == ERROR_KIND_UNSUPPORTED;
+    }
+
     /// `analysis_error_kind` 列に書く値。失敗が無ければ NULL。
     pub(crate) fn error_kind(&self) -> Option<&'static str> {
         self.error.as_ref().map(|_| {
@@ -279,6 +285,62 @@ impl PhotoWork {
 
 pub(crate) const ERROR_KIND_UNSUPPORTED: &str = "unsupported";
 pub(crate) const ERROR_KIND_TRANSIENT: &str = "transient";
+
+/// 解析・表示用画像の失敗の理由（R2）。**画面に出す文言（`message`）と DB に書く種類（`kind`）は
+/// ここだけが決める。** 呼ぶ側は `PhotoWork::fail` に理由を渡すだけ。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PhotoFailure {
+    /// 撮影時刻が読めなかった。
+    NoCaptureTime,
+    /// ファイルを開けない・読みの途中で切れた・サムネイルを作れない・理由が分からない。一時的。
+    Unreadable,
+    /// 全部読めたのに復号できない（壊れている・非対応の形式）。原本が変わらない限り同じ＝非対応。
+    Undecodable,
+    /// Amazon から取った画像を復号できない。文言は `Undecodable` と同じだが、網の側の
+    /// 不調かもしれないので一時的のまま（U58 以前からの挙動）。
+    RemoteUndecodable,
+    /// Amazon から画像を取れなかった。理由の文言は取得側が作る。
+    Fetch(String),
+    /// 1 枚が時間内に終わらなかった（秒）。
+    Timeout(u64),
+    /// 動かせる worker が残らず、解析されないまま確定した。
+    Stalled,
+    /// 表示用の画像を作れなかった。
+    DisplayFailed,
+}
+
+impl PhotoFailure {
+    /// 復号の失敗（U58）を、ファイルの状態も見て解析の失敗にする。
+    /// 非対応にするのは「全部読めたのに復号できない」ときだけ（`readable`＝fingerprint が取れた）。
+    pub(crate) fn from_decode(failure: Option<DecodeFailure>, readable: bool) -> Self {
+        if readable && failure == Some(DecodeFailure::Undecodable) {
+            Self::Undecodable
+        } else {
+            Self::Unreadable
+        }
+    }
+
+    /// 画面と `analysis_error` 列に出す文言。
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::NoCaptureTime => "撮影時刻を読み取れませんでした。".into(),
+            Self::Unreadable => "ファイルを開けませんでした（移動・削除・権限）。".into(),
+            Self::Undecodable | Self::RemoteUndecodable => "画像を読み取れませんでした（破損または非対応の形式）。".into(),
+            Self::Fetch(message) => message.clone(),
+            Self::Timeout(secs) => format!("解析が {secs} 秒以内に終わりませんでした。"),
+            Self::Stalled => "読み込みが応答しないため、解析できませんでした。".into(),
+            Self::DisplayFailed => "表示用の画像を作れませんでした。".into(),
+        }
+    }
+
+    /// `analysis_error_kind` 列に書く値。
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Undecodable => ERROR_KIND_UNSUPPORTED,
+            _ => ERROR_KIND_TRANSIENT,
+        }
+    }
+}
 
 /// 並列に流せる仕事。timeout した1枚を writer が単独で確定させるために、
 /// 仕事そのものから写真の id を取れる必要がある。
@@ -433,10 +495,7 @@ where
             outcome.timed_out += 1;
             let mut result = PhotoWork::new(index, items[index].photo_id());
             result.duration_ms = started.elapsed().as_millis() as u64;
-            result.error = Some(format!(
-                "解析が {} 秒以内に終わりませんでした。",
-                timeout.as_secs()
-            ));
+            result.fail(PhotoFailure::Timeout(timeout.as_secs()));
             on_result(result)?;
         }
         // 代わりも含めて、動かせる worker が 1 本も残っていない（全員が timeout 済みの
@@ -459,7 +518,7 @@ where
                 outcome.completed += 1;
                 outcome.timed_out += 1;
                 let mut result = PhotoWork::new(index, items[index].photo_id());
-                result.error = Some("読み込みが応答しないため、解析できませんでした。".into());
+                result.fail(PhotoFailure::Stalled);
                 on_result(result)?;
             }
             return Ok(outcome);
