@@ -790,7 +790,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     enterMethod, openSlideshowSettings, openSettings, beginTournament, startTournament,
     finishTournamentStart, openSelection, enterStage, resumeSession
   } = useSelectionStart({
-    desktop, activeProject, session, view, loading, error, settings, groupLimits, taskDialog, taskWarning,
+    desktop, activeProject, session, view, loading, error, settings, groupLimits, taskDialog, scanRunning, taskWarning,
     restartDialog, restartForStart, pendingTournamentSettings, sidecarClash, sidecarChecking, hasSelectionData,
     syncAtBreak, loadSummary, loadCoreInputs, ensureCoreInputs, loadPairOverrides,
     getPairOverrides: () => pairOverrides,

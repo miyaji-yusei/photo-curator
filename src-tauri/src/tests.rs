@@ -536,6 +536,46 @@ fn rescanning_a_photo_without_readable_metadata_keeps_its_analysis() {
     fs::remove_dir_all(&directory).expect("remove test directory");
 }
 
+// 原本が変わった（大きさ・更新時刻が違う）再走査では、表示用画像も作り直しの対象に戻す（B3）。
+// 変わらなければ消さない。
+#[test]
+fn rescanning_a_changed_original_resets_its_display_image() {
+    let directory = test_directory("rescan-display");
+    let conn = open_database(&directory.join("scan.sqlite3")).expect("open database");
+    let absolute = "C:/photos/a.jpg";
+    let scan = |mtime: i64, size: i64| {
+        upsert_photo(&conn, "project-1", absolute, "a.jpg", "a.jpg", Some(mtime), Some(size)).expect("scan");
+    };
+    let display = || -> (Option<String>, Option<i64>) {
+        conn.query_row(
+            "SELECT display_path,display_edge FROM photos WHERE path=?1",
+            params![absolute],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read display")
+    };
+
+    scan(10, 100);
+    conn.execute(
+        "UPDATE photos SET display_path='old.jpg', display_edge=1024 WHERE path=?1",
+        params![absolute],
+    )
+    .expect("record display");
+
+    scan(10, 100);
+    assert_eq!(display(), (Some("old.jpg".to_string()), Some(1024)), "変わらなければ消さない");
+    scan(11, 100);
+    assert_eq!(display(), (None, None), "更新時刻が違えば作り直し");
+
+    conn.execute("UPDATE photos SET display_path='old.jpg', display_edge=1024 WHERE path=?1", params![absolute])
+        .expect("record display");
+    scan(11, 101);
+    assert_eq!(display(), (None, None), "大きさが違えば作り直し");
+
+    drop(conn);
+    fs::remove_dir_all(&directory).expect("remove test directory");
+}
+
 // 解析全体をひとつのトランザクションで囲んでいた頃は、キャンセルすると
 // すべて rollback され、何度やり直しても d_hash が1件も残らなかった。
 #[test]

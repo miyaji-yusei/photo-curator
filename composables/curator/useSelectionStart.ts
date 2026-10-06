@@ -23,6 +23,7 @@ export interface SelectionStartDeps {
   settings: TournamentSettings
   groupLimits: GroupSizeLimits
   taskDialog: Ref<boolean>
+  scanRunning: Ref<boolean>
   taskWarning: Ref<string | null>
   restartDialog: Ref<boolean>
   restartForStart: Ref<boolean>
@@ -49,7 +50,7 @@ export interface SelectionStartDeps {
 /** 選別の開始（R5。`useCurator.ts` から切り出した。中身は変えていない）。 */
 export function useSelectionStart(deps: SelectionStartDeps) {
   const {
-    desktop, activeProject, session, view, loading, error, settings, groupLimits, taskDialog, taskWarning,
+    desktop, activeProject, session, view, loading, error, settings, groupLimits, taskDialog, scanRunning, taskWarning,
     restartDialog, restartForStart, pendingTournamentSettings, sidecarClash, sidecarChecking, hasSelectionData,
     syncAtBreak, loadSummary, loadCoreInputs, ensureCoreInputs, loadPairOverrides, getPairOverrides,
     thresholdFor, currentDistance, noteJudgementChanged, setCore, saveSession, loadCurrentPhotos,
@@ -57,7 +58,7 @@ export function useSelectionStart(deps: SelectionStartDeps) {
   } = deps
 
   function enterMethod() {
-    if (!canStartSelection({ photoCount: activeProject.value?.photoCount ?? 0, sidecarClash: !!sidecarClash.value, sidecarChecking: sidecarChecking.value })) return
+    if (!canStartSelection({ photoCount: activeProject.value?.photoCount ?? 0, scanRunning: scanRunning.value, sidecarClash: !!sidecarClash.value, sidecarChecking: sidecarChecking.value })) return
     view.value = 'method'
   }
 
@@ -77,7 +78,7 @@ export function useSelectionStart(deps: SelectionStartDeps) {
   // 解析の完了を待たない。scan 後の事前生成で出来ているぶんをそのまま使い、
   // 未解析が残っていても選別画面へ進む。残りはバックグラウンドで進み続ける。
   async function beginTournament() {
-    if (!canStartSelection({ hasProject: !!activeProject.value, taskDialog: taskDialog.value, sidecarClash: !!sidecarClash.value }) || !activeProject.value) return
+    if (!canStartSelection({ hasProject: !!activeProject.value, taskDialog: taskDialog.value, scanRunning: scanRunning.value, sidecarClash: !!sidecarClash.value }) || !activeProject.value) return
     // 始める前にサイドカーを確かめる（設計書 §4.5）。この端末が未着手で、別の端末が進めていれば、
     // ここで確認なしに取り込む。取り込んだら始めずにプロジェクトの画面へ戻し、続きから再開してもらう
     // （このまま始めると、取り込んだ星を全部 0 にしてしまう）。食い違えばダイアログを出して止める。
@@ -101,7 +102,7 @@ export function useSelectionStart(deps: SelectionStartDeps) {
   }
 
   async function startTournament() {
-    if (!canStartSelection({ hasProject: !!activeProject.value, taskDialog: taskDialog.value, sidecarClash: !!sidecarClash.value }) || !activeProject.value) return
+    if (!canStartSelection({ hasProject: !!activeProject.value, taskDialog: taskDialog.value, scanRunning: scanRunning.value, sidecarClash: !!sidecarClash.value }) || !activeProject.value) return
     pendingTournamentSettings.value = { ...settings }
     if (settings.groupBursts) {
       taskWarning.value = null
@@ -194,7 +195,7 @@ export function useSelectionStart(deps: SelectionStartDeps) {
 
   async function resumeSession() {
     // 別の端末の記録との食い違いを選ぶまで、選別は始めさせない。
-    if (!canStartSelection({ sidecarClash: !!sidecarClash.value, sidecarChecking: sidecarChecking.value })) return
+    if (!canStartSelection({ scanRunning: scanRunning.value, sidecarClash: !!sidecarClash.value, sidecarChecking: sidecarChecking.value })) return
     if (!session.value) return openSettings()
     // 別の環境で作られたセッションは、この端末の上限を超える枚数を持ちうる。
     const clamped = clampGroupSize(session.value.settings.groupSize, groupLimits)

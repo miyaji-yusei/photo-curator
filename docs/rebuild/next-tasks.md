@@ -75,6 +75,8 @@
 | R2 | 解析の失敗の理由を `PhotoFailure`（`message()`・`kind()`）に集約（PC。挙動・文言は不変） | S | `src-tauri/src/parallel.rs`・`analysis.rs`・`display.rs` | 済（`refactor/mb-r2-analysis-failure`） |
 | R1 | 写真の候補にする名前・組の RAW の規則を共通のフィクスチャで試験に縛る（`11-ユーザーフロー.md` §2.5） | S | `core/tests/fixtures/photo-names.json`・`tests/`・Android の `test/` | 済（`test/mb-r1-photo-name-fixture`。10 章 §7 の R1 の行。既知の差は表の `known_differences`） |
 | R4 | 準備の状態を 1 回で返す口 `get_prepare_state`（`getPrepareState`。解析の残り・表示用画像の残り・失敗・非対応の枚数。カードと `refreshPrepareCounts` を置き換え。挙動不変） | S | `src-tauri/src/lib.rs`・`composables/`・`types/photo.ts` | 済（`refactor/mb-r4-prepare-state`） |
+| B3 | PC: フォルダの再走査で原本が変わっても表示用画像が残り、差し替え前の絵が選別画面に出る件を、Amazon 版と同じく作り直しの対象に戻す（`11-ユーザーフロー.md` §4 B3） | S | `src-tauri/src/scan.rs`（`upsert_photo`）・`tests.rs` | 済（`fix/mb-b3-b9`。実アプリでは未確認） |
+| B9 | PC・Web: 「写真を再読み込み」の走査中は「選別を開始／再開」を押せなくする（設計書 01 章。Android と同じ。`11-ユーザーフロー.md` §4 B9） | S | `utils/selectionGate.ts`・`useSelectionStart.ts`・`ProjectView.vue` | 済（`fix/mb-b3-b9`。実アプリでは未確認） |
 
 ---
 

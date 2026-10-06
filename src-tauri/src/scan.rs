@@ -190,6 +190,8 @@ pub(crate) fn upsert_photo(
            thumbnail_size=CASE WHEN photos.fingerprint_mtime IS excluded.fingerprint_mtime AND photos.fingerprint_size IS excluded.fingerprint_size THEN photos.thumbnail_size ELSE NULL END,
            thumbnail_source=CASE WHEN photos.fingerprint_mtime IS excluded.fingerprint_mtime AND photos.fingerprint_size IS excluded.fingerprint_size THEN photos.thumbnail_source ELSE NULL END,
            thumbnail_version=CASE WHEN photos.fingerprint_mtime IS excluded.fingerprint_mtime AND photos.fingerprint_size IS excluded.fingerprint_size THEN photos.thumbnail_version ELSE NULL END,
+           display_path=CASE WHEN photos.fingerprint_mtime IS excluded.fingerprint_mtime AND photos.fingerprint_size IS excluded.fingerprint_size THEN photos.display_path ELSE NULL END,
+           display_edge=CASE WHEN photos.fingerprint_mtime IS excluded.fingerprint_mtime AND photos.fingerprint_size IS excluded.fingerprint_size THEN photos.display_edge ELSE NULL END,
            analysis_error=CASE WHEN photos.fingerprint_mtime IS excluded.fingerprint_mtime AND photos.fingerprint_size IS excluded.fingerprint_size THEN photos.analysis_error ELSE NULL END,
            analysis_error_at=CASE WHEN photos.fingerprint_mtime IS excluded.fingerprint_mtime AND photos.fingerprint_size IS excluded.fingerprint_size THEN photos.analysis_error_at ELSE NULL END,
            analysis_error_kind=CASE WHEN photos.fingerprint_mtime IS excluded.fingerprint_mtime AND photos.fingerprint_size IS excluded.fingerprint_size THEN photos.analysis_error_kind ELSE NULL END,
