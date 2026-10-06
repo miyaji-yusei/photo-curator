@@ -4665,6 +4665,8 @@ fn analysis_failure_messages_and_kinds_are_fixed() {
     assert_eq!(PhotoFailure::from_decode(Some(DecodeFailure::Undecodable), false), PhotoFailure::Unreadable);
     assert_eq!(PhotoFailure::from_decode(Some(DecodeFailure::Unreadable), true), PhotoFailure::Unreadable);
     assert_eq!(PhotoFailure::from_decode(None, true), PhotoFailure::Unreadable);
+}
+
 // -----------------------------------------------------------------------
 // R1: どの名前を写真の候補にするか・組の RAW をどう除くかの共通の表
 //
