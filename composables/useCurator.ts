@@ -20,6 +20,7 @@ import { healRatings, syncRatings } from '~/utils/selectionFlow'
 import { prepareProgress, projectStatus } from '~/utils/projectStatus'
 import type { CardState, CardStatus, PrepareLine } from '~/utils/projectStatus'
 import type { RatingChange, SavedSelection } from '~/utils/selectionFlow'
+import { canStartSelection } from '~/utils/selectionGate'
 import { SLIDESHOW_GROUP_SIZE, clampGroupSize, groupSizeLimits, isSlideshowSize, tournamentGroupSize } from '~/utils/groupSize'
 import { registerAutoPush, useSidecarSync } from '~/composables/useSidecarSync'
 import type { View } from '~/composables/curator/types'
@@ -809,7 +810,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   }
 
   function enterMethod() {
-    if (!activeProject.value?.photoCount || sidecarClash.value || sidecarChecking.value) return
+    if (!canStartSelection({ photoCount: activeProject.value?.photoCount ?? 0, sidecarClash: !!sidecarClash.value, sidecarChecking: sidecarChecking.value })) return
     view.value = 'method'
   }
 
@@ -829,7 +830,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   // 解析の完了を待たない。scan 後の事前生成で出来ているぶんをそのまま使い、
   // 未解析が残っていても選別画面へ進む。残りはバックグラウンドで進み続ける。
   async function beginTournament() {
-    if (!activeProject.value || taskDialog.value || sidecarClash.value) return
+    if (!canStartSelection({ hasProject: !!activeProject.value, taskDialog: taskDialog.value, sidecarClash: !!sidecarClash.value }) || !activeProject.value) return
     // 始める前にサイドカーを確かめる（設計書 §4.5）。この端末が未着手で、別の端末が進めていれば、
     // ここで確認なしに取り込む。取り込んだら始めずにプロジェクトの画面へ戻し、続きから再開してもらう
     // （このまま始めると、取り込んだ星を全部 0 にしてしまう）。食い違えばダイアログを出して止める。
@@ -862,7 +863,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   }
 
   async function startTournament() {
-    if (!activeProject.value || taskDialog.value || sidecarClash.value) return
+    if (!canStartSelection({ hasProject: !!activeProject.value, taskDialog: taskDialog.value, sidecarClash: !!sidecarClash.value }) || !activeProject.value) return
     pendingTournamentSettings.value = { ...settings }
     if (settings.groupBursts) {
       taskWarning.value = null
@@ -1431,7 +1432,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
 
   async function resumeSession() {
     // 別の端末の記録との食い違いを選ぶまで、選別は始めさせない。
-    if (sidecarClash.value || sidecarChecking.value) return
+    if (!canStartSelection({ sidecarClash: !!sidecarClash.value, sidecarChecking: sidecarChecking.value })) return
     if (!session.value) return openSettings()
     // 別の環境で作られたセッションは、この端末の上限を超える枚数を持ちうる。
     const clamped = clampGroupSize(session.value.settings.groupSize, groupLimits)
