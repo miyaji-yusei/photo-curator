@@ -94,17 +94,10 @@
     },
     {
       "id": "not_photo_names",
-      "note": "写真でない名前（B4）。PC・Android は拡張子で絞る。Web は動画と隠しファイル以外は全部候補にする。",
+      "note": "写真でない名前（B4）。3 実装とも拡張子で絞り、画像・RAW 以外は候補にしない（Web は B4 で PC に揃えた）。",
       "files": ["d/Thumbs.db", "d/a.xmp", "d/a.jpg.xmp", "d/notes.txt", "d/a.gif", "d/a.tif", "d/a.jpg"],
       "pair_on": ["d/a.jpg"],
-      "pair_off": ["d/a.jpg"],
-      "known_differences": {
-        "web": {
-          "reason": "B4: folderScan.ts は拡張子で絞らない（動画と . 始まり以外は全部）。後の中身の判定で非対応になる",
-          "pair_on": ["d/Thumbs.db", "d/a.xmp", "d/a.jpg.xmp", "d/notes.txt", "d/a.gif", "d/a.tif", "d/a.jpg"],
-          "pair_off": ["d/Thumbs.db", "d/a.xmp", "d/a.jpg.xmp", "d/notes.txt", "d/a.gif", "d/a.tif", "d/a.jpg"]
-        }
-      }
+      "pair_off": ["d/a.jpg"]
     },
     {
       "id": "no_extension",
