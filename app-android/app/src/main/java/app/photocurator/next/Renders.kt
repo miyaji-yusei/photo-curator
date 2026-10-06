@@ -189,16 +189,31 @@ object Renders {
         }?.size ?: 0
 
     /**
-     * 置いてある枚数を、（置き場の id, 大きさ）ごとに**1 回の列挙で**数える。
-     * ホームが全プロジェクトぶんを数えるときに、フォルダを何度も舐めない（A3）。
+     * 置いてある表示用画像の道筋の名前（[CacheName.of]）を、（置き場の id, 大きさ）ごとに
+     * **1 回の列挙で**集める。ホームが全プロジェクトぶんを数えるときに、フォルダを何度も舐めない（A3）。
+     * 置き場の id は NAS ごと（同じ NAS の別プロジェクトで共有する）なので、**枚数ではなく名前で持ち**、
+     * プロジェクトの写真の顔ぶれで数える（B7。[madeCount]）。
      */
-    fun tally(context: Context): Map<Pair<String, Int>, Int> {
-        val out = HashMap<Pair<String, Int>, Int>()
+    fun tally(context: Context): Map<Pair<String, Int>, Set<String>> {
+        val out = HashMap<Pair<String, Int>, MutableSet<String>>()
         dir(context).list()?.forEach { name ->
-            CacheName.parseRender(name)?.let { out.merge(it, 1, Int::plus) }
+            CacheName.parseRenderParts(name)?.let { (id, hash, edge) ->
+                out.getOrPut(id to edge) { HashSet() }.add(hash)
+            }
         }
         return out
     }
+
+    /** 表示用画像の名前に使う、写真の道筋（NAS は共有内の道筋、Amazon はノード id）。 */
+    fun pathOf(photo: Photo): String? = photo.smb?.path ?: photo.amazon?.nodeId
+
+    /**
+     * プロジェクトの写真（選別の対象だけ）のうち、表示用画像がもう置いてあるものの数（B7）。
+     * [made] は [tally] の、そのプロジェクトの（置き場の id, 大きさ）の分。
+     * 同じ NAS の別プロジェクトの絵は、このプロジェクトの写真でなければ数えない。
+     */
+    fun madeCount(photos: List<Photo>, made: Set<String>): Int =
+        photos.count { photo -> pathOf(photo)?.let { CacheName.of(it) in made } == true }
 
     /** 置いてある量。**消すときに何 MB 消えるかを言うため。** */
     fun bytes(context: Context, cacheId: String): Long =

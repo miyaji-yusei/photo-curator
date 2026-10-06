@@ -1,8 +1,9 @@
 /**
  * 出所のフォルダを再帰で走査して、準備する写真の一覧を作る。
  *
- * 除くもの: 名前が `.` で始まるもの（隠しフォルダ・`.photo-curator` など）と動画。
- * PC の走査（`src-tauri` の `filter_entry`）と同じ考え方。
+ * 除くもの: 名前が `.` で始まるもの（隠しフォルダ・`.photo-curator` など）、動画、画像・RAW の拡張子でないもの
+ * （`.xmp`・`.txt`・`Thumbs.db`・`.AAE` など。B4）。拡張子が無い名前は候補に残す（中身で決める）。
+ * PC の走査（`src-tauri` の `filter_entry`・`is_supported`）と同じ考え方。
  * `SourceIO` にだけ頼るので、Node 上でテストできる。
  */
 import type { SourceIO } from '~/composables/backends/web/sourceIO'
@@ -14,6 +15,22 @@ export function isVideoName(name: string): boolean {
   const dot = name.lastIndexOf('.')
   if (dot < 0) return false
   return VIDEO_EXTENSIONS.has(name.slice(dot + 1).toLowerCase())
+}
+
+/**
+ * 写真の候補にする拡張子。PC の `IMAGE_EXTENSIONS`（`src-tauri/src/scan.rs`）に揃える。
+ * rw2・pef・srw は PC には無いが、Web・Android は候補にする（B8 は今回は揃えない）。
+ */
+const PHOTO_EXTENSIONS = new Set([
+  'jpg', 'jpeg', 'png', 'webp', 'heic', 'heif',
+  'cr2', 'cr3', 'nef', 'arw', 'dng', 'raf', 'orf', 'rw2', 'pef', 'srw'
+])
+
+/** 写真の候補の名前か。動画は除く。拡張子が無い名前は候補（中身で決める）。PC の `is_supported` と同じ。 */
+export function isPhotoName(name: string): boolean {
+  const dot = name.lastIndexOf('.')
+  if (dot < 0) return true
+  return PHOTO_EXTENSIONS.has(name.slice(dot + 1).toLowerCase())
 }
 
 export interface ScannedFile {
@@ -44,7 +61,7 @@ export async function scanFolder(
         await walk(joinPath(subPath, entry.name))
         continue
       }
-      if (isVideoName(entry.name)) continue
+      if (isVideoName(entry.name) || !isPhotoName(entry.name)) continue
       found.push({
         relativePath: joinPath(subPath, entry.name),
         subPath,

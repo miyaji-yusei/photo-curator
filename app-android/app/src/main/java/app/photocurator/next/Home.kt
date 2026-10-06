@@ -379,7 +379,7 @@ internal suspend fun standingOf(
     known: List<Photo>?,
     edge: Int,
     // 表示用画像の枚数（置き場の id, 大きさ）→ 枚数。全プロジェクトで 1 回の列挙を共有する。
-    renderTally: suspend () -> Map<Pair<String, Int>, Int>
+    renderTally: suspend () -> Map<Pair<String, Int>, Set<String>>
 ): Standing {
     val session = Store.load(context, project.id)
 
@@ -398,7 +398,8 @@ internal suspend fun standingOf(
         }
         val prints = Fingerprints.load(context, project.source.key).size
         // **非対応の写真は分母にも枚数にも入れない**（U58。選別の対象でないので）。
-        val total = Failures.workableCount(known, Failures.load(context, project.source.key))
+        val failures = Failures.load(context, project.source.key)
+        val total = Failures.workableCount(known, failures)
         if (prints < total) {
             return Standing(
                 "準備中 · 撮影時刻・サムネイル",
@@ -407,7 +408,10 @@ internal suspend fun standingOf(
         }
         val cacheId = project.source.cacheId
         if (project.source.remote && cacheId != null) {
-            val made = renderTally()[cacheId to edge] ?: 0
+            // **プロジェクトの写真の顔ぶれで数える**（B7）。置き場の id は NAS ごとなので、
+            // 枚数をそのまま使うと同じ NAS の別プロジェクトの絵まで足される。
+            val workable = known.filterNot { Failures.isUnsupported(it, failures[it.relativePath]) }
+            val made = Renders.madeCount(workable, renderTally()[cacheId to edge] ?: emptySet())
             if (made < total) {
                 return Standing(
                     "準備中 · 表示用画像を作成",
