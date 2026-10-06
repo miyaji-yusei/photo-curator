@@ -68,6 +68,7 @@
 | U58 | 解析できなかった写真の一覧・非対応形式は再試行しない・準備の分母と選別の対象から外す（PC・Web。Android は別担当）。`photos.analysis_error_kind` を 1 列追加 | M | `src-tauri/`（`analysis.rs`・`image_pipeline.rs`・`display.rs`・`lib.rs`）・`composables/`・`utils/analysisFailures.ts`・`AnalysisFailuresDialog.vue` | 済（PC・Web。Android は未着手。詳細は 10 章 §7 の U58 の行） |
 | B2 | Android: 出所ごとの控え（顔ぶれ・ハッシュ値・つまずき）のファイル名が同じ文字数の日本語のフォルダで衝突する件を、SHA-256 の名前にする。古い名前の控えは中身で確かめられたときだけ引き継ぎ、消さない（`11-ユーザーフロー.md` §4 B2・DB-3） | S〜M | `app-android/`（`SourceFiles.kt`・`Store.kt`・`HomeCards.kt`） | 済（`fix/mb-b2-android-cache-names`。実機・NAS は未確認。古い名前のファイルの片付けは後の版） |
 | R3・R5 | 「選別を始められるか」を `utils/selectionGate.ts` の純関数に・選別の開始を `composables/curator/useSelectionStart.ts` へ（挙動不変。`11-ユーザーフロー.md` §2.5） | S | `utils/`・`composables/`・`components/views/ProjectView.vue`・`tests/` | 済（`refactor/mb-r3-r5-selection-start`。10 章 §7 の R3・R5 の行） |
+| R7 | 連写の学習・確認を `composables/curator/useBurstLearning.ts` へ（挙動不変。`11-ユーザーフロー.md` §2.5） | S | `composables/` | 済（`refactor/mb-r7-burst-learning`。10 章 §7 の R7 の行） |
 
 ---
 
