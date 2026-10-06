@@ -3,6 +3,7 @@ mod format;
 mod sidecar;
 mod capture;
 mod image_pipeline;
+mod raw_preview;
 mod candidates;
 mod scan;
 mod xmp;
@@ -14,6 +15,7 @@ mod export;
 
 use capture::*;
 use image_pipeline::*;
+use raw_preview::*;
 use candidates::*;
 use scan::*;
 use xmp::*;
