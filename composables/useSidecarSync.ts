@@ -717,6 +717,8 @@ export function useSidecarSync(
   const access = ref<SidecarAccess>('none')
   const clash = ref<SidecarClash | null>(null)
   const busy = ref(false)
+  /** 開いたとき・始める前の確認の最中。終わるまで「選別を開始・再開」は押させない（Android と同じ）。 */
+  const checking = ref(false)
   /** 失敗の理由（赤）。 */
   const message = ref('')
   /** お知らせ（取り込んだ など）。 */
@@ -751,6 +753,7 @@ export function useSidecarSync(
     clash.value = null
     message.value = ''
     notice.value = ''
+    checking.value = true
     try {
       const outcome = await sync.checkOnOpen(project)
       show(project, outcome)
@@ -761,6 +764,8 @@ export function useSidecarSync(
       await refreshAccess(project.id).catch(() => undefined)
       message.value = cause instanceof Error ? cause.message : 'サイドカーを確認できませんでした。'
       return null
+    } finally {
+      checking.value = false
     }
   }
 
@@ -865,7 +870,7 @@ export function useSidecarSync(
   }
 
   return {
-    sync, access, clash, busy, message, notice, detached, savedAt, refreshAccess, checkOnOpen, pushAuto, saveNow,
+    sync, access, clash, busy, checking, message, notice, detached, savedAt, refreshAccess, checkOnOpen, pushAuto, saveNow,
     writeToNas, resolve, markChanged, markRestarted
   }
 }

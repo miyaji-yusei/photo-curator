@@ -94,7 +94,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     }
   })
   const {
-    access: sidecarAccess, clash: sidecarClash, busy: sidecarBusy,
+    access: sidecarAccess, clash: sidecarClash, busy: sidecarBusy, checking: sidecarChecking,
     message: sidecarMessage, notice: sidecarNotice, detached: sidecarDetached, savedAt: sidecarSavedAt
   } = sidecar
   /** 写真の行がまだ無いまま開いたプロジェクト。走査が済んでから確かめる。 */
@@ -778,7 +778,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   }
 
   function enterMethod() {
-    if (!activeProject.value?.photoCount || sidecarClash.value) return
+    if (!activeProject.value?.photoCount || sidecarClash.value || sidecarChecking.value) return
     view.value = 'method'
   }
 
@@ -1400,7 +1400,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
 
   async function resumeSession() {
     // 別の端末の記録との食い違いを選ぶまで、選別は始めさせない。
-    if (sidecarClash.value) return
+    if (sidecarClash.value || sidecarChecking.value) return
     if (!session.value) return openSettings()
     // 別の環境で作られたセッションは、この端末の上限を超える枚数を持ちうる。
     const clamped = clampGroupSize(session.value.settings.groupSize, groupLimits)
@@ -1869,6 +1869,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     sidecarAccess,
     sidecarClash,
     sidecarBusy,
+    sidecarChecking,
     sidecarMessage,
     sidecarSavedAt,
     sidecarNotice,
