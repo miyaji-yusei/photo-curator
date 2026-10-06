@@ -27,7 +27,12 @@ export interface ScannedFile {
 
 /** 走査の結果。並びは名前順（同じフォルダなら何度走査しても同じ順にする）。 */
 export async function scanFolder(
-  io: SourceIO, options: { isCancelled?: () => boolean, onFound?: (count: number) => void } = {}
+  io: SourceIO, options: {
+    isCancelled?: () => boolean
+    onFound?: (count: number) => void
+    /** 同名の JPEG と RAW を 1 枚の写真として扱う（プロジェクトの設定。既定 true。U46）。 */
+    pairRawJpeg?: boolean
+  } = {}
 ): Promise<ScannedFile[]> {
   const found: ScannedFile[] = []
   const walk = async (subPath: string): Promise<void> => {
@@ -51,5 +56,33 @@ export async function scanFolder(
     options.onFound?.(found.length)
   }
   await walk('')
-  return found
+  // RAW+JPEG 同時撮影の組の RAW は写真に数えない（U46）。
+  return skipPairedRaw(found, options.pairRawJpeg ?? true)
+}
+
+/** RAW の拡張子。HEIC・HEIF は RAW ではない。PC の `RAW_EXTENSIONS`（`src-tauri`）と同じ。 */
+const RAW_EXTENSIONS = new Set(['cr2', 'cr3', 'nef', 'arw', 'dng', 'raf', 'orf', 'rw2', 'pef', 'srw'])
+
+function extensionOf(name: string): string {
+  const dot = name.lastIndexOf('.')
+  return dot < 0 ? '' : name.slice(dot + 1).toLowerCase()
+}
+
+/**
+ * RAW＋JPEG 同時撮影の「組」の RAW を除く（U46）。同じフォルダ（`subPath`）に、拡張子を除いた
+ * 名前が大文字小文字を無視して一致する JPEG（.jpg・.jpeg）がある RAW は、写真に数えない。
+ * 組の JPEG が無い RAW、別フォルダの同名、HEIC・HEIF、PNG・WebP との組は除かない。
+ * PC の `skip_paired_raw`（`src-tauri`）と同じ規則。入力の並びは保つ。`enabled` が false なら何も除かない。
+ */
+export function skipPairedRaw<T extends { subPath: string, name: string }>(files: T[], enabled = true): T[] {
+  if (!enabled) return files
+  const keyOf = (file: T) => {
+    const dot = file.name.lastIndexOf('.')
+    const stem = dot < 0 ? file.name : file.name.slice(0, dot)
+    return `${file.subPath}\u0000${stem.toLowerCase()}`
+  }
+  const jpegKeys = new Set(files
+    .filter(file => ['jpg', 'jpeg'].includes(extensionOf(file.name)))
+    .map(keyOf))
+  return files.filter(file => !(RAW_EXTENSIONS.has(extensionOf(file.name)) && jpegKeys.has(keyOf(file))))
 }

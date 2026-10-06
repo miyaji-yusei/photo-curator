@@ -30,10 +30,18 @@ object Store {
      * 書けなかったことは記録する（黙って落とさない）。
      */
     suspend fun save(context: Context, projectId: String, session: Session) {
+        queue(context, projectId, session).await()
+    }
+
+    /**
+     * 保存を**その場でアプリの列に積む**（待たない）。画面から呼ぶときはこちら（U50・D14）。
+     * 画面の scope で `launch { save() }` すると、すぐ戻ったときに最後の 1 組が消えうる。
+     */
+    fun queue(context: Context, projectId: String, session: Session): kotlinx.coroutines.Deferred<Unit> {
         // **保存はアプリの列で 1 本ずつ。最後に頼んだ状態が必ず残る**（A2）。
         // 確定を連打しても、同じ一時ファイルを奪い合わず、古い状態が新しい状態を戻さない。
         val target = file(context, projectId)
-        Persist.latest("session:$projectId") {
+        return Persist.submit("session:$projectId") {
             try {
                 // 途中で落ちても壊れた JSON を残さないよう、書いてから差し替える。
                 // rename が使えない環境ではコピーで置き換える。
@@ -44,17 +52,27 @@ object Store {
         }
     }
 
-    /** 読み戻す。**形が合わなければ null。** 最初からやり直してもらう。 */
+    /**
+     * 読み戻す。**形が合わなければ null。** 最初からやり直してもらう。
+     * サイドカーの同期は [read] を使う（「無い」と「読めなかった」を分ける）。
+     */
     suspend fun load(context: Context, projectId: String): Session? =
+        (read(context, projectId) as? Stored.Ok)?.value
+
+    /**
+     * 読み戻す。**無ければ Ok(null)、あるのに読めなければ Broken**（D2）。
+     * 読めなかったら、元のファイルを残したまま `session-<id>.broken-<時刻>.json` に写しを残し、
+     * サイドカーの同期に「読めなかった」印を立てる（このあと選別画面が作り直して上書きしても、
+     * 端末の分で NAS を自動で上書きしない）。
+     */
+    suspend fun read(context: Context, projectId: String): Stored<Session?> =
         withContext(Dispatchers.IO) {
-            val target = file(context, projectId)
-            if (!target.exists()) return@withContext null
-            try {
-                sessionFromJson(target.readText())
-            } catch (error: Exception) {
-                Log.w(TAG, "選別の途中を読めなかった: $projectId", error)
-                null
+            val read = file(context, projectId).readStored(null as Session?) { sessionFromJson(it) }
+            if (read is Stored.Broken) {
+                Log.w(TAG, "選別の途中を読めなかった: $projectId（${read.reason}）。控え: ${read.keptAs?.name}")
+                SyncState.markLocalBroken(context, projectId)
             }
+            read
         }
 
     /**
@@ -236,6 +254,45 @@ object Prefs {
             .edit().putInt("display_edge_" + projectId, edge.coerceIn(768, 1920)).apply()
     }
 
+    /**
+     * 「ファイル名が同じ JPEG と RAW を 1 枚の写真として扱う」（U49。PC の `pair_raw_jpeg` と同じ）。
+     * **プロジェクトごと、既定はオン。** 反映は次の走査（「写真を再読み込み」）から。
+     *
+     * 切り替えた時刻（`changedAt`、epoch ミリ秒）も持つ。**0 は「一度も切り替えていない（既定のまま）」。**
+     * NAS のプロジェクトは、サイドカーの `settings.pairRawJpeg` と同期する（U51。新しく切り替えた方を採る。`SidecarSync`）。
+     */
+    data class PairRawSetting(val enabled: Boolean, val changedAt: Long)
+
+    private fun pairRawKey(projectId: String) = "pair_raw_jpeg_$projectId"
+    private fun pairRawAtKey(projectId: String) = "pair_raw_jpeg_at_$projectId"
+
+    fun pairRawSetting(context: Context, projectId: String): PairRawSetting {
+        val preferences = context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+        return PairRawSetting(
+            enabled = preferences.getBoolean(pairRawKey(projectId), true),
+            changedAt = preferences.getLong(pairRawAtKey(projectId), 0L)
+        )
+    }
+
+    fun pairRawJpeg(context: Context, projectId: String): Boolean =
+        pairRawSetting(context, projectId).enabled
+
+    /**
+     * 変える。`at` は切り替えた時刻。サイドカーから取り込むときは**相手の時刻をそのまま**渡す
+     * （ここで今の時刻にすると、取り込んだだけで自分の方が新しく見える）。
+     */
+    fun setPairRawJpeg(
+        context: Context,
+        projectId: String,
+        enabled: Boolean,
+        at: Long = System.currentTimeMillis()
+    ) {
+        context.getSharedPreferences(FILE, Context.MODE_PRIVATE).edit()
+            .putBoolean(pairRawKey(projectId), enabled)
+            .putLong(pairRawAtKey(projectId), at)
+            .apply()
+    }
+
     /** 表示用画像の大きさの選択肢。**画面ごとに書き直さない。** */
     val EDGES = listOf(768, 1024, 1280, 1536, 1920)
 
@@ -323,7 +380,9 @@ object Prefs {
     /** プロジェクトを消すときに、そのプロジェクトだけの設定を片付ける。 */
     fun forgetProject(context: Context, projectId: String) {
         context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
-            .edit().remove("display_edge_" + projectId).apply()
+            .edit().remove("display_edge_" + projectId)
+            .remove(pairRawKey(projectId)).remove(pairRawAtKey(projectId))
+            .apply()
     }
 }
 
@@ -339,12 +398,15 @@ object Overrides {
     internal fun file(context: Context, projectId: String) =
         File(context.filesDir, "overrides-$projectId.json")
 
+    // 読めないものは無かったことにする。**中途半端に読まない。**（同期は [read] で区別する）
     suspend fun load(context: Context, projectId: String): List<PairOverride> =
+        (read(context, projectId) as? Stored.Ok)?.value ?: emptyList()
+
+    /** 無ければ Ok(空)、あるのに読めなければ Broken（写しを残し、同期に印を立てる。[Store.read] と同じ）。 */
+    suspend fun read(context: Context, projectId: String): Stored<List<PairOverride>> =
         withContext(Dispatchers.IO) {
-            val target = file(context, projectId)
-            if (!target.exists()) return@withContext emptyList()
-            try {
-                val array = org.json.JSONArray(target.readText())
+            val read = file(context, projectId).readStored(emptyList<PairOverride>()) { text ->
+                val array = org.json.JSONArray(text)
                 (0 until array.length()).map { at ->
                     val entry = array.getJSONObject(at)
                     PairOverride(
@@ -353,11 +415,12 @@ object Overrides {
                         decision = entry.getString("d")
                     )
                 }
-            } catch (error: Exception) {
-                // 読めないものは無かったことにする。**中途半端に読まない。**
-                Log.w(TAG, "手直しを読めなかった: $projectId", error)
-                emptyList()
             }
+            if (read is Stored.Broken) {
+                Log.w(TAG, "手直しを読めなかった: $projectId（${read.reason}）。控え: ${read.keptAs?.name}")
+                SyncState.markLocalBroken(context, projectId)
+            }
+            read
         }
 
     /** 手直しを全部消す。**やり直しのときだけ。** */
@@ -366,7 +429,11 @@ object Overrides {
     }
 
     suspend fun save(context: Context, projectId: String, list: List<PairOverride>) =
-        Persist.latest("overrides:$projectId") {
+        queue(context, projectId, list).await()
+
+    /** その場でアプリの列に積む（待たない）。画面から呼ぶときはこちら（U50・D14。[Store.queue] と同じ）。 */
+    fun queue(context: Context, projectId: String, list: List<PairOverride>): kotlinx.coroutines.Deferred<Unit> =
+        Persist.submit("overrides:$projectId") {
             try {
                 val array = org.json.JSONArray()
                 for (item in list) {
@@ -619,20 +686,30 @@ object SyncState {
                     store.getString("$projectId-seenKey", "") ?: "",
                     store.getString("$projectId-seenEpoch", null)
                 ),
-                detached = store.getBoolean("$projectId-detached", false)
+                detached = store.getBoolean("$projectId-detached", false),
+                localBroken = store.getBoolean("$projectId-localBroken", false)
             )
         }
+        val broken = store.getBoolean("$projectId-localBroken", false)
         // 古い控えからの移し替え。seenAt/seenBy は core の legacy の token と同じ形にする。
         // dirty=true なら比較キーを空にして「変更あり」、false なら今の端末の比較キーで埋める。
         val seenAt = store.getLong("$projectId-seenAt", -1L)
-        if (seenAt < 0) return SeenState(uniffi.photo_curator_core.SeenRecord("", "", null), detached = false)
+        if (seenAt < 0) {
+            return SeenState(uniffi.photo_curator_core.SeenRecord("", "", null), detached = false, localBroken = broken)
+        }
         val seenBy = store.getString("$projectId-seenBy", "") ?: ""
         val dirty = store.getBoolean("$projectId-dirty", false)
         return SeenState(
             uniffi.photo_curator_core.SeenRecord("legacy:$seenAt:$seenBy", "", null),
             detached = false,
-            keyFromLocal = !dirty
+            keyFromLocal = !dirty,
+            localBroken = broken
         )
+    }
+
+    /** 端末の選別状況のファイルを読めなかった（D2）。次に控えを保存するまで、自動で上書きしない。 */
+    fun markLocalBroken(context: Context, projectId: String) {
+        prefs(context).edit().putBoolean("$projectId-localBroken", true).commit()
     }
 
     fun save(context: Context, projectId: String, state: SeenState) {
@@ -641,6 +718,7 @@ object SyncState {
             .putString("$projectId-seenKey", state.seen.key)
             .putString("$projectId-seenEpoch", state.seen.epoch)
             .putBoolean("$projectId-detached", state.detached)
+            .putBoolean("$projectId-localBroken", state.localBroken)
             // 古い控えは移したので消す（残すと、消したあとの移し替えで古い版に戻る）。
             .remove("$projectId-seenAt")
             .remove("$projectId-seenBy")

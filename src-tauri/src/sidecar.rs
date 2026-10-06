@@ -268,41 +268,87 @@ pub fn write(folder: &Path, file_name: &str, json: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 取ったロック。手放すとき（drop）にファイルを消す。
+/// 取ったロック。手放すとき（drop）に、**まだ自分が書いた中身のときだけ**ファイルを消す（U52 D5。
+/// ほかの端末が古いと見なして取り直していたら、そのロックは残す。Android の U44 と同じ）。
 struct LockGuard {
     path: PathBuf,
+    body: Vec<u8>,
 }
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        if fs::read(&self.path).is_ok_and(|current| current == self.body) {
+            let _ = fs::remove_file(&self.path);
+        }
     }
+}
+
+fn now_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or(0)
 }
 
 fn try_create_lock(path: &Path, holder: &str) -> std::io::Result<LockGuard> {
     let mut file = fs::OpenOptions::new().write(true).create_new(true).open(path)?;
-    let at = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|value| value.as_millis())
-        .unwrap_or(0);
-    // 中身は人が見て分かるためだけ（判定には更新時刻だけを使う）。
-    let _ = write!(file, "{{\"holder\":{},\"at\":{at}}}", serde_json::Value::String(holder.to_string()));
-    Ok(LockGuard { path: path.to_path_buf() })
+    // 形は Android と同じ `{"holder","at"}`（at は書いた端末の時計の ms）。nonce は放すときの見分け。
+    let body = format!(
+        "{{\"holder\":{},\"at\":{},\"nonce\":\"{}\"}}",
+        serde_json::Value::String(holder.to_string()),
+        now_millis(),
+        Uuid::new_v4().simple()
+    )
+    .into_bytes();
+    let _ = file.write_all(&body);
+    Ok(LockGuard { path: path.to_path_buf(), body })
 }
 
-/// 排他のロックを取る。あれば、`ttl` より古いものだけ壊して取り直す。取れなければ None。
+/// ロックの中身の `at`（ms）。無い・読めなければ None。
+fn lock_at(body: &[u8]) -> Option<u128> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    value.get("at")?.as_u64().map(u128::from)
+}
+
+/// 古いロックか（U52 D5。Android の U44 と同じ判断）:
+/// - 中身に `at` がある: `at`（書いた端末の時計）と更新時刻（NAS の時計）の**両方**が `ttl` より古い
+/// - 中身が空・読めない（作った直後でまだ書いていない、など）: 更新時刻が古い
+/// - 更新時刻が分からなければ古いと見なさない
+fn lock_stale(path: &Path, body: &[u8], ttl: Duration) -> bool {
+    let Some(age) = fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+    else {
+        return false;
+    };
+    if age <= ttl {
+        return false;
+    }
+    match lock_at(body) {
+        Some(at) => now_millis().saturating_sub(at) > ttl.as_millis(),
+        None => true,
+    }
+}
+
+/// 排他のロックを取る。あれば、古いもの（[`lock_stale`]）だけ壊して取り直す。取れなければ None。
+/// **壊す前にもう一度読み、中身が変わっていれば（ほかの端末が取り直した）壊さない。**
 fn acquire_lock(dir: &Path, holder: &str, ttl: Duration) -> Result<Option<LockGuard>, String> {
     let path = dir.join(LOCK_FILE);
     for _ in 0..2 {
         match try_create_lock(&path, holder) {
             Ok(guard) => return Ok(Some(guard)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let stale = fs::metadata(&path)
-                    .and_then(|meta| meta.modified())
-                    .ok()
-                    .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-                    .is_some_and(|age| age > ttl);
-                if !stale {
+                let first = match fs::read(&path) {
+                    Ok(body) => body,
+                    // 読む前に消えた → 取り直す。
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(_) => return Ok(None),
+                };
+                if !lock_stale(&path, &first, ttl) {
+                    return Ok(None);
+                }
+                if !fs::read(&path).is_ok_and(|again| again == first) {
                     return Ok(None);
                 }
                 // 書いた端末が途中で止まった。壊して取り直す（同時に壊した端末があれば、どちらかが負ける）。
@@ -319,8 +365,22 @@ fn acquire_lock(dir: &Path, holder: &str, ttl: Duration) -> Result<Option<LockGu
 /// ロックを取る → `catalog.json` を読み、`expected`（画面が判断に使った中身。無かったなら None）と
 /// 同じことを確かめる → 一時ファイルに書いて rename → 読み戻して確かめる → ロックを放す。
 /// 見た版と違えば**書かずに** `Changed` を返す（画面が判定し直す）。
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn write_checked(folder: &Path, json: &str, expected: Option<&str>, holder: &str) -> Result<CheckedWrite, String> {
-    write_checked_with(folder, json, expected, holder, LOCK_TTL)
+    write_checked_with(folder, json, expected, holder, LOCK_TTL, None)
+}
+
+/// [`write_checked`] に、置き換える版の退避を足したもの（U52 D4）。`aside_tag` があり、置き換える版が
+/// あれば、**ロックを取って見た版と同じことを確かめたあとで** `catalog.<印>.<時刻>.json` に退避する。
+/// 退避が書けなければ置き換えない（Err）。
+pub fn write_checked_aside(
+    folder: &Path,
+    json: &str,
+    expected: Option<&str>,
+    holder: &str,
+    aside_tag: Option<&str>,
+) -> Result<CheckedWrite, String> {
+    write_checked_with(folder, json, expected, holder, LOCK_TTL, aside_tag)
 }
 
 fn write_checked_with(
@@ -329,22 +389,253 @@ fn write_checked_with(
     expected: Option<&str>,
     holder: &str,
     ttl: Duration,
+    aside_tag: Option<&str>,
+) -> Result<CheckedWrite, String> {
+    write_checked_core(folder, json, expected, holder, ttl, aside_tag, &|folder| read(folder))
+}
+
+/// [`write_checked_with`] の中身。`read_before` は「ロックを取ったあとの確かめ」の読み方（テストで、
+/// Windows の SMB クライアントの「無い」のキャッシュ（D12）を真似るために差し替える）。
+fn write_checked_core(
+    folder: &Path,
+    json: &str,
+    expected: Option<&str>,
+    holder: &str,
+    ttl: Duration,
+    aside_tag: Option<&str>,
+    read_before: &dyn Fn(&Path) -> Result<Option<String>, String>,
 ) -> Result<CheckedWrite, String> {
     let dir = sidecar_dir(folder);
     fs::create_dir_all(&dir).map_err(|error| format!("サイドカーのフォルダを作れませんでした: {error}"))?;
     let Some(_lock) = acquire_lock(&dir, holder, ttl)? else {
         return Ok(CheckedWrite::Locked);
     };
-    let current = read(folder)?;
+    let current = read_before(folder)?;
     if current.as_deref() != expected {
         return Ok(CheckedWrite::Changed);
     }
-    write(folder, SIDECAR_FILE, json)?;
+    if let (Some(tag), Some(replaced)) = (aside_tag, current.as_deref()) {
+        // **退避に失敗したら上書きしない。** 消してしまうより、次に持ち越す。
+        write_aside(folder, tag, replaced)?;
+    }
+    if current.is_none() {
+        // 最初の版を作る（D12）。「無い」と読めても、Windows の SMB クライアントの「無い」のキャッシュで
+        // 実は相手の最初の版がありうる。置き換えを許さずに作り、先にあれば書かずに判定し直す。
+        if !write_new(folder, json, NEGATIVE_CACHE_SETTLE)? {
+            return Ok(CheckedWrite::Changed);
+        }
+    } else {
+        write(folder, SIDECAR_FILE, json)?;
+    }
     // 古い版のアプリはロックを見ない。読み戻して、自分の書いたものが残っているかを確かめる。
     if read(folder)?.as_deref() != Some(json) {
         return Ok(CheckedWrite::Changed);
     }
     Ok(CheckedWrite::Written)
+}
+
+/// Windows の SMB クライアントが「ファイルが無い」を覚えている時間（FileNotFoundCacheLifetime、既定 5 秒）より
+/// 少し長く。ハードリンクを作れない共有で、最初の版を作る前に待つ（D12）。
+const NEGATIVE_CACHE_SETTLE: Duration = Duration::from_secs(6);
+
+/// `catalog.json` が無いときだけ作る（U52 D12）。作れたら true、先にあれば false（何も変えない）。
+///
+/// 一時ファイルに書いてから**ハードリンク**で名前を付ける。ハードリンクは同じ名前があればサーバーが断るので、
+/// クライアントの「無い」のキャッシュに騙されても、相手の版を置き換えない（`fs::rename` は Windows では
+/// 置き換えを許す）。ハードリンクを作れない共有（FAT 系など）では、キャッシュが切れるまで待って読み直し、
+/// まだ無ければ置き換えを許す移動で仕上げる（このときは確証が無い。実機で確かめる必要がある）。
+fn write_new(folder: &Path, json: &str, settle: Duration) -> Result<bool, String> {
+    let dir = sidecar_dir(folder);
+    let temp = dir.join(format!(".{SIDECAR_FILE}.{}.tmp", Uuid::new_v4().simple()));
+    fs::write(&temp, json.as_bytes()).map_err(|error| {
+        let _ = fs::remove_file(&temp);
+        format!("サイドカーを書けませんでした: {error}")
+    })?;
+    let target = dir.join(SIDECAR_FILE);
+    let result = match fs::hard_link(&temp, &target) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(_) => {
+            std::thread::sleep(settle);
+            match read(folder) {
+                Ok(Some(_)) => Ok(false),
+                Ok(None) => fs::rename(&temp, &target)
+                    .map(|()| true)
+                    .map_err(|error| format!("サイドカーを書けませんでした: {error}")),
+                Err(error) => Err(error),
+            }
+        }
+    };
+    // ハードリンクのあと・失敗したときに一時ファイルを消す（rename したあとは、もう無い）。
+    let _ = fs::remove_file(&temp);
+    result
+}
+
+// ---------------------------------------------------------------------------
+// 退避（U52 D4。名前・数は Android の U44 と同じ）
+// ---------------------------------------------------------------------------
+
+/// NAS の退避を、印ごとにいくつまで残すか（Android の `ASIDE_KEEP` と同じ。CON-3 のため小さく）。
+pub const ASIDE_KEEP: usize = 5;
+/// 端末の中の退避を、プロジェクトごとにいくつまで残すか（Android の `aside/` と同じ）。
+pub const LOCAL_ASIDE_KEEP: usize = 5;
+
+/// 退避の名前に使う端末の印か（画面の `asideTag` が作る: 英数字・`-`・`_`、12 文字まで）。
+fn valid_aside_tag(tag: &str) -> bool {
+    !tag.is_empty() && tag.len() <= 64 && tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// UTC の `yyyyMMddHHmmss`（名前の順が時刻の順になる）。
+fn utc_stamp(at: SystemTime) -> String {
+    let secs = at.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let days = secs.div_euclid(86_400);
+    let rest = secs.rem_euclid(86_400);
+    // 日付（proleptic グレゴリオ暦。Howard Hinnant の civil_from_days）。
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}{month:02}{day:02}{:02}{:02}{:02}",
+        rest / 3600,
+        (rest % 3600) / 60,
+        rest % 60
+    )
+}
+
+/// 退避の名前（`catalog.<印>.<UTC yyyyMMddHHmmss>.json`、`n` が 2 以上なら `-n`）。
+pub fn aside_name(tag: &str, stamp: &str, n: u32) -> String {
+    if n > 1 {
+        format!("catalog.{tag}.{stamp}-{n}.json")
+    } else {
+        format!("catalog.{tag}.{stamp}.json")
+    }
+}
+
+/// その印の時刻つきの退避なら（時刻, 通し番号）。時刻の無い古い名前は None。
+fn parse_aside(name: &str, tag: &str) -> Option<(String, u32)> {
+    let rest = name.strip_prefix("catalog.")?.strip_prefix(tag)?.strip_prefix('.')?.strip_suffix(".json")?;
+    let (stamp, n) = match rest.split_once('-') {
+        Some((stamp, n)) => (stamp, n.parse::<u32>().ok()?),
+        None => (rest, 1),
+    };
+    (stamp.len() == 14 && stamp.chars().all(|c| c.is_ascii_digit())).then(|| (stamp.to_string(), n))
+}
+
+/// 退避を NAS に書く（いまの時刻で）。返すのは書いた名前。
+pub fn write_aside(folder: &Path, tag: &str, json: &str) -> Result<String, String> {
+    write_aside_at(folder, tag, json, SystemTime::now())
+}
+
+/// 退避を NAS に書く。**無いときだけ作る**（`create_new`。前の退避もほかの端末の退避も上書きしない）。
+/// 同じ秒に重なれば `-2` 以降。書けたら、同じ印の時刻つきの退避を新しい [`ASIDE_KEEP`] 個だけ残す
+/// （片付けの失敗は止めない。時刻の無い古い名前・ほかの印の退避は消さない）。
+pub fn write_aside_at(folder: &Path, tag: &str, json: &str, now: SystemTime) -> Result<String, String> {
+    if !valid_aside_tag(tag) {
+        return Err("退避のファイル名が正しくありません。".to_string());
+    }
+    let dir = sidecar_dir(folder);
+    fs::create_dir_all(&dir).map_err(|error| format!("サイドカーのフォルダを作れませんでした: {error}"))?;
+    let stamp = utc_stamp(now);
+    // 同じ秒の退避より後ろの番号から（片付けで消えた番号を使い直すと、新しい退避が古い扱いで消える）。
+    let first = fs::read_dir(&dir)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .filter_map(|entry| parse_aside(&entry.file_name().to_string_lossy(), tag))
+                .filter(|(found, _)| *found == stamp)
+                .map(|(_, n)| n)
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0)
+        + 1;
+    let mut written = None;
+    for n in first..first + 9 {
+        let name = aside_name(tag, &stamp, n);
+        match fs::OpenOptions::new().write(true).create_new(true).open(dir.join(&name)) {
+            Ok(mut file) => {
+                let result = file.write_all(json.as_bytes()).and_then(|()| file.sync_all());
+                drop(file);
+                if let Err(error) = result {
+                    // 書きかけの退避は残さない（中身の無い退避を、あるものと思わせない）。
+                    let _ = fs::remove_file(dir.join(&name));
+                    return Err(format!("NAS に退避できませんでした: {error}"));
+                }
+                written = Some(name);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("NAS に退避できませんでした: {error}")),
+        }
+    }
+    let Some(name) = written else {
+        return Err("NAS に退避のファイルを作れませんでした（同じ名前がありました）".to_string());
+    };
+    if let Ok(entries) = fs::read_dir(&dir) {
+        let mut ours: Vec<(String, u32, PathBuf)> = entries
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let file = entry.file_name().to_string_lossy().into_owned();
+                parse_aside(&file, tag).map(|(stamp, n)| (stamp, n, entry.path()))
+            })
+            .collect();
+        ours.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+        for (_, _, path) in ours.into_iter().skip(ASIDE_KEEP) {
+            let _ = fs::remove_file(path);
+        }
+    }
+    Ok(name)
+}
+
+/// 端末の中に退避する（`dir` はアプリのデータフォルダの `aside/`）。名前は `<プロジェクト>-<ミリ秒>.json`
+/// （同じ時刻があれば 1 つずらす。前の退避を上書きしない）。プロジェクトごとに最新 [`LOCAL_ASIDE_KEEP`] 個だけ残す。
+pub fn write_local_aside(dir: &Path, project_id: &str, json: &str) -> Result<(), String> {
+    if project_id.is_empty() || !project_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err("プロジェクトの id が正しくありません。".to_string());
+    }
+    fs::create_dir_all(dir).map_err(|error| format!("端末の中に退避できませんでした: {error}"))?;
+    let mut at = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    loop {
+        let path = dir.join(format!("{project_id}-{at}.json"));
+        match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                let result = file.write_all(json.as_bytes()).and_then(|()| file.sync_all());
+                drop(file);
+                if let Err(error) = result {
+                    let _ = fs::remove_file(&path);
+                    return Err(format!("端末の中に退避できませんでした: {error}"));
+                }
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => at += 1,
+            Err(error) => return Err(format!("端末の中に退避できませんでした: {error}")),
+        }
+    }
+    let prefix = format!("{project_id}-");
+    if let Ok(entries) = fs::read_dir(dir) {
+        let mut ours: Vec<(u128, PathBuf)> = entries
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let millis = name.strip_prefix(&prefix)?.strip_suffix(".json")?.parse::<u128>().ok()?;
+                Some((millis, entry.path()))
+            })
+            .collect();
+        ours.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, path) in ours.into_iter().skip(LOCAL_ASIDE_KEEP) {
+            let _ = fs::remove_file(path);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -440,6 +731,109 @@ mod tests {
         names
     }
 
+    fn at_utc(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    /// U52 D4: NAS の退避は Android（U44）と同じ名前で、上書きせず、同じ印の時刻つきは新しい 5 つだけ残す。
+    #[test]
+    fn aside_is_timestamped_never_overwrites_and_keeps_the_newest_five() {
+        let folder = temp_dir("aside-stamp");
+        let dir = folder.join(SIDECAR_DIR);
+        fs::create_dir_all(&dir).unwrap();
+        // 時刻の無い古い名前・ほかの印の退避は消さない。
+        fs::write(dir.join("catalog.abc.json"), "old").unwrap();
+        fs::write(dir.join("catalog.other.20200101000000.json"), "other").unwrap();
+        // 2026-10-03 04:05:06 UTC
+        let base = 1_791_000_306;
+        let first = write_aside_at(&folder, "abc", "v1", at_utc(base)).unwrap();
+        assert_eq!(first, "catalog.abc.20261003040506.json");
+        // 同じ秒なら -2（前の退避を上書きしない）。
+        let second = write_aside_at(&folder, "abc", "v2", at_utc(base)).unwrap();
+        assert_eq!(second, "catalog.abc.20261003040506-2.json");
+        assert_eq!(fs::read_to_string(dir.join(&first)).unwrap(), "v1");
+        // 同じ秒に 7 つ書いても、どれも別の名前で、片付けで消えるのは古い番号から。
+        let mut same: Vec<String> = Vec::new();
+        for index in 0..7 {
+            same.push(write_aside_at(&folder, "burst", &format!("b{index}"), at_utc(base)).unwrap());
+        }
+        let unique: std::collections::HashSet<&String> = same.iter().collect();
+        assert_eq!(unique.len(), 7);
+        assert!(dir.join(same.last().unwrap()).exists(), "いちばん新しい退避は残る");
+        for offset in 1..=5 {
+            write_aside_at(&folder, "abc", "later", at_utc(base + offset)).unwrap();
+        }
+        let ours: Vec<String> = leftovers(&folder)
+            .into_iter()
+            .filter(|name| name.starts_with("catalog.abc.2"))
+            .collect();
+        assert_eq!(ours.len(), 5, "{ours:?}");
+        assert!(!ours.contains(&first) && !ours.contains(&second), "古い 2 つが消える: {ours:?}");
+        assert_eq!(fs::read_to_string(dir.join("catalog.abc.json")).unwrap(), "old");
+        assert!(dir.join("catalog.other.20200101000000.json").exists());
+        // 印に使えない文字は断る。
+        assert!(write_aside_at(&folder, "a/b", "x", at_utc(base)).is_err());
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    /// U52 D4: 置き換える版の退避は、ロックを取って見た版と同じことを確かめた**あと**で書く。
+    #[test]
+    fn checked_write_asides_the_replaced_version_only_after_checking() {
+        let folder = temp_dir("checked-aside");
+        write(&folder, SIDECAR_FILE, "android-v1").unwrap();
+        // 見た版と違う → 書かない。退避も作らない。
+        assert_eq!(
+            write_checked_aside(&folder, "pc", Some("old"), "pc", Some("zzzzzzzz-111")).unwrap(),
+            CheckedWrite::Changed
+        );
+        assert_eq!(leftovers(&folder), vec![SIDECAR_FILE.to_string()]);
+        // 見た版のまま → 退避してから書く。
+        assert_eq!(
+            write_checked_aside(&folder, "pc", Some("android-v1"), "pc", Some("zzzzzzzz-111")).unwrap(),
+            CheckedWrite::Written
+        );
+        let names = leftovers(&folder);
+        let aside: Vec<&String> = names.iter().filter(|name| name.starts_with("catalog.zzzzzzzz-111.")).collect();
+        assert_eq!(aside.len(), 1, "{names:?}");
+        assert_eq!(fs::read_to_string(folder.join(SIDECAR_DIR).join(aside[0])).unwrap(), "android-v1");
+        assert_eq!(read(&folder).unwrap().as_deref(), Some("pc"));
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    /// U52 D4: 退避を書けなければ、置き換えない。
+    #[test]
+    fn checked_write_does_not_replace_when_the_aside_cannot_be_written() {
+        let folder = temp_dir("checked-aside-fail");
+        write(&folder, SIDECAR_FILE, "android-v1").unwrap();
+        // 印が正しくない（退避の名前を作れない）→ 書かない。
+        assert!(write_checked_aside(&folder, "pc", Some("android-v1"), "pc", Some("bad/tag")).is_err());
+        assert_eq!(read(&folder).unwrap().as_deref(), Some("android-v1"));
+        assert!(!lock_path(&folder).exists());
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    /// U52 D4: 端末の中の退避（アプリのデータフォルダの `aside/`）。プロジェクトごとに最新 5 つ。
+    #[test]
+    fn local_aside_keeps_the_newest_five_per_project() {
+        let dir = temp_dir("local-aside").join("aside");
+        for index in 0..7 {
+            write_local_aside(&dir, "p1", &format!("v{index}")).unwrap();
+        }
+        write_local_aside(&dir, "p2", "other").unwrap();
+        let mut mine: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("p1-"))
+            .collect();
+        mine.sort();
+        assert_eq!(mine.len(), 5, "{mine:?}");
+        let contents: Vec<String> = mine.iter().map(|name| fs::read_to_string(dir.join(name)).unwrap()).collect();
+        assert_eq!(contents, vec!["v2", "v3", "v4", "v5", "v6"]);
+        assert!(fs::read_dir(&dir).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with("p2-")));
+        // プロジェクトの id に使えない文字は断る。
+        assert!(write_local_aside(&dir, "../x", "x").is_err());
+    }
+
     #[test]
     fn checked_write_creates_replaces_and_releases_the_lock() {
         let folder = temp_dir("checked");
@@ -478,6 +872,97 @@ mod tests {
         fs::File::options().write(true).open(lock_path(&folder)).unwrap().set_modified(old).unwrap();
         assert_eq!(write_checked(&folder, "v2", Some("v1"), "pc").unwrap(), CheckedWrite::Written);
         assert_eq!(read(&folder).unwrap().as_deref(), Some("v2"));
+        assert!(!lock_path(&folder).exists());
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    /// U52 D12: 「無い」と読んだ（Windows の SMB クライアントの「無い」のキャッシュで、実は相手の最初の版が
+    /// ある）ときは、置き換えを許さずに作る。先にあれば書かずに Changed（相手の版を消さない）。
+    #[test]
+    fn creating_the_first_catalog_never_replaces_one_that_appeared_meanwhile() {
+        let folder = temp_dir("first-create");
+        write(&folder, SIDECAR_FILE, "android-first").unwrap();
+        // ロックを取ったあとの確かめが「無い」と読んだ（キャッシュ）。
+        let stale_read = |_: &Path| -> Result<Option<String>, String> { Ok(None) };
+        let result = write_checked_core(&folder, "pc-first", None, "pc", LOCK_TTL, None, &stale_read).unwrap();
+        assert_eq!(result, CheckedWrite::Changed);
+        assert_eq!(read(&folder).unwrap().as_deref(), Some("android-first"));
+        assert_eq!(leftovers(&folder), vec![SIDECAR_FILE.to_string()], "一時ファイルもロックも残さない");
+        // 本当に無ければ作れる。
+        let empty = temp_dir("first-create-empty");
+        assert_eq!(write_checked(&empty, "pc-first", None, "pc").unwrap(), CheckedWrite::Written);
+        assert_eq!(read(&empty).unwrap().as_deref(), Some("pc-first"));
+        assert_eq!(leftovers(&empty), vec![SIDECAR_FILE.to_string()]);
+        let _ = fs::remove_dir_all(&folder);
+        let _ = fs::remove_dir_all(&empty);
+    }
+
+    fn now_ms() -> u128 {
+        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis()
+    }
+
+    fn age_lock(folder: &Path, secs: u64) {
+        let old = SystemTime::now() - Duration::from_secs(secs);
+        fs::File::options().write(true).open(lock_path(folder)).unwrap().set_modified(old).unwrap();
+    }
+
+    /// U52 D5（Android の U44 と同じ判断）: 中身の `at` が新しければ、更新時刻が古くても壊さない
+    /// （NAS の時計と PC の時計がずれていても、生きているロックを壊さない）。
+    #[test]
+    fn lock_with_a_fresh_at_is_not_broken_even_if_its_modified_time_is_old() {
+        let folder = temp_dir("lock-fresh-at");
+        write(&folder, SIDECAR_FILE, "v1").unwrap();
+        fs::write(lock_path(&folder), format!("{{\"holder\":\"android\",\"at\":{}}}", now_ms())).unwrap();
+        age_lock(&folder, 120);
+        assert_eq!(write_checked(&folder, "v2", Some("v1"), "pc").unwrap(), CheckedWrite::Locked);
+        assert_eq!(read(&folder).unwrap().as_deref(), Some("v1"));
+        assert!(lock_path(&folder).exists());
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    /// U52 D5: `at` と更新時刻の両方が古ければ壊す。`at` が古くても更新時刻が新しければ壊さない。
+    #[test]
+    fn lock_is_broken_only_when_both_at_and_modified_time_are_old() {
+        let folder = temp_dir("lock-both-old");
+        write(&folder, SIDECAR_FILE, "v1").unwrap();
+        let old_at = now_ms() - 120_000;
+        fs::write(lock_path(&folder), format!("{{\"holder\":\"android\",\"at\":{old_at}}}")).unwrap();
+        assert_eq!(write_checked(&folder, "v2", Some("v1"), "pc").unwrap(), CheckedWrite::Locked);
+        age_lock(&folder, 120);
+        assert_eq!(write_checked(&folder, "v2", Some("v1"), "pc").unwrap(), CheckedWrite::Written);
+        assert!(!lock_path(&folder).exists());
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    /// U52 D5: 中身が空（作った直後でまだ書いていない）なら、更新時刻が古いときだけ壊す。
+    #[test]
+    fn empty_lock_is_broken_only_when_its_modified_time_is_old() {
+        let folder = temp_dir("lock-empty");
+        write(&folder, SIDECAR_FILE, "v1").unwrap();
+        fs::write(lock_path(&folder), "").unwrap();
+        assert_eq!(write_checked(&folder, "v2", Some("v1"), "pc").unwrap(), CheckedWrite::Locked);
+        age_lock(&folder, 120);
+        assert_eq!(write_checked(&folder, "v2", Some("v1"), "pc").unwrap(), CheckedWrite::Written);
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    /// U52 D5: 放すのは自分が書いた中身のときだけ（ほかの端末が古いと見なして取り直したロックは残す）。
+    #[test]
+    fn releasing_leaves_a_lock_that_someone_else_took_over() {
+        let folder = temp_dir("lock-release");
+        let dir = folder.join(SIDECAR_DIR);
+        fs::create_dir_all(&dir).unwrap();
+        let guard = acquire_lock(&dir, "pc", LOCK_TTL).unwrap().expect("取れる");
+        let mine = fs::read_to_string(lock_path(&folder)).unwrap();
+        assert!(mine.contains("\"holder\":\"pc\"") && mine.contains("\"at\":"), "{mine}");
+        // ほかの端末が取り直した。
+        fs::write(lock_path(&folder), "{\"holder\":\"android\",\"at\":1}").unwrap();
+        drop(guard);
+        assert_eq!(fs::read_to_string(lock_path(&folder)).unwrap(), "{\"holder\":\"android\",\"at\":1}");
+        // 自分のロックなら放す。
+        fs::remove_file(lock_path(&folder)).unwrap();
+        let guard = acquire_lock(&dir, "pc", LOCK_TTL).unwrap().expect("取れる");
+        drop(guard);
         assert!(!lock_path(&folder).exists());
         let _ = fs::remove_dir_all(&folder);
     }

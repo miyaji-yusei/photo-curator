@@ -45,8 +45,15 @@ fun ClearIcon(value: String, onClear: () -> Unit) {
  */
 enum class Preview { Ready, Generating, Queued, Failed, Unsupported }
 
-/** 端末も NAS も読めない形式。**拡張子で分かるものだけを言う。** */
-private val UNREADABLE = setOf("arw", "cr2", "cr3", "nef", "orf", "raf", "rw2", "dng", "tif", "tiff")
+/**
+ * 端末も NAS も読めない形式。**拡張子で分かるものだけを言う。**
+ * RAW は U49 から中のプレビュー JPEG を取り出して出すので、ここには入れない
+ * （取り出せなかったときは、読み込みの失敗として「RAW（表示できません）」を出す）。
+ */
+private val UNREADABLE = setOf("tif", "tiff")
+
+/** RAW のプレビューを取り出せなかったときの 1 語（U49）。 */
+const val RAW_UNREADABLE = "RAW（表示できません）"
 
 fun unsupportedFormat(name: String): String? {
     val extension = name.substringAfterLast('.', "").lowercase()
@@ -69,12 +76,14 @@ fun unsupportedFormat(photo: Photo): String? =
  * `Ready` では何も描かない。読み込みが終われば写真がこの上に載る。
  */
 @Composable
-fun EmptyTile(state: Preview, format: String? = null) {
+fun EmptyTile(state: Preview, format: String? = null, raw: Boolean = false) {
     if (state == Preview.Ready) return
     val (icon, label, tint) = when (state) {
         Preview.Generating -> Triple(Icons.Filled.Sync, "作成中", Sky)
         Preview.Queued -> Triple(Icons.Filled.Schedule, "待機", Faint)
-        Preview.Failed -> Triple(Icons.Filled.BrokenImage, "読めません", Warn)
+        // U49: RAW の中にプレビューが見つからなかった。**選別・星は付けられる。**
+        Preview.Failed -> if (raw) Triple(Icons.Filled.Block, RAW_UNREADABLE, Faint)
+        else Triple(Icons.Filled.BrokenImage, "読めません", Warn)
         else -> Triple(Icons.Filled.Block, "${format ?: "この形式"} 非対応", Faint)
     }
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {

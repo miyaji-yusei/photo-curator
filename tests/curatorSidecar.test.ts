@@ -109,3 +109,129 @@ describe('U34: サイドカーを書く・確かめるタイミング', () => {
     expect(calls.resetSelectionResults).toBeUndefined()
   })
 })
+
+describe('U48: プロジェクトの設定（同名の JPEG と RAW）をサイドカーで同期する', () => {
+  /** sidecarDesktop に、プロジェクトの設定（値と切り替えた時刻）を持たせる。 */
+  function withPair(count: number) {
+    const fake = sidecarDesktop(count)
+    const pair = { value: true, at: 0 }
+    const desktop = new Proxy(fake.desktop, {
+      get(target, key: string) {
+        if (key === 'listProjects') {
+          return async () => [project('P', { photoCount: count, pairRawJpeg: pair.value, pairRawJpegAt: pair.at })]
+        }
+        if (key === 'saveProjectPairRaw') {
+          return async (_id: string, enabled: boolean, at?: number) => {
+            pair.value = enabled
+            pair.at = at ?? Date.now()
+            return enabled
+          }
+        }
+        return Reflect.get(target, key)
+      }
+    })
+    return { ...fake, desktop, pair }
+  }
+
+  it('画面で切り替えたら、選別していなくても設定をサイドカーに書く（区切りの自動の書き込み）', async () => {
+    const { createCurator } = await loadCuratorModule()
+    const { desktop, nas, pair } = withPair(2)
+    const curator = createCurator(desktop)
+    await curator.openProject(project('P', { photoCount: 2 }))
+    expect(nas.has('catalog.json')).toBe(false)
+    await curator.setPairRawJpeg(false)
+    for (let index = 0; index < 5; index++) await settle()
+    expect(pair.value).toBe(false)
+    expect(pair.at).toBeGreaterThan(0)
+    const written = core.sidecarFromJson(nas.get('catalog.json')!)
+    expect(written?.settings?.pairRawJpeg).toEqual({ value: false, at: pair.at })
+    expect(curator.activeProject.value?.pairRawJpeg).toBe(false)
+  })
+
+  it('開いたとき、ほかの端末で新しく切り替えた設定を取り込み、再読み込みを促す（自動では走査しない）', async () => {
+    const { createCurator } = await loadCuratorModule()
+    const { desktop, nas, pair, calls } = withPair(2)
+    nas.set('catalog.json', core.sidecarToJson({
+      version: 2, updatedAt: 5, updatedBy: ANDROID, updatedByName: 'Pixel', writeId: 'w-a1', keyBase: 'folder',
+      photos: {}, burstOverrides: [], sessions: {}, settings: { pairRawJpeg: { value: false, at: 1_790_955_613_101 } }
+    }))
+    const curator = createCurator(desktop)
+    await curator.openProject(project('P', { photoCount: 2 }))
+    for (let index = 0; index < 5; index++) await settle()
+    expect(pair).toEqual({ value: false, at: 1_790_955_613_101 })
+    expect(curator.activeProject.value?.pairRawJpeg).toBe(false)
+    expect(curator.sidecarNotice.value).toContain('「同名の JPEG と RAW を 1 枚として扱う」をオフにしました')
+    expect(curator.sidecarNotice.value).toContain('「写真を再読み込み」を押してください')
+    expect(calls.startProjectScan).toBeUndefined()
+    expect(curator.sidecarClash.value).toBeNull()
+  })
+})
+
+describe('U52 D10: セッションに無い写真の星の一括移動も、選別状況（比較キー）に映る', () => {
+  /** 写真 3 枚。セッションは IMG_0・IMG_1 だけで始めて終えた（IMG_2 はあとから増えた写真）。 */
+  async function outsideSession() {
+    const fake = sidecarDesktop(3)
+    const { all } = fake
+    const threshold = { window_ms: 4000, distance: 9, d_hash_version: 2 }
+    const refs = all.slice(0, 2).map(photo => ({
+      relative_path: photo.relativePath, captured_at: photo.capturedAt, d_hash: null, d_hash_version: 2
+    }))
+    const finished = core.advance(core.startRound(refs, 2, 0, false, threshold, []), ['IMG_0.JPG'])
+    expect(finished.finished).toBe(true)
+    all[0]!.rating = 1
+    await fake.desktop.saveSession('P', {
+      v: 2, core: finished, stage: 'result', settings: { groupSize: 2, groupBursts: false },
+      multiSelect: false, selectedInGroup: [], learning: null, burstDistance: null, updatedAt: 1
+    } as SavedSelection)
+    const desktop = new Proxy(fake.desktop, {
+      get(target, key: string) {
+        if (key === 'moveRating') {
+          return async (_id: string, from: number, to: number, include: string[] | null, exclude: string[]) => {
+            let moved = 0
+            for (const photo of all) {
+              const chosen = include ? include.includes(photo.id) : !exclude.includes(photo.id)
+              if (photo.rating === from && chosen) {
+                photo.rating = to
+                moved += 1
+              }
+            }
+            return moved
+          }
+        }
+        return Reflect.get(target, key)
+      }
+    })
+    return { ...fake, desktop }
+  }
+
+  it('全部を選んで ★0 → ★1: セッションに無い IMG_2 もセッションの星に入る', async () => {
+    const { createCurator } = await loadCuratorModule()
+    const { desktop, all } = await outsideSession()
+    const curator = createCurator(desktop)
+    await curator.openProject(project('P', { photoCount: 3 }))
+    expect(curator.session.value?.core.ratings).not.toHaveProperty('IMG_2.JPG')
+    curator.openMoveDialog(0)
+    curator.moveTo.value = 1
+    await curator.runMove()
+    expect(all.map(photo => photo.rating)).toEqual([1, 1, 1])
+    expect(curator.session.value?.core.ratings).toMatchObject({ 'IMG_0.JPG': 1, 'IMG_1.JPG': 1, 'IMG_2.JPG': 1 })
+    // 比較キーに映る（サイドカーの正規形の星に IMG_2 が入る）。
+    const sidecar = { version: 2, updatedAt: 1, updatedBy: 'x', updatedByName: 'x', photos: {}, burstOverrides: [],
+      sessions: { tournament: curator.session.value!.core } }
+    expect(JSON.stringify(core.sidecarJudgement(sidecar as never))).toContain('IMG_2.JPG')
+  })
+
+  it('選んだ写真だけ ★0 → ★2: セッションに無い IMG_2 を選べば、セッションの星に入る', async () => {
+    const { createCurator } = await loadCuratorModule()
+    const { desktop, all } = await outsideSession()
+    const curator = createCurator(desktop)
+    await curator.openProject(project('P', { photoCount: 3 }))
+    curator.openMoveDialog(0)
+    curator.moveTo.value = 2
+    curator.setMoveSelectAll(false)
+    curator.toggleMoveSelection('P-2')
+    await curator.runMove()
+    expect(all.map(photo => photo.rating)).toEqual([1, 0, 2])
+    expect(curator.session.value?.core.ratings).toMatchObject({ 'IMG_0.JPG': 1, 'IMG_1.JPG': 0, 'IMG_2.JPG': 2 })
+  })
+})

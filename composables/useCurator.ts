@@ -1,49 +1,39 @@
 import type {
-  AmazonPreview, BurstGroup, ExportReport, Photo, PhotoSort, Project, ProjectProgress,
-  SelectionResult, SelectionSummary, TournamentSettings
+  BurstGroup, Photo, Project, ProjectProgress,
+  SelectionResult, TournamentSettings
 } from '~/types/photo'
 import { MAX_RATING } from '~/types/photo'
-import type { DisplaySettings, PhotoBackend } from '~/composables/photoBackend'
-import { previewRefreshPlan, withNewThumbnails } from '~/utils/previewRefresh'
-import { builtDisplayCount, displayEdgePlan } from '~/utils/displayEdge'
-import type { MoveSelection } from '~/utils/ratingMove'
-// `selectedCount` は選別画面側の computed と名前がぶつかるので別名にする。
-import {
-  createMoveSelection, isSelected as isMovePicked, selectedCount as countMoveSelection,
-  setSelectAll, toMoveArgs, toggleSelection
-} from '~/utils/ratingMove'
+import type { PhotoBackend } from '~/composables/photoBackend'
 import * as core from '~/lib/core'
 import type { BurstThreshold, PairOverride, PhotoRef, Session } from '~/lib/core'
-import {
-  blocksFromCuts, cutAll, cutAroundSelection, cutsFromGroups, moveCut, toggleAt
-} from '~/utils/burstEdit'
 import { buildBurstQuestions } from '~/utils/burstQuestions'
-import { burstNeighborhood } from '~/utils/burstNeighborhood'
-import { joinSpanOverrides, overridesFromShape } from '~/utils/burstShape'
+import { joinSpanOverrides } from '~/utils/burstShape'
 import { createSaveQueue } from '~/utils/saveQueue'
 import { createSerialQueue } from '~/utils/serialQueue'
 import {
   BURST_WINDOW_MS, D_HASH_VERSION, DEFAULT_BURST_DISTANCE,
-  buildCoreInputs, maxNeighborDistance, toPhotoRef
+  buildCoreInputs, maxNeighborDistance
 } from '~/utils/coreInputs'
 import type { CoreInputs } from '~/utils/coreInputs'
-import { applyChanges, moveRatings, pathsWithRating, reviewChanges, setRating } from '~/utils/ratingEdit'
+import { applyChanges } from '~/utils/ratingEdit'
 import { healRatings, syncRatings } from '~/utils/selectionFlow'
-import { collapseBursts } from '~/utils/collapseBursts'
 import { prepareProgress, projectStatus } from '~/utils/projectStatus'
 import type { CardState, CardStatus, PrepareLine } from '~/utils/projectStatus'
-import { exportTargetsForStars } from '~/utils/exportTargets'
-import { resultsCsv } from '~/utils/amazonCsv'
 import type { RatingChange, SavedSelection } from '~/utils/selectionFlow'
 import { SLIDESHOW_GROUP_SIZE, clampGroupSize, groupSizeLimits, isSlideshowSize, tournamentGroupSize } from '~/utils/groupSize'
-import {
-  SHARE_FILE_LIMIT, downloadBlob, shareFiles, zipEntriesByRating
-} from '~/utils/shareExport'
-import { createStoredZip } from '~/utils/zip'
 import { registerAutoPush, useSidecarSync } from '~/composables/useSidecarSync'
-import type { ClashChoice } from '~/composables/useSidecarSync'
-
-type View = 'home' | 'project' | 'method' | 'settings' | 'app-settings' | 'burst-threshold' | 'burst-preview' | 'tournament' | 'result' | 'results' | 'burst-review'
+import type { View } from '~/composables/curator/types'
+import { useExport } from '~/composables/curator/useExport'
+import { useResults } from '~/composables/curator/useResults'
+import { useMove } from '~/composables/curator/useMove'
+import { useDisplayImages } from '~/composables/curator/useDisplayImages'
+import { useZoom } from '~/composables/curator/useZoom'
+import { useProjectCreate } from '~/composables/curator/useProjectCreate'
+import { useBurstReview } from '~/composables/curator/useBurstReview'
+import { useBurstEdit } from '~/composables/curator/useBurstEdit'
+import { usePreviewGrid } from '~/composables/curator/usePreviewGrid'
+import { useSidecarActions } from '~/composables/curator/useSidecarActions'
+import { useKeyboard } from '~/composables/curator/useKeyboard'
 
 /**
  * 行の星を**読む・消す・動かす**メソッド。選別の 1 タップは行の星の書き込みを待たずに次の組を出す（W1）ので、
@@ -93,7 +83,16 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   const desktop = withRatingsBarrier(backend, () => ratingsQueue.flush())
   const { notify } = useNotice()
   // サイドカー（写真のフォルダの `.photo-curator/catalog.json`）。開き方の判断は core の sidecarPlan が行う。
-  const sidecar = useSidecarSync(desktop)
+  // ほかの端末で切り替えた「同名の JPEG と RAW を 1 枚として扱う」を取り込んだら（U48）、画面のプロジェクトを
+  // 読み直す（お知らせは useSidecarSync が出す。写真への反映は「写真を再読み込み」で、自動では走査しない）。
+  const sidecar = useSidecarSync(desktop, {
+    onSettingsAdopted: async (projectId) => {
+      await refreshProjects()
+      if (activeProject.value?.id === projectId) {
+        activeProject.value = projects.value.find(item => item.id === projectId) ?? activeProject.value
+      }
+    }
+  })
   const {
     access: sidecarAccess, clash: sidecarClash, busy: sidecarBusy,
     message: sidecarMessage, notice: sidecarNotice, detached: sidecarDetached, savedAt: sidecarSavedAt
@@ -108,8 +107,8 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   /** 開いているプロジェクトの、まだ解析が要る枚数（準備の進み）。 */
   const analysisBacklog = ref(0)
   const activeProject = ref<Project | null>(null)
-  const previewPhotos = shallowRef<Photo[]>([])
-  const previewTotal = ref(0)
+  // プロジェクトの画面の格子（`composables/curator/usePreviewGrid.ts`）
+  const { previewPhotos, previewTotal, loadPreview, refreshPreviewThumbnails, loadMorePreview } = usePreviewGrid(desktop, activeProject)
   const tournamentPhotos = ref<Photo[]>([])
   /**
    * 選別の途中（封筒）。`core` が core の Session そのもの。
@@ -143,43 +142,19 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     const project = activeProject.value
     return project && project.id !== deletingProjectId ? project : null
   }
-  const createDialog = ref(false)
-  /** 作成ダイアログのタブ。Amazon は `capabilities.amazon` が true のときだけ選べる。 */
-  const createTab = ref<'folder' | 'amazon'>('folder')
-  const amazonUrl = ref('')
-  const amazonPreview = ref<AmazonPreview | null>(null)
-  const amazonLoading = ref(false)
-  const amazonError = ref('')
-  const projectName = ref('')
-  const folderPath = ref('')
-  /** (開発用) フォルダの絶対パス。`pnpm dev` のときだけ作成ダイアログに出す。 */
-  const devFolderPath = ref('')
-  // 開発用の配信（server/api/dev-folder/）は、Nuxt の開発サーバーが動くブラウザ版でだけ使える。
-  // `tauri dev` の画面では使えない（Rust に渡しても読めない）。
-  const isDev = import.meta.dev && desktop.kind === 'local'
   const taskProgress = ref<ProjectProgress | null>(null)
   const taskWarning = ref<string | null>(null)
   const taskDialog = ref(false)
   // 連写解析は前面をブロックしない。ダイアログではなく帯で知らせるだけにする。
   const analysisProgress = ref<ProjectProgress | null>(null)
   const analysisFailures = ref(0)
-  // 選別画面に出す表示用画像の設定。既定は全体、プロジェクトごとに上書きできる。
-  const displaySettings = ref<DisplaySettings | null>(null)
-  /** このプロジェクトで実際に使う長辺。 */
-  const displayEdge = ref(0)
-  const displayBacklog = ref(0)
-  const displayBusy = ref(false)
-  /** 「大きな画像で選別する」= 大きい方の長辺を選んでいるか。 */
-  const largeDisplay = computed({
-    get: () => displayEdge.value >= (displaySettings.value?.largeEdge ?? 1536),
-    set: (on: boolean) => {
-      const settings = displaySettings.value
-      if (settings) void requestDisplayEdge(on ? settings.largeEdge : settings.defaultEdge)
-    }
-  })
-  /** 「表示用画像を作り直します。よろしいですか」の確認。OK までは px を変えない（選択は元のまま）。 */
-  const displayEdgeDialog = ref(false)
-  const pendingDisplayEdge = ref<number | null>(null)
+  // 選別画面に出す表示用画像の設定（`composables/curator/useDisplayImages.ts`）。
+  // 先読みの表は下で作るので、捨てる関数として渡す（呼ばれるのは作ったあと）。
+  const {
+    displaySettings, displayEdge, displayBacklog, displayBusy, largeDisplay, displayEdgeDialog, pendingDisplayEdge,
+    refreshDisplayState, applyDisplayEdge, startDisplayAfterScan, requestDisplayEdge, confirmDisplayEdge,
+    cancelDisplayEdge, regenerateDisplayImages
+  } = useDisplayImages({ desktop, activeProject, error, taskWarning, clearPrefetched: () => prefetched.clear() })
   const pendingTournamentSettings = ref<TournamentSettings | null>(null)
   /**
    * 1 グループの枚数の既定と上限。デスクトップは 10 枚、iPad などブラウザは
@@ -227,11 +202,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   const deleteTarget = ref<Project | null>(null)
   const deleteBusy = ref(false)
 
-  /** 枚数に対する列数。1画面に収まりやすい並びを枚数ごとに決めてある。 */
-  function columnsFor(count: number) {
-    const byCount: Record<number, number> = { 1: 1, 2: 2, 3: 3, 4: 2, 5: 3, 6: 3, 7: 4, 8: 4, 9: 3, 10: 5 }
-    return byCount[count] ?? Math.min(5, Math.max(1, Math.ceil(Math.sqrt(count))))
-  }
   /** 写真を見比べている画面かどうか。余白の詰め方を変える。 */
   const isSelecting = computed(() =>
     view.value === 'tournament' || view.value === 'burst-threshold' || view.value === 'burst-review'
@@ -246,73 +216,11 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   const restartForStart = ref(false)
   watch(restartDialog, open => { if (!open) restartForStart.value = false })
   const restartBusy = ref(false)
-  const resultsPhotos = shallowRef<Photo[]>([])
-  const resultsTotal = ref(0)
-  const resultsOffset = ref(0)
-  const resultsBusy = ref(false)
-  /** null は全件。数値はその星ちょうど。 */
-  const resultsRating = ref<number | null>(null)
-  const resultsSort = ref<PhotoSort>('rating')
-  const selectionSummary = ref<SelectionSummary | null>(null)
-  /** 星が1つでも付いていれば結果を見る意味がある。 */
-  const hasSelectionData = computed(() => {
-    const counts = selectionSummary.value?.counts ?? []
-    return counts.slice(1).some(count => count > 0)
-  })
-  const ratingCount = (rating: number) => selectionSummary.value?.counts[rating] ?? 0
 
-  // レートの移動
-  const moveDialog = ref(false)
-  const moveFrom = ref(0)
-  const moveTo = ref(0)
-  const moveBusy = ref(false)
-  const movePhotos = shallowRef<Photo[]>([])
-  const moveTotal = ref(0)
-  const moveOffset = ref(0)
-  /** ダイアログ内に出すエラー。画面上部に出すとモーダルに隠れて気づけない。 */
-  const moveError = ref('')
-  /**
-   * 既定は「全選択」。個別のチェックは**ここからの差分**だけを持つ。
-   * 5,000 枚の id を並べて持たないための形。詳細は `utils/ratingMove.ts`。
-   */
-  const moveSelection = ref<MoveSelection>(createMoveSelection())
-  const moveSelectedCount = computed(() => countMoveSelection(moveSelection.value, moveTotal.value))
-  const isMoveSelected = (photoId: string) => isMovePicked(moveSelection.value, photoId)
-
-  // 書き出し
-  const exportDialog = ref(false)
-  // Amazon の写真は移動できない（原本は Amazon にある）。開くたびにコピーへ戻す。
-  watch(exportDialog, open => { if (open && isAmazon.value) exportMode.value = 'copy' })
-  const exportMode = ref<'copy' | 'move'>('copy')
-  const exportDestination = ref('')
-  const exportRatings = ref<number[]>([5, 4, 3, 2, 1])
-  const exportBusy = ref(false)
-  const exportResult = ref<ExportReport | null>(null)
-  /** ダイアログ内に出すエラー。画面上部に出すとモーダルに隠れて気づけない。 */
-  const exportError = ref('')
-  const metadataError = ref('')
-  const metadataDialog = ref(false)
-  const metadataRatings = ref<number[]>([5, 4, 3, 2, 1, 0])
-  const metadataBusy = ref(false)
-  const metadataAcknowledged = ref(false)
-  const metadataResult = ref<ExportReport | null>(null)
-
-  // ブラウザからライブラリへ渡す出口（共有シート / 星ごとの ZIP）。
-  //
-  // Shortcuts でアルバムに入れる経路も試したが、写真ライブラリを名前で辿る手立てが
-  // 実機に無く（「写真を検索」に相当するアクションが見当たらず、写真アプリの
-  // 「検索」はファイル名で検索できない）、成立しないので取り下げた。
-  // 星はこのアプリが持ち続け、写真そのものは共有シートか ZIP で渡す。
-  const shareDialog = ref(false)
-  const shareRatings = ref<number[]>([MAX_RATING])
-  const shareBusy = ref(false)
-  const shareError = ref('')
-  const shareMessage = ref('')
-
-  // 拡大表示・まとめの展開
-  const zoomPhoto = ref<Photo | null>(null)
-  /** 拡大中に ← → で辿れる一覧。開いた場所に並んでいた写真をそのまま入れる。 */
-  const zoomList = ref<Photo[]>([])
+  // 拡大表示（`composables/curator/useZoom.ts`）
+  const {
+    zoomPhoto, zoomList, openZoom, zoomSrc, zoomError, zoomLoading, zoomIndex, stepZoom, onZoomKeydown
+  } = useZoom(desktop)
 
   // 一覧の列数。`'auto'` は今までどおり画面幅にまかせる。
   // null ではなく文字列にしてあるのは、mandatory な v-btn-toggle が null を
@@ -330,42 +238,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   const gridClass = (density: GridDensity) => (density === 'auto' ? '' : 'is-fixed')
   const gridStyle = (density: GridDensity) =>
     density === 'auto' ? undefined : { '--grid-columns': String(density) }
-  // まとめの中身を直す画面。
-  //
-  // 状態の中心は **`burstCuts`（隣どうしの境目）** ひとつだけ。まとまりは
-  // `burstPhotos` の並びの上で必ず連続しているので、境目の真偽値の列があれば
-  // 分割・切り離し・結合・全解除がすべて表せる。詳細は `utils/burstEdit.ts`。
-  const burstDialog = ref(false)
-  const burstOwner = ref<Photo | null>(null)
-  /** 撮影順に並んだ1続きの写真。まとめの中身と、近くの写真の両方が入る。 */
-  const burstPhotos = ref<Photo[]>([])
-  const burstCuts = ref<boolean[]>([])
-  /** 開いたときに元のまとめへ入っていた写真。外の写真と見分けるために持つ。 */
-  const burstOriginal = ref<string[]>([])
-  const burstPicked = ref<string[]>([])
-  /** 利用者が明示的に代表へ指名した写真。まとまりを組み直すときに優先する。 */
-  const burstReps = ref<string[]>([])
-  const burstBusy = ref(false)
-
-  // 連写の見直し（選別が終わったあと）。
-  //
-  // 選別中、まとめは代表1枚に畳まれ、仲間には代表と同じ星が配られる。そこまでで
-  // 「まとめ全体の良し悪し」は決まるが、**その中のどれが一番良いか**はまだ決めて
-  // いない。この画面がその1手を引き受ける。
-  //
-  // グループは保存していない。`getBurstGroups` が学習済みの閾値から**そのつど
-  // 引き直す**ので、セッションが終わっても、何度でもここへ戻ってこられる。
-  const burstReviewGroups = ref<BurstGroup[]>([])
-  const burstReviewIndex = ref(0)
-  const burstReviewPhotos = ref<Photo[]>([])
-  const burstReviewKept = ref<string[]>([])
-  const burstReviewBusy = ref(false)
-  const burstReviewLoaded = ref(false)
-  const burstReviewColumns = computed(() => columnsFor(burstReviewPhotos.value.length))
-  const burstReviewRows = computed(() =>
-    Math.max(1, Math.ceil(burstReviewPhotos.value.length / burstReviewColumns.value))
-  )
-
   // ---- core（判断）との橋 --------------------------------------------------
   //
   // 判断は全部 core（wasm）が行う。ここでは core に渡す・返ってきたものを画面と
@@ -538,53 +410,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     if (activeProject.value?.id !== projectId) return
     analysisBacklog.value = analysis
     displayBacklog.value = display
-  }
-
-  const PREVIEW_PAGE = 120
-  let previewMoreBusy = false
-  /** 読み直し（先頭から）の世代。新しい読み直しが始まったら、古い読み直し・続きの応答は捨てる（W7）。 */
-  let previewToken = 0
-  /** 先頭から読み直す。すでにページ送りで読んだ分は、その数まで読み直す（準備の途中の更新でスクロールが戻らないように）。 */
-  async function loadPreview(projectId: string) {
-    const token = ++previewToken
-    const page = await desktop.getProjectPhotoPage(projectId, 0, Math.max(PREVIEW_PAGE, previewPhotos.value.length))
-    if (token !== previewToken) return
-    if (activeProject.value && activeProject.value.id !== projectId) return
-    previewPhotos.value = page.photos
-    previewTotal.value = page.total
-  }
-
-  /**
-   * 準備の途中の更新（W11）。サムネイルがまだ無い行だけを読み直して、その場で置き換える
-   * （全件の読み直しは、準備が終わったときだけ）。読み込み中に一覧が読み直されたら捨てる。
-   */
-  async function refreshPreviewThumbnails(projectId: string) {
-    const plan = previewRefreshPlan(previewPhotos.value, previewTotal.value, PREVIEW_PAGE)
-    if (plan.kind === 'full') return loadPreview(projectId)
-    if (!plan.ids.length) return
-    const token = previewToken
-    const fresh = await desktop.getPhotosByIds(projectId, plan.ids)
-    if (token !== previewToken || activeProject.value?.id !== projectId) return
-    const next = withNewThumbnails(previewPhotos.value, fresh)
-    if (next) previewPhotos.value = next
-  }
-
-  /** 格子の末尾が見えたら次のページ（全部を見られる）。 */
-  async function loadMorePreview() {
-    const project = activeProject.value
-    if (!project || previewMoreBusy || previewPhotos.value.length >= previewTotal.value) return
-    previewMoreBusy = true
-    const token = previewToken
-    try {
-      const page = await desktop.getProjectPhotoPage(project.id, previewPhotos.value.length, PREVIEW_PAGE)
-      if (activeProject.value?.id !== project.id || token !== previewToken) return
-      previewPhotos.value = [...previewPhotos.value, ...page.photos]
-      previewTotal.value = page.total
-    } catch {
-      // 次のスクロールでもう一度読む。
-    } finally {
-      previewMoreBusy = false
-    }
   }
 
   async function loadCurrentPhotos(ids = currentGroup.value) {
@@ -763,68 +588,15 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     }
   }
 
-  /** 開いたときのサイドカーの確認。書く・取り込むは片付け、食い違いだけダイアログを出す。 */
-  async function runSidecarCheck(project: Project) {
-    await core.init()
-    return sidecar.checkOnOpen(project)
-  }
-
-  /**
-   * 選別画面から戻ったとき・選別を始める前の確認（設計書 §4.5）。保存の列を書き終えてから読む。
-   * 取り込んだら画面を読み直して true を返す。
-   */
-  async function syncAtBreak(project: Project): Promise<boolean> {
-    await ratingsQueue.flush()
-    await saveQueue.flush()
-    const outcome = await runSidecarCheck(project)
-    if (outcome?.kind !== 'pulled') return false
-    await reloadAfterSidecar(project.id)
-    return true
-  }
-
-  /** 取り込んだあとに、画面が持っている分を読み直す。 */
-  async function reloadAfterSidecar(projectId: string) {
-    if (activeProject.value?.id !== projectId) return
-    await saveQueue.flush()
-    const value = await desktop.loadSession(projectId)
-    if (value) value.core = markRaw(value.core)
-    session.value = value
-    coreInputs.value = null
-    pairOverrides = []
-    await refreshProjects().catch(() => undefined)
-    activeProject.value = projects.value.find(item => item.id === projectId) ?? activeProject.value
-    await loadPreview(projectId).catch(() => undefined)
-    await loadSummary()
-  }
-
-  /**
-   * 食い違いのダイアログの答え（5 択）。選ぶまで選別は始められない（「この端末の状況を残す」が先へ進む役）。
-   * 端末の選別状況が変わる答え（取り込む・混ぜる）のあとは、画面が持っている分を読み直す。
-   */
-  async function resolveSidecarClash(choice: ClashChoice) {
-    const projectId = sidecarClash.value?.projectId
-    if (!projectId) return
-    await ratingsQueue.flush()
-    await saveQueue.flush()
-    if (await sidecar.resolve(choice)) await reloadAfterSidecar(projectId)
-  }
-
-  /** 「今すぐ保存」。開いたときと同じ判断（取り込んだら読み直す）。 */
-  async function saveSidecarNow() {
-    await ratingsQueue.flush()
-    await saveQueue.flush()
-    const project = activeProject.value
-    if (!project) return
-    const outcome = await sidecar.saveNow(project)
-    if (outcome?.kind === 'pulled') await reloadAfterSidecar(project.id)
-  }
-
-  /** 切り離し中（「この端末の状況を残す」のあと）の「NAS に書き込む」。 */
-  async function writeSidecarToNas() {
-    await ratingsQueue.flush()
-    await saveQueue.flush()
-    if (activeProject.value) await sidecar.writeToNas(activeProject.value)
-  }
+  // ---- サイドカーを呼ぶ側の薄い層（`composables/curator/useSidecarActions.ts`） ----
+  // `loadSummary` は下（useResults）で作るので、呼ぶ関数として渡す（呼ばれるのは作ったあと）。
+  const {
+    runSidecarCheck, syncAtBreak, reloadAfterSidecar, resolveSidecarClash, saveSidecarNow, writeSidecarToNas
+  } = useSidecarActions({
+    desktop, sidecar, sidecarClash, ratingsQueue, saveQueue, projects, activeProject, session, coreInputs,
+    setPairOverrides: (overrides) => { pairOverrides = overrides },
+    refreshProjects, loadPreview, loadSummary: () => loadSummary()
+  })
 
   /** 開く処理の世代。新しい呼び出しが来たら古い呼び出しは、以降の結果を捨てて終わる（W6）。 */
   let openToken = 0
@@ -913,15 +685,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     }
   }
 
-  async function chooseFolder() {
-    try {
-      const selected = await desktop.chooseFolder()
-      if (selected) folderPath.value = selected
-    } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : 'フォルダを選択できませんでした。'
-    }
-  }
-
   /**
    * 写真ライブラリから取り込める環境か。ブラウザはフォルダを走査できないので、
    * 代わりに写真ピッカーから受け取る。
@@ -968,146 +731,32 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     }
   }
 
-  /** リンクを読み込み、名前・枚数・見本を出す。 */
-  async function loadAmazonPreview() {
-    const url = amazonUrl.value.trim()
-    if (!url || !desktop.amazonPreview || amazonLoading.value) return
-    amazonLoading.value = true
-    amazonError.value = ''
-    amazonPreview.value = null
-    try {
-      const preview = await desktop.amazonPreview(url)
-      amazonPreview.value = preview
-      // 名前は共有の名前を初期値にする（あとで直せる）。
-      if (!projectName.value.trim()) projectName.value = preview.name
-    } catch (cause) {
-      amazonError.value = cause instanceof Error ? cause.message : 'Amazon Photos のリンクを読めませんでした。'
-    } finally {
-      amazonLoading.value = false
-    }
-  }
-
-  function resetAmazonDraft() {
-    amazonUrl.value = ''
-    amazonPreview.value = null
-    amazonError.value = ''
-    createTab.value = 'folder'
-  }
-
-  // リンクを書き換えたら、前の読み込みの結果は古い。
-  watch(amazonUrl, () => {
-    amazonPreview.value = null
-    amazonError.value = ''
+  // ---- 作成ダイアログ・Amazon のリンク・アプリの設定（`composables/curator/useProjectCreate.ts`） ----
+  const {
+    createDialog, createTab, amazonUrl, amazonPreview, amazonLoading, amazonError, projectName, folderPath,
+    devFolderPath, isDev, chooseFolder, loadAmazonPreview, createPairRaw, createDisplayChoices, createDisplayEdge,
+    appDisplayChoices, appDisplayEdge, saveAppDisplayEdge, createProject
+  } = useProjectCreate({
+    desktop, view, loading, error, notify, canImportPhotos, fileName, refreshProjects, openProject
   })
-  watch(createDialog, open => {
-    if (!open) resetAmazonDraft()
-    else void loadCreateDisplay()
-  })
-
-  // 作成ダイアログの「表示用画像の大きさ」。既定はアプリの設定の値。
-  const createDisplayChoices = ref<number[]>([])
-  const createDisplayEdge = ref(0)
-  async function loadCreateDisplay() {
-    try {
-      const settings = await desktop.getDisplaySettings()
-      createDisplayChoices.value = settings.choices
-      createDisplayEdge.value = settings.edge
-    } catch {
-      // 読めなければ選択欄を出さず、あとから設定で変えられる。
-      createDisplayChoices.value = []
-    }
-  }
-
-  // アプリの設定の画面。表示用画像の既定（これから作るプロジェクトの分）。
-  const appDisplayChoices = ref<number[]>([])
-  const appDisplayEdge = ref(0)
-  async function loadAppSettings() {
-    try {
-      const settings = await desktop.getDisplaySettings()
-      appDisplayChoices.value = settings.choices
-      appDisplayEdge.value = settings.edge
-    } catch {
-      appDisplayChoices.value = []
-    }
-  }
-  /** 選んだらその場で既定に保存する。既存のプロジェクトの表示用画像は作り直さない。 */
-  async function saveAppDisplayEdge(edge: number) {
-    const previous = appDisplayEdge.value
-    appDisplayEdge.value = edge
-    try {
-      appDisplayEdge.value = await desktop.saveDisplayEdge(edge)
-    } catch (caught) {
-      appDisplayEdge.value = previous
-      notify(caught instanceof Error ? caught.message : '設定を保存できませんでした')
-    }
-  }
-  watch(view, next => { if (next === 'app-settings') void loadAppSettings() })
 
   /**
-   * 作成した直後、**準備（表示用画像づくり）を始める前**に、ダイアログで選んだ長辺を
-   * このプロジェクトに書く（生成はこの値で行う）。**アプリの既定は変えない**
-   * （既定はダイアログの初期値にだけ効く。変えるのはアプリの設定の画面）。
+   * このプロジェクトの「同名の JPEG と RAW を 1 枚の写真として扱う」を切り替える。
+   * 反映は次の走査から。変えたらその旨を知らせる（自動では走査しない）。
+   * 切り替えた時刻も保存し（backend）、ほかの端末へ届くようサイドカーにも書く（U48。いつもの自動の書き込み
+   * ＝区切りで書くのと同じ経路。選別状況が同じなら設定だけを書く。書けなければ次の区切りで書く）。
    */
-  async function applyCreateDisplayEdge(projectId: string) {
-    const edge = createDisplayEdge.value
-    if (!edge || !createDisplayChoices.value.length) return
+  async function setPairRawJpeg(enabled: boolean) {
+    const project = activeProject.value
+    if (!project || project.pairRawJpeg === enabled) return
     try {
-      await desktop.saveProjectDisplayEdge(projectId, edge)
-    } catch (cause) {
-      // 作成は続ける（既定の大きさで作られる）が、黙らずに知らせる。
-      error.value = cause instanceof Error ? cause.message : '表示用画像の大きさを保存できませんでした。既定の大きさで作ります。'
-    }
-  }
-
-  /** Amazon のプロジェクトを作る。作ると走査が始まる（`openProject` が読み込みを始める）。 */
-  async function createAmazonProject() {
-    const preview = amazonPreview.value
-    if (!preview || !desktop.createAmazonProject) return
-    loading.value = true
-    try {
-      const project = await desktop.createAmazonProject(projectName.value.trim() || preview.name, amazonUrl.value.trim())
-      await applyCreateDisplayEdge(project.id)
-      createDialog.value = false
-      projectName.value = ''
+      await desktop.saveProjectPairRaw(project.id, enabled)
       await refreshProjects()
-      await openProject(project)
+      activeProject.value = projects.value.find(item => item.id === project.id) ?? activeProject.value
+      notify('設定を変えました。写真に反映するには「写真を再読み込み」を押してください。')
+      void flushThenPush().catch(() => undefined)
     } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : 'プロジェクトを作成できませんでした。'
-    } finally {
-      loading.value = false
-    }
-  }
-
-  async function createProject() {
-    if (createTab.value === 'amazon' && desktop.capabilities.amazon) {
-      await createAmazonProject()
-      return
-    }
-    // フォルダを選べないブラウザでは、名前だけ決めて作り、続けて写真を選ばせる。
-    // フォルダ（選んだもの・開発用の絶対パス）があれば、そこから読む。
-    const devPath = isDev ? devFolderPath.value.trim() : ''
-    if (!canImportPhotos.value && !folderPath.value) return
-    loading.value = true
-    try {
-      const fallbackName = devPath ? fileName(devPath) : folderPath.value ? fileName(folderPath.value) : '新しいプロジェクト'
-      const project = await desktop.createProject(
-        projectName.value.trim() || fallbackName, devPath ? `dev:${devPath}` : folderPath.value
-      )
-      await applyCreateDisplayEdge(project.id)
-      createDialog.value = false
-      projectName.value = ''
-      folderPath.value = ''
-      devFolderPath.value = ''
-      await refreshProjects()
-      await openProject(project)
-      // ここで写真ピッカーを自動で開かない。iOS はファイル選択を
-      // **利用者の操作の流れの中でしか**許さず、`await` を挟んだあとの
-      // `click()` は黙って無視される。開いたつもりで何も起きない状態になるので、
-      // プロジェクト画面の「写真を追加」を押してもらう形にしてある。
-    } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : 'プロジェクトを作成できませんでした。'
-    } finally {
-      loading.value = false
+      error.value = cause instanceof Error ? cause.message : '設定を保存できませんでした。'
     }
   }
 
@@ -1540,223 +1189,16 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     await advanceWith(core.keepAndTop(current.core, selected, path))
   }
 
-  /**
-   * 拡大表示を開く。`list` にその写真が並んでいた一覧を渡すと、
-   * 拡大したまま ← → で前後の写真へ移れる。
-   */
-  function openZoom(photo: Photo | null, list: Photo[] = []) {
-    if (!photo) return
-    zoomPhoto.value = photo
-    zoomList.value = list.length ? [...list] : [photo]
-  }
-
-  /**
-   * 拡大に出す画像。**原本**（Amazon は取ってきて端末に置いたもの）。取れるまでの間だけ表示用を見せる。
-   * 写真が変わったら、遅れて届いた前の写真の結果は捨てる。
-   */
-  const zoomSrc = ref('')
-  const zoomError = ref('')
-  const zoomLoading = ref(false)
-  let zoomToken = 0
-  watch(zoomPhoto, async (photo) => {
-    const token = ++zoomToken
-    zoomError.value = ''
-    zoomLoading.value = false
-    zoomSrc.value = ''
-    if (!photo) return
-    const pending = desktop.photoOriginalUrl(photo)
-    let arrived = false
-    // すぐ着く（フォルダの写真）ときは途中の絵を挟まない。時間がかかるときだけ表示用を先に見せる。
-    const timer = setTimeout(() => {
-      if (arrived || token !== zoomToken) return
-      zoomLoading.value = true
-      zoomSrc.value = desktop.photoDisplayUrl(photo)
-    }, 80)
-    try {
-      const url = await pending
-      arrived = true
-      if (token === zoomToken) zoomSrc.value = url
-    } catch (cause) {
-      arrived = true
-      if (token === zoomToken) zoomError.value = cause instanceof Error ? cause.message : '原本を読み込めませんでした。'
-    } finally {
-      clearTimeout(timer)
-      if (token === zoomToken) zoomLoading.value = false
-    }
+  // ---- まとめの中身を直す画面（`composables/curator/useBurstEdit.ts`） ----
+  const {
+    burstDialog, burstPhotos, burstCuts, burstOriginal, burstPicked, burstBusy, openBurst, burstBlocks, burstPhotoOf,
+    representativeOf, toggleBurstPick, splitBurstSelection, toggleBurstCut, moveBurstCut, scatterBurst,
+    confirmBurstPhoto, dropBurstPhoto, makeBurstRepresentative, applyBurstShape
+  } = useBurstEdit({
+    desktop, activeProject, session, error, burstSizeOf, idsOf, pathOf, thresholdFor, currentDistance,
+    ensureCoreInputs, loadPairOverrides, setPairOverrides: (overrides) => { pairOverrides = overrides },
+    setCore, applyCore, saveSession, noteJudgementChanged, enterTournamentAfterRebuild
   })
-
-  const zoomIndex = computed(() =>
-    zoomPhoto.value ? zoomList.value.findIndex(item => item.id === zoomPhoto.value!.id) : -1
-  )
-
-  /** 拡大中に前後へ移る。行き先が無ければ**動かないだけ**で、拡大は閉じない。 */
-  function stepZoom(step: number) {
-    const next = zoomList.value[zoomIndex.value + step]
-    if (next) zoomPhoto.value = next
-  }
-
-  /**
-   * まとめの中身を開く。**ここが「まとまりの形」を直す唯一の場所。**
-   *
-   * 表示するのは代表のまとめだけではなく、**撮影順で前後 4 秒に入る1続きの写真**。
-   * まとめの中身も、まとめに入れられる近くの写真も、同じ1本の並びの上にあるので、
-   * 「切る」「繋ぐ」の 2 つだけで分割・切り離し・追加・全解除がすべて表せる。
-   */
-  async function openBurst(photo: Photo | null) {
-    const current = session.value
-    if (!photo || !current || !activeProject.value || burstSizeOf(photo.id) < 2) return
-    const memberPaths = current.core.members[photo.relativePath] ?? []
-    burstOwner.value = photo
-    burstDialog.value = true
-    burstBusy.value = true
-    burstPicked.value = []
-    burstReps.value = []
-    try {
-      const inputs = await ensureCoreInputs()
-      // 撮影順の全写真から、前後 4 秒に入る 1 続きを切り出す（時刻で絞るだけ）。
-      const run = burstNeighborhood(inputs.photos, memberPaths, BURST_WINDOW_MS)
-      // 近くに何も無ければ、まとめの中身だけで組む。
-      const ids = run.length ? run.map(item => item.id) : idsOf(memberPaths)
-      burstPhotos.value = await desktop.getPhotosByIds(activeProject.value.id, ids)
-      const shown = burstPhotos.value.map(item => item.id)
-      // いまのまとまり方を境目に起こす。まとめに属さない近くの写真は、
-      // それぞれ 1 枚のまとまりとして並ぶ。
-      burstCuts.value = cutsFromGroups(shown, Object.values(current.core.members).map(idsOf))
-      const memberIds = new Set(idsOf(memberPaths))
-      burstOriginal.value = shown.filter(id => memberIds.has(id))
-    } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : 'まとめを読み込めませんでした。'
-      burstPhotos.value = []
-      burstCuts.value = []
-    } finally {
-      burstBusy.value = false
-    }
-  }
-
-  /** いま画面に見えているまとまりの並び。 */
-  const burstBlocks = computed(() =>
-    blocksFromCuts(burstPhotos.value.map(photo => photo.id), burstCuts.value)
-  )
-  const burstPhotoOf = (photoId: string) => burstPhotos.value.find(photo => photo.id === photoId) ?? null
-  /** その塊の代表。指名があればそれ、無ければ撮影順の先頭。 */
-  const representativeOf = (block: string[]) =>
-    block.find(id => burstReps.value.includes(id)) ?? block[0]!
-
-  function toggleBurstPick(photoId: string) {
-    burstPicked.value = burstPicked.value.includes(photoId)
-      ? burstPicked.value.filter(id => id !== photoId)
-      : [...burstPicked.value, photoId]
-  }
-
-  /** 選んだ写真を、連続した塊ごとに切り離す。 */
-  function splitBurstSelection() {
-    if (!burstPicked.value.length) return
-    burstCuts.value = cutAroundSelection(
-      burstPhotos.value.map(photo => photo.id), burstCuts.value, burstPicked.value
-    )
-    burstPicked.value = []
-  }
-
-  /** 境目をひとつ、切る／つなぐ（バーのタップ）。 */
-  function toggleBurstCut(boundaryIndex: number) {
-    burstCuts.value = toggleAt(burstCuts.value, boundaryIndex)
-  }
-
-  /** 切れている境目を別の境目へずらす（バーのドラッグ）。 */
-  function moveBurstCut(from: number, to: number) {
-    burstCuts.value = moveCut(burstCuts.value, from, to)
-  }
-
-  function scatterBurst() {
-    burstCuts.value = cutAll(burstCuts.value)
-    burstPicked.value = []
-  }
-
-  /**
-   * まとめの中で 1 枚の星を決める。★5 の確定と、明らかな脱落（−1）。
-   *
-   * **人が星を直接決める手直し**なので `ratingEdit` で Session の星を書き換え、
-   * 行へも写す。もう一度押したら取り消し（この回の星に戻す）。
-   * 仲間の星は動かさない。core の確定は仲間の星を差分で動かすので、
-   * ここで付けた差は次の確定でも保たれる。
-   */
-  async function settleBurstPhoto(photoId: string, decide: (star: number, target: number) => number) {
-    const current = session.value
-    const path = pathOf(photoId)
-    if (!current || !path || !activeProject.value) return
-    const star = current.core.ratings[path] ?? 0
-    const next = setRating(current.core, path, decide(star, current.core.target_star))
-    const photo = burstPhotoOf(photoId)
-    if (photo) photo.rating = next.ratings[path] ?? star
-    await applyCore(next)
-    await saveSession()
-  }
-
-  const confirmBurstPhoto = (photoId: string) =>
-    settleBurstPhoto(photoId, (star, target) => (star >= MAX_RATING ? target : MAX_RATING))
-  const dropBurstPhoto = (photoId: string) =>
-    settleBurstPhoto(photoId, (star, target) => (star < target ? target : star - 1))
-
-  /**
-   * 選んだ1枚をそのまとまりの代表に指名する。
-   * **反映は「この形で戻る」のとき。** 途中で候補やグループを書き換えると、
-   * そのあとの切り離しと噛み合わなくなる。
-   */
-  function makeBurstRepresentative(photoId: string) {
-    const block = burstBlocks.value.find(ids => ids.includes(photoId))
-    if (!block) return
-    // 同じ塊の中の古い指名は外す。代表は塊に1枚。
-    burstReps.value = [...burstReps.value.filter(id => !block.includes(id)), photoId]
-    burstPicked.value = []
-  }
-
-  /**
-   * 直した形を確定して選別画面へ戻す。
-   *
-   * 保存するのは**手直しそのもの**（基準との食い違いだけ）。何度押しても結果は同じ。
-   * 反映は core の `regroup`（まだ判断していない写真だけを組み直す）。
-   * 代表の指名は core の `setRepresentative` で。
-   */
-  async function applyBurstShape() {
-    const current = session.value
-    const project = activeProject.value
-    if (!current || !project) return
-    burstBusy.value = true
-    try {
-      const inputs = await ensureCoreInputs()
-      const threshold = thresholdFor(currentDistance())
-      const runRefs = burstPhotos.value.map(toPhotoRef)
-      const blocks = burstBlocks.value.map(block => block.map(pathOf).filter((path): path is string => path !== null))
-      const existing = await loadPairOverrides()
-      const overrides = overridesFromShape(
-        runRefs, blocks, existing,
-        (left, right) => core.isSameBurst({ left, right }, threshold)
-      )
-      await desktop.savePairOverrides(project.id, overrides)
-      noteJudgementChanged(project.id)
-      pairOverrides = overrides
-
-      let next = core.regroup(current.core, inputs.refs, current.settings.groupBursts, threshold, overrides)
-      // 指名された代表を、組み直したあとのまとまりに当てる（当てられないものは無視）。
-      for (const id of burstReps.value) {
-        const wanted = pathOf(id)
-        if (!wanted) continue
-        const shown = Object.keys(next.members).find(key => next.members[key]?.includes(wanted))
-        if (!shown || shown === wanted) continue
-        next = core.setRepresentative(next, shown, wanted) ?? next
-      }
-      setCore(next)
-      current.selectedInGroup = []
-
-      burstDialog.value = false
-      burstOwner.value = null
-      await enterTournamentAfterRebuild()
-    } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : 'まとめの形を保存できませんでした。'
-    } finally {
-      burstBusy.value = false
-    }
-  }
 
   /** 直前の 1 グループぶんの判断を取り消してやり直す。**判断は core の `undo`。** */
   async function undoChoice() {
@@ -1917,637 +1359,44 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     }
   }
 
-  // ---- 書き出し -------------------------------------------------------------
+  // ---- 選別結果の一覧と集計（`composables/curator/useResults.ts`） ----
+  // 関数より前で使う名前（`loadSummary`・`selectionSummary` など）も、使うのは呼ばれたとき（作るときではない）。
+  const {
+    resultsPhotos, resultsTotal, resultsOffset, resultsBusy, resultsRating, resultsSort,
+    selectionSummary, hasSelectionData, ratingCount,
+    openResults, returnToResults, resultsTiles, loadMoreResults, loadSummary, selectResultsRating, loadResultsPage
+  } = useResults({ desktop, activeProject, coreSession, view, error })
 
-  async function chooseExportDestination() {
-    try {
-      const selected = await desktop.chooseFolder()
-      if (selected) exportDestination.value = selected
-    } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : 'フォルダを選択できませんでした。'
-    }
-  }
+  // ---- 書き出し・共有・CSV・メタデータ（`composables/curator/useExport.ts`） ----
+  const {
+    exportDialog, exportMode, exportDestination, exportRatings, exportBusy, exportResult, exportError,
+    metadataError, metadataDialog, metadataRatings, metadataBusy, metadataAcknowledged, metadataResult,
+    shareDialog, shareRatings, shareBusy, shareError, shareMessage,
+    chooseExportDestination, runExport, runMetadataWrite, exportResultsCsv, exportPreviewCount,
+    exportMoveConfirm, requestExport, shareSelectedPhotos, exportZipByRating, exportCsvByRating, openShareDialog
+  } = useExport({
+    desktop, activeProject, coreSession, coreInputs, view, error, isAmazon, resultsRating, notify,
+    refreshProjects, loadSummary, loadResultsPage
+  })
 
-  /**
-   * 書き出しの対象を決める（フォルダ分け・メタデータ・共有・ZIP・CSV の全部が使う）。
-   *
-   * 選んだ星の写真を、連写ごとに畳んだ行にして仲間まで広げ、**その 1 枚自身の星が選んだ星に合う
-   * ものだけ**にする（`utils/exportTargets.ts`）。連写の中身を選別した組は、選んだものだけが出る。
-   * 行は全部を読み直して使う（結果の格子はページ送りで、全部は持っていないので）。
-   */
-  async function exportPhotosFor(stars: readonly number[]): Promise<Photo[]> {
-    const projectId = activeProject.value?.id
-    if (!projectId || !stars.length) return []
-    const rows = [...await desktop.getCoreInputs(projectId)]
-      .sort((left, right) => (left.relativePath < right.relativePath ? -1 : left.relativePath > right.relativePath ? 1 : 0))
-    const byPath = new Map(rows.map(row => [row.relativePath, row]))
-    return exportTargetsForStars(rows, coreSession.value?.members, stars)
-      .map(target => byPath.get(target.relativePath))
-      .filter((photo): photo is Photo => !!photo)
-  }
+  // ---- 連写の見直し（`composables/curator/useBurstReview.ts`） ----
+  const {
+    burstReviewGroups, burstReviewIndex, burstReviewPhotos, burstReviewKept, burstReviewBusy, burstReviewLoaded,
+    burstReviewColumns, burstReviewRows, openBurstReview, toggleBurstReviewKeep, applyBurstReview, skipBurstReview
+  } = useBurstReview({
+    desktop, activeProject, session, view, error, idOf, thresholdFor, currentDistance, toViewGroup,
+    loadCoreInputs, loadPairOverrides, sessionWithRowRatings, setCore, saveSession, writeRatings,
+    loadSummary, returnToResults
+  })
 
-  /**
-   * ダイアログに出す枚数のための、広げたあとの写真。ダイアログを開いたときと、星を選び直したときに
-   * 読み直す（`exportPreviewFor`）。星ごとの枚数 `ratingCount` は広げる前の行の数。
-   */
-  const exportPreviewRows = shallowRef<Photo[]>([])
-  const exportPreviewStars = ref<number[]>([])
-  let exportPreviewToken = 0
-  async function refreshExportPreview() {
-    const token = ++exportPreviewToken
-    const stars = [...exportPreviewStars.value]
-    const rows = stars.length && activeProject.value ? await exportPhotosFor(stars).catch(() => []) : []
-    if (token === exportPreviewToken) exportPreviewRows.value = rows
-  }
-  /** いま開いているダイアログが、どの星の一覧を見せるか。閉じたら空。 */
-  const exportPreviewCount = computed(() => exportPreviewRows.value.length)
-  watch(
-    () => exportDialog.value ? [...exportRatings.value]
-      : metadataDialog.value ? [...metadataRatings.value]
-        : shareDialog.value ? [...shareRatings.value] : [],
-    stars => { exportPreviewStars.value = stars; void refreshExportPreview() },
-    { immediate: true }
-  )
-
-  /** 「移動」を押したときの確認。コピーは確認なしで実行する。 */
-  const exportMoveConfirm = ref(false)
-  function requestExport() {
-    if (exportMode.value === 'move') exportMoveConfirm.value = true
-    else void runExport()
-  }
-
-  async function runExport() {
-    exportMoveConfirm.value = false
-    if (!activeProject.value || !exportDestination.value) return
-    exportBusy.value = true
-    exportResult.value = null
-    exportError.value = ''
-    try {
-      const photos = await exportPhotosFor(exportRatings.value)
-      if (!photos.length) throw new Error('対象の写真がありません。')
-      exportResult.value = await desktop.exportPhotos(
-        activeProject.value.id, exportDestination.value,
-        photos.map(photo => photo.id), exportMode.value === 'move'
-      )
-      if (exportMode.value === 'move') {
-        // 移動した写真は、原本がそのフォルダに無いのでプロジェクトから外れる。数・一覧・対応表を読み直す。
-        coreInputs.value = null
-        await refreshProjects()
-        await loadSummary()
-        if (view.value === 'results') await loadResultsPage(true)
-        const moved = exportResult.value?.processed ?? 0
-        if (moved > 0) notify(`${moved.toLocaleString()} 枚を移動しました（このプロジェクトからは外れます）`)
-      }
-    } catch (cause) {
-      // ダイアログの外に出すと、モーダルに隠れて気づけない。中に出す。
-      exportError.value = cause instanceof Error ? cause.message : '書き出しに失敗しました。'
-    } finally {
-      exportBusy.value = false
-    }
-  }
-
-  async function runMetadataWrite() {
-    if (!activeProject.value || !metadataAcknowledged.value) return
-    metadataBusy.value = true
-    metadataResult.value = null
-    metadataError.value = ''
-    try {
-      const photos = await exportPhotosFor(metadataRatings.value)
-      if (!photos.length) throw new Error('対象の写真がありません。')
-      metadataResult.value = await desktop.writeRatingsToPhotos(
-        activeProject.value.id, photos.map(photo => photo.id)
-      )
-    } catch (cause) {
-      metadataError.value = cause instanceof Error ? cause.message : 'メタデータを書き込めませんでした。'
-    } finally {
-      metadataBusy.value = false
-    }
-  }
-
-  /**
-   * CSV を書き出す。全部の出所で同じ（先頭 3 列は `relative_path,rating,captured_at`、Amazon は 4 列目に `name`）。
-   * PC は保存ダイアログ、ブラウザはダウンロード。**原本には触れない。**
-   */
-  async function saveResultsCsv(stars: readonly number[]): Promise<string> {
-    const photos = await exportPhotosFor(stars)
-    if (!photos.length) throw new Error('対象の写真がありません。')
-    const stamp = new Date().toISOString().slice(0, 10)
-    const text = resultsCsv(photos.map(photo => ({
-      relativePath: photo.relativePath, rating: photo.rating, capturedAt: photo.capturedAt, name: photo.name
-    })), isAmazon.value)
-    const saved = await desktop.saveCsv(`photo-curator-${stamp}.csv`, text)
-    return saved ? `${photos.length.toLocaleString()} 枚を CSV にしました。` : ''
-  }
-
-  /** 結果の画面の「CSV を書き出す」。いまの絞り込み（すべてなら全部の星）が対象。 */
-  async function exportResultsCsv() {
-    try {
-      notify(await saveResultsCsv(resultsRating.value === null ? [5, 4, 3, 2, 1, 0] : [resultsRating.value]))
-    } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : 'CSV を書き出せませんでした。'
-    }
-  }
-
-  /** 選別結果の一覧。中断中でも開ける。 */
-  async function openResults(rating?: unknown) {
-    if (!activeProject.value) return
-    view.value = 'results'
-    resultsOffset.value = 0
-    resultsPhotos.value = []
-    await loadSummary()
-    // 星の指定が無ければ、その結果で実際に付いている一番高い星に絞る（全部 ★0 なら「すべて」）。
-    // プロジェクトの画面の星の行から来たときは、その星のまま。
-    // （`@click="openResults"` はイベントを渡してくるので、数値か null だけを指定とみなす。）
-    resultsRating.value = rating === null || typeof rating === 'number' ? rating : highestRating()
-    await loadResultsPage(true)
-  }
-
-  /** 結果へ戻る（絞り込みはそのまま）。 */
-  const returnToResults = () => openResults(resultsRating.value)
-
-  /** 実際に付いている一番高い星（1〜5）。1 枚も付いていなければ null。 */
-  function highestRating(): number | null {
-    return [5, 4, 3, 2, 1].find(star => ratingCount(star) > 0) ?? null
-  }
-
-  /** 結果の格子のタイル。連写は、読み込んだ行の中で星が一番高い 1 枚に畳む。 */
-  const resultsTiles = computed(() => collapseBursts(resultsPhotos.value, coreSession.value?.members))
-
-  /** ページの末尾が見えたら次のページ。 */
-  function loadMoreResults() {
-    if (!resultsBusy.value && resultsPhotos.value.length < resultsTotal.value) void loadResultsPage()
-  }
-
-  async function loadSummary() {
-    if (!activeProject.value) return
-    try {
-      selectionSummary.value = await desktop.getSelectionSummary(activeProject.value.id)
-    } catch (cause) {
-      // 「選別結果を見る」が黙って消えないように、読めなかったことを出す。
-      selectionSummary.value = null
-      console.warn('選別の集計を読めませんでした', cause)
-      error.value = cause instanceof Error ? `選別の集計を読めませんでした（${cause.message}）` : '選別の集計を読めませんでした。'
-    }
-  }
-
-  async function selectResultsRating(rating: number | null) {
-    resultsRating.value = rating
-    await loadResultsPage(true)
-  }
-
-  /** 結果の読み直し（reset）の世代。reset が来たら、それ以前の読み込みの応答は捨てる（W7）。 */
-  let resultsToken = 0
-  async function loadResultsPage(reset = false) {
-    if (!activeProject.value) return
-    const token = reset ? ++resultsToken : resultsToken
-    resultsBusy.value = true
-    try {
-      if (reset) {
-        resultsOffset.value = 0
-        resultsPhotos.value = []
-      }
-      const page = await desktop.getProjectPhotoPage(
-        activeProject.value.id, resultsOffset.value, 80, resultsRating.value, resultsSort.value
-      )
-      if (token !== resultsToken) return
-      resultsPhotos.value = [...resultsPhotos.value, ...page.photos]
-      resultsTotal.value = page.total
-      resultsOffset.value += page.photos.length
-    } catch (cause) {
-      if (token === resultsToken) error.value = cause instanceof Error ? cause.message : '選別結果を読み込めませんでした。'
-    } finally {
-      // 古い読み込みが、新しい読み込みの「読み込み中」を落とさない。
-      if (token === resultsToken) resultsBusy.value = false
-    }
-  }
-
-  // ---- 連写の見直し --------------------------------------------------------
-
-  /** いま見ているまとめ。 */
-  const burstReviewGroup = computed(() => burstReviewGroups.value[burstReviewIndex.value] ?? null)
-
-  /**
-   * 連写の見直しを開く。**まとめは保存していない**ので、学習済みの閾値から
-   * その場で引き直す。2枚以上のものだけが対象。
-   */
-  async function openBurstReview(focus?: unknown) {
-    if (!activeProject.value) return
-    view.value = 'burst-review'
-    burstReviewLoaded.value = false
-    burstReviewBusy.value = true
-    burstReviewGroups.value = []
-    burstReviewIndex.value = 0
-    burstReviewPhotos.value = []
-    try {
-      const inputs = await loadCoreInputs()
-      if (!inputs) throw new Error('プロジェクトが開かれていません。')
-      const overrides = await loadPairOverrides()
-      // 判断は core の `groupBursts`。2 枚以上のものだけが対象。
-      const groups = core.groupBursts(inputs.refs, thresholdFor(currentDistance()), overrides)
-      burstReviewGroups.value = groups
-        .filter(group => group.members.length > 1)
-        .map(group => toViewGroup(group, inputs))
-      // 結果の格子の `⧉N` から来たときは、その連写から始める（`focus` は仲間の 1 枚の relativePath）。
-      if (typeof focus === 'string') {
-        const id = idOf(focus)
-        const at = id ? burstReviewGroups.value.findIndex(group => group.photoIds.includes(id)) : -1
-        if (at > 0) burstReviewIndex.value = at
-      }
-      await loadBurstReviewPhotos()
-    } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : '連写を読み込めませんでした。'
-    } finally {
-      burstReviewBusy.value = false
-      burstReviewLoaded.value = true
-    }
-  }
-
-  /**
-   * いま見ているまとめの写真だけを読む。**全グループぶんを先読みしない。**
-   * 連写が数百グループある写真集でも、載るのは常に1グループぶん。
-   */
-  async function loadBurstReviewPhotos() {
-    const group = burstReviewGroup.value
-    burstReviewKept.value = []
-    if (!activeProject.value || !group) {
-      burstReviewPhotos.value = []
-      return
-    }
-    const photos = await desktop.getPhotosByIds(activeProject.value.id, group.photoIds)
-    // getPhotosByIds の並びは問わない。まとめの中は撮影順で見せる。
-    const order = new Map(group.photoIds.map((id, index) => [id, index]))
-    burstReviewPhotos.value = [...photos].sort(
-      (left, right) => (order.get(left.id) ?? 0) - (order.get(right.id) ?? 0)
-    )
-  }
-
-  function toggleBurstReviewKeep(photoId: string) {
-    const kept = burstReviewKept.value
-    burstReviewKept.value = kept.includes(photoId)
-      ? kept.filter(id => id !== photoId)
-      : [...kept, photoId]
-  }
-
-  /** 次のまとめへ。最後まで来たら結果画面に戻す。 */
-  async function advanceBurstReview() {
-    if (burstReviewIndex.value + 1 >= burstReviewGroups.value.length) {
-      await returnToResults()
-      return
-    }
-    burstReviewIndex.value += 1
-    await loadBurstReviewPhotos()
-  }
-
-  /**
-   * 残す写真を確定する。**残した写真は+1、外した写真は−1。**
-   * 通常の選別と違って下げるのは、ここが「星をそろえたあとの絞り込み」だから。
-   */
-  async function applyBurstReview() {
-    if (!activeProject.value || !burstReviewKept.value.length) return
-    burstReviewBusy.value = true
-    try {
-      // 人が星を決める手直し。行の星を土台に `ratingEdit` で +1 / −1 して、変わった行だけ書く。
-      const { base } = await sessionWithRowRatings()
-      const shown = burstReviewPhotos.value.map(photo => photo.relativePath)
-      const kept = burstReviewPhotos.value
-        .filter(photo => burstReviewKept.value.includes(photo.id))
-        .map(photo => photo.relativePath)
-      const next = markRaw(applyChanges(base, reviewChanges(base, shown, kept)))
-      // Session を先に待ち行列へ入れてから、行の星を書く（applyCore と同じ順。途中で終了しても開き直しで揃う）。
-      if (session.value) {
-        setCore(next)
-        saveSession()
-      }
-      await writeRatings(syncRatings(base, next))
-      await loadSummary()
-      await advanceBurstReview()
-    } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : '連写の結果を保存できませんでした。'
-    } finally {
-      burstReviewBusy.value = false
-    }
-  }
-
-  async function skipBurstReview() {
-    burstReviewBusy.value = true
-    try {
-      await advanceBurstReview()
-    } finally {
-      burstReviewBusy.value = false
-    }
-  }
-
-  // ---- 表示用画像 ----------------------------------------------------------
-
-  /**
-   * 表示用画像の設定と、残っている生成量を読む。
-   * プロジェクトを開くたびに呼ぶので、外で作られた分もここで拾える。
-   */
-  async function refreshDisplayState() {
-    if (!activeProject.value) return
-    // 表示用画像が替わりうるので、先読みした行（表示用の場所を含む）は捨てる。
-    prefetched.clear()
-    try {
-      // プロジェクトの上書きを反映した実効値（読むだけ。上書きは消さない）。
-      const settings = await desktop.getDisplaySettings(activeProject.value.id)
-      displaySettings.value = settings
-      displayEdge.value = settings.projectEdge ?? settings.edge
-      displayBacklog.value = await desktop.getDisplayBacklog(activeProject.value.id)
-    } catch (cause) {
-      // 設定が読めなくても選別は続けられる。表示用が無ければ原本に落ちるだけ。
-      // ただし設定のカードが黙って消えるので、読めなかったことは通知に出す。
-      displaySettings.value = null
-      console.warn('表示用画像の設定を読めませんでした', cause)
-      taskWarning.value = '表示用画像の設定を読めませんでした。'
-    }
-  }
-
-  /**
-   * 長辺を変えて作り直す。
-   *
-   * **下げるときは原本を読み直さない**（保存済みを縮めるだけ）。上げるときは
-   * 原本が要るので通信量が増える。UI にその違いを出しておく。
-   */
-  async function applyDisplayEdge(edge: number) {
-    if (!activeProject.value || displayBusy.value) return
-    displayBusy.value = true
-    try {
-      displayEdge.value = await desktop.saveProjectDisplayEdge(activeProject.value.id, edge)
-      displayBacklog.value = await desktop.getDisplayBacklog(activeProject.value.id)
-      await desktop.startDisplayGeneration(activeProject.value.id)
-    } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : '表示用の設定を変えられませんでした。'
-    } finally {
-      displayBusy.value = false
-    }
-  }
-
-  /** 走査が終わったプロジェクトの表示用画像を、選んだ長辺で作り始める。 */
-  async function startDisplayAfterScan(projectId: string) {
-    if (activeProject.value?.id !== projectId) return
-    await refreshDisplayState()
-    if (displayBacklog.value > 0) desktop.startDisplayGeneration(projectId).catch(() => undefined)
-  }
-
-  /**
-   * プロジェクトの画面から px を変える。作り直しが要るとき（作られた画像があり、値が変わる）だけ
-   * 確認を出す。要らなければ保存だけ。変えられないとき・同じ値のときは何もしない。
-   */
-  async function requestDisplayEdge(edge: number) {
-    const project = activeProject.value
-    if (!project || displayBusy.value) return
-    const plan = displayEdgePlan({
-      current: displayEdge.value,
-      next: edge,
-      canRebuild: displaySettings.value?.canRebuild,
-      rebuildsOnChange: displaySettings.value?.rebuildsOnChange,
-      builtCount: builtDisplayCount(project.photoCount, displayBacklog.value)
-    })
-    if (plan === 'locked' || plan === 'same') return
-    if (plan === 'confirm') {
-      pendingDisplayEdge.value = edge
-      displayEdgeDialog.value = true
-      return
-    }
-    await applyDisplayEdge(edge)
-  }
-
-  /** 確認の OK。選んだ px で作り直す。 */
-  async function confirmDisplayEdge() {
-    const edge = pendingDisplayEdge.value
-    displayEdgeDialog.value = false
-    pendingDisplayEdge.value = null
-    if (edge !== null) await applyDisplayEdge(edge)
-  }
-
-  /** 確認のキャンセル。選択は元のまま、作り直さない。 */
-  function cancelDisplayEdge() {
-    displayEdgeDialog.value = false
-    pendingDisplayEdge.value = null
-  }
-
-  /** 明示的に作り直す。壊れたときや、途中で止まったときの逃げ道。 */
-  async function regenerateDisplayImages() {
-    if (!activeProject.value || displayBusy.value) return
-    displayBusy.value = true
-    try {
-      await desktop.resetDisplayImages(activeProject.value.id)
-      displayBacklog.value = await desktop.getDisplayBacklog(activeProject.value.id)
-      await desktop.startDisplayGeneration(activeProject.value.id)
-    } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : '作り直しを始められませんでした。'
-    } finally {
-      displayBusy.value = false
-    }
-  }
-
-  // ---- レートの移動 --------------------------------------------------------
-
-  /**
-   * ある星の写真をまとめて別の星へ移す。
-   *
-   * 選択状態は id の集合ではなく **「全選択からの差分」** で持つ。
-   * 既定が全選択なので、id を並べる持ち方だと開いた瞬間に 5,000 件をフロントへ
-   * 載せることになる。差分なら、利用者が実際に触った枚数しか持たない。
-   * 「全解除」を押すと `moveSelectAll` が反転し、差分の意味も反転する。
-   */
-  function openMoveDialog(rating: number) {
-    moveFrom.value = rating
-    // 移動先の初期値は、上限に居るときだけ1つ下。それ以外は1つ上。
-    moveTo.value = rating >= MAX_RATING ? rating - 1 : rating + 1
-    moveSelection.value = createMoveSelection()
-    movePhotos.value = []
-    moveOffset.value = 0
-    moveTotal.value = 0
-    moveError.value = ''
-    moveDialog.value = true
-    void loadMovePage(true)
-  }
-
-  /** 移動の一覧の読み直し（reset）の世代（W7）。 */
-  let moveToken = 0
-  async function loadMovePage(reset = false) {
-    if (!activeProject.value) return
-    const token = reset ? ++moveToken : moveToken
-    moveBusy.value = true
-    try {
-      if (reset) {
-        moveOffset.value = 0
-        movePhotos.value = []
-      }
-      const page = await desktop.getProjectPhotoPage(
-        activeProject.value.id, moveOffset.value, 80, moveFrom.value, 'name'
-      )
-      if (token !== moveToken) return
-      movePhotos.value = [...movePhotos.value, ...page.photos]
-      moveTotal.value = page.total
-      moveOffset.value += page.photos.length
-    } catch (cause) {
-      if (token === moveToken) moveError.value = cause instanceof Error ? cause.message : '写真を読み込めませんでした。'
-    } finally {
-      if (token === moveToken) moveBusy.value = false
-    }
-  }
-
-  function toggleMoveSelection(photoId: string) {
-    moveSelection.value = toggleSelection(moveSelection.value, photoId)
-  }
-
-  /** 全選択・全解除は、差分の基準そのものを切り替える。 */
-  function setMoveSelectAll(all: boolean) {
-    moveSelection.value = setSelectAll(all)
-  }
-
-  async function runMove() {
-    if (!activeProject.value || moveFrom.value === moveTo.value) return
-    moveBusy.value = true
-    moveError.value = ''
-    const { includeIds, excludeIds } = toMoveArgs(moveSelection.value)
-    try {
-      const moved = await desktop.moveRating(
-        activeProject.value.id, moveFrom.value, moveTo.value, includeIds, excludeIds
-      )
-      noteJudgementChanged()
-      // 進行中のセッションが持つ星も合わせる。人が星を決める手直しなので `ratingEdit` で。
-      // Session に無い写真は飛ばす。行への書き込みは上の `moveRating` が済ませている。
-      if (session.value) {
-        await ensureCoreInputs()
-        const excluded = new Set(excludeIds.map(pathOf))
-        const paths = includeIds
-          ? includeIds.map(pathOf).filter((path): path is string => path !== null)
-          : pathsWithRating(session.value.core, moveFrom.value).filter(path => !excluded.has(path))
-        setCore(moveRatings(session.value.core, paths, moveTo.value))
-        await saveSession()
-      }
-      moveDialog.value = false
-      await loadSummary()
-      if (view.value === 'results') await loadResultsPage(true)
-      error.value = ''
-      notify(`${moved.toLocaleString()} 枚を ★${moveFrom.value} から ★${moveTo.value} へ移しました。`)
-    } catch (cause) {
-      moveError.value = cause instanceof Error ? cause.message : 'レートを移動できませんでした。'
-    } finally {
-      moveBusy.value = false
-    }
-  }
-
-  // ---- ライブラリへの反映（ブラウザ） --------------------------------------
-
-  /**
-   * 書き出しの対象を集める（共有・ZIP）。対象の決め方は `exportPhotosFor`（連写の仲間まで広げる）。
-   *
-   * **原本はこのセッションで取り込んだぶんしか手元に無い。** iOS には永続的な
-   * ファイルハンドルが無いため、リロードすると参照が切れる。書き出せる枚数と
-   * 全体の枚数を分けて返し、画面で差を伝える。
-   */
-  async function collectShareCandidates() {
-    const project = activeProject.value
-    if (!project) return { rows: [], files: [], missing: 0 }
-    const rows: { name: string, rating: number, capturedAt: number | null, file: File }[] = []
-    let missing = 0
-    for (const photo of await exportPhotosFor(shareRatings.value)) {
-      const file = desktop.originalFile?.(photo.id) ?? null
-      if (file) rows.push({ name: photo.name, rating: photo.rating, capturedAt: photo.capturedAt, file })
-      else missing += 1
-    }
-    return { rows, files: rows.map(row => row.file), missing }
-  }
-
-  /** 選んだ写真を共有シートに渡す。写真アプリには重複として入る。 */
-  async function shareSelectedPhotos() {
-    shareBusy.value = true
-    shareError.value = ''
-    shareMessage.value = ''
-    try {
-      const { files, missing } = await collectShareCandidates()
-      if (!files.length) {
-        shareError.value = missing
-          ? 'この端末に原本が残っていません。写真を選び直してから書き出してください。'
-          : '対象の写真がありません。'
-        return
-      }
-      if (files.length > SHARE_FILE_LIMIT) {
-        shareError.value = `一度に共有できるのは ${SHARE_FILE_LIMIT} 枚までです。ZIP で書き出してください。`
-        return
-      }
-      const outcome = await shareFiles(files, `★${shareRatings.value.join('・')} の写真`)
-      if (outcome === 'unsupported') shareError.value = 'この端末では共有シートを開けませんでした。ZIP で書き出してください。'
-      else if (outcome === 'shared') shareMessage.value = `${files.length} 枚を共有シートに渡しました。`
-    } catch (cause) {
-      shareError.value = cause instanceof Error ? cause.message : '共有できませんでした。'
-    } finally {
-      shareBusy.value = false
-    }
-  }
-
-  /**
-   * Amazon の結果の ZIP（原本を取る）。原本が 1 枚も取れないときは、その理由が `shareError` に出る
-   * （CSV だけ書き出せます）。
-   */
-  async function exportAmazonZip() {
-    const project = activeProject.value
-    if (!project || !desktop.exportAmazon) return
-    shareBusy.value = true
-    shareError.value = ''
-    shareMessage.value = ''
-    try {
-      const photos = await exportPhotosFor(shareRatings.value)
-      const out = await desktop.exportAmazon(project.id, photos.map(photo => photo.id))
-      downloadBlob(out.blob, out.fileName)
-      shareMessage.value = `${out.count} 枚を ZIP にしました${out.skipped ? `（原本を取れなかった ${out.skipped} 枚は除いています）` : ''}。`
-    } catch (cause) {
-      shareError.value = cause instanceof Error ? cause.message : '書き出せませんでした。'
-    } finally {
-      shareBusy.value = false
-    }
-  }
-
-  /** 書き出しダイアログの CSV。全部の出所で同じ。 */
-  async function exportCsvByRating() {
-    shareBusy.value = true
-    shareError.value = ''
-    shareMessage.value = ''
-    try {
-      shareMessage.value = await saveResultsCsv(shareRatings.value)
-    } catch (cause) {
-      shareError.value = cause instanceof Error ? cause.message : 'CSV を書き出せませんでした。'
-    } finally {
-      shareBusy.value = false
-    }
-  }
-
-  /** 星ごとのフォルダに分けた ZIP を書き出す。 */
-  async function exportZipByRating() {
-    if (isAmazon.value) return exportAmazonZip()
-    shareBusy.value = true
-    shareError.value = ''
-    shareMessage.value = ''
-    try {
-      const { rows, missing } = await collectShareCandidates()
-      if (!rows.length) {
-        shareError.value = missing
-          ? 'この端末に原本が残っていません。写真を選び直してから書き出してください。'
-          : '対象の写真がありません。'
-        return
-      }
-      const zip = await createStoredZip(zipEntriesByRating(rows.map(row => ({
-        name: row.name, rating: row.rating, blob: row.file, modifiedAt: row.file.lastModified
-      }))))
-      const stamp = new Date().toISOString().slice(0, 10)
-      downloadBlob(zip, `photo-curator-${stamp}.zip`)
-      shareMessage.value = `${rows.length} 枚を ZIP にしました${missing ? `（原本の無い ${missing} 枚は除いています）` : ''}。`
-    } catch (cause) {
-      shareError.value = cause instanceof Error ? cause.message : 'ZIP を作れませんでした。'
-    } finally {
-      shareBusy.value = false
-    }
-  }
-
-  function openShareDialog() {
-    shareError.value = ''
-    shareMessage.value = ''
-    shareDialog.value = true
-  }
+  // ---- レートの移動（`composables/curator/useMove.ts`） ----
+  const {
+    moveDialog, moveFrom, moveTo, moveBusy, movePhotos, moveTotal, moveOffset, moveError,
+    moveSelectedCount, isMoveSelected, openMoveDialog, loadMovePage, toggleMoveSelection, setMoveSelectAll, runMove
+  } = useMove({
+    desktop, activeProject, session, view, error, notify, ensureCoreInputs, pathOf, setCore, saveSession,
+    noteJudgementChanged, loadSummary, loadResultsPage
+  })
 
   async function resumeSession() {
     // 別の端末の記録との食い違いを選ぶまで、選別は始めさせない。
@@ -2635,110 +1484,12 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     }
   }
 
-  function onKeydown(event: KeyboardEvent) {
-    // 拡大中は拡大のキーだけ。選択には流さない。
-    if (zoomPhoto.value) {
-      onZoomKeydown(event)
-      return
-    }
-    if (event.target instanceof HTMLInputElement) return
-    // ヘルプを開いている間は、選別のキー（数字・Enter・Backspace など）を後ろの画面へ流さない。
-    if (helpDialog.value) return
-
-    // 連写の見直し。**セッションが無くても開ける**画面なので、下の session 判定より
-    // 手前で拾う。操作は選別画面と同じ（数字で選ぶ／Ctrl+数字で拡大／Enter で確定）。
-    if (view.value === 'burst-review') {
-      if (event.key === 'Enter') {
-        event.preventDefault()
-        if (burstReviewKept.value.length) void applyBurstReview()
-        return
-      }
-      const digit = /^(Digit|Numpad)(\d)$/.exec(event.code)
-      const index = digit ? (Number(digit[2]) === 0 ? 10 : Number(digit[2])) : 0
-      const target = burstReviewPhotos.value[index - 1] ?? null
-      if (!target) return
-      event.preventDefault()
-      if (event.ctrlKey || event.metaKey) openZoom(target, burstReviewPhotos.value)
-      else toggleBurstReviewKeep(target.id)
-      return
-    }
-
-    if (!session.value) return
-
-    // 閾値の判定画面。テンポよく答えられるよう手を離さずに済ませる。
-    if (view.value === 'burst-threshold' && currentPair.value) {
-      // ボタンの並び（左から）と数字を一致させる。1=判断できない 2=別々 3=まとめる
-      const key = event.key
-      if (key === '1') { event.preventDefault(); void skipCurrentPair(); return }
-      if (key === '2') { event.preventDefault(); void answerPair(false); return }
-      if (key === '3') { event.preventDefault(); void answerPair(true); return }
-      return
-    }
-
-    if (view.value !== 'tournament') return
-
-    // 選び間違えたときに1手戻す。
-    if (event.key === 'Backspace') {
-      event.preventDefault()
-      void undoChoice()
-      return
-    }
-    // スライドショーは 1 枚ずつ。Enter・M・Space は使わず（Enter で「落とす」が走らないように）、
-    // 1・3・5 と ←・→・↑ は画面（SlideshowView）が受ける（2・4・↓ は何もしない）。修飾キー付き（Ctrl＝拡大など）は下の共通処理へ。
-    if (isSlideshow.value) {
-      if (event.key === 'Enter' || event.key === ' ' || event.key.toLowerCase() === 'm') {
-        event.preventDefault()
-        return
-      }
-      if (!event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey && /^(Digit|Numpad)\d$/.test(event.code)) return
-    }
-    // Enter は「今の選択で確定」。1枚も選んでいなければ「どれも選ばない」になる。
-    if (event.key === 'Enter') {
-      event.preventDefault()
-      void confirmChoices()
-      return
-    }
-    // 複数枚選択のトグルは M でもスペースでも。
-    if (event.key.toLowerCase() === 'm' || event.key === ' ') {
-      event.preventDefault()
-      session.value.multiSelect = !session.value.multiSelect
-      session.value.selectedInGroup = []
-      void saveSession()
-      return
-    }
-
-    // 数字キーは修飾キーで役割を変える。
-    //   そのまま … 選ぶ / Ctrl … 拡大 / Shift … 確定 / Alt … まとめを開く
-    // Shift+数字 は event.key が記号になるため、物理キー(code)から番号を取る。
-    const fromCode = /^(Digit|Numpad)(\d)$/.exec(event.code)
-    const raw = fromCode ? Number(fromCode[2]) : Number(event.key)
-    const number = raw === 0 ? 10 : raw
-    if (!Number.isInteger(number) || number < 1 || number > tournamentPhotos.value.length) return
-    const photo = tournamentPhotos.value[number - 1] ?? null
-    if (!photo) return
-
-    event.preventDefault()
-    if (event.ctrlKey || event.metaKey) openZoom(photo, tournamentPhotos.value)
-    else if (event.shiftKey) void confirmPhoto(photo.id)
-    else if (event.altKey) void openBurst(photo)
-    else void toggleChoice(photo.id)
-  }
-
-  /**
-   * 拡大表示のキー。← → は前後送り、Esc・Enter・Space は閉じる。
-   * Ctrl・Shift・Alt・Meta の単独の押下や、ほかのキーでは閉じない（Ctrl+ホイールの前に Ctrl を押すだけで閉じない）。
-   * どのキーでも、選別画面の操作には流さない。
-   */
-  function onZoomKeydown(event: KeyboardEvent) {
-    if (!zoomPhoto.value) return
-    event.stopPropagation()
-    if (event.key === 'ArrowLeft') { event.preventDefault(); stepZoom(-1); return }
-    if (event.key === 'ArrowRight') { event.preventDefault(); stepZoom(1); return }
-    if (event.key === 'Escape' || event.key === 'Enter' || event.key === ' ') {
-      event.preventDefault()
-      zoomPhoto.value = null
-    }
-  }
+  // ---- 選別画面のキー操作（`composables/curator/useKeyboard.ts`） ----
+  const { onKeydown } = useKeyboard({
+    view, session, helpDialog, zoomPhoto, tournamentPhotos, burstReviewPhotos, burstReviewKept, currentPair,
+    isSlideshow, onZoomKeydown, openZoom, openBurst, applyBurstReview, toggleBurstReviewKeep, skipCurrentPair,
+    answerPair, undoChoice, confirmChoices, confirmPhoto, toggleChoice, saveSession
+  })
 
   /** 準備の途中で、格子のサムネイルを少しずつ埋める（ブラウザだけ。PC は元から原本が見える）。 */
   let previewRefreshedAt = 0
@@ -2892,6 +1643,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     createDialog,
     createDisplayChoices,
     createDisplayEdge,
+    createPairRaw,
     appDisplayChoices,
     appDisplayEdge,
     saveAppDisplayEdge,
@@ -3095,6 +1847,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     applyBurstReview,
     skipBurstReview,
     applyDisplayEdge,
+    setPairRawJpeg,
     regenerateDisplayImages,
     openMoveDialog,
     loadMovePage,

@@ -68,6 +68,11 @@ describe('core-wasm のサイドカー同期（U33）', () => {
     const seen = { token: fixture.seen_token, key: androidKey, epoch: null }
     const plan = wasm.sidecarPlan(seen, wasm.sidecarJudgement(android), untouched, true, false)
     expect(plan).toEqual(fixture.expected_plan)
+
+    // U42: 端末は見た版のままでも、ほかの端末がやり直した版（早送りの関係）は確認する。
+    const restarted = read(fixture.restarted, fixture.pc_folder)
+    const again = wasm.sidecarPlan(seen, wasm.sidecarJudgement(android), restarted, true, false)
+    expect(again[fixture.expected_restarted.plan]?.reason).toBe(fixture.expected_restarted.reason)
   })
 
   it('意味が同じなら、並び・空白・updatedAt が違っても何もしない（警告なし）', () => {
@@ -136,12 +141,14 @@ describe('core-wasm のサイドカー同期（U33）', () => {
   })
 
   it('混ぜ方: 積集合・和集合と、混ぜた星の完了状態から続きを始められる', () => {
-    const done = { ...fresh(), queue: [], current: [], finished: true, ratings: { 'a.jpg': 2, 'b.jpg': 1, 'd.jpg': 1 } }
+    // 本物のセッションと同じく ratings には全部の写真を★0 も含めて載せる（D3: 記録に無い写真は未判定）。
+    const all = fresh().ratings
+    const done = { ...fresh(), queue: [], current: [], finished: true, ratings: { ...all, 'a.jpg': 2, 'b.jpg': 1, 'd.jpg': 1 } }
     const midway = {
       ...fresh(),
       queue: [],
       current: ['d.jpg'],
-      ratings: { 'a.jpg': 1, 'sub/c.jpg': 1 },
+      ratings: { ...all, 'a.jpg': 1, 'sub/c.jpg': 1 },
       history: [{ group: ['a.jpg', 'b.jpg'], chosen: ['a.jpg'], topped: null, before: {} }]
     }
     const mine = judge(done)
@@ -153,8 +160,10 @@ describe('core-wasm のサイドカー同期（U33）', () => {
       theirs_starred: 2,
       intersection_starred: 2,
       union_starred: 4,
-      undecided: 1,
-      mid_round: true
+      // U45: 混ぜたあとも残る、どちらも見ていない写真の数。端末は完了しているので 0（以前の期待は 1）。
+      undecided: 0,
+      mid_round: true,
+      mergeable: true
     })
 
     const result = wasm.mergeJudgements(mine, theirs, 'Intersection', 2, 'e-new')
@@ -164,6 +173,15 @@ describe('core-wasm のサイドカー同期（U33）', () => {
     const again = roundFor(result.session, refs, 1, false, threshold, [])
     expect(again.current).toEqual(['a.jpg', 'd.jpg'])
 
+    // D3: 片方（Android）の記録に無い写真（RAW）は、記録のある側（PC）の★を採る。
+    const pc = judge({ ...done, ratings: { ...done.ratings, 'a.cr2': 2 } })
+    expect(pc.known).toContain('a.cr2')
+    expect(wasm.mergeStars(mine, pc, 'Intersection')).toEqual({ 'a.jpg': 2, 'b.jpg': 1, 'd.jpg': 1, 'a.cr2': 2 })
+    // 記録の顔ぶれ（★0 の写真）は、意味が同じかの判断と比較キーに入れない。
+    const pcZero = judge({ ...done, ratings: { ...done.ratings, 'a.cr2': 0 } })
+    expect(wasm.judgementEquivalent(mine, pcZero)).toBe(true)
+    expect(wasm.judgementKey(pcZero)).toBe(wasm.judgementKey(mine))
+
     const session = wasm.sessionFromRatings({ 'a.jpg': 5, 'b.jpg': 1 }, 1, 0, 2, null)
     expect(session.survivors).toEqual(['b.jpg'])
     expect(
@@ -172,6 +190,27 @@ describe('core-wasm のサイドカー同期（U33）', () => {
         [{ left: 'a.jpg', right: 'b.jpg', decision: 'join' }]
       )
     ).toEqual([{ left: 'a.jpg', right: 'b.jpg', decision: 'split' }])
+  })
+
+  it('U45: 途中の ROUND どうしを混ぜても、どちらも見ていない写真は queue に残り続きから選別できる（フィクスチャ）', () => {
+    const merge = fixture.merge_mid_round
+    const mine = judge(merge.mine)
+    const theirs = judge(merge.theirs)
+    expect(wasm.mergePreview(mine, theirs)).toMatchObject(merge.expected_preview)
+    for (const [mode, expected] of [['Union', merge.expected_union], ['Intersection', merge.expected_intersection]]) {
+      const result = wasm.mergeJudgements(mine, theirs, mode, merge.group_size, 'e')
+      expect(result.session.finished, mode).toBe(expected.finished)
+      expect(result.session.current, mode).toEqual(expected.current)
+      expect(result.session.queue, mode).toEqual(expected.queue)
+      expect(result.session.survivors, mode).toEqual(expected.survivors)
+      expect(result.ratings, mode).toEqual(expected.ratings)
+      expect(result.undecided, mode).toBe(expected.undecided)
+      expect(result.session.history, mode).toEqual([])
+      // 続きから選別できる。
+      expect(advance(result.session, ['e.jpg']).ratings['e.jpg'], mode).toBe(1)
+    }
+    // ROUND が違えば混ぜない。
+    expect(wasm.mergePreview(judge({ ...merge.mine, round: 2, target_star: 1 }), theirs).mergeable).toBe(false)
   })
 
   it('写真の鍵: Android 形式とフォルダ形式を行き来し、一致率を数える', () => {
@@ -206,5 +245,26 @@ describe('core-wasm のサイドカー同期（U33）', () => {
     const legacy = catalog(fresh())
     delete legacy.keyBase
     expect(sidecarToJson(legacy)).not.toMatch(/writeId|basedOn|lineage|epoch|keyBase|progress/)
+  })
+
+  it('U48: 設定（settings.pairRawJpeg）の判断がフィクスチャ（cargo test と同じ）と一致し、比較キーに入らない', () => {
+    const settings = JSON.parse(
+      readFileSync(join(root, '..', 'core', 'tests', 'fixtures', 'settings_resolve.json'), 'utf-8')
+    )
+    for (const item of settings.cases) {
+      expect(wasm.settingsResolve(item.local, item.remote), item.name).toEqual(item.expected)
+    }
+    const without = sidecarFromJson(JSON.stringify(settings.catalog_without_settings))
+    const withSettings = sidecarFromJson(JSON.stringify(settings.catalog_with_settings))
+    expect(withSettings.settings).toEqual(settings.catalog_with_settings.settings)
+    expect(wasm.judgementKey(wasm.sidecarJudgement(withSettings)))
+      .toBe(wasm.judgementKey(wasm.sidecarJudgement(without)))
+    // 書き戻しても未知の設定を保つ。settings の無い版には足さない。
+    expect(JSON.parse(sidecarToJson(withSettings)).settings).toEqual(settings.catalog_with_settings.settings)
+    expect(JSON.parse(sidecarToJson(without))).toEqual(settings.catalog_without_settings)
+    // 書く前の刻印は、置き換える版の未知の設定を引き継ぐ（端末の値は端末のまま）。
+    const mine = { ...without, settings: { pairRawJpeg: { value: true, at: 0 } } }
+    const stamped = wasm.sidecarStamp(mine, 'w-3', withSettings)
+    expect(stamped.settings).toEqual({ pairRawJpeg: { value: true, at: 0 }, futureThing: { value: 3 } })
   })
 })

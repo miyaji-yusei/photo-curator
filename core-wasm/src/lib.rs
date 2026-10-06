@@ -329,6 +329,16 @@ pub fn sidecar_stamp(sidecar: JsValue, write_id: String, base: JsValue) -> Resul
     ser(&core::sidecar_stamp(sidecar, write_id, base))
 }
 
+/// U48: プロジェクトの設定（pairRawJpeg）をどうするか。`local`・`remote` は catalog.json の
+/// `settings` の形（`{ pairRawJpeg: { value, at } }`）か null。答えは `"Keep"`・`"PushLocal"`・
+/// `{ AdoptRemote: { value, at } }`。
+#[wasm_bindgen(js_name = settingsResolve)]
+pub fn settings_resolve(local: JsValue, remote: JsValue) -> Result<JsValue, JsValue> {
+    let local: Option<core::SettingsRecord> = de_option(local)?;
+    let remote: Option<core::SettingsRecord> = de_option(remote)?;
+    ser(&core::settings_resolve(local, remote))
+}
+
 /// `mode` は "Intersection"（積集合）か "Union"（和集合）。
 #[wasm_bindgen(js_name = mergeStars)]
 pub fn merge_stars(mine: JsValue, theirs: JsValue, mode: JsValue) -> Result<JsValue, JsValue> {

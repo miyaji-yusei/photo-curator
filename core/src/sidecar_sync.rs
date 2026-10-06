@@ -129,7 +129,7 @@ pub struct JudgementSession {
 ///
 /// 写真の鍵は「選んだフォルダからの相対・`/` 区切り・NFC」。呼ぶ側は、端末の中の鍵を
 /// 先に `sidecar_keys_to_folder` などでフォルダ形式にしておく。
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Judgement {
     /// ★1 以上の写真（鍵の順）。★0 と「鍵が無い」は同じ扱い。
     pub stars: Vec<PhotoStar>,
@@ -139,6 +139,35 @@ pub struct Judgement {
     pub burst_distance: Option<u32>,
     /// やり直しの世代。
     pub epoch: Option<String>,
+    /// その端末の記録にある写真（★0 も含む。セッションの `ratings` と `photos` の鍵。鍵の順）。
+    /// 積集合（D）で「その端末の記録に無い写真＝未判定」を見分けるためだけに使う（D3）。
+    /// **意味が同じかの判断と比較キーには入れない**（端末ごとに対象の拡張子が違うので、
+    /// ★0 の顔ぶれの違いで警告を出さない）。None は「分からない」＝全部を記録にあると見なす。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known: Option<Vec<String>>,
+}
+
+/// 意味が同じか。`known`（記録の顔ぶれ）は比べない。
+impl PartialEq for Judgement {
+    fn eq(&self, other: &Self) -> bool {
+        self.stars == other.stars
+            && self.session == other.session
+            && self.overrides == other.overrides
+            && self.burst_distance == other.burst_distance
+            && self.epoch == other.epoch
+    }
+}
+
+impl Eq for Judgement {}
+
+/// 比較キーに使う形（`known` を除いた Judgement と同じ JSON になる。並びも同じ）。
+#[derive(serde::Serialize)]
+struct JudgementKeyView<'a> {
+    stars: &'a Vec<PhotoStar>,
+    session: &'a Option<JudgementSession>,
+    overrides: &'a Vec<PairOverride>,
+    burst_distance: &'a Option<u32>,
+    epoch: &'a Option<String>,
 }
 
 /// 端末の控え。最後に読んだ／書いた版。**今の seenAt/seenBy/dirty の代わり。**
@@ -234,10 +263,14 @@ pub struct MergePreview {
     pub theirs_starred: u32,
     pub intersection_starred: u32,
     pub union_starred: u32,
-    /// どちらかの途中の ROUND で、まだ見ていない写真の数（混ぜると今の★のままになる）。
+    /// 混ぜたあとも残る、**どちらの端末もまだ見ていない**写真の数（連写の仲間も数える）。
+    /// 混ぜたセッションの続き（queue）で選別する（U45）。混ぜられないときは 0。
     pub undecided: u32,
     /// どちらかが ROUND の途中か。
     pub mid_round: bool,
+    /// 混ぜられるか（U45）。どちらかが ROUND の途中なのに、2 つの ROUND か対象の★が違うと
+    /// false（どちらの判断で続きを選別すればよいか決められないので、D・E を出さない）。
+    pub mergeable: bool,
 }
 
 /// 開き方の判断（設計書 §4.3）。
@@ -267,7 +300,8 @@ pub enum SidecarPlan {
 /// D・E で混ぜた結果。端末をこの状態にしてから、NAS にも書く（両方を同じにする）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MergeResult {
-    /// 「混ぜた星の完了状態」のセッション（1 つ戻すはできない）。
+    /// 混ぜたセッション（1 つ戻すはできない）。どちらの端末もまだ見ていない写真が残るなら
+    /// 未完了で、その写真が queue に残る（続きから選別する。U45）。残りが無ければ完了状態。
     pub session: Session,
     /// 混ぜた★（★1 以上だけ。載っていない写真は★0）。
     pub ratings: HashMap<String, i32>,
@@ -275,7 +309,7 @@ pub struct MergeResult {
     pub burst_distance: Option<u32>,
     pub epoch: Option<String>,
     pub starred: u32,
-    /// 途中の ROUND で、まだ見ていなかった写真の数。
+    /// 混ぜたあとも残る、どちらの端末もまだ見ていない写真の数（`session` の続きで選別する）。
     pub undecided: u32,
 }
 
@@ -369,12 +403,20 @@ pub fn canonical_judgement(
             *entry = (*entry).max(*rating);
         }
     }
+    // 記録の顔ぶれ（D3）。セッションの ratings と photos の両方の鍵。
+    let known: BTreeSet<String> = session
+        .iter()
+        .flat_map(|session| session.ratings.keys())
+        .chain(photos.keys())
+        .map(|path| norm(path))
+        .collect();
     Judgement {
         stars: stars.into_iter().map(|(path, rating)| PhotoStar { path, rating }).collect(),
         session: session.as_ref().map(canonical_session),
         overrides: canonical_overrides(&overrides),
         burst_distance,
         epoch: epoch.filter(|epoch| !epoch.is_empty()),
+        known: Some(known.into_iter().collect()),
     }
 }
 
@@ -401,7 +443,14 @@ pub fn judgement_key(judgement: Judgement) -> String {
 
 fn key_of(judgement: &Judgement) -> String {
     // 正規形は Vec と Option だけでできているので、JSON は入れた順に関係なく同じ文字列になる。
-    let bytes = serde_json::to_vec(judgement).unwrap_or_default();
+    let view = JudgementKeyView {
+        stars: &judgement.stars,
+        session: &judgement.session,
+        overrides: &judgement.overrides,
+        burst_distance: &judgement.burst_distance,
+        epoch: &judgement.epoch,
+    };
+    let bytes = serde_json::to_vec(&view).unwrap_or_default();
     let digest = Sha256::digest(&bytes);
     let mut out = String::with_capacity(JUDGEMENT_KEY_PREFIX.len() + 64);
     out.push_str(JUDGEMENT_KEY_PREFIX);
@@ -531,11 +580,15 @@ pub fn sidecar_seen(sidecar: Sidecar) -> SeenRecord {
 /// 書く直前に、v2 の印を入れる: `version`・`writeId`（呼ぶ側が作った乱数）・
 /// `basedOn`／`lineage`（いま NAS にある、置き換える版。無ければ None）・`keyBase`・`progress`。
 ///
+/// 設定（`settings`）は、`base` にあって `sidecar` に無いものを引き継ぐ（未知の設定を消さない。U48）。
+///
 /// 鍵は先にフォルダ形式（`sidecar_keys_to_folder`）にしておく。
 pub fn sidecar_stamp(sidecar: Sidecar, write_id: String, base: Option<Sidecar>) -> Sidecar {
     let mut out = sidecar;
     out.version = SIDECAR_VERSION;
     out.write_id = Some(write_id);
+    // 設定は、置き換える版にあって端末に無いもの（未知の設定など）を引き継ぐ（U48）。
+    out.settings = carried_settings(out.settings.take(), base.as_ref().and_then(|base| base.settings.as_ref()));
     match base {
         Some(base) => {
             let token = token_of(&base);
@@ -559,6 +612,122 @@ pub fn sidecar_stamp(sidecar: Sidecar, write_id: String, base: Option<Sidecar>) 
     progress.total = Some(total as u32);
     out.progress = Some(progress);
     out
+}
+
+// ---------------------------------------------------------------------------
+// プロジェクトの設定（U48。catalog.json の `settings`）
+// ---------------------------------------------------------------------------
+//
+// ユーザー決定（2026-10-03）: 「同名の JPEG と RAW を 1 枚の写真として扱う」（pairRawJpeg）の
+// ON・OFF もサイドカーに書いて同期する。端末どうしで違えば**新しく切り替えた方**を採る
+// （確認ダイアログは出さない。選別状況の食い違いとは別扱い）。
+//
+// **設定は選別状況ではない。** 正規形（Judgement）・比較キー・`judgement_equivalent`・
+// `sidecar_seen` には入れない（設定を変えただけで「端末が変わった」や確認にならない）。
+
+/// 真偽の設定 1 つ（値と、切り替えた時刻 ms）。`at` が 0 なら「作ったまま一度も切り替えていない」。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SettingValueBool {
+    pub value: bool,
+    #[serde(default)]
+    pub at: i64,
+}
+
+/// catalog.json の `settings`。知っている設定は型つきで、**知らない設定は JSON の文字列のまま**
+/// `other` に持って書き戻す（新しい版のアプリが足した設定を、古い版が消さない）。
+///
+/// JSON では `other` の中身が `settings` の直下に並ぶ（`{"pairRawJpeg":{…},"未知の名前":…}`）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SettingsRecord {
+    /// 同名の JPEG と RAW を 1 枚の写真として扱う（U46）。
+    pub pair_raw_jpeg: Option<SettingValueBool>,
+    /// 知らない設定（名前 → その値の JSON 文字列）。
+    pub other: HashMap<String, String>,
+}
+
+const SETTING_PAIR_RAW_JPEG: &str = "pairRawJpeg";
+
+impl serde::Serialize for SettingsRecord {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        // 並びを決まった順にする（同じ中身なら同じ文字列）。
+        let mut others: Vec<(&String, &String)> =
+            self.other.iter().filter(|(name, _)| name.as_str() != SETTING_PAIR_RAW_JPEG || self.pair_raw_jpeg.is_none()).collect();
+        others.sort();
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(value) = &self.pair_raw_jpeg {
+            map.serialize_entry(SETTING_PAIR_RAW_JPEG, value)?;
+        }
+        for (name, raw) in others {
+            // 読めない文字列（手で入れたなど）は、文字列の値として残す。
+            let value: serde_json::Value =
+                serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.clone()));
+            map.serialize_entry(name, &value)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SettingsRecord {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut entries: BTreeMap<String, serde_json::Value> = serde::Deserialize::deserialize(deserializer)?;
+        // 型が違う pairRawJpeg は読み捨てる（全体を読めないことにはしない）。
+        let pair_raw_jpeg = entries
+            .remove(SETTING_PAIR_RAW_JPEG)
+            .and_then(|value| serde_json::from_value::<SettingValueBool>(value).ok());
+        let other = entries
+            .into_iter()
+            .map(|(name, value)| (name, serde_json::to_string(&value).unwrap_or_default()))
+            .collect();
+        Ok(SettingsRecord { pair_raw_jpeg, other })
+    }
+}
+
+/// 設定をどうするか（`settings_resolve`）。今は pairRawJpeg だけを見る。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SettingsPlan {
+    /// 何もしない（両方に無い・値が同じ）。
+    Keep,
+    /// NAS の値を端末に取り込む（端末の設定を `value` にし、切り替えた時刻を `at` にする）。
+    AdoptRemote { value: bool, at: i64 },
+    /// 端末の値を NAS に書く（NAS に無い・端末の方が新しく切り替えた）。
+    PushLocal,
+}
+
+/// 端末の設定（`local`）と、NAS の catalog.json の `settings`（`remote`）から、どうするか。
+///
+/// 1. どちらかが無ければ、ある方（NAS だけ → 取り込む、端末だけ → 書く、両方無い → 何もしない）
+/// 2. 両方あって値が同じ → 何もしない（時刻が違っても）
+/// 3. 値が違えば、切り替えた時刻（`at`）が新しい方。時刻が同じなら NAS
+///
+/// **時刻を比べるのは設定だけ。** 選別状況は時刻の大小では決めない（`sidecar_plan`）。
+pub fn settings_resolve(local: Option<SettingsRecord>, remote: Option<SettingsRecord>) -> SettingsPlan {
+    let mine = local.and_then(|record| record.pair_raw_jpeg);
+    let theirs = remote.and_then(|record| record.pair_raw_jpeg);
+    match (mine, theirs) {
+        (None, None) => SettingsPlan::Keep,
+        (None, Some(theirs)) => SettingsPlan::AdoptRemote { value: theirs.value, at: theirs.at },
+        (Some(_), None) => SettingsPlan::PushLocal,
+        (Some(mine), Some(theirs)) if mine.value == theirs.value => SettingsPlan::Keep,
+        (Some(mine), Some(theirs)) if mine.at > theirs.at => SettingsPlan::PushLocal,
+        (Some(_), Some(theirs)) => SettingsPlan::AdoptRemote { value: theirs.value, at: theirs.at },
+    }
+}
+
+/// 書く版の設定に、置き換える版（`base`）の設定のうち端末に無いものを足す
+/// （未知の設定・端末が持っていない設定を消さない）。
+fn carried_settings(mine: Option<SettingsRecord>, base: Option<&SettingsRecord>) -> Option<SettingsRecord> {
+    let Some(base) = base else {
+        return mine;
+    };
+    let mut out = mine.unwrap_or_default();
+    if out.pair_raw_jpeg.is_none() {
+        out.pair_raw_jpeg = base.pair_raw_jpeg;
+    }
+    for (name, raw) in &base.other {
+        out.other.entry(name.clone()).or_insert_with(|| raw.clone());
+    }
+    Some(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -619,8 +788,11 @@ fn total_of(sidecar: &Sidecar) -> u32 {
 /// 3. 見た版のまま → 端末が変わっていれば書く
 /// 4. 端末が未着手 → 確認なしに取り込む
 /// 5. NAS が未着手（端末は着手済み）→ 確認なしに書く（NAS の版は退避）
-/// 6. 早送り（NAS の版の系統に、端末が見た版がある。端末は変わっていない）→ 確認なしに取り込む
+/// 6. 早送り（NAS の版の系統に、端末が見た版がある。端末は変わっていない）→ 確認なしに取り込む。
+///    ただし NAS の側がやり直した版（epoch が違う）は早送りにせず、#9 で確認する（U42）
 /// 7. 星とセッションが同じで、手直し・境目が片方にだけある → 持っている方に合わせる
+/// 7b. 版の見分けは違うが NAS の選別状況の比較キーが見た版のもの（ほかの端末が設定だけを書き直した版。
+///    U48）→ #3 と同じく、端末が変わっていれば確認せずに書く
 /// 8. 書けない共有 → 何もしない（この端末だけの結果）
 /// 9. やり直しが絡む → 確認
 /// 10. それ以外（両方着手済みで違う）→ 確認
@@ -723,10 +895,12 @@ pub fn sidecar_plan(
     }
 
     // 6. 早送り。系統（basedOn・lineage）に端末が見た版がある。古い形（writeId 無し）は見なさない。
+    //    **NAS の側がやり直した版（epoch が違う）は早送りにしない**（U42。ユーザー決定 2026-10-02）。
+    //    端末が着手済みなら #9 で確認する（未着手なら #4 で取り込み済み、同じなら #2 で済み）。
     let descends = theirs.write_id.as_deref().is_some_and(|id| !id.is_empty())
         && (theirs.based_on.as_deref() == Some(seen.token.as_str())
             || theirs.lineage.as_ref().is_some_and(|lineage| lineage.iter().any(|id| *id == seen.token)));
-    if !never_seen && !local_changed && descends {
+    if !never_seen && !local_changed && !remote_restarted && descends {
         return pull(true, PullReason::FastForward);
     }
 
@@ -752,6 +926,19 @@ pub fn sidecar_plan(
             }
             Extras::Conflict => return clash(ClashReason::ExtrasConflict),
         }
+    }
+
+    // 7b. 版の見分けは違うが、NAS の選別状況は見た版のまま（比較キーが見た版のものと同じ）。
+    //     ほかの端末が**設定だけ**を書き直した版（U48）。端末の変更は #3 と同じく確認せずに書く。
+    if !never_seen && !seen.key.is_empty() && remote_key == seen.key {
+        if !can_write {
+            return settled(blocked);
+        }
+        if detached {
+            return settled(SettledReason::Detached);
+        }
+        let aside_theirs = untouched(&local) && !untouched(&remote_judgement);
+        return SidecarPlan::Push { expected: Some(token), aside_theirs, reason: PushReason::LocalChanged };
     }
 
     // 8. 書けない共有。端末の分はそのまま。
@@ -794,12 +981,14 @@ fn pending_of(judgement: &Judgement) -> Option<HashSet<String>> {
     Some(pending)
 }
 
-/// 未判定か: 途中のセッションでまだ見ていない、またはセッションが無く★も 0。
+/// 未判定か: 途中のセッションでまだ見ていない、セッションが無く★も 0、
+/// または**その端末の記録に無い**（D3。PC だけが対象にする RAW・HEIC など）。
 fn undecided(judgement: &Judgement, pending: &Option<HashSet<String>>, path: &str, star: i32) -> bool {
+    let recorded = recorded(judgement, path);
     match (&judgement.session, pending) {
         (None, _) => star == 0,
-        (Some(_), Some(pending)) => pending.contains(path),
-        (Some(_), None) => false,
+        (Some(_), Some(pending)) => !recorded || pending.contains(path),
+        (Some(_), None) => !recorded,
     }
 }
 
@@ -856,6 +1045,9 @@ pub fn merge_overrides(mine: Vec<PairOverride>, theirs: Vec<PairOverride>) -> Ve
 /// `finished = true`・`queue`／`current`／`history` は空（1 つ戻すはできない）。
 /// `survivors` は★が `target_star` を超え、★5 未満の写真（★5 は以降のラウンドに出さない）。
 /// 続きは結果画面の「もう一度選別する（★n から）」（`round_for`）で始める。
+///
+/// **選別の残りが無いときだけ使う**（D・E で両方とも見終わっているとき、星だけの記録を取り込む
+/// とき）。途中の ROUND をこれで閉じると、まだ見ていない写真を飛ばしてしまう（U45）。
 pub fn session_from_ratings(
     ratings: HashMap<String, i32>,
     round: u32,
@@ -885,17 +1077,15 @@ pub fn session_from_ratings(
 }
 
 fn preview_of(mine: &Judgement, theirs: &Judgement) -> MergePreview {
-    let (mine_pending, theirs_pending) = (pending_of(mine), pending_of(theirs));
-    let mut open: HashSet<String> = HashSet::new();
-    open.extend(mine_pending.iter().flatten().cloned());
-    open.extend(theirs_pending.iter().flatten().cloned());
+    let shape = merge_shape(mine, theirs);
     MergePreview {
         mine_starred: mine.stars.len() as u32,
         theirs_starred: theirs.stars.len() as u32,
         intersection_starred: merged_stars(mine, theirs, MergeMode::Intersection).len() as u32,
         union_starred: merged_stars(mine, theirs, MergeMode::Union).len() as u32,
-        undecided: open.len() as u32,
-        mid_round: mine_pending.is_some() || theirs_pending.is_some(),
+        undecided: shape.open_count(),
+        mid_round: pending_of(mine).is_some() || pending_of(theirs).is_some(),
+        mergeable: !matches!(shape, MergeShape::Blocked),
     }
 }
 
@@ -904,11 +1094,343 @@ pub fn merge_preview(mine: Judgement, theirs: Judgement) -> MergePreview {
     preview_of(&mine, &theirs)
 }
 
+// ---------------------------------------------------------------------------
+// 途中の ROUND を混ぜる（U45）
+//
+// 以前は D・E を選ぶと、途中の ROUND でも「混ぜた星の完了状態」にしていた。そのため、
+// **どちらの端末もまだ見ていない写真が、選別されないまま ROUND の終わりに飛ばされた**
+// （実機の報告: 残り 444 枚が未選別のまま ROUND 1 が終わった）。
+// 今は、どちらの端末も見ていない写真を queue に残し、続きから選別できるようにする。
+// ---------------------------------------------------------------------------
+
+/// 連写のまとまり（代表 → 仲間）。
+fn groups_of(session: &JudgementSession) -> HashMap<&str, &Vec<String>> {
+    session
+        .members
+        .iter()
+        .map(|group| (group.representative.as_str(), &group.members))
+        .collect()
+}
+
+/// その端末がこの ROUND で判定した写真（`history` に出た組と、その連写の仲間）。
+fn judged_in_round(session: &JudgementSession) -> HashSet<String> {
+    let groups = groups_of(session);
+    let mut judged = HashSet::new();
+    for decision in &session.history {
+        for id in &decision.group {
+            judged.insert(id.clone());
+            if let Some(mates) = groups.get(id.as_str()) {
+                judged.extend(mates.iter().cloned());
+            }
+        }
+    }
+    judged
+}
+
+/// その端末の記録（セッションの ratings・photos）にある写真か。分からなければ「ある」。
+fn recorded(judgement: &Judgement, path: &str) -> bool {
+    judgement
+        .known
+        .as_ref()
+        .is_none_or(|known| known.binary_search_by(|id| id.as_str().cmp(path)).is_ok())
+}
+
+/// 片方の端末の、混ぜるための控え。
+struct MergeSide<'a> {
+    judgement: &'a Judgement,
+    /// この ROUND で判定した写真（途中のセッションのときだけ使う）。
+    judged: HashSet<String>,
+    /// この ROUND を通った写真（`survivors` と、その連写の仲間）。
+    kept: HashSet<String>,
+}
+
+impl<'a> MergeSide<'a> {
+    fn new(judgement: &'a Judgement) -> Self {
+        let (judged, kept) = match &judgement.session {
+            Some(session) => {
+                let groups = groups_of(session);
+                let mut kept: HashSet<String> = HashSet::new();
+                for id in &session.survivors {
+                    kept.insert(id.clone());
+                    if let Some(mates) = groups.get(id.as_str()) {
+                        kept.extend(mates.iter().cloned());
+                    }
+                }
+                (judged_in_round(session), kept)
+            }
+            None => (HashSet::new(), HashSet::new()),
+        };
+        MergeSide { judgement, judged, kept }
+    }
+
+    /// この ROUND で、この端末が判定した写真か。
+    ///
+    /// - 終わったセッション: 記録にある写真は全部判定済み（記録に無い RAW などは未判定。D3）
+    /// - 途中のセッション: `history` に出た組（連写の仲間まで）
+    /// - セッションが無い（★だけの古い記録）: **判定済みにしない**（★は混ぜるが、
+    ///   選別の続きからは外さない。外すと、その写真を見ないまま飛ばすことになる）
+    fn has_judged(&self, path: &str) -> bool {
+        match &self.judgement.session {
+            None => false,
+            Some(session) if session.finished => recorded(self.judgement, path),
+            Some(_) => self.judged.contains(path),
+        }
+    }
+
+    /// まだ見ていない代表の並び（途中のセッションだけ）。
+    fn remaining(&self) -> &[String] {
+        match &self.judgement.session {
+            Some(session) if !session.finished => &session.remaining,
+            _ => &[],
+        }
+    }
+}
+
+/// 混ぜたときに、まだ選別する写真があるか。
+enum MergeShape {
+    /// どちらかが途中なのに、2 つの ROUND か対象の★が違う。混ぜない。
+    Blocked,
+    /// 選別の残りが無い。混ぜた星の完了状態にする（今までどおり）。
+    Finished,
+    /// どちらの端末もまだ見ていない写真（連写の仲間も）が残る。ROUND・対象の★はそろっている。
+    Continue { open: HashSet<String>, round: u32, target_star: i32 },
+}
+
+impl MergeShape {
+    fn open_count(&self) -> u32 {
+        match self {
+            MergeShape::Continue { open, .. } => open.len() as u32,
+            _ => 0,
+        }
+    }
+}
+
+fn merge_shape(mine: &Judgement, theirs: &Judgement) -> MergeShape {
+    let (mine_pending, theirs_pending) = (pending_of(mine), pending_of(theirs));
+    if mine_pending.is_none() && theirs_pending.is_none() {
+        return MergeShape::Finished;
+    }
+    // 途中のセッションが 1 つはあるので、セッションは 1 つ以上ある。
+    let sessions: Vec<&JudgementSession> = mine.session.iter().chain(theirs.session.iter()).collect();
+    let Some(first) = sessions.first() else {
+        return MergeShape::Finished;
+    };
+    if sessions
+        .iter()
+        .any(|session| session.round != first.round || session.target_star != first.target_star)
+    {
+        return MergeShape::Blocked;
+    }
+    let (mine_side, theirs_side) = (MergeSide::new(mine), MergeSide::new(theirs));
+    let open: HashSet<String> = mine_pending
+        .into_iter()
+        .flatten()
+        .chain(theirs_pending.into_iter().flatten())
+        .filter(|path| !mine_side.has_judged(path) && !theirs_side.has_judged(path))
+        .collect();
+    if open.is_empty() {
+        return MergeShape::Finished;
+    }
+    MergeShape::Continue { open, round: first.round, target_star: first.target_star }
+}
+
+/// 2 つの並びを、どちらの順も崩さずに 1 つにする（`second` にだけあるものは、
+/// `second` の中で直前にあるものの次に入れる）。
+fn merged_order(first: &[String], second: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(first.len() + second.len());
+    let mut seen: HashSet<String> = HashSet::new();
+    for id in first {
+        if seen.insert(id.clone()) {
+            out.push(id.clone());
+        }
+    }
+    let mut anchor: Option<usize> = None;
+    for id in second {
+        if seen.contains(id) {
+            anchor = out.iter().position(|item| item == id);
+            continue;
+        }
+        let at = anchor.map_or(0, |position| position + 1);
+        out.insert(at, id.clone());
+        seen.insert(id.clone());
+        anchor = Some(at);
+    }
+    out
+}
+
+/// まとまりの表（代表 → 仲間）。端末の分を優先し、NAS の分は端末のまとまりと重ならないものだけ。
+fn merged_members(mine: &Judgement, theirs: &Judgement) -> HashMap<String, Vec<String>> {
+    let groups = |judgement: &Judgement| -> Vec<MemberGroup> {
+        judgement.session.as_ref().map(|session| session.members.clone()).unwrap_or_default()
+    };
+    let (mine_groups, theirs_groups) = (groups(mine), groups(theirs));
+    let taken: HashSet<&String> = mine_groups.iter().flat_map(|group| group.members.iter()).collect();
+    let mut members: HashMap<String, Vec<String>> = HashMap::new();
+    for group in &theirs_groups {
+        if !taken.contains(&group.representative) && group.members.iter().all(|id| !taken.contains(id)) {
+            members.insert(group.representative.clone(), group.members.clone());
+        }
+    }
+    for group in &mine_groups {
+        members.insert(group.representative.clone(), group.members.clone());
+    }
+    members
+}
+
+/// 混ぜた星を、セッションの ratings にする（記録にある写真は★0 も持つ。次に混ぜるとき、
+/// 「記録に無い＝その端末では未判定」と読み違えないように。D3）。
+fn session_ratings(
+    stars: &BTreeMap<String, i32>,
+    sides: &[&Judgement],
+    open: &HashSet<String>,
+) -> HashMap<String, i32> {
+    let mut ratings: HashMap<String, i32> = HashMap::new();
+    for judgement in sides {
+        for path in judgement.known.iter().flatten() {
+            ratings.insert(path.clone(), 0);
+        }
+    }
+    for path in open {
+        ratings.insert(path.clone(), 0);
+    }
+    for (path, star) in stars {
+        ratings.insert(path.clone(), *star);
+    }
+    ratings
+}
+
+/// 途中の ROUND を混ぜたセッション（未完了。続きから選別できる）。
+#[allow(clippy::too_many_arguments)]
+fn continued_session(
+    mine: &Judgement,
+    theirs: &Judgement,
+    mode: MergeMode,
+    stars: &BTreeMap<String, i32>,
+    open: &HashSet<String>,
+    round: u32,
+    target_star: i32,
+    group_size: u32,
+) -> Session {
+    let (mine_side, theirs_side) = (MergeSide::new(mine), MergeSide::new(theirs));
+    let mine_remaining: HashSet<&String> = mine_side.remaining().iter().collect();
+    let mine_groups = mine.session.as_ref().map(groups_of).unwrap_or_default();
+    let theirs_groups = theirs.session.as_ref().map(groups_of).unwrap_or_default();
+    let mut members = merged_members(mine, theirs);
+
+    // queue: どちらの端末もまだ見ていない写真だけ。元の並び順を保つ。
+    // 代表の仲間のうち、ほかの端末で判定済みのもの（まとまりの組み方が違った）は外す
+    // （続きで代表を選んだときに、判定済みの仲間の★まで動かさない）。
+    let mut queue: Vec<String> = Vec::new();
+    let mut covered: HashSet<String> = HashSet::new();
+    for rep in merged_order(mine_side.remaining(), theirs_side.remaining()) {
+        let own = if mine_remaining.contains(&rep) { mine_groups.get(rep.as_str()) } else { None };
+        let group: Vec<String> = own
+            .or_else(|| theirs_groups.get(rep.as_str()))
+            .map(|mates| (*mates).clone())
+            .unwrap_or_else(|| vec![rep.clone()]);
+        let fresh: Vec<String> = group
+            .into_iter()
+            .filter(|id| open.contains(id) && !covered.contains(id))
+            .collect();
+        if fresh.is_empty() {
+            continue;
+        }
+        covered.extend(fresh.iter().cloned());
+        if fresh.contains(&rep) {
+            if fresh.len() > 1 {
+                members.insert(rep.clone(), fresh);
+            } else {
+                members.remove(&rep);
+            }
+            queue.push(rep);
+        } else {
+            // 代表は判定済みで、仲間だけが残った。1 枚ずつ出す。
+            for id in fresh {
+                members.remove(&id);
+                queue.push(id);
+            }
+        }
+    }
+    // 念のため: 並びに出てこなかった未判定の写真も、飛ばさずに最後に出す。
+    let mut left: Vec<String> = open.iter().filter(|id| !covered.contains(*id)).cloned().collect();
+    left.sort();
+    for id in left {
+        members.remove(&id);
+        queue.push(id);
+    }
+
+    // survivors（この ROUND を通ったもの）: 和集合は両方の分。積集合は、判定した端末が
+    // すべて通したものだけ（片方だけが判定した写真は、判定した側の判断）。
+    let candidates: BTreeSet<String> = mine
+        .session
+        .iter()
+        .chain(theirs.session.iter())
+        .flat_map(|session| session.survivors.iter().cloned())
+        .collect();
+    let survivors: Vec<String> = candidates
+        .into_iter()
+        .filter(|id| !covered.contains(id))
+        .filter(|id| match mode {
+            MergeMode::Union => true,
+            MergeMode::Intersection => [&mine_side, &theirs_side]
+                .iter()
+                .all(|side| !side.has_judged(id) || side.kept.contains(id)),
+        })
+        .collect();
+
+    let mut session = Session {
+        group_size: group_size.max(1),
+        target_star,
+        round: round.max(1),
+        queue,
+        current: Vec::new(),
+        survivors,
+        ratings: session_ratings(stars, &[mine, theirs], open),
+        members,
+        history: Vec::new(),
+        finished: false,
+    };
+    crate::fill(&mut session);
+    session
+}
+
+/// 混ぜられないときに返す、この端末の分そのまま（1 つ戻すの控えだけは持たない）。
+fn session_of(judgement: &Judgement, group_size: u32) -> Option<Session> {
+    let canonical = judgement.session.as_ref()?;
+    let stars: BTreeMap<String, i32> = stars_map(judgement);
+    let mut session = Session {
+        group_size: group_size.max(1),
+        target_star: canonical.target_star,
+        round: canonical.round.max(1),
+        queue: canonical.remaining.clone(),
+        current: Vec::new(),
+        survivors: canonical.survivors.clone(),
+        ratings: session_ratings(&stars, &[judgement], &HashSet::new()),
+        members: canonical
+            .members
+            .iter()
+            .map(|group| (group.representative.clone(), group.members.clone()))
+            .collect(),
+        history: Vec::new(),
+        finished: canonical.finished,
+    };
+    crate::fill(&mut session);
+    Some(session)
+}
+
 /// D・E: 両方の選別状況から新しい 1 つを作る。
 ///
 /// - 星: `merge_stars`
-/// - セッション: 混ぜられないので「混ぜた星の完了状態」（`session_from_ratings`）。ROUND と
-///   対象の★は両方の大きい方。連写のまとまりは端末の分（無ければ NAS の分）
+/// - セッション（U45）:
+///   - **どちらの端末もまだ見ていない写真が残るなら、未完了のまま続きから選別できる形**。
+///     queue はその写真だけ（元の並び順。連写は代表だけ）。どちらかの端末で判定済みの写真は
+///     queue に出さず、判定は混ぜた★と `survivors` に入れる（和集合は両方の分、積集合は
+///     判定した端末がすべて通したものだけ。片方だけが判定した写真は判定した側）。`history` は
+///     空（1 つ戻すはできない）。ROUND・対象の★はそのまま（2 つでそろっているときだけ混ぜる）
+///   - 残りが無ければ、今までどおり「混ぜた星の完了状態」（`session_from_ratings`。ROUND と
+///     対象の★は両方の大きい方）
+///   - どちらかが途中なのに ROUND か対象の★が違えば混ぜない（`merge_preview` の
+///     `mergeable = false`）。呼ばれたら**この端末の分をそのまま返す**（写真を飛ばさない）
 /// - 手直し: 和集合（食い違えば端末）。境目: 端末にあれば端末、無ければ NAS
 /// - やり直しの世代: 同じならそのまま、違えば `fresh_epoch`（呼ぶ側が作った乱数）
 pub fn merge_judgements(
@@ -918,26 +1440,51 @@ pub fn merge_judgements(
     group_size: u32,
     fresh_epoch: String,
 ) -> MergeResult {
-    let ratings: HashMap<String, i32> = merged_stars(&mine, &theirs, mode).into_iter().collect();
-    let sessions = || mine.session.iter().chain(theirs.session.iter());
-    let round = sessions().map(|session| session.round).max().unwrap_or(1);
-    let target_star = sessions().map(|session| session.target_star).max().unwrap_or(0);
-    let members: HashMap<String, Vec<String>> = mine
-        .session
-        .as_ref()
-        .or(theirs.session.as_ref())
-        .map(|session| {
-            session
-                .members
-                .iter()
-                .map(|group| (group.representative.clone(), group.members.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let undecided = preview_of(&mine, &theirs).undecided;
+    let shape = merge_shape(&mine, &theirs);
+    if let MergeShape::Blocked = shape {
+        if let Some(session) = session_of(&mine, group_size) {
+            let ratings: HashMap<String, i32> = stars_map(&mine).into_iter().collect();
+            let undecided = pending_of(&mine).map_or(0, |pending| pending.len() as u32);
+            return MergeResult {
+                session,
+                starred: ratings.len() as u32,
+                ratings,
+                overrides: mine.overrides.clone(),
+                burst_distance: mine.burst_distance,
+                epoch: mine.epoch.clone(),
+                undecided,
+            };
+        }
+    }
+    let stars = merged_stars(&mine, &theirs, mode);
+    let ratings: HashMap<String, i32> = stars.clone().into_iter().collect();
+    let undecided = shape.open_count();
+    let session = match &shape {
+        MergeShape::Continue { open, round, target_star } => {
+            continued_session(&mine, &theirs, mode, &stars, open, *round, *target_star, group_size)
+        }
+        _ => {
+            let sessions = || mine.session.iter().chain(theirs.session.iter());
+            let round = sessions().map(|session| session.round).max().unwrap_or(1);
+            let target_star = sessions().map(|session| session.target_star).max().unwrap_or(0);
+            let members: HashMap<String, Vec<String>> = mine
+                .session
+                .as_ref()
+                .or(theirs.session.as_ref())
+                .map(|session| {
+                    session
+                        .members
+                        .iter()
+                        .map(|group| (group.representative.clone(), group.members.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            session_from_ratings(ratings.clone(), round, target_star, group_size, members)
+        }
+    };
     let starred = ratings.len() as u32;
     MergeResult {
-        session: session_from_ratings(ratings.clone(), round, target_star, group_size, members),
+        session,
         ratings,
         overrides: merge_overrides(mine.overrides.clone(), theirs.overrides.clone()),
         burst_distance: mine.burst_distance.or(theirs.burst_distance),

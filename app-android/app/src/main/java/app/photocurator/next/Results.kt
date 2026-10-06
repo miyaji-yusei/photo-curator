@@ -128,7 +128,7 @@ fun ResultsScreen(
         // 圏外では空になる。選別と同じ並び（EXIF の撮影時刻）にもなる（A11）。
         // 端末のアルバムは写真を移すと変わるので、いつも今の状態を読む。
         photos = (if (project.source.remote) Listing.load(context, project.source.key) else null)
-            ?: Photos.forSource(context, project.source)
+            ?: Photos.forSource(context, project.source, Prefs.pairRawJpeg(context, project.id))
         val loaded = Store.load(context, project.id)
         session = loaded
         ratings = loaded?.ratings ?: emptyMap()
@@ -233,7 +233,7 @@ fun ResultsScreen(
                         val moved = current.copy(ratings = current.ratings + next)
                         session = moved
                         ratings = moved.ratings
-                        scope.launch { Store.save(context, project.id, moved) }
+                        Store.queue(context, project.id, moved)
                     }
                     reviewing = null
                 },
@@ -417,7 +417,7 @@ fun ResultsScreen(
                                 if (format != null) Preview.Unsupported else Preview.Generating
                             )
                         }
-                        EmptyTile(state, format)
+                        EmptyTile(state, format, raw = photo.isRaw)
                         if (state != Preview.Unsupported) {
                             AsyncImage(
                                 model = ImageRequest.Builder(LocalContext.current)
@@ -776,6 +776,6 @@ private fun shiftStars(
     }
     if (count == 0) return
     val moved = live.copy(ratings = changed)
-    scope.launch { Store.save(context, project.id, moved) }
+    Store.queue(context, project.id, moved)
     onDone(moved, count)
 }

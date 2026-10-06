@@ -25,6 +25,7 @@ const {
       <p class="text-caption text-medium-emphasis mb-4">
         書き込みは、いったん別ファイルを作って画像として開けるか確かめてから置き換えます。
         途中で失敗しても原本はそのまま残ります。対象は JPEG のみで、PNG と WebP は飛ばします。
+        同じ名前の RAW が JPEG と組になっているときは、RAW 本体は変えず、隣の .xmp ファイルに星を書きます。
       </p>
 
       <div class="text-subtitle-2 mb-2">書き込む星</div>
@@ -48,6 +49,7 @@ const {
       </v-alert>
       <v-alert v-if="metadataResult" :type="metadataResult.failed ? 'warning' : 'success'" variant="tonal" class="mt-4">
         {{ metadataResult.processed.toLocaleString() }} 枚に書き込みました。
+        <template v-if="metadataResult.pairedRawProcessed">組の RAW {{ metadataResult.pairedRawProcessed.toLocaleString() }} 枚の .xmp にも書きました。</template>
         <template v-if="metadataResult.skipped">対象外で飛ばした写真 {{ metadataResult.skipped }} 枚。</template>
         <template v-if="metadataResult.failed">失敗 {{ metadataResult.failed }} 枚（原本は変更していません）。</template>
         <ul v-if="metadataResult.errors.length" class="mt-2 text-caption">

@@ -31,7 +31,10 @@ object Analyse {
      * 読めない写真どうしが同一に見えて誤ってまとまる。
      */
     fun hash(context: Context, photo: Photo): String? {
-        val source = Photos.thumbnail(context, photo, edge = 64) ?: return null
+        // U49: RAW は OS が縮小画像を作れないことがある。**そのときは中のプレビューから作る。**
+        val source = Photos.thumbnail(context, photo, edge = 64)
+            ?: (if (photo.isRaw) RawImages.localThumbBitmap(context, photo.uri, 64) else null)
+            ?: return null
         return try {
             hashOf(source)
         } catch (error: Exception) {
@@ -55,6 +58,7 @@ object Analyse {
         fallbackAt: Long
     ): Fingerprint? {
         val path = photo.smb?.path ?: return null
+        if (photo.isRaw) return hashRawOverNetwork(context, reader, photo, path, fallbackAt)
         val head = reader.head(path, SmbExifReader.HEAD_BYTES) ?: return null
         val exif = SmbExifReader.parse(head, fallbackAt)
         // 縮小画像が無い写真はハッシュ値を作らない。**原本を引きに行かない。**
@@ -74,6 +78,35 @@ object Analyse {
         } catch (error: Exception) {
             Log.w(TAG, "NAS のハッシュ値を作れなかった: ${photo.name}", error)
             Fingerprint(VERSION, photo.size, "", exif.takenAt)
+        }
+    }
+
+    /**
+     * NAS の RAW（U49）。**IFD をたどって、小さいプレビューと撮影時刻だけを読む。**
+     * 25MB の原本は引かない。プレビューが無ければハッシュ値は空（連写のまとめに入らないだけ）。
+     */
+    private fun hashRawOverNetwork(
+        context: Context,
+        reader: Smb.Reader,
+        photo: Photo,
+        path: String,
+        fallbackAt: Long
+    ): Fingerprint? {
+        val got = reader.ranged(path) { RawImages.extract(it, thumb = true) }
+            ?: return Fingerprint(VERSION, photo.size, "", fallbackAt)
+        val takenAt = got.takenAt ?: fallbackAt
+        return try {
+            val bitmap = RawImages.decode(got.jpeg, got.orientation, 256)
+                ?: return Fingerprint(VERSION, photo.size, "", takenAt)
+            val small = RawImages.shrink(bitmap, RawImages.THUMB_STORE)
+            if (small !== bitmap) bitmap.recycle()
+            photo.smb?.let { ThumbCache.write(context, it.nasId, it.path, small) }
+            val made = hashOf(small)
+            small.recycle()
+            Fingerprint(VERSION, photo.size, made ?: "", takenAt)
+        } catch (error: Exception) {
+            Log.w(TAG, "NAS の RAW のハッシュ値を作れなかった: ${photo.name}", error)
+            Fingerprint(VERSION, photo.size, "", takenAt)
         }
     }
 
@@ -263,7 +296,7 @@ object Analyse {
             }
         }
 
-        if (nasAccess != null) {
+        if (nasAccess != null && photos.any(::needsWork)) {
             // **1 本の接続で全部読む。** 1 枚ごとに張り直すと、網の往復が
             // そのまま待ち時間になる（実測 50 枚で 40 秒）。
             val (nas, password) = nasAccess
@@ -309,18 +342,60 @@ object Prepare {
         Skip,
 
         /** 前は写真があったのに空で返ってきた。**前の控えを残し、失敗として扱う。** */
-        KeepPrevious
+        KeepPrevious,
+
+        /**
+         * 一覧が欠けている（読めなかったフォルダがある・上限で止めた。U50・D8）。
+         * **控えもハッシュ値も触らず（前の控えを残し）、失敗として扱う。**
+         */
+        Incomplete
     }
 
     /**
-     * 取り直した顔ぶれを控えに書いてよいか。**空で上書きしない。**
-     * 失敗が空に見える形（網の途切れなど）で、ハッシュ値まで失うのを防ぐ。
+     * 取り直した顔ぶれを控えに書いてよいか。**空で上書きしない。欠けた一覧で上書きしない。**
+     * 失敗が空・欠けに見える形（網の途切れなど）で、写真とハッシュ値を失うのを防ぐ。
+     *
+     * 前の控えが無くても、欠けた一覧は控えにしない。控えると次からそれが「前の一覧」になり、
+     * 欠けたまま選別が始まってしまう（端末だけでなく NAS の相手にも、写真が無いように見える）。
      */
-    fun decideListing(previous: List<Photo>?, fresh: List<Photo>): ListingDecision = when {
+    fun decideListing(previous: List<Photo>?, fresh: List<Photo>, complete: Boolean = true): ListingDecision = when {
+        !complete -> ListingDecision.Incomplete
         fresh.isNotEmpty() -> ListingDecision.Replace
         !previous.isNullOrEmpty() -> ListingDecision.KeepPrevious
         else -> ListingDecision.Skip
     }
+
+    /** 欠けた一覧を使わなかったときの言い方（「止まっています」に出る）。 */
+    fun incompleteReason(listed: Listed, hadPrevious: Boolean): String {
+        val what = if (listed.incomplete > 0) "一部のフォルダを読めませんでした"
+        else "写真が多すぎるか、フォルダが深すぎて、全部を数えられませんでした"
+        return what + if (hadPrevious) "。前の一覧のままです" else "。読めるようにしてから再試行してください"
+    }
+
+    /**
+     * 取り直した一覧を控えに書き、使う一覧を返す。**欠けていれば書かずに理由を投げる**
+     * （このあとのハッシュ値の刈り込みまで進ませない）。[save] は控えへの書き込み。
+     */
+    suspend fun settleListing(
+        previous: List<Photo>?,
+        listed: Listed,
+        save: suspend (List<Photo>) -> Unit
+    ): List<Photo> {
+        val fresh = listed.photos
+        when (decideListing(previous, fresh, listed.complete)) {
+            ListingDecision.Replace -> save(fresh)
+            ListingDecision.Skip -> Unit
+            ListingDecision.KeepPrevious ->
+                throw IllegalStateException("写真の一覧を取れませんでした（前の状態は残してあります）")
+            ListingDecision.Incomplete ->
+                throw IllegalStateException(incompleteReason(listed, hadPrevious = !previous.isNullOrEmpty()))
+        }
+        return fresh
+    }
+
+    /** ハッシュ値を作り直す写真があるか。**無ければ NAS へつながない**（U43）。 */
+    fun needsNetwork(photos: List<Photo>, cached: Map<String, Fingerprint>): Boolean =
+        photos.any { !Analyse.upToDate(cached[it.relativePath], it) }
 
     suspend fun run(
         context: android.content.Context,
@@ -333,20 +408,18 @@ object Prepare {
         // そのたびに網の往復が要る。
         val previous = Listing.load(context, project.source.key)
         val listed = if (!rescan && previous != null) previous else {
-            val fresh = Photos.list(context, project.source)
-            when (decideListing(previous, fresh)) {
-                ListingDecision.Replace -> Listing.save(context, project.source.key, fresh)
-                ListingDecision.Skip -> Unit
-                ListingDecision.KeepPrevious ->
-                    throw IllegalStateException("写真の一覧を取れませんでした（前の状態は残してあります）")
-            }
-            fresh
+            // U49: 組の RAW を外すかはプロジェクトの設定。変えたら「写真を再読み込み」で反映。
+            // U50: 欠けた一覧（読めなかったフォルダ・上限）なら、控えもハッシュ値も触らずに止まる。
+            val fresh = Photos.listing(context, project.source, Prefs.pairRawJpeg(context, project.id))
+            settleListing(previous, fresh) { Listing.save(context, project.source.key, it) }
         }
         val photos = inShootingOrder(listed)
         val cached = Fingerprints.load(context, project.source.key)
 
-        // NAS のときだけ、つなぎ先とパスワードを渡す。
-        val nasAccess = if (project.source.kind == SourceKind.Nas) {
+        // NAS のときだけ、つなぎ先とパスワードを渡す。**作るものが無ければつながない**（U43）。
+        // 準備済みのプロジェクトを開くたびに NAS へつないでいると、Wi-Fi・NAS が起きる前に
+        // 開いただけで「止まっています」になる（A1 で接続の失敗を出すようにしたため）。
+        val nasAccess = if (project.source.kind == SourceKind.Nas && needsNetwork(photos, cached)) {
             val nasId = project.source.key.substringBefore("|")
             NasStore.all(context).firstOrNull { it.id == nasId }?.let { nas ->
                 NasPasswords.password(context, nas)?.let { nas to it }
@@ -487,6 +560,12 @@ object Prepare {
                     chunk.map { photo ->
                         async {
                             val path = photo.smb?.path ?: return@async false
+                            // U49: RAW は**中の大きいプレビューだけ**を読む（原本 25MB は引かない）。
+                            if (photo.isRaw) {
+                                val got = reader.ranged(path) { RawImages.extract(it, thumb = false) }
+                                    ?: return@async false
+                                return@async Renders.write(context, nasId, path, edge, got.jpeg, got.orientation)
+                            }
                             val whole = reader.whole(path) ?: return@async false
                             val orientation = SmbExifReader.parse(whole, 0L).orientation
                             Renders.write(context, nasId, path, edge, whole, orientation)

@@ -788,6 +788,7 @@ fn carry_members(
     in_round: &std::collections::HashSet<String>,
 ) -> HashMap<String, Vec<String>> {
     let mut all = previous.clone();
+    let fresh_reps: std::collections::HashSet<String> = fresh.keys().cloned().collect();
     for (rep, mates) in fresh {
         let mut merged: Vec<String> = Vec::new();
         for id in &mates {
@@ -813,6 +814,18 @@ fn carry_members(
         }
         all.insert(rep, merged);
     }
+    // 前のまとまりのうち、このラウンドで組み直していないもの: **このラウンドに別々に出ている
+    // 仲間は外す**（代表は残す。仲間が 1 枚になったまとまりは消す）。外さないと、まとめる設定を
+    // 切った・境目が変わったあとの「もう一度選別する」で、代表を選んだだけで別に出ている仲間の
+    // 星も上がる（両方選ぶと +2。D6）。`next_round` の in_round は代表だけなので、仲間が
+    // 代表に追従する今の動き（R15）は変わらない。
+    all.retain(|rep, mates| {
+        if fresh_reps.contains(rep) {
+            return true;
+        }
+        mates.retain(|mate| mate == rep || !in_round.contains(mate));
+        mates.len() > 1
+    });
     all
 }
 
@@ -998,6 +1011,14 @@ pub struct Sidecar {
         deserialize_with = "sidecar_sync::lenient"
     )]
     pub progress: Option<SidecarProgress>,
+    /// プロジェクトの設定（U48。今は `pairRawJpeg`）。**選別状況ではない**ので、比較キー・
+    /// 「意味が同じか」には入れない。知らない設定も読んで書き戻す（`SettingsRecord`）。
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "sidecar_sync::lenient"
+    )]
+    pub settings: Option<SettingsRecord>,
 }
 
 /// サイドカーを文字列にする。**形は core が持つ。** 各環境が独自に組み立てない。
@@ -2133,7 +2154,7 @@ mod tests {
             burst_overrides: vec![],
             sessions: SidecarSessions::default(),
             burst_distance: None,
-            write_id: None, based_on: None, lineage: None, epoch: None, key_base: None, progress: None,
+            write_id: None, based_on: None, lineage: None, epoch: None, key_base: None, progress: None, settings: None,
         };
         let outcome = sidecar_decide(100, "device-a".into(), false, Some(theirs));
         assert!(matches!(outcome, SidecarSync::Settled));
@@ -2150,7 +2171,7 @@ mod tests {
             burst_overrides: vec![],
             sessions: SidecarSessions::default(),
             burst_distance: None,
-            write_id: None, based_on: None, lineage: None, epoch: None, key_base: None, progress: None,
+            write_id: None, based_on: None, lineage: None, epoch: None, key_base: None, progress: None, settings: None,
         };
         let outcome = sidecar_decide(100, "device-a".into(), true, Some(theirs));
         assert!(matches!(outcome, SidecarSync::Push));
@@ -2167,7 +2188,7 @@ mod tests {
             burst_overrides: vec![],
             sessions: SidecarSessions::default(),
             burst_distance: None,
-            write_id: None, based_on: None, lineage: None, epoch: None, key_base: None, progress: None,
+            write_id: None, based_on: None, lineage: None, epoch: None, key_base: None, progress: None, settings: None,
         };
         let outcome = sidecar_decide(100, "device-a".into(), false, Some(theirs));
         match outcome {
@@ -2187,7 +2208,7 @@ mod tests {
             burst_overrides: vec![],
             sessions: SidecarSessions::default(),
             burst_distance: None,
-            write_id: None, based_on: None, lineage: None, epoch: None, key_base: None, progress: None,
+            write_id: None, based_on: None, lineage: None, epoch: None, key_base: None, progress: None, settings: None,
         };
         let outcome = sidecar_decide(100, "device-a".into(), true, Some(theirs));
         match outcome {
@@ -2208,7 +2229,7 @@ mod tests {
             burst_overrides: vec![],
             sessions: SidecarSessions::default(),
             burst_distance: None,
-            write_id: None, based_on: None, lineage: None, epoch: None, key_base: None, progress: None,
+            write_id: None, based_on: None, lineage: None, epoch: None, key_base: None, progress: None, settings: None,
         };
         let outcome = sidecar_decide(100, "device-a".into(), true, Some(theirs));
         assert!(matches!(outcome, SidecarSync::Clash(_)));
@@ -2233,7 +2254,7 @@ mod tests {
                 tournament: Some(round(&["1", "2"], 2)),
             },
             burst_distance: Some(9),
-            write_id: None, based_on: None, lineage: None, epoch: None, key_base: None, progress: None,
+            write_id: None, based_on: None, lineage: None, epoch: None, key_base: None, progress: None, settings: None,
         };
         let json = sidecar_to_json(sidecar.clone());
         let back = sidecar_from_json(json).expect("読み戻せるはず");
@@ -2379,6 +2400,54 @@ mod tests {
         let after = advance(second, vec!["A1".into()]);
         assert_eq!(after.ratings["A2"], 2);
         assert_eq!(after.ratings["B"], 1);
+    }
+
+    // ---- D6（レビュー 2026-10-02）: carry_members がこのラウンドに出ている仲間ごと残す ----
+
+    /// 1 ラウンド目で A1 を通す（連写の仲間 A2 も★1）。A3・B は★0。
+    fn pass_a1_only(photos: &[PhotoRef]) -> Session {
+        let session = start_round(photos.to_vec(), 3, 0, true, threshold(), vec![]);
+        assert_eq!(session.current, vec!["A1", "B", "A3"]);
+        let session = advance(session, vec!["A1".into()]);
+        assert_eq!(session.ratings["A2"], 1);
+        assert_eq!(session.members["A1"], vec!["A1", "A2"]);
+        session
+    }
+
+    #[test]
+    fn d6_まとめる設定を切ってもう一度選別すると選んでいない仲間の星が上がらない() {
+        let photos = split_by_b(false);
+        let first = pass_a1_only(&photos);
+        // 「連写をまとめる」を切って「もう一度選別する（★1 から）」。A1 と A2 が別々に出る。
+        let again = round_for(first, photos, 1, false, threshold(), vec![]).unwrap();
+        assert_eq!(again.current, vec!["A1", "A2"]);
+
+        let only_a1 = advance(again.clone(), vec!["A1".into()]);
+        assert_eq!(only_a1.ratings["A1"], 2);
+        assert_eq!(only_a1.ratings["A2"], 1, "選んでいない A2 の星が上がった");
+
+        let both = advance(again, vec!["A1".into(), "A2".into()]);
+        assert_eq!(both.ratings["A1"], 2);
+        assert_eq!(both.ratings["A2"], 2, "A2 が +2 になった");
+    }
+
+    #[test]
+    fn d6_境目を切ってからもう一度選別すると選んでいない仲間の星が上がらない() {
+        let photos = split_by_b(false);
+        let first = pass_a1_only(&photos);
+        // 手直しで A1 と A2 のあいだを切った（境目を学び直したときも同じ）。
+        let split = vec![PairOverride {
+            left: "A1".into(),
+            right: "A2".into(),
+            decision: "split".into(),
+        }];
+        let again = round_for(first, photos, 1, true, threshold(), split).unwrap();
+        assert_eq!(again.current, vec!["A1", "A2"]);
+        assert!(!again.members.contains_key("A1"), "このラウンドに別々に出る仲間をまとめたまま");
+
+        let after = advance(again, vec!["A1".into()]);
+        assert_eq!(after.ratings["A1"], 2);
+        assert_eq!(after.ratings["A2"], 1, "選んでいない A2 の星が上がった");
     }
 
     #[test]

@@ -11,6 +11,7 @@ const {
   createDialog,
   createDisplayChoices,
   createDisplayEdge,
+  createPairRaw,
   createProject,
   createTab,
   desktop,
@@ -44,6 +45,8 @@ const edgeItems = computed(() => createDisplayChoices.value.map(edge => ({ title
   </v-alert>
   <!-- 開発用（pnpm dev のときだけ）。OS のダイアログを使わず、フォルダの絶対パスで読む。 -->
   <v-text-field v-if="isDev" v-model="devFolderPath" label="(開発用) フォルダの絶対パス" placeholder="/tmp/photos" prepend-inner-icon="mdi-folder-wrench" class="mt-5" hide-details />
+  <!-- RAW＋JPEG 同時撮影のとき、同名の RAW を対象から外す（U46。既定はオン）。 -->
+  <v-switch v-if="desktop.capabilities.browseFolders || isDev" v-model="createPairRaw" color="primary" density="comfortable" hide-details="auto" label="ファイル名が同じ JPEG と RAW を 1 枚の写真として扱う" messages="RAW＋JPEG 同時撮影のとき、RAW を対象から外します。あとからプロジェクトの画面でも変えられます。" class="mt-5" />
   </template>
 
   <!-- Amazon Photos の共有リンク。ログインしない。公開の一覧を読むだけ。 -->
