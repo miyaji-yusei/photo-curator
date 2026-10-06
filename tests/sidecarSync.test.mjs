@@ -9,8 +9,9 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { beforeAll, describe, expect, it } from 'vitest'
+import { ref } from 'vue'
 import * as core from '~/lib/core'
-import { createSidecarSync, summarize } from '~/composables/useSidecarSync'
+import { createSidecarSync, summarize, useSidecarSync } from '~/composables/useSidecarSync'
 import { asideName, asideStamp, asideTag, asidesToDrop } from '~/utils/sidecarAside'
 
 const wasmPath = join(import.meta.dirname, '..', 'core-wasm', 'pkg', 'photo_curator_core_wasm_bg.wasm')
@@ -1331,5 +1332,27 @@ describe('U52 D15: 写真の鍵の Unicode・大文字小文字・ドライブ�
       written.push(Object.keys(nasCatalog(pc).sessions.tournament.ratings).sort())
     }
     expect(written[0]).toEqual(written[1])
+  })
+})
+
+describe('開いたときの確認の最中（画面が「選別を開始・再開」を止めるための印）', () => {
+  it('確認している間だけ checking が立ち、終われば（失敗しても）下りる', async () => {
+    const backend = fakeBackend()
+    let release
+    const gate = new Promise(resolve => { release = resolve })
+    const original = backend.sidecarSupported
+    backend.sidecarSupported = async (...args) => { await gate; return original(...args) }
+    globalThis.ref = ref // Nuxt の自動 import の代わり
+    const state = useSidecarSync(backend)
+    expect(state.checking.value).toBe(false)
+    const running = state.checkOnOpen(project)
+    expect(state.checking.value).toBe(true)
+    release()
+    await running
+    expect(state.checking.value).toBe(false)
+
+    backend.sidecarSupported = async () => { throw new Error('つながらない') }
+    await state.checkOnOpen(project)
+    expect(state.checking.value).toBe(false)
   })
 })
