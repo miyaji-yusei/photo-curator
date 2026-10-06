@@ -77,7 +77,7 @@ object HomeCards {
     private suspend fun cardOf(
         context: Context,
         project: Project,
-        tally: suspend () -> Map<Pair<String, Int>, Int>
+        tally: suspend () -> Map<Pair<String, Int>, Set<String>>
     ): Card {
         val key = project.source.key
         val edge = Prefs.projectEdge(context, project.id)

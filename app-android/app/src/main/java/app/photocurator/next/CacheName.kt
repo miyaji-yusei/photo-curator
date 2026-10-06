@@ -38,6 +38,15 @@ object CacheName {
         return match.groupValues[1] to edge
     }
 
+    /** 表示用画像の名前から（置き場の id, 道筋の名前 [of], 大きさ）を取り出す。そうでなければ null。 */
+    fun parseRenderParts(fileName: String): Triple<String, String, Int>? {
+        val match = RENDER_PARTS.matchEntire(fileName) ?: return null
+        val edge = match.groupValues[3].toIntOrNull() ?: return null
+        return Triple(match.groupValues[1], match.groupValues[2], edge)
+    }
+
+    private val RENDER_PARTS = Regex("^(.+)_([0-9a-f]{" + DIGITS + "})_([0-9]+)[.]jpg$")
+
     /** 新しい名前の絵で、大きさが [edge] のものか。 */
     fun isRender(fileName: String, cacheId: String, edge: Int): Boolean =
         Regex("^" + Regex.escape(cacheId) + "_[0-9a-f]{" + DIGITS + "}_" + edge + "[.]jpg$").matches(fileName)
