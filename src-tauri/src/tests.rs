@@ -4638,3 +4638,101 @@ fn a_raw_range_read_that_fails_midway_is_transient_not_unsupported() {
         Some(DecodeFailure::Undecodable)
     );
 }
+
+// -----------------------------------------------------------------------
+// R1: どの名前を写真の候補にするか・組の RAW をどう除くかの共通の表
+//
+// `core/tests/fixtures/photo-names.json` を、Web（`tests/photoNames.test.ts`）・Android
+// （`PhotoNamesFixtureTest`）も読む。実際にフォルダを作って `list_photo_files`（隠し・拡張子・
+// 組の RAW の 3 つの規則が通る入口）に通し、今の挙動を縛る。食い違いは表の `known_differences.pc`。
+// -----------------------------------------------------------------------
+
+fn photo_names_expected(case: &serde_json::Value, implementation: &str, key: &str) -> Vec<String> {
+    let value = case["known_differences"][implementation]
+        .get(key)
+        .unwrap_or(&case[key]);
+    let mut names: Vec<String> = value
+        .as_array()
+        .expect("expected is an array")
+        .iter()
+        .map(|name| name.as_str().expect("name").to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn photo_names_fixture_matches_the_scan_of_this_implementation() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../core/tests/fixtures/photo-names.json"))
+            .expect("fixture parses");
+    let cases = fixture["cases"].as_array().expect("cases");
+    assert!(cases.len() >= 10);
+    for case in cases {
+        let id = case["id"].as_str().expect("id");
+        let root = test_directory(&format!("photo-names-{id}"));
+        for name in case["files"].as_array().expect("files") {
+            let path = root.join(name.as_str().expect("name"));
+            fs::create_dir_all(path.parent().expect("parent")).expect("create folder");
+            fs::write(&path, b"x").expect("create file");
+        }
+        for (pair_raw, key) in [(true, "pair_on"), (false, "pair_off")] {
+            let listing = list_photo_files(root.to_str().expect("utf-8 path"), pair_raw)
+                .expect("list the fixture folder");
+            let mut actual: Vec<String> = listing
+                .files
+                .iter()
+                .map(|file| {
+                    file.path
+                        .strip_prefix(&root)
+                        .expect("under the root")
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                })
+                .collect();
+            actual.sort();
+            assert_eq!(
+                actual,
+                photo_names_expected(case, "pc", key),
+                "case {id} / {key}"
+            );
+        }
+        fs::remove_dir_all(&root).expect("remove fixture folder");
+    }
+}
+
+#[test]
+fn photo_names_known_differences_are_real_differences() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../core/tests/fixtures/photo-names.json"))
+            .expect("fixture parses");
+    for case in fixture["cases"].as_array().expect("cases") {
+        let Some(differences) = case["known_differences"].as_object() else {
+            continue;
+        };
+        for (implementation, difference) in differences {
+            assert!(
+                ["pc", "web", "android"].contains(&implementation.as_str()),
+                "unknown implementation {implementation}"
+            );
+            assert!(difference["reason"].is_string(), "reason is required");
+            for key in ["pair_on", "pair_off"] {
+                if difference.get(key).is_some() {
+                    let mut default: Vec<String> = case[key]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|name| name.as_str().unwrap().to_string())
+                        .collect();
+                    default.sort();
+                    assert_ne!(
+                        photo_names_expected(case, implementation, key),
+                        default,
+                        "stale known difference: {} {implementation} {key}",
+                        case["id"]
+                    );
+                }
+            }
+        }
+    }
+}
