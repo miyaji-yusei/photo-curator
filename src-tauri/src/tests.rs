@@ -3868,3 +3868,24 @@ fn a_failing_xmp_is_reported_while_the_jpeg_write_still_counts() {
     assert_eq!(fs::read_to_string(&xmp).unwrap(), "<broken><x></broken>");
     fs::remove_dir_all(&directory).ok();
 }
+
+/// RAW（`image` で開けない）は、EXIF のサムネイルが取れなかったら、本体を丸ごと読まずに諦める。
+#[test]
+fn a_raw_without_a_thumbnail_gives_up_without_reading_the_whole_file() {
+    let source = CountingSource::new(vec![0u8; 4 * 1024 * 1024], "IMG_0001.CR2");
+    assert!(decode_hash_source_with(&source, false).is_none());
+    assert_eq!(source.all_calls.get(), 0, "RAW の本体を丸ごと読んでいる");
+    assert!(source.served.get() <= EXIF_HEAD_PROBE);
+}
+
+/// 解析できなかった件数は、DB の行を数える。前回までの失敗を、今回の失敗として二重に足さない。
+#[test]
+fn failed_photo_count_counts_rows_once() {
+    let conn = Connection::open_in_memory().expect("open");
+    conn.execute_batch(
+        "CREATE TABLE photos (project_id TEXT, is_missing INTEGER, analysis_error TEXT);
+         INSERT INTO photos VALUES ('p',0,'x'),('p',0,NULL),('p',1,'x'),('q',0,'x');",
+    )
+    .expect("seed");
+    assert_eq!(failed_photo_count(&conn, "p").expect("count"), 1);
+}
