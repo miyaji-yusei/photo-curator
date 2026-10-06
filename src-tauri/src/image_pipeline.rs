@@ -213,9 +213,8 @@ pub(crate) fn try_decode_hash_source_with(
     if !pixel_fallback {
         // RAW: 本体の中に埋め込まれたプレビュー JPEG を、範囲読みで取り出して使う（U57）。
         // 向きは RAW 本体の Orientation（decode_preview が焼き込む）。取り出せない RAW だけが失敗になる。
-        return decode_preview(source, &head, Want::Thumb)
-            .map(|image| (image, DecodeSource::RawPreview))
-            .ok_or(DecodeFailure::Undecodable);
+        return try_decode_preview(source, &head, Want::Thumb)
+            .map(|image| (image, DecodeSource::RawPreview));
     }
     // ここから先は生の画素なので、本体（IFD0）の Orientation をそのまま当てる。
     // IFD0 は TIFF ブロックの先頭近くなので、先頭だけで読める。

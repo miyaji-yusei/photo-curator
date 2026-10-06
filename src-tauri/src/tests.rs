@@ -4584,3 +4584,57 @@ fn timeouts_and_unresponsive_workers_are_transient() {
     assert_eq!(work.error_kind(), Some("unsupported"));
     assert_eq!(PhotoWork::new(1, "q").error_kind(), None, "失敗が無ければ種類も無い");
 }
+
+/// 範囲読みだけ壊せる `PhotoSource`（NAS の瞬断の代わり）。
+struct FlakyRange {
+    inner: CountingSource,
+    mode: u8, // 0=正常 1=読めない 2=半分で切れる
+}
+
+impl PhotoSource for FlakyRange {
+    fn head(&self, want: usize) -> Option<Vec<u8>> {
+        self.inner.head(want)
+    }
+    fn all(&self) -> Option<Vec<u8>> {
+        self.inner.all()
+    }
+    fn read_range(&self, offset: u64, length: usize) -> Option<Vec<u8>> {
+        match self.mode {
+            1 => None,
+            2 => self
+                .inner
+                .read_range(offset, length)
+                .map(|bytes| bytes[..bytes.len() / 2].to_vec()),
+            _ => self.inner.read_range(offset, length),
+        }
+    }
+    fn fingerprint(&self) -> Option<(i64, i64)> {
+        self.inner.fingerprint()
+    }
+    fn name(&self) -> Option<String> {
+        self.inner.name()
+    }
+}
+
+#[test]
+fn a_raw_range_read_that_fails_midway_is_transient_not_unsupported() {
+    let bytes = cr2_like(&real_jpeg(1200, 800), &real_jpeg(320, 240), 3000, 90_000, 100_000, 1);
+    let make = |mode| FlakyRange { inner: CountingSource::new(bytes.clone(), "IMG_0100.CR2"), mode };
+    // 正常に読めればプレビューが取れる。
+    assert!(try_decode_hash_source_with(&make(0), false).is_ok());
+    // 範囲読みが途中で読めない・短く返る＝一時的。
+    assert_eq!(
+        try_decode_hash_source_with(&make(1), false).err(),
+        Some(DecodeFailure::Unreadable)
+    );
+    assert_eq!(
+        try_decode_hash_source_with(&make(2), false).err(),
+        Some(DecodeFailure::Unreadable)
+    );
+    // 最後まで正常に読めたのにプレビューが無い＝非対応のまま。
+    let none = FlakyRange { inner: CountingSource::new(vec![0u8; 100_000], "IMG_0101.CR2"), mode: 0 };
+    assert_eq!(
+        try_decode_hash_source_with(&none, false).err(),
+        Some(DecodeFailure::Undecodable)
+    );
+}
