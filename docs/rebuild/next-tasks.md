@@ -64,6 +64,7 @@
 | U39 | 「指紋」を「ハッシュ値」に言い換える（docs・文言。識別子は変えない） | S | docs・画面の文言 | 済（#47） |
 | U40 | Android のホームのカードが「…」のまま固まる件 | S | `app-android/` | 済（#48） |
 | U57 | PC の RAW（CR2 など）を解析・選別できるようにする。RAW に埋め込まれたプレビュー JPEG を取り出してサムネイル・dHash・表示用画像の元にする（Android の U49 と同じ規則） | M | `src-tauri/src/raw_preview.rs`・`image_pipeline.rs`・`capture.rs` | 済（PC。Web 版は未対応） |
+| U58 | 解析できなかった写真の一覧・非対応形式は再試行しない・準備の分母と選別の対象から外す（PC・Web。Android は別担当）。`photos.analysis_error_kind` を 1 列追加 | M | `src-tauri/`（`analysis.rs`・`image_pipeline.rs`・`display.rs`・`lib.rs`）・`composables/`・`utils/analysisFailures.ts`・`AnalysisFailuresDialog.vue` | 済（PC・Web。Android は未着手。詳細は 10 章 §7 の U58 の行） |
 
 ---
 
