@@ -27,6 +27,7 @@ import type {
   SettingValueBool, SettledReason, Sidecar, SidecarProgress
 } from '~/lib/core'
 import type { PhotoBackend, SidecarAccess, SidecarState } from '~/composables/photoBackend'
+import type { Photo } from '~/types/photo'
 import type { SavedSelection } from '~/utils/selectionFlow'
 import { applyChanges } from '~/utils/ratingEdit'
 import { alignFolderHint, asideTag, relocalizeKeys } from '~/utils/sidecarAside'
@@ -203,6 +204,11 @@ interface Snapshot {
   photoKeys: string[]
   /** 載せる写真のうち、欠損でない行の数（0 なら書かない）。 */
   liveRows: number
+  /**
+   * `mineRaw` を組んだ写真の行（R9）。**このあとに行を書いていない間だけ**組み立てに渡してよい
+   * （取り込み・混ぜるで `applyLocal` が★を書いたあとは古い）。
+   */
+  rows: Photo[]
   identity: { id: string, name: string }
   /**
    * 設定（U48）をどうするか。`AdoptRemote` のときは `mine` の設定をもう NAS の値にしてある
@@ -230,8 +236,11 @@ export interface SidecarSync {
   markChanged: (projectId: string) => Promise<void>
   /** 「最初からやり直す」。この端末の選別状況の世代を新しくする。 */
   markRestarted: (projectId: string) => Promise<void>
-  /** 端末の分から Sidecar を組む（端末の鍵のまま）。 */
-  buildSidecar: (project: ProjectRef, updatedAt?: number) => Promise<Sidecar>
+  /**
+   * 端末の分から Sidecar を組む（端末の鍵のまま）。`rows` は組む直前に同じ処理の中で読んだ写真の行だけを渡す
+   * （R9。渡さなければ自分で読む。古い行を渡すと★や手直しの最新が欠ける）。
+   */
+  buildSidecar: (project: ProjectRef, updatedAt?: number, rows?: Photo[]) => Promise<Sidecar>
   /** 切り離し中か。 */
   isDetached: (projectId: string) => Promise<boolean>
   access: (projectId: string) => Promise<SidecarAccess>
@@ -263,10 +272,14 @@ export function createSidecarSync(backend: SidecarBackend, now: () => number = D
     if (!state.localChanged) knownChanged.delete(projectId)
   }
 
-  async function buildWith(project: ProjectRef, updatedAt?: number) {
+  /**
+   * 端末の分を組む。`given` は写真の行（`getCoreInputs` の結果）で、**組む直前に同じ処理の中で読んだもの
+   * だけ**を渡す（R9）。渡さなければ今どおりここで読む。古い行を渡すと、★や手直しの最新が欠けた版を組む。
+   */
+  async function buildWith(project: ProjectRef, updatedAt?: number, given?: Photo[]) {
     const [identity, rows, overrides, saved, projects, state] = await Promise.all([
       backend.deviceIdentity(),
-      backend.getCoreInputs(project.id),
+      given ?? backend.getCoreInputs(project.id),
       backend.getPairOverrides(project.id),
       backend.loadSession(project.id),
       backend.listProjects(),
@@ -302,11 +315,14 @@ export function createSidecarSync(backend: SidecarBackend, now: () => number = D
     return { sidecar, identity, rows, saved, state, folderPath: info?.folderPath ?? '', separator, pair }
   }
 
-  async function buildSidecar(project: ProjectRef, updatedAt?: number): Promise<Sidecar> {
-    return (await buildWith(project, updatedAt)).sidecar
+  async function buildSidecar(project: ProjectRef, updatedAt?: number, rows?: Photo[]): Promise<Sidecar> {
+    return (await buildWith(project, updatedAt, rows)).sidecar
   }
 
-  /** 端末の今の比較キー（取り込んだ・混ぜたあとの控えに使う）。 */
+  /**
+   * 端末の今の比較キー（取り込んだ・混ぜたあとの控えに使う）。行は渡さずに読み直す（R9: 直前の `applyLocal` が
+   * ★を書いたので、それより前に読んだ行は古い）。
+   */
   async function currentKey(project: ProjectRef): Promise<string> {
     const { sidecar } = await buildWith(project)
     return core.judgementKey(core.sidecarJudgement(core.sidecarKeysToFolder(sidecar, '')))
@@ -346,6 +362,7 @@ export function createSidecarSync(backend: SidecarBackend, now: () => number = D
       separator: built.separator,
       photoKeys: Object.keys(mine.photos),
       liveRows: built.rows.length,
+      rows: built.rows,
       identity: built.identity
     }
   }
@@ -554,7 +571,8 @@ export function createSidecarSync(backend: SidecarBackend, now: () => number = D
   async function adopt(project: ProjectRef, sidecar: Sidecar): Promise<void> {
     await serialized(project.id, async () => {
       const snap = await snapshot(project, await access(project.id))
-      const built = await buildWith(project)
+      // R9: 行は直前の snapshot が同じ列の中で読んだもの（間に書き込みは無い）。ここで使うのは folderPath だけ。
+      const built = await buildWith(project, undefined, snap.rows)
       const theirs = core.sidecarNormalizeKeys(sidecar, folderHint(sidecar, built.folderPath))
       await pull(project, snap, theirs, core.sidecarToken(theirs), true)
     })
