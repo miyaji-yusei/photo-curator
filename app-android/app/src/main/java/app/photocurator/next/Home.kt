@@ -397,24 +397,26 @@ internal suspend fun standingOf(
             return Standing("準備中 · 写真の走査", "", null, Sky, "開く")
         }
         val prints = Fingerprints.load(context, project.source.key).size
-        if (prints < known.size) {
+        // **非対応の写真は分母にも枚数にも入れない**（U58。選別の対象でないので）。
+        val total = Failures.workableCount(known, Failures.load(context, project.source.key))
+        if (prints < total) {
             return Standing(
                 "準備中 · 撮影時刻・サムネイル",
-                "$prints / ${known.size} 枚", ratio(prints, known.size), Sky, "開始"
+                "$prints / $total 枚", ratio(prints, total), Sky, "開始"
             )
         }
         val cacheId = project.source.cacheId
         if (project.source.remote && cacheId != null) {
             val made = renderTally()[cacheId to edge] ?: 0
-            if (made < known.size) {
+            if (made < total) {
                 return Standing(
                     "準備中 · 表示用画像を作成",
-                    "$made / ${known.size} 枚", ratio(made, known.size), Sky, "開始"
+                    "$made / $total 枚", ratio(made, total), Sky, "開始"
                 )
             }
         }
         // ---- 未開始 ----
-        return Standing("準備完了", "${known.size} 枚", null, Faint, "開始")
+        return Standing("準備完了", "$total 枚", null, Faint, "開始")
     }
 
     val total = session.ratings.size
