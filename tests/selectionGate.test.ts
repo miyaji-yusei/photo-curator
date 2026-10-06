@@ -3,15 +3,15 @@ import { canStartSelection } from '../utils/selectionGate'
 import type { SelectionGateFacts } from '../utils/selectionGate'
 
 // 各入口が今どの条件を見ているか（`useCurator` の旧ガードと `ProjectView` の旧 :disabled をそのまま写した）。
-const clear = { photoCount: 10, sidecarClash: false, sidecarChecking: false, hasProject: true, taskDialog: false }
+const clear = { photoCount: 10, sidecarClash: false, sidecarChecking: false, hasProject: true, taskDialog: false, scanRunning: false }
 const entries: Record<string, { reads: (keyof SelectionGateFacts)[], blockedBy: (keyof SelectionGateFacts)[] }> = {
-  enterMethod: { reads: ['photoCount', 'sidecarClash', 'sidecarChecking'], blockedBy: ['photoCount', 'sidecarClash', 'sidecarChecking'] },
-  startButton: { reads: ['photoCount', 'sidecarClash', 'sidecarChecking'], blockedBy: ['photoCount', 'sidecarClash', 'sidecarChecking'] },
-  beginTournament: { reads: ['hasProject', 'taskDialog', 'sidecarClash'], blockedBy: ['hasProject', 'taskDialog', 'sidecarClash'] },
-  startTournament: { reads: ['hasProject', 'taskDialog', 'sidecarClash'], blockedBy: ['hasProject', 'taskDialog', 'sidecarClash'] },
-  resumeSession: { reads: ['sidecarClash', 'sidecarChecking'], blockedBy: ['sidecarClash', 'sidecarChecking'] }
+  enterMethod: { reads: ['photoCount', 'scanRunning', 'sidecarClash', 'sidecarChecking'], blockedBy: ['photoCount', 'scanRunning', 'sidecarClash', 'sidecarChecking'] },
+  startButton: { reads: ['photoCount', 'scanRunning', 'sidecarClash', 'sidecarChecking'], blockedBy: ['photoCount', 'scanRunning', 'sidecarClash', 'sidecarChecking'] },
+  beginTournament: { reads: ['hasProject', 'taskDialog', 'scanRunning', 'sidecarClash'], blockedBy: ['hasProject', 'taskDialog', 'scanRunning', 'sidecarClash'] },
+  startTournament: { reads: ['hasProject', 'taskDialog', 'scanRunning', 'sidecarClash'], blockedBy: ['hasProject', 'taskDialog', 'scanRunning', 'sidecarClash'] },
+  resumeSession: { reads: ['scanRunning', 'sidecarClash', 'sidecarChecking'], blockedBy: ['scanRunning', 'sidecarClash', 'sidecarChecking'] }
 }
-const bad: Record<string, unknown> = { photoCount: 0, sidecarClash: true, sidecarChecking: true, hasProject: false, taskDialog: true }
+const bad: Record<string, unknown> = { photoCount: 0, sidecarClash: true, sidecarChecking: true, hasProject: false, taskDialog: true, scanRunning: true }
 const all = Object.keys(bad) as (keyof SelectionGateFacts)[]
 
 function factsFor(entry: string, overrides: Record<string, unknown>): SelectionGateFacts {
@@ -43,7 +43,8 @@ describe('canStartSelection（入口 × 条件）', () => {
     expect(canStartSelection({ photoCount: Number.NaN })).toBe(false)
   })
 
-  it('走査中は条件に無い（B9。直すときはここに 1 行足す）', () => {
-    expect(Object.keys(clear)).not.toContain('scanRunning')
+  it('走査中は始められない（B9。どの入口も見る）', () => {
+    expect(canStartSelection({ scanRunning: true })).toBe(false)
+    expect(canStartSelection({ scanRunning: false })).toBe(true)
   })
 })

@@ -7,11 +7,11 @@
  *
  * | 入口 | 渡す事実 |
  * | --- | --- |
- * | `enterMethod`・開始ボタン | `photoCount`・`sidecarClash`・`sidecarChecking` |
- * | `beginTournament`・`startTournament` | `hasProject`・`taskDialog`・`sidecarClash` |
- * | `resumeSession` | `sidecarClash`・`sidecarChecking` |
+ * | `enterMethod`・開始ボタン | `photoCount`・`scanRunning`・`sidecarClash`・`sidecarChecking` |
+ * | `beginTournament`・`startTournament` | `hasProject`・`taskDialog`・`scanRunning`・`sidecarClash` |
+ * | `resumeSession` | `scanRunning`・`sidecarClash`・`sidecarChecking` |
  *
- * 走査中（`scanRunning`）はどの入口も見ていない（設計書 11 章 §4 B9）。直すときはここに 1 行足す。
+ * 走査中（`scanRunning`）はどの入口も見る（設計書 01 章「走査中は開始できない」。11 章 §4 B9）。
  */
 export interface SelectionGateFacts {
   /** プロジェクトを開いているか。 */
@@ -20,6 +20,8 @@ export interface SelectionGateFacts {
   photoCount?: number
   /** 走査などの進捗ダイアログが開いているか。 */
   taskDialog?: boolean
+  /** 写真の走査（再読み込みを含む）の最中か。 */
+  scanRunning?: boolean
   /** 別の端末の記録との食い違いが未解決か。 */
   sidecarClash?: boolean
   /** サイドカーを確かめている最中か。 */
@@ -31,6 +33,7 @@ export function canStartSelection(facts: SelectionGateFacts): boolean {
   if (facts.hasProject === false) return false
   if (facts.photoCount !== undefined && !facts.photoCount) return false
   if (facts.taskDialog) return false
+  if (facts.scanRunning) return false
   if (facts.sidecarClash) return false
   if (facts.sidecarChecking) return false
   return true
