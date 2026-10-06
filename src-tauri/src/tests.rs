@@ -993,6 +993,7 @@ struct CountingSource {
     name: String,
     served: std::cell::Cell<usize>,
     all_calls: std::cell::Cell<usize>,
+    range_calls: std::cell::Cell<usize>,
 }
 
 impl CountingSource {
@@ -1002,6 +1003,7 @@ impl CountingSource {
             name: name.to_owned(),
             served: std::cell::Cell::new(0),
             all_calls: std::cell::Cell::new(0),
+            range_calls: std::cell::Cell::new(0),
         }
     }
 }
@@ -1016,6 +1018,16 @@ impl PhotoSource for CountingSource {
         self.all_calls.set(self.all_calls.get() + 1);
         self.served.set(self.served.get() + self.bytes.len());
         Some(self.bytes.clone())
+    }
+    fn read_range(&self, offset: u64, length: usize) -> Option<Vec<u8>> {
+        let start = usize::try_from(offset).ok()?;
+        if start >= self.bytes.len() {
+            return None;
+        }
+        let end = start.saturating_add(length).min(self.bytes.len());
+        self.range_calls.set(self.range_calls.get() + 1);
+        self.served.set(self.served.get() + (end - start));
+        Some(self.bytes[start..end].to_vec())
     }
     fn fingerprint(&self) -> Option<(i64, i64)> {
         Some((1_700_000_000_000, self.bytes.len() as i64))
@@ -3888,4 +3900,365 @@ fn failed_photo_count_counts_rows_once() {
     )
     .expect("seed");
     assert_eq!(failed_photo_count(&conn, "p").expect("count"), 1);
+}
+
+// -----------------------------------------------------------------------
+// U57: RAW に埋め込まれたプレビュー JPEG
+// -----------------------------------------------------------------------
+
+/// 小さな TIFF を手で組む入れ物。
+struct TiffBuf {
+    d: Vec<u8>,
+    little: bool,
+}
+
+impl TiffBuf {
+    fn new(size: usize, little: bool) -> Self {
+        let mut t = Self { d: vec![0; size], little };
+        t.d[0..2].copy_from_slice(if little { b"II" } else { b"MM" });
+        t.u16(2, 42);
+        t
+    }
+    fn u16(&mut self, at: usize, v: u16) {
+        let b = if self.little { v.to_le_bytes() } else { v.to_be_bytes() };
+        self.d[at..at + 2].copy_from_slice(&b);
+    }
+    fn u32(&mut self, at: usize, v: u32) {
+        let b = if self.little { v.to_le_bytes() } else { v.to_be_bytes() };
+        self.d[at..at + 4].copy_from_slice(&b);
+    }
+    fn put(&mut self, at: usize, bytes: &[u8]) {
+        self.d[at..at + bytes.len()].copy_from_slice(bytes);
+    }
+    /// (tag, type, count, value)。type 3（SHORT）の値は先頭 2 バイトに置く。
+    fn ifd(&mut self, at: usize, entries: &[(u16, u16, u32, u32)], next: u32) {
+        self.u16(at, entries.len() as u16);
+        for (i, (tag, ty, n, value)) in entries.iter().enumerate() {
+            let e = at + 2 + i * 12;
+            self.u16(e, *tag);
+            self.u16(e + 2, *ty);
+            self.u32(e + 4, *n);
+            if *ty == 3 {
+                self.u16(e + 8, *value as u16);
+            } else {
+                self.u32(e + 8, *value);
+            }
+        }
+        self.u32(at + 2 + entries.len() * 12, next);
+    }
+    fn first_ifd(&mut self, at: u32) {
+        self.u32(4, at);
+    }
+}
+
+/// SOF だけが正しい、デコードはできない JPEG 風のバイト列。
+fn fake_jpeg(width: u16, height: u16, len: usize, sof: u8) -> Vec<u8> {
+    let mut v = vec![0u8; len];
+    v[0..2].copy_from_slice(&[0xFF, 0xD8]);
+    v[2..6].copy_from_slice(&[0xFF, 0xE0, 0x00, 0x10]); // APP0 16 バイト
+    v[6 + 14..6 + 14 + 4].copy_from_slice(&[0xFF, sof, 0x00, 0x11]);
+    let s = 6 + 14 + 4; // SOF の中身
+    v[s] = 8;
+    v[s + 1..s + 3].copy_from_slice(&height.to_be_bytes());
+    v[s + 3..s + 5].copy_from_slice(&width.to_be_bytes());
+    v[s + 5] = 3;
+    v[len - 2..].copy_from_slice(&[0xFF, 0xD9]);
+    v
+}
+
+/// 実際にデコードできる JPEG。
+fn real_jpeg(width: u32, height: u32) -> Vec<u8> {
+    let img = image::RgbImage::from_fn(width, height, |x, y| {
+        image::Rgb([(x * 255 / width) as u8, (y * 255 / height) as u8, ((x ^ y) & 0xFF) as u8])
+    });
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85)
+        .encode(img.as_raw(), width, height, image::ExtendedColorType::Rgb8)
+        .expect("encode");
+    out
+}
+
+/// CR2 風: IFD0（向き・JPEG 圧縮 1 本の strip）→ IFD1（JPEGInterchangeFormat のサムネイル）。
+/// `big` を IFD0 の strip（大きいプレビュー）、`small` を IFD1 のサムネイルとして `total` バイトの中に置く。
+fn cr2_like(big: &[u8], small: &[u8], big_at: usize, small_at: usize, total: usize, orientation: u16) -> Vec<u8> {
+    let mut t = TiffBuf::new(total, true);
+    t.first_ifd(8);
+    t.ifd(
+        8,
+        &[
+            (0x0103, 3, 1, 6),
+            (0x0111, 4, 1, big_at as u32),
+            (0x0112, 3, 1, orientation as u32),
+            (0x0117, 4, 1, big.len() as u32),
+        ],
+        100,
+    );
+    t.ifd(
+        100,
+        &[(0x0201, 4, 1, small_at as u32), (0x0202, 4, 1, small.len() as u32)],
+        0,
+    );
+    t.put(big_at, big);
+    t.put(small_at, small);
+    t.d
+}
+
+fn raw_info_of(bytes: &[u8]) -> RawInfo {
+    inspect(&SliceSource(bytes))
+}
+
+#[test]
+fn raw_preview_picks_the_largest_jpeg_in_a_cr2_like_file() {
+    let big = fake_jpeg(1620, 1080, 3000, 0xC0);
+    let small = fake_jpeg(160, 120, 800, 0xC0);
+    let bytes = cr2_like(&big, &small, 1000, 5000, 8000, 6);
+    let info = raw_info_of(&bytes);
+    assert_eq!(info.previews.len(), 2);
+    assert_eq!(info.orientation, Some(6));
+    let top = largest(&info).expect("largest");
+    assert_eq!((top.width, top.height, top.offset, top.length), (1620, 1080, 1000, 3000));
+    // サムネイル用: 長辺 256 以上で最小 → 大きい方。100 以上なら小さい方。
+    assert_eq!(for_thumb(&info, 256).unwrap().width, 1620);
+    assert_eq!(for_thumb(&info, 100).unwrap().width, 160);
+    // 足りるものが無ければ一番大きいもの。
+    assert_eq!(for_thumb(&info, 5000).unwrap().width, 1620);
+    assert_eq!(bytes_of(&SliceSource(&bytes), &top).unwrap(), big);
+}
+
+#[test]
+fn raw_preview_follows_sub_ifds_in_a_big_endian_file() {
+    // NEF 風: IFD0 に SubIFD（0x014A）が 2 つ。片方に大きい JPEG、もう片方に可逆（C3）の本体。
+    let mut t = TiffBuf::new(9000, false);
+    t.first_ifd(8);
+    t.ifd(8, &[(0x0112, 3, 1, 1), (0x014A, 4, 2, 200)], 0);
+    t.u32(200, 300);
+    t.u32(204, 400);
+    t.ifd(300, &[(0x0201, 4, 1, 1000), (0x0202, 4, 1, 4000)], 0);
+    t.ifd(400, &[(0x0201, 4, 1, 6000), (0x0202, 4, 1, 2000)], 0);
+    t.put(1000, &fake_jpeg(4000, 3000, 4000, 0xC2)); // プログレッシブ
+    t.put(6000, &fake_jpeg(6000, 4000, 2000, 0xC3)); // 可逆 = RAW 本体
+    let info = raw_info_of(&t.d);
+    assert_eq!(info.previews.len(), 1, "可逆 JPEG（RAW 本体）は数えない");
+    assert_eq!(largest(&info).unwrap().width, 4000);
+    assert_eq!(info.orientation, Some(1));
+}
+
+#[test]
+fn raw_preview_is_empty_without_a_jpeg() {
+    let mut t = TiffBuf::new(2000, true);
+    t.first_ifd(8);
+    t.ifd(8, &[(0x0103, 3, 1, 7), (0x0111, 4, 1, 500), (0x0112, 3, 1, 1), (0x0117, 4, 1, 800)], 0);
+    t.put(500, &fake_jpeg(6000, 4000, 800, 0xC3));
+    let info = raw_info_of(&t.d);
+    assert!(info.previews.is_empty());
+    assert!(largest(&info).is_none());
+    // 見出しが違う・短い・空。
+    assert!(raw_info_of(b"not a raw file at all, just text").previews.is_empty());
+    assert!(raw_info_of(&[]).previews.is_empty());
+    assert!(raw_info_of(&[0x49, 0x49]).previews.is_empty());
+}
+
+#[test]
+fn raw_preview_survives_broken_offsets_and_loops() {
+    let big = fake_jpeg(1620, 1080, 3000, 0xC0);
+    let mut bytes = cr2_like(&big, &fake_jpeg(160, 120, 800, 0xC0), 1000, 5000, 8000, 1);
+    // 範囲外のオフセット・長さ（IFD1 の JPEG）。IFD0 の方だけが残る。
+    let mut t = TiffBuf { d: bytes.clone(), little: true };
+    t.ifd(100, &[(0x0201, 4, 1, 7_900), (0x0202, 4, 1, 4_000_000_000)], 0);
+    assert_eq!(raw_info_of(&t.d).previews.len(), 1, "範囲外の方だけ捨てる");
+    // IFD の鎖がループ（自分自身を指す）。
+    let mut t = TiffBuf { d: bytes.clone(), little: true };
+    t.ifd(100, &[(0x0201, 4, 1, 5000), (0x0202, 4, 1, 800)], 100);
+    t.ifd(8, &[(0x0112, 3, 1, 1)], 100);
+    assert!(raw_info_of(&t.d).previews.len() <= 1);
+    // SubIFD が自分を指す・IFD0 の次が IFD0。
+    let mut t = TiffBuf { d: bytes.clone(), little: true };
+    t.ifd(8, &[(0x014A, 4, 1, 8)], 8);
+    let _ = raw_info_of(&t.d);
+    // 最初の IFD が範囲外（u32 の上限）。
+    t.first_ifd(0xFFFF_FFFF);
+    assert!(raw_info_of(&t.d).previews.is_empty());
+    // どの 1 バイトを壊しても、途中で切っても panic しない。
+    for i in 0..bytes.len().min(400) {
+        let saved = bytes[i];
+        for value in [0u8, 0xFF, 0x7F] {
+            bytes[i] = value;
+            let _ = raw_info_of(&bytes);
+        }
+        bytes[i] = saved;
+    }
+    for cut in [0, 1, 7, 8, 9, 50, 99, 101, 130, 1500, 4000, 7999] {
+        let _ = raw_info_of(&bytes[..cut]);
+    }
+}
+
+#[test]
+fn raw_preview_reads_the_raf_header() {
+    let jpeg = fake_jpeg(1920, 1280, 5000, 0xC0);
+    let mut bytes = vec![0u8; 12000];
+    bytes[..15].copy_from_slice(b"FUJIFILMCCD-RAW");
+    bytes[84..88].copy_from_slice(&2000u32.to_be_bytes());
+    bytes[88..92].copy_from_slice(&5000u32.to_be_bytes());
+    bytes[2000..7000].copy_from_slice(&jpeg);
+    let info = raw_info_of(&bytes);
+    assert_eq!(info.previews.len(), 1);
+    assert_eq!(info.orientation, None);
+    assert_eq!(largest(&info).unwrap().length, 5000);
+    // 見出しが範囲外を指すなら空。
+    bytes[84..88].copy_from_slice(&900_000u32.to_be_bytes());
+    assert!(raw_info_of(&bytes).previews.is_empty());
+}
+
+fn hex16(text: &str) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).unwrap();
+    }
+    out
+}
+
+fn iso_box(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut b = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+    b.extend_from_slice(kind);
+    b.extend_from_slice(body);
+    b
+}
+
+/// CR3 風: ftyp → moov（uuid(CMT) → CMT1 の TIFF）→ uuid(PRVW) → mdat。
+fn cr3_like(jpeg: &[u8], orientation: u16) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend(iso_box(b"ftyp", b"crx \0\0\0\x01crx isom"));
+    let mut t = TiffBuf::new(40, true);
+    t.first_ifd(8);
+    t.ifd(8, &[(0x0112, 3, 1, orientation as u32)], 0);
+    let mut uuid_cmt = hex16("85c0b687820f11e08111f4ce462b6a48").to_vec();
+    uuid_cmt.extend(iso_box(b"CMT1", &t.d));
+    out.extend(iso_box(b"moov", &iso_box(b"uuid", &uuid_cmt)));
+    // PRVW: uuid(16) + 詰め物 8 + 箱（サイズ 4・PRVW 4・詰め物 12・JPEG の長さ 4・JPEG）
+    let mut body = hex16("eaf42b5e1c984b88b9fbb7dc406e4d16").to_vec();
+    body.extend_from_slice(&[0u8; 8]);
+    body.extend_from_slice(&((24 + jpeg.len()) as u32).to_be_bytes());
+    body.extend_from_slice(b"PRVW");
+    body.extend_from_slice(&[0u8; 12]);
+    body.extend_from_slice(&(jpeg.len() as u32).to_be_bytes());
+    body.extend_from_slice(jpeg);
+    out.extend(iso_box(b"uuid", &body));
+    out.extend(iso_box(b"mdat", &[0u8; 64]));
+    out
+}
+
+#[test]
+fn raw_preview_reads_the_cr3_prvw_box_and_orientation() {
+    let jpeg = fake_jpeg(1620, 1080, 3000, 0xC0);
+    let bytes = cr3_like(&jpeg, 8);
+    let info = raw_info_of(&bytes);
+    assert_eq!(info.previews.len(), 1, "PRVW の JPEG を見つける");
+    assert_eq!(info.orientation, Some(8), "向きは moov の CMT1 から");
+    let region = largest(&info).unwrap();
+    assert_eq!((region.width, region.height), (1620, 1080));
+    assert_eq!(bytes_of(&SliceSource(&bytes), &region).unwrap(), jpeg);
+    // 途中で切れていたら（JPEG が全部読めない）使わない。
+    assert!(raw_info_of(&bytes[..bytes.len() - 100]).previews.is_empty());
+    for cut in (0..bytes.len()).step_by(37) {
+        let _ = raw_info_of(&bytes[..cut]);
+    }
+}
+
+#[test]
+fn raw_preview_does_not_hand_back_a_truncated_jpeg() {
+    let big = fake_jpeg(1620, 1080, 3000, 0xC0);
+    let bytes = cr2_like(&big, &fake_jpeg(160, 120, 800, 0xC0), 1000, 5000, 8000, 1);
+    let region = largest(&raw_info_of(&bytes)).unwrap();
+    // 実際のファイルが JPEG の途中までしか無い。
+    assert!(bytes_of(&SliceSource(&bytes[..2000]), &region).is_none());
+}
+
+#[test]
+fn a_raw_preview_reads_only_the_head_and_the_jpeg_range() {
+    // 8MB の「RAW」。大きいプレビューは 5MB 付近、サムネイル用は 6MB 付近に置く。
+    let big = real_jpeg(1200, 800);
+    let small = real_jpeg(320, 240);
+    let total = 8 * 1024 * 1024;
+    let bytes = cr2_like(&big, &small, 5 * 1024 * 1024, 6 * 1024 * 1024, total, 1);
+    let source = CountingSource::new(bytes, "IMG_0001.CR2");
+    let (image, how) = decode_hash_source_with(&source, false).expect("raw preview");
+    assert_eq!(how, DecodeSource::RawPreview);
+    assert_eq!((image.width(), image.height()), (320, 240), "長辺 256 以上で一番小さいもの");
+    assert_eq!(source.all_calls.get(), 0, "RAW の本体を丸ごと読んでいる");
+    assert!(source.range_calls.get() >= 1);
+    // 先頭 64KB ＋ 各 JPEG の確認の区画（64KB ずつ）＋ JPEG 本体。本体の丸読み（8MB）には遠い。
+    let budget = EXIF_HEAD_PROBE + 4 * 64 * 1024 + big.len() + small.len();
+    assert!(source.served.get() <= budget, "読んだ量 {} > {}", source.served.get(), budget);
+    assert!(source.served.get() < total / 4);
+}
+
+#[test]
+fn a_raw_preview_gets_the_raw_orientation() {
+    let big = real_jpeg(600, 400);
+    let bytes = cr2_like(&big, &real_jpeg(160, 120), 3000, 70_000, 80_000, 6);
+    let source = CountingSource::new(bytes, "IMG_0002.CR2");
+    let (image, _) = decode_hash_source_with(&source, false).expect("raw preview");
+    // 向き 6（時計回りに 90 度）→ 縦長になる。
+    assert_eq!((image.width(), image.height()), (400, 600));
+}
+
+#[test]
+fn a_raw_without_a_usable_preview_still_fails() {
+    let mut t = TiffBuf::new(5000, true);
+    t.first_ifd(8);
+    t.ifd(8, &[(0x0112, 3, 1, 1)], 0);
+    let source = CountingSource::new(t.d, "IMG_0003.CR2");
+    assert!(decode_hash_source_with(&source, false).is_none());
+    assert_eq!(source.all_calls.get(), 0);
+    // 壊れた JPEG（SOF は正しいが中身がデコードできない）。
+    let bytes = cr2_like(&fake_jpeg(1620, 1080, 3000, 0xC0), &fake_jpeg(160, 120, 800, 0xC0), 1000, 5000, 8000, 1);
+    let source = CountingSource::new(bytes, "IMG_0004.CR2");
+    assert!(decode_hash_source_with(&source, false).is_none());
+}
+
+#[test]
+fn display_of_a_raw_comes_from_the_largest_preview() {
+    let big = real_jpeg(1600, 1000);
+    let bytes = cr2_like(&big, &real_jpeg(320, 240), 3000, 200_000, 300_000, 1);
+    let source = CountingSource::new(bytes, "IMG_0005.CR2");
+    let built = build_display(&source, 1024, None).expect("display");
+    let image = image::load_from_memory(&built).expect("decode");
+    assert_eq!((image.width(), image.height()), (1024, 640));
+    assert_eq!(source.all_calls.get(), 0);
+    // 取り出せない RAW は None（表示用を作れない）。
+    let broken = CountingSource::new(vec![0u8; 4096], "IMG_0006.NEF");
+    assert!(build_display(&broken, 1024, None).is_none());
+}
+
+#[test]
+fn a_local_file_serves_ranges() {
+    let directory = test_directory("read-range");
+    let path = directory.join("IMG_0007.CR2");
+    let bytes: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+    fs::write(&path, &bytes).unwrap();
+    let local = LocalPhoto(&path);
+    assert_eq!(local.read_range(10, 5).unwrap(), bytes[10..15]);
+    assert_eq!(local.read_range(990, 100).unwrap(), bytes[990..], "終わりにかかれば短く返す");
+    assert!(local.read_range(1000, 1).is_none(), "ファイルの外");
+    assert!(local.read_range(5000, 1).is_none());
+    fs::remove_dir_all(&directory).ok();
+}
+
+#[test]
+fn analysing_a_raw_makes_a_thumbnail_and_a_hash() {
+    let directory = test_directory("raw-analyse");
+    let path = directory.join("IMG_0008.CR2");
+    let bytes = cr2_like(&real_jpeg(1200, 800), &real_jpeg(320, 240), 3000, 90_000, 100_000, 1);
+    fs::write(&path, &bytes).unwrap();
+    let outcome = analyse_photo(
+        &directory.join("thumbs"),
+        "p1",
+        &path,
+        fingerprint(&path),
+        &CachedAnalysis::default(),
+    );
+    assert_eq!(outcome.thumbnail_state, ThumbnailState::Generated(DecodeSource::RawPreview));
+    assert!(outcome.d_hash.is_some());
+    assert!(outcome.thumbnail_path.is_some());
+    fs::remove_dir_all(&directory).ok();
 }

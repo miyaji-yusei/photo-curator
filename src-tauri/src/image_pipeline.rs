@@ -11,6 +11,8 @@ use super::*;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeSource {
     ExifThumbnail,
+    /// RAW に埋め込まれたプレビュー JPEG（U57）。
+    RawPreview,
     JpegScaled,
     FullDecode,
 }
@@ -19,6 +21,7 @@ impl DecodeSource {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ExifThumbnail => "exif_thumbnail",
+            Self::RawPreview => "raw_preview",
             Self::JpegScaled => "jpeg_scaled",
             Self::FullDecode => "full_decode",
         }
@@ -186,7 +189,10 @@ pub(crate) fn decode_hash_source_with(
     }
 
     if !pixel_fallback {
-        return None;
+        // RAW: 本体の中に埋め込まれたプレビュー JPEG を、範囲読みで取り出して使う（U57）。
+        // 向きは RAW 本体の Orientation（decode_preview が焼き込む）。取り出せない RAW だけが失敗になる。
+        return decode_preview(source, &head, Want::Thumb)
+            .map(|image| (image, DecodeSource::RawPreview));
     }
     // ここから先は生の画素なので、本体（IFD0）の Orientation をそのまま当てる。
     // IFD0 は TIFF ブロックの先頭近くなので、先頭だけで読める。
@@ -204,6 +210,11 @@ pub(crate) fn decode_hash_source_with(
     image::load_from_memory(&bytes)
         .ok()
         .map(|image| (apply_orientation(image, orientation), DecodeSource::FullDecode))
+}
+
+/// ファイル名の拡張子が RAW か。
+pub(crate) fn is_raw_name(name: &str) -> bool {
+    extension_lower(Path::new(name)).is_some_and(|ext| RAW_EXTENSIONS.contains(&ext.as_str()))
 }
 
 pub(crate) fn decode_hash_source(path: &Path) -> Option<(DynamicImage, DecodeSource)> {
@@ -265,6 +276,16 @@ pub(crate) fn build_display(
                 return encode_display(&image, edge);
             }
         }
+    }
+    // RAW は `image` で開けない。埋め込みの一番大きいプレビューから作る（原本の画素ではない。U57）。
+    // 先頭と JPEG の範囲だけを読み、本体は丸読みしない。
+    if source
+        .name()
+        .is_some_and(|name| is_raw_name(&name))
+    {
+        let head = source.head(EXIF_HEAD_PROBE)?;
+        let image = decode_preview(source, &head, Want::Largest)?;
+        return encode_display(&image, edge);
     }
     // 原本から作る。**ここだけが全体を読む。**
     // Orientation は decode_hash_source_from と同じ規則で焼き込む。

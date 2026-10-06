@@ -63,6 +63,7 @@
 | U38 | core のレビュー R15〜R17（次のラウンドで仲間の星が追従する・`advance` の検証・手直しの重複は先勝ち） | S〜M | `core/src/lib.rs` | 済（#46） |
 | U39 | 「指紋」を「ハッシュ値」に言い換える（docs・文言。識別子は変えない） | S | docs・画面の文言 | 済（#47） |
 | U40 | Android のホームのカードが「…」のまま固まる件 | S | `app-android/` | 済（#48） |
+| U57 | PC の RAW（CR2 など）を解析・選別できるようにする。RAW に埋め込まれたプレビュー JPEG を取り出してサムネイル・dHash・表示用画像の元にする（Android の U49 と同じ規則） | M | `src-tauri/src/raw_preview.rs`・`image_pipeline.rs`・`capture.rs` | 済（PC。Web 版は未対応） |
 
 ---
 
