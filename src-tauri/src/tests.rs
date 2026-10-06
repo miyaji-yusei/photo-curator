@@ -3323,6 +3323,43 @@ fn moving_one_photo_marks_only_that_photo_missing() {
 }
 
 #[test]
+fn prepare_state_bundles_the_backlogs_and_failure_counts() {
+    let directory = test_directory("prepare-state");
+    let conn = open_database(&directory.join("ps.sqlite3")).expect("open database");
+    conn.execute(
+        "INSERT INTO projects (id,name,folder_path,photo_count,status,created_at,updated_at)
+             VALUES ('p1','p1','C:/photos',3,'ready',1,1)",
+        [],
+    )
+    .expect("insert project");
+    for (id, at) in [("a1", 1_000_000_i64), ("a2", 1_001_000), ("a3", 1_002_000)] {
+        conn.execute(
+            "INSERT INTO photos (id,project_id,path,relative_path,name,captured_at,timestamp_source,is_missing)
+                 VALUES (?1,'p1',?2,?1,?1,?3,'exif_original',0)",
+            params![id, format!("C:/photos/{id}.jpg"), at],
+        )
+        .expect("insert photo");
+    }
+    conn.execute(
+        "UPDATE photos SET analysis_error='x',analysis_error_kind='unsupported',analysis_error_at=1 WHERE id='a3'",
+        [],
+    )
+    .expect("unsupported");
+    conn.execute(
+        "UPDATE photos SET analysis_error='y',analysis_error_kind='transient',analysis_error_at=1 WHERE id='a2'",
+        [],
+    )
+    .expect("transient");
+    let edge = 2048;
+    let state = prepare_state(&conn, "p1", false, edge).expect("state");
+    assert_eq!(state.analysis_backlog, analysis_backlog(&conn, "p1", false).unwrap());
+    assert_eq!(state.display_backlog, display_backlog_count(&conn, "p1", edge).unwrap());
+    assert_eq!((state.failed, state.unsupported), (2, 1), "失敗 2 枚のうち非対応は 1 枚");
+    drop(conn);
+    fs::remove_dir_all(&directory).expect("remove test directory");
+}
+
+#[test]
 fn analysis_backlog_counts_only_photos_the_analysis_targets() {
     let directory = test_directory("backlog");
     let conn = open_database(&directory.join("b.sqlite3")).expect("open database");

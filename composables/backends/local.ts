@@ -15,7 +15,7 @@
  * - **写真ライブラリは書き換えない。** 反映は共有シートや ZIP 書き出しなど、利用者の操作を経由する。
  */
 import type {
-  AmazonExport, AmazonPreview, AnalysisFailure, ExportReport, Photo, PhotoPage, PhotoSort, Project,
+  AmazonExport, AmazonPreview, AnalysisFailure, ExportReport, Photo, PhotoPage, PhotoSort, PrepareState, Project,
   ProjectProgress, ProjectTask, SelectionResult, SelectionSummary
 } from '~/types/photo'
 import { init as initCore } from '~/lib/core'
@@ -603,6 +603,25 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
     return { blob: zip, fileName: `photo-curator-${stamp}.zip`, count: taken.length, skipped: rows.length - taken.length }
   }
 
+  async function analysisBacklogOf(projectId: string): Promise<number> {
+    if (noRelay.has(projectId)) return 0
+    const rows = await store.photosOfProject(projectId)
+    return rows.filter(needsAnalysis).length
+  }
+
+  async function analysisFailuresOf(projectId: string): Promise<AnalysisFailure[]> {
+    return (await store.photosOfProject(projectId))
+      .filter(row => !row.isMissing && publicErrorKind(row) !== null)
+      .sort((left, right) => (left.relativePath < right.relativePath ? -1 : left.relativePath > right.relativePath ? 1 : 0))
+      .map(row => ({
+        relativePath: row.relativePath,
+        name: row.name,
+        kind: publicErrorKind(row)!,
+        reason: row.analysisError ?? '',
+        at: null
+      }))
+  }
+
   return {
     kind: 'local',
     capabilities,
@@ -821,23 +840,20 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
       }
     },
 
-    getAnalysisBacklog: async (projectId: string) => {
-      if (noRelay.has(projectId)) return 0
-      const rows = await store.photosOfProject(projectId)
-      return rows.filter(needsAnalysis).length
+    getAnalysisBacklog: analysisBacklogOf,
+
+    // 準備と同時に作っているので、表示用画像の残りは常に 0（`getDisplayBacklog` と同じ）。
+    getPrepareState: async (projectId: string): Promise<PrepareState> => {
+      const [analysisBacklog, failures] = await Promise.all([analysisBacklogOf(projectId), analysisFailuresOf(projectId)])
+      return {
+        analysisBacklog,
+        displayBacklog: 0,
+        failed: failures.length,
+        unsupported: failures.filter(failure => failure.kind === 'unsupported').length
+      }
     },
 
-    getAnalysisFailures: async (projectId: string): Promise<AnalysisFailure[]> =>
-      (await store.photosOfProject(projectId))
-        .filter(row => !row.isMissing && publicErrorKind(row) !== null)
-        .sort((left, right) => (left.relativePath < right.relativePath ? -1 : left.relativePath > right.relativePath ? 1 : 0))
-        .map(row => ({
-          relativePath: row.relativePath,
-          name: row.name,
-          kind: publicErrorKind(row)!,
-          reason: row.analysisError ?? '',
-          at: null
-        })),
+    getAnalysisFailures: analysisFailuresOf,
 
     cancelProjectTask: (projectId: string) => {
       cancelled.add(projectId)

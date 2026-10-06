@@ -185,6 +185,13 @@ describe('Web の解析の再試行', () => {
     expect(await backend.getAnalysisBacklog('p')).toBe(0)
     expect((await backend.getAnalysisFailures('p')).map(item => [item.relativePath, item.kind]))
       .toEqual([['fresh.jpg', 'unsupported']])
+    // 準備の状態（R4）は個別の口の合成と一致する。
+    expect(await backend.getPrepareState('p')).toEqual({
+      analysisBacklog: await backend.getAnalysisBacklog('p'),
+      displayBacklog: await backend.getDisplayBacklog('p'),
+      failed: (await backend.getAnalysisFailures('p')).length,
+      unsupported: 1
+    })
     expect((await store.getProject('p'))?.photoCount).toBe(1)
     const inputs = buildCoreInputs(await backend.getCoreInputs('p'))
     expect(inputs.photos).toHaveLength(2)

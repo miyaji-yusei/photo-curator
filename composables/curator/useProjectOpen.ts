@@ -91,15 +91,14 @@ export function useProjectOpen(deps: ProjectOpenDeps) {
       try {
         // 状態を決める 4 つのどれかが読めなかったら、状態を作らない（0・null にして
         // 「準備完了」「選別なし」と誤表示しない）。見本だけは読めなくても状態に関係しない。
-        const [analysis, display, saved, summary, first] = await Promise.all([
-          desktop.getAnalysisBacklog(project.id),
-          desktop.getDisplayBacklog(project.id),
+        const [prepare, saved, summary, first] = await Promise.all([
+          desktop.getPrepareState(project.id),
           desktop.loadSession(project.id),
           desktop.getSelectionSummary(project.id),
           desktop.getProjectPhotoPage(project.id, 0, 1).catch(() => null)
         ])
         const status = projectStatus({
-          project, analysisBacklog: analysis, displayBacklog: display,
+          project, analysisBacklog: prepare.analysisBacklog, displayBacklog: prepare.displayBacklog,
           session: saved?.core ?? null,
           keptCount: summary ? summary.counts.slice(1).reduce((sum, count) => sum + count, 0) : 0
         })
@@ -137,13 +136,10 @@ export function useProjectOpen(deps: ProjectOpenDeps) {
     const now = Date.now()
     if (!force && now - prepareCountsAt < 1000) return
     prepareCountsAt = now
-    const [analysis, display] = await Promise.all([
-      desktop.getAnalysisBacklog(projectId).catch(() => 0),
-      desktop.getDisplayBacklog(projectId).catch(() => 0)
-    ])
+    const state = await desktop.getPrepareState(projectId).catch(() => null)
     if (activeProject.value?.id !== projectId) return
-    analysisBacklog.value = analysis
-    displayBacklog.value = display
+    analysisBacklog.value = state?.analysisBacklog ?? 0
+    displayBacklog.value = state?.displayBacklog ?? 0
   }
 
   /** 開く処理の世代。新しい呼び出しが来たら古い呼び出しは、以降の結果を捨てて終わる（W6）。 */
