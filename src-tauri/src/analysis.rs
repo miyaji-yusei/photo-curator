@@ -246,12 +246,10 @@ pub(crate) fn run_burst_analysis(
             // worker はファイルを読むだけ。DB には触れない。
             |index, job: &MetadataJob| metadata_one(index, job),
             &mut |item| {
-                if item.error.is_some() {
-                    failed += 1;
-                }
                 pending.push(item);
                 if pending.len() >= ANALYSIS_CHUNK_SIZE {
                     committed += flush_results(&conn, &mut pending, &apply)?;
+                    failed = failed_photo_count(&conn, &project_id)?;
                     progress_note(
                         &app,
                         &project_id,
@@ -288,6 +286,7 @@ pub(crate) fn run_burst_analysis(
         )?;
         // キャンセルされていても、読み終わっているぶんは書いてから抜ける。
         committed += flush_results(&conn, &mut pending, &apply)?;
+        failed = failed_photo_count(&conn, &project_id)?;
         // 中身が画像ではなかった写真は数から外れているので、件数を数え直す。
         recount_photos(&conn, &project_id)?;
         if outcome.cancelled {
@@ -476,12 +475,10 @@ pub(crate) fn run_burst_analysis(
             None => hash_one(&thumbnails_for_workers, index, record),
         },
         &mut |item| {
-            if item.error.is_some() {
-                failed += 1;
-            }
             pending.push(item);
             if pending.len() >= ANALYSIS_CHUNK_SIZE {
                 committed += flush_results(&conn, &mut pending, &apply)?;
+                failed = failed_photo_count(&conn, &project_id)?;
                 progress_note(
                     &app,
                     &project_id,
@@ -517,6 +514,7 @@ pub(crate) fn run_burst_analysis(
         },
     )?;
     committed += flush_results(&conn, &mut pending, &apply)?;
+    failed = failed_photo_count(&conn, &project_id)?;
     // リンクが消えていたら、ここで止めて理由を伝える。開いたときに自動では続けない。
     if amazon_book.as_ref().is_some_and(|book| book.is_gone()) {
         mark_amazon_gone(&conn, &project_id);
