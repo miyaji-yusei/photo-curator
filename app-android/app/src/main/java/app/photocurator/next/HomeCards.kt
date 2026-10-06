@@ -87,6 +87,8 @@ object HomeCards {
             addAll(stamp(Trouble.file(context, key)))
             addAll(stamp(Listing.file(context, key)))
             addAll(stamp(Fingerprints.file(context, key)))
+            // 非対応の数が変わると「準備中」の分母が変わる（足さないと数が古いまま）。
+            addAll(stamp(Failures.file(context, key)))
             // 絵の置き場は、中身が増減するとフォルダの更新時刻が動く。
             addAll(stamp(Renders.dirOf(context)))
             addAll(stamp(ThumbCache.dirOf(context)))
