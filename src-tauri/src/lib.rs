@@ -285,8 +285,14 @@ const PHOTO_COLUMNS: &str =
 /// 星の上限。1ラウンド通過ごとに +1 で、ここで頭打ちになる。「確定」も同じ値。
 const MAX_RATING: i64 = 5;
 
-#[tauri::command(async)]
-fn list_projects(app: AppHandle) -> Result<Vec<Project>, String> {
+#[tauri::command]
+async fn list_projects(app: AppHandle) -> Result<Vec<Project>, String> {
+    tauri::async_runtime::spawn_blocking(move || list_projects_blocking(app))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn list_projects_blocking(app: AppHandle) -> Result<Vec<Project>, String> {
     let conn = connection(&app)?;
     let mut statement = conn
         .prepare("SELECT id,name,folder_path,photo_count,status,created_at,updated_at,burst_threshold,burst_threshold_learned_at,source_kind,pair_raw_jpeg,pair_raw_jpeg_at FROM projects ORDER BY updated_at DESC")
@@ -313,8 +319,14 @@ fn list_projects(app: AppHandle) -> Result<Vec<Project>, String> {
         .map_err(|error| error.to_string())
 }
 
-#[tauri::command(async)]
-fn create_project(app: AppHandle, name: String, folder_path: String) -> Result<Project, String> {
+#[tauri::command]
+async fn create_project(app: AppHandle, name: String, folder_path: String) -> Result<Project, String> {
+    tauri::async_runtime::spawn_blocking(move || create_project_blocking(app, name, folder_path))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn create_project_blocking(app: AppHandle, name: String, folder_path: String) -> Result<Project, String> {
     if !Path::new(&folder_path).is_dir() {
         return Err(
             "選択した写真フォルダが見つかりません。フォルダの場所を確認してください。".into(),
@@ -537,8 +549,14 @@ fn write_atomically(file: &Path, bytes: &[u8]) -> Result<(), String> {
 /// これが無かったため、プロジェクトを開くたびに無条件で事前生成を起動しており、
 /// 実際には何もすることが無くても進捗イベントだけが飛んで、UI に解析中の帯が
 /// 一瞬出ていた。
-#[tauri::command(async)]
-fn get_analysis_backlog(app: AppHandle, project_id: String) -> Result<i64, String> {
+#[tauri::command]
+async fn get_analysis_backlog(app: AppHandle, project_id: String) -> Result<i64, String> {
+    tauri::async_runtime::spawn_blocking(move || get_analysis_backlog_blocking(app, project_id))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn get_analysis_backlog_blocking(app: AppHandle, project_id: String) -> Result<i64, String> {
     let conn = connection(&app)?;
     // Amazon の撮影時刻は走査で入る（contentDate が無い写真は空のまま）ので、空でも「未解析」に数えない。
     let is_amazon = amazon_source_of(&conn, &project_id)?.is_some();
@@ -647,8 +665,14 @@ fn analysis_failures(conn: &Connection, project_id: &str) -> Result<Vec<Analysis
 }
 
 /// 解析できなかった写真の一覧（名前・理由・種類）。
-#[tauri::command(async)]
-fn get_analysis_failures(app: AppHandle, project_id: String) -> Result<Vec<AnalysisFailure>, String> {
+#[tauri::command]
+async fn get_analysis_failures(app: AppHandle, project_id: String) -> Result<Vec<AnalysisFailure>, String> {
+    tauri::async_runtime::spawn_blocking(move || get_analysis_failures_blocking(app, project_id))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn get_analysis_failures_blocking(app: AppHandle, project_id: String) -> Result<Vec<AnalysisFailure>, String> {
     analysis_failures(&connection(&app)?, &project_id)
 }
 
@@ -675,8 +699,14 @@ fn prepare_state(conn: &Connection, project_id: &str, is_amazon: bool, edge: u32
     })
 }
 
-#[tauri::command(async)]
-fn get_prepare_state(app: AppHandle, project_id: String) -> Result<PrepareState, String> {
+#[tauri::command]
+async fn get_prepare_state(app: AppHandle, project_id: String) -> Result<PrepareState, String> {
+    tauri::async_runtime::spawn_blocking(move || get_prepare_state_blocking(app, project_id))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn get_prepare_state_blocking(app: AppHandle, project_id: String) -> Result<PrepareState, String> {
     let conn = connection(&app)?;
     let is_amazon = amazon_source_of(&conn, &project_id)?.is_some();
     let edge = resolve_display_edge(&app, &project_id)?;
@@ -909,7 +939,17 @@ struct SelectionSummary {
 /// 判定結果を書き込む。全件ではなく**判定したグループぶんだけ**を受け取る前提。
 /// 全件を毎回送ると 5,000 行の IPC が毎クリック発生する。
 #[tauri::command]
-fn save_selection_results(
+async fn save_selection_results(
+    app: AppHandle,
+    project_id: String,
+    entries: Vec<SelectionResult>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || save_selection_results_blocking(app, project_id, entries))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn save_selection_results_blocking(
     app: AppHandle,
     project_id: String,
     entries: Vec<SelectionResult>,
@@ -1033,7 +1073,20 @@ fn fill_id_table(conn: &Connection, ids: &[String]) -> Result<(), String> {
 /// 選別結果の画面から、ある星の写真をまとめて別の星へ移す。
 /// 移した枚数を返す。
 #[tauri::command]
-fn move_rating(
+async fn move_rating(
+    app: AppHandle,
+    project_id: String,
+    from_rating: i64,
+    to_rating: i64,
+    include_ids: Option<Vec<String>>,
+    exclude_ids: Vec<String>,
+) -> Result<i64, String> {
+    tauri::async_runtime::spawn_blocking(move || move_rating_blocking(app, project_id, from_rating, to_rating, include_ids, exclude_ids))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn move_rating_blocking(
     app: AppHandle,
     project_id: String,
     from_rating: i64,
@@ -1055,7 +1108,13 @@ fn move_rating(
 /// 星を全部 0 に戻す。解析結果（d_hash やサムネイル）には触れないので、
 /// やり直しても解析のやり直しにはならない。
 #[tauri::command]
-fn reset_selection_results(app: AppHandle, project_id: String) -> Result<(), String> {
+async fn reset_selection_results(app: AppHandle, project_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || reset_selection_results_blocking(app, project_id))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn reset_selection_results_blocking(app: AppHandle, project_id: String) -> Result<(), String> {
     connection(&app)?
         .execute(
             "UPDATE photos SET rating=0 WHERE project_id=?1",
@@ -1149,8 +1208,18 @@ async fn write_text_file(path: String, text: String) -> Result<(), String> {
     .map_err(|error| error.to_string())?
 }
 
-#[tauri::command(async)]
-fn get_photos_by_ids(
+#[tauri::command]
+async fn get_photos_by_ids(
+    app: AppHandle,
+    project_id: String,
+    photo_ids: Vec<String>,
+) -> Result<Vec<Photo>, String> {
+    tauri::async_runtime::spawn_blocking(move || get_photos_by_ids_blocking(app, project_id, photo_ids))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn get_photos_by_ids_blocking(
     app: AppHandle,
     project_id: String,
     photo_ids: Vec<String>,
@@ -1239,8 +1308,14 @@ struct PairOverrideRow {
     decision: String,
 }
 
-#[tauri::command(async)]
-fn get_pair_overrides(app: AppHandle, project_id: String) -> Result<Vec<PairOverrideRow>, String> {
+#[tauri::command]
+async fn get_pair_overrides(app: AppHandle, project_id: String) -> Result<Vec<PairOverrideRow>, String> {
+    tauri::async_runtime::spawn_blocking(move || get_pair_overrides_blocking(app, project_id))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn get_pair_overrides_blocking(app: AppHandle, project_id: String) -> Result<Vec<PairOverrideRow>, String> {
     let conn = connection(&app)?;
     let mut statement = conn
         .prepare(
@@ -1263,7 +1338,17 @@ fn get_pair_overrides(app: AppHandle, project_id: String) -> Result<Vec<PairOver
 
 /// そのプロジェクトの例外を、渡したものに丸ごと入れ替える。
 #[tauri::command]
-fn save_pair_overrides(
+async fn save_pair_overrides(
+    app: AppHandle,
+    project_id: String,
+    overrides: Vec<PairOverrideRow>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || save_pair_overrides_blocking(app, project_id, overrides))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn save_pair_overrides_blocking(
     app: AppHandle,
     project_id: String,
     overrides: Vec<PairOverrideRow>,
@@ -1334,8 +1419,14 @@ struct DisplaySettings {
     project_edge: Option<u32>,
 }
 
-#[tauri::command(async)]
-fn get_display_settings(app: AppHandle, project_id: Option<String>) -> Result<DisplaySettings, String> {
+#[tauri::command]
+async fn get_display_settings(app: AppHandle, project_id: Option<String>) -> Result<DisplaySettings, String> {
+    tauri::async_runtime::spawn_blocking(move || get_display_settings_blocking(app, project_id))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn get_display_settings_blocking(app: AppHandle, project_id: Option<String>) -> Result<DisplaySettings, String> {
     let project_edge = match project_id {
         Some(id) => Some(resolve_display_edge(&app, &id)?),
         None => None,
@@ -1354,7 +1445,13 @@ fn get_display_settings(app: AppHandle, project_id: Option<String>) -> Result<Di
 }
 
 #[tauri::command]
-fn save_display_edge(app: AppHandle, edge: u32) -> Result<u32, String> {
+async fn save_display_edge(app: AppHandle, edge: u32) -> Result<u32, String> {
+    tauri::async_runtime::spawn_blocking(move || save_display_edge_blocking(app, edge))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn save_display_edge_blocking(app: AppHandle, edge: u32) -> Result<u32, String> {
     let normalized = normalize_display_edge(edge as i64);
     connection(&app)?
         .execute(
@@ -1397,7 +1494,18 @@ fn store_project_pair_raw(
 
 /// 設定を保存する。反映は次の走査（「写真を再読み込み」）から。
 #[tauri::command]
-fn save_project_pair_raw(
+async fn save_project_pair_raw(
+    app: AppHandle,
+    project_id: String,
+    enabled: bool,
+    at: Option<i64>,
+) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || save_project_pair_raw_blocking(app, project_id, enabled, at))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn save_project_pair_raw_blocking(
     app: AppHandle,
     project_id: String,
     enabled: bool,
@@ -1409,7 +1517,17 @@ fn save_project_pair_raw(
 
 /// プロジェクト単位の上書き。`None` を渡すと全体の設定に戻す。
 #[tauri::command]
-fn save_project_display_edge(
+async fn save_project_display_edge(
+    app: AppHandle,
+    project_id: String,
+    edge: Option<u32>,
+) -> Result<u32, String> {
+    tauri::async_runtime::spawn_blocking(move || save_project_display_edge_blocking(app, project_id, edge))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn save_project_display_edge_blocking(
     app: AppHandle,
     project_id: String,
     edge: Option<u32>,
@@ -1426,8 +1544,14 @@ fn save_project_display_edge(
 
 /// まだ表示用画像が要る枚数。0 なら生成を起動しない
 /// （`get_analysis_backlog` と同じ考え方）。
-#[tauri::command(async)]
-fn get_display_backlog(app: AppHandle, project_id: String) -> Result<i64, String> {
+#[tauri::command]
+async fn get_display_backlog(app: AppHandle, project_id: String) -> Result<i64, String> {
+    tauri::async_runtime::spawn_blocking(move || get_display_backlog_blocking(app, project_id))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn get_display_backlog_blocking(app: AppHandle, project_id: String) -> Result<i64, String> {
     let edge = resolve_display_edge(&app, &project_id)?;
     display_backlog_count(&connection(&app)?, &project_id, edge)
 }
@@ -1457,7 +1581,13 @@ fn start_display_generation(
 
 /// 表示用画像を作り直す。設定を変えたときと、利用者が明示的に押したとき。
 #[tauri::command]
-fn reset_display_images(app: AppHandle, project_id: String) -> Result<(), String> {
+async fn reset_display_images(app: AppHandle, project_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || reset_display_images_blocking(app, project_id))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn reset_display_images_blocking(app: AppHandle, project_id: String) -> Result<(), String> {
     connection(&app)?
         .execute(
             "UPDATE photos SET display_path=NULL, display_edge=NULL WHERE project_id=?1",
@@ -1468,7 +1598,13 @@ fn reset_display_images(app: AppHandle, project_id: String) -> Result<(), String
 }
 
 #[tauri::command]
-fn save_burst_threshold(app: AppHandle, project_id: String, threshold: u32) -> Result<(), String> {
+async fn save_burst_threshold(app: AppHandle, project_id: String, threshold: u32) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || save_burst_threshold_blocking(app, project_id, threshold))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn save_burst_threshold_blocking(app: AppHandle, project_id: String, threshold: u32) -> Result<(), String> {
     connection(&app)?
         .execute(
             "UPDATE projects SET burst_threshold=?1,burst_threshold_learned_at=?2,updated_at=?2 WHERE id=?3",
@@ -1479,7 +1615,13 @@ fn save_burst_threshold(app: AppHandle, project_id: String, threshold: u32) -> R
 }
 
 #[tauri::command]
-fn clear_burst_threshold(app: AppHandle, project_id: String) -> Result<(), String> {
+async fn clear_burst_threshold(app: AppHandle, project_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || clear_burst_threshold_blocking(app, project_id))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn clear_burst_threshold_blocking(app: AppHandle, project_id: String) -> Result<(), String> {
     connection(&app)?
         .execute(
             "UPDATE projects SET burst_threshold=NULL,burst_threshold_learned_at=NULL,updated_at=?1 WHERE id=?2",
@@ -1563,8 +1705,18 @@ fn cancel_project_task(registry: State<'_, TaskRegistry>, project_id: String, ta
     registry.cancel(&format!("{task}:{project_id}"));
 }
 
-#[tauri::command(async)]
-fn save_project_state(
+#[tauri::command]
+async fn save_project_state(
+    app: AppHandle,
+    project_id: String,
+    state_json: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || save_project_state_blocking(app, project_id, state_json))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn save_project_state_blocking(
     app: AppHandle,
     project_id: String,
     state_json: String,
@@ -1576,8 +1728,14 @@ fn save_project_state(
     Ok(())
 }
 
-#[tauri::command(async)]
-fn load_project_state(app: AppHandle, project_id: String) -> Result<Option<String>, String> {
+#[tauri::command]
+async fn load_project_state(app: AppHandle, project_id: String) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || load_project_state_blocking(app, project_id))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn load_project_state_blocking(app: AppHandle, project_id: String) -> Result<Option<String>, String> {
     let conn = connection(&app)?;
     match conn.query_row(
         "SELECT state_json FROM project_states WHERE project_id=?1",
@@ -1815,13 +1973,29 @@ async fn aside_local(app: AppHandle, project_id: String, json: String) -> Result
     .map_err(|error| error.to_string())?
 }
 
-#[tauri::command(async)]
-fn load_sidecar_state(app: AppHandle, project_id: String) -> Result<sidecar::SidecarState, String> {
+#[tauri::command]
+async fn load_sidecar_state(app: AppHandle, project_id: String) -> Result<sidecar::SidecarState, String> {
+    tauri::async_runtime::spawn_blocking(move || load_sidecar_state_blocking(app, project_id))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn load_sidecar_state_blocking(app: AppHandle, project_id: String) -> Result<sidecar::SidecarState, String> {
     sidecar::load_state(&connection(&app)?, &project_id)
 }
 
 #[tauri::command]
-fn save_sidecar_state(
+async fn save_sidecar_state(
+    app: AppHandle,
+    project_id: String,
+    state: sidecar::SidecarState,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || save_sidecar_state_blocking(app, project_id, state))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn save_sidecar_state_blocking(
     app: AppHandle,
     project_id: String,
     state: sidecar::SidecarState,
@@ -1829,8 +2003,14 @@ fn save_sidecar_state(
     sidecar::save_state(&connection(&app)?, &project_id, &state)
 }
 
-#[tauri::command(async)]
-fn device_identity(app: AppHandle) -> Result<sidecar::DeviceIdentity, String> {
+#[tauri::command]
+async fn device_identity(app: AppHandle) -> Result<sidecar::DeviceIdentity, String> {
+    tauri::async_runtime::spawn_blocking(move || device_identity_blocking(app))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn device_identity_blocking(app: AppHandle) -> Result<sidecar::DeviceIdentity, String> {
     sidecar::device_identity(&connection(&app)?)
 }
 
