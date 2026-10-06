@@ -2,7 +2,7 @@ import { convertFileSrc } from '@tauri-apps/api/core'
 import { capabilitiesFor, detectPlatform } from '~/utils/capabilities'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import type {
-  AmazonPreview, AnalysisFailure, ExportReport, Photo, PhotoPage, PhotoSort, Project,
+  AmazonPreview, AnalysisFailure, ExportReport, Photo, PhotoPage, PhotoSort, PrepareState, Project,
   ProjectProgress, ProjectTask, SelectionResult, SelectionSummary
 } from '~/types/photo'
 import type { PairOverride } from '~/lib/core'
@@ -94,6 +94,7 @@ export function createTauriBackend(): PhotoBackend {
     startProjectScan: (projectId: string) => invokeDesktop<void>('start_project_scan', { projectId }),
     startBurstAnalysis: (projectId: string) => invokeDesktop<void>('start_burst_analysis', { projectId }),
     getAnalysisBacklog: (projectId: string) => invokeDesktop<number>('get_analysis_backlog', { projectId }),
+    getPrepareState: (projectId: string) => invokeDesktop<PrepareState>('get_prepare_state', { projectId }),
     getAnalysisFailures: (projectId: string) => invokeDesktop<AnalysisFailure[]>('get_analysis_failures', { projectId }),
     startBackgroundAnalysis: (projectId: string) => invokeDesktop<void>('start_background_analysis', { projectId }),
     cancelProjectTask: (projectId: string, task: ProjectTask) => invokeDesktop<void>('cancel_project_task', { projectId, task }),

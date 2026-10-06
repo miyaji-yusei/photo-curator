@@ -652,6 +652,37 @@ fn get_analysis_failures(app: AppHandle, project_id: String) -> Result<Vec<Analy
     analysis_failures(&connection(&app)?, &project_id)
 }
 
+/// 準備の状態（解析の残り・表示用画像の残り・解析できなかった枚数）を 1 回で返す（R4）。
+/// 中身は `analysis_backlog`・`display_backlog_count`・`analysis_failures` を呼ぶだけ（SQL は変えない）。
+#[derive(Serialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct PrepareState {
+    analysis_backlog: i64,
+    display_backlog: i64,
+    /// 解析できなかった枚数（非対応を含む）。
+    failed: i64,
+    /// うち、対応していない形式の枚数。
+    unsupported: i64,
+}
+
+fn prepare_state(conn: &Connection, project_id: &str, is_amazon: bool, edge: u32) -> Result<PrepareState, String> {
+    let failures = analysis_failures(conn, project_id)?;
+    Ok(PrepareState {
+        analysis_backlog: analysis_backlog(conn, project_id, is_amazon)?,
+        display_backlog: display_backlog_count(conn, project_id, edge)?,
+        failed: failures.len() as i64,
+        unsupported: failures.iter().filter(|failure| failure.kind == ERROR_KIND_UNSUPPORTED).count() as i64,
+    })
+}
+
+#[tauri::command(async)]
+fn get_prepare_state(app: AppHandle, project_id: String) -> Result<PrepareState, String> {
+    let conn = connection(&app)?;
+    let is_amazon = amazon_source_of(&conn, &project_id)?.is_some();
+    let edge = resolve_display_edge(&app, &project_id)?;
+    prepare_state(&conn, &project_id, is_amazon, edge)
+}
+
 /// プロジェクトを削除する。**写真原本には一切触れない。**
 /// 消すのは DB の行と、このアプリが `app_data_dir` 配下に作ったサムネイルだけ。
 #[tauri::command]
@@ -1817,6 +1848,7 @@ pub fn run() {
             amazon_original,
             get_analysis_backlog,
             get_analysis_failures,
+            get_prepare_state,
             get_project_photo_page,
             get_photos_by_ids,
             save_selection_results,
