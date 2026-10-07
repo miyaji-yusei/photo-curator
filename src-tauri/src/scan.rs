@@ -39,45 +39,27 @@ pub(crate) fn extension_lower(path: &Path) -> Option<String> {
 }
 
 /// RAW の拡張子（`IMAGE_EXTENSIONS` のうち HEIC・HEIF 以外。rw2・pef・srw は今は走査の
-/// 候補に入らないが、入れる日のために並べておく）。
-pub(crate) const RAW_EXTENSIONS: [&str; 10] = [
-    "cr2", "cr3", "nef", "arw", "dng", "raf", "orf", "rw2", "pef", "srw",
-];
+/// 候補に入らないが、RAW としては数える）。一覧は core が持つ（R10）。
+pub(crate) use photo_curator_core::RAW_EXTENSIONS;
 
 /// RAW＋JPEG 同時撮影の「組」の RAW を除く（U46）。同じフォルダに、拡張子を除いた名前が
 /// 大文字小文字を無視して一致する JPEG（.jpg・.jpeg）がある RAW は、写真に数えない。
-/// Android は jpg/png/webp だけを走査するので、これで 2 台の顔ぶれが揃う。
 /// 組の JPEG が無い RAW、別フォルダの同名、HEIC・HEIF、PNG・WebP との組は除かない。
 /// `enabled` はプロジェクトの設定（`pair_raw_jpeg`）。false なら何も除かない。
+/// 規則は core の `paired_raw_mask`（R10。Web・Android と同じ 1 か所）。ここは並びを保って絞るだけ。
 pub(crate) fn skip_paired_raw<T>(items: Vec<T>, enabled: bool, path_of: impl Fn(&T) -> &Path) -> Vec<T> {
     if !enabled {
         return items;
     }
-    let key_of = |path: &Path| -> Option<(PathBuf, String)> {
-        let stem = path.file_stem()?.to_string_lossy().to_lowercase();
-        Some((path.parent().map(Path::to_path_buf).unwrap_or_default(), stem))
-    };
-    let jpeg_keys: HashSet<(PathBuf, String)> = items
+    let paths: Vec<String> = items
         .iter()
-        .filter_map(|item| {
-            let path = path_of(item);
-            let ext = extension_lower(path)?;
-            if ext == "jpg" || ext == "jpeg" {
-                key_of(path)
-            } else {
-                None
-            }
-        })
+        .map(|item| path_of(item).to_string_lossy().into_owned())
         .collect();
+    let mask = photo_curator_core::paired_raw_mask(paths);
     items
         .into_iter()
-        .filter(|item| {
-            let path = path_of(item);
-            let is_raw = extension_lower(path)
-                .map(|ext| RAW_EXTENSIONS.contains(&ext.as_str()))
-                .unwrap_or(false);
-            !(is_raw && key_of(path).is_some_and(|key| jpeg_keys.contains(&key)))
-        })
+        .zip(mask)
+        .filter_map(|(item, skip)| (!skip).then_some(item))
         .collect()
 }
 

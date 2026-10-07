@@ -1,10 +1,15 @@
 // R1: どの名前を写真の候補にするか・組の RAW をどう除くかの共通の表を、Web の走査（scanFolder）に通す。
 // 同じ `core/tests/fixtures/photo-names.json` を PC（src-tauri/src/tests.rs）と
 // Android（PhotoNamesFixtureTest）も読む。食い違いは表の `known_differences.web`。
-import { describe, expect, it } from 'vitest'
+import { beforeAll, describe, expect, it } from 'vitest'
 import type { SourceEntry, SourceIO } from '~/composables/backends/web/sourceIO'
 import { scanFolder } from '~/utils/folderScan'
 import fixture from '~/core/tests/fixtures/photo-names.json'
+import { initWithBytes } from '~/lib/core'
+import { wasmBytes } from './helpers/wasmBytes.mjs'
+
+// 組の RAW を除く規則は core（wasm）が持つ（R10）。
+beforeAll(() => initWithBytes(wasmBytes()))
 
 interface Difference { reason: string, pair_on?: string[], pair_off?: string[] }
 interface Case {

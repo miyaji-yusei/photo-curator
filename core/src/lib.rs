@@ -12,6 +12,9 @@ uniffi::include_scaffolding!("photo_curator_core");
 pub mod sidecar_sync;
 pub use sidecar_sync::*;
 
+pub mod photo_files;
+pub use photo_files::*;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PhotoRef {
     pub relative_path: String,

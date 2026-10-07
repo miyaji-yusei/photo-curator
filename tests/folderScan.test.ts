@@ -1,7 +1,12 @@
-import { describe, expect, it } from 'vitest'
+import { beforeAll, describe, expect, it } from 'vitest'
 import type { SourceEntry, SourceIO } from '~/composables/backends/web/sourceIO'
 import { PickerIO, joinPath } from '~/composables/backends/web/sourceIO'
 import { isPhotoName, isVideoName, scanFolder, skipPairedRaw } from '~/utils/folderScan'
+import { initWithBytes } from '~/lib/core'
+import { wasmBytes } from './helpers/wasmBytes.mjs'
+
+// 組の RAW を除く規則は core（wasm）が持つ（R10）。
+beforeAll(() => initWithBytes(wasmBytes()))
 
 /** サイドカーは走査に関係しない。 */
 const noSidecar = {
