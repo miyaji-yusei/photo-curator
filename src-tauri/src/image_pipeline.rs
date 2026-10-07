@@ -234,9 +234,9 @@ pub(crate) fn try_decode_hash_source_with(
         .map_err(|_| DecodeFailure::Undecodable)
 }
 
-/// ファイル名の拡張子が RAW か。
+/// ファイル名の拡張子が RAW か。規則は core が持つ（R10）。
 pub(crate) fn is_raw_name(name: &str) -> bool {
-    extension_lower(Path::new(name)).is_some_and(|ext| RAW_EXTENSIONS.contains(&ext.as_str()))
+    photo_curator_core::is_raw_name(name)
 }
 
 pub(crate) fn decode_hash_source(path: &Path) -> Option<(DynamicImage, DecodeSource)> {

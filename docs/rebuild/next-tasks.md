@@ -80,6 +80,7 @@
 | R9 | サイドカーの組み立て（`buildWith`・`buildSidecar`）に写真の行を渡せるように（渡さなければ今どおり読む。渡すのは `adopt` の 2 回目の組み立てだけ。挙動不変。`11-ユーザーフロー.md` §2.5） | S | `composables/useSidecarSync.ts`・`tests/sidecarSync.test.mjs` | 済（`refactor/mb-r9-sidecar-rows`。10 章 §7 の R9 の行） |
 | R3 続き | PC Rust: 書き込み・設定の同期コマンド 25 本を `async` ＋ `spawn_blocking` に（挙動不変。順序は `ratingsQueue`・`serialized` で保証済みを確認） | S | `src-tauri/src/lib.rs` | 済（`refactor/mb-rust-r3-async-writes`。10 章 §7 の R3 続きの行） |
 | W17 | `useCurator()` の戻り値の未使用キーを外す（`selectedCount`・`onKeydown`） | S | `composables/useCurator.ts` | 済（push 済み） |
+| R10 | 組の RAW を除く規則と RAW の判定を core（`photo_files.rs`）へ移し、wasm・UniFFI で公開。3 実装は呼ぶだけ（候補の拡張子の一覧＝B8 は移さない。`11-ユーザーフロー.md` §2.5） | M | `core/`・`core-wasm/`・`lib/core.ts`・`scan.rs`・`utils/folderScan.ts`・`RawFiles.kt` | 済（`refactor/mb-r10-photo-files-core`。10 章 §7 の R10 の行） |
 
 ---
 
