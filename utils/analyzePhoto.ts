@@ -12,6 +12,7 @@
  * ハッシュ値は、保存したサムネイルをそのまま輝度にして core の `dHashFromGray` に渡す
  * （9×8 への縮小も core がする。設計 04 章「縮小も core で」）。
  */
+import type { StoredErrorKind } from '~/utils/browserStore'
 import type { CaptureTime, TimestampSource } from '~/utils/captureTime'
 import { resolveCaptureTime } from '~/utils/captureTime'
 import { dHashFromGray, init as initCore } from '~/lib/core'
@@ -39,6 +40,18 @@ export interface AnalyzedPhoto {
   timestampSource: TimestampSource
   /** 解析できなかった理由。成功時は null。 */
   error: string | null
+  /** `error` の種類（U58）。省略は一時的。**迷ったら一時的。** */
+  errorKind?: StoredErrorKind | null
+}
+
+/**
+ * `createImageBitmap` が「読めたのに復号できない」で失敗したか。ブラウザが画像として開けなかったとき、
+ * Chrome・Firefox・Safari は `InvalidStateError`（古い版は `EncodingError`）を返す。
+ * それ以外（メモリ不足・ファイルが読めない・中断）は一時的とみなす（名前が違うブラウザでも、安全側＝再試行になる）。
+ */
+export function isUndecodableError(cause: unknown): boolean {
+  const name = (cause as { name?: unknown } | null)?.name
+  return name === 'InvalidStateError' || name === 'EncodingError'
 }
 
 interface Surface {
@@ -142,14 +155,20 @@ export async function analyzePhotoFile(
     // ここを取り違えると、一覧のサムネイルだけが横倒しになる（原本を直接
     // `<img>` に渡す選別画面はブラウザが自動で正立させるため）。
     // デスクトップの `apply_orientation` と同じ結果になる。
-    bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' })
+    try {
+      bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' })
+    } catch (cause) {
+      // 開けなかった。復号できない形式（HEIC を開けないブラウザ・壊れたファイルなど）は非対応、それ以外は一時的。
+      const message = cause instanceof Error && cause.message ? cause.message : '画像を読み込めませんでした。'
+      return { ...base, error: message, errorKind: isUndecodableError(cause) ? 'unsupported' : 'transient' }
+    }
     const size = thumbnailSize(bitmap.width, bitmap.height)
     const surface = createSurface(size.width, size.height)
     surface.context.imageSmoothingEnabled = true
     surface.context.imageSmoothingQuality = 'high'
     surface.context.drawImage(bitmap, 0, 0, size.width, size.height)
     const thumbnail = await surface.toBlob('image/jpeg', THUMBNAIL_QUALITY)
-    if (!thumbnail) return { ...base, error: 'サムネイルを作れませんでした。' }
+    if (!thumbnail) return { ...base, error: 'サムネイルを作れませんでした。', errorKind: 'transient' }
     // 表示用も同じ復号から作る。**原本をもう一度読まない。**
     // iPad では原本がリロードで失われるので、ここで作らないと二度と作れない。
     const displaySize = fitLongEdge(bitmap.width, bitmap.height, displayEdge)
@@ -161,11 +180,15 @@ export async function analyzePhotoFile(
     const dHash = await hashThumbnail(thumbnail)
     // ハッシュ値だけ作れなかった写真も、サムネイルと表示用はあるので選別には使える。
     // 理由を残しておかないと「解析待ち」に数え続けてしまう。
-    return { ...base, thumbnail, display, dHash, error: dHash ? null : 'ハッシュ値を作れませんでした（画像が小さすぎます）。' }
+    return {
+      ...base, thumbnail, display, dHash,
+      error: dHash ? null : 'ハッシュ値を作れませんでした（画像が小さすぎます）。',
+      errorKind: dHash ? null : 'unhashable'
+    }
   } catch (cause) {
     // 非対応の形式・壊れたファイル・メモリ不足がここに来る。
     const message = cause instanceof Error ? cause.message : '画像を読み込めませんでした。'
-    return { ...base, error: message }
+    return { ...base, error: message, errorKind: 'transient' }
   } finally {
     bitmap?.close()
   }

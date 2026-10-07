@@ -9,8 +9,9 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { beforeAll, describe, expect, it } from 'vitest'
+import { ref } from 'vue'
 import * as core from '~/lib/core'
-import { createSidecarSync, summarize } from '~/composables/useSidecarSync'
+import { createSidecarSync, summarize, useSidecarSync } from '~/composables/useSidecarSync'
 import { asideName, asideStamp, asideTag, asidesToDrop } from '~/utils/sidecarAside'
 
 const wasmPath = join(import.meta.dirname, '..', 'core-wasm', 'pkg', 'photo_curator_core_wasm_bg.wasm')
@@ -1331,5 +1332,173 @@ describe('U52 D15: 写真の鍵の Unicode・大文字小文字・ドライブ�
       written.push(Object.keys(nasCatalog(pc).sessions.tournament.ratings).sort())
     }
     expect(written[0]).toEqual(written[1])
+  })
+})
+
+describe('開いたときの確認の最中（画面が「選別を開始・再開」を止めるための印）', () => {
+  it('確認している間だけ checking が立ち、終われば（失敗しても）下りる', async () => {
+    const backend = fakeBackend()
+    let release
+    const gate = new Promise(resolve => { release = resolve })
+    const original = backend.sidecarSupported
+    backend.sidecarSupported = async (...args) => { await gate; return original(...args) }
+    globalThis.ref = ref // Nuxt の自動 import の代わり
+    const state = useSidecarSync(backend)
+    expect(state.checking.value).toBe(false)
+    const running = state.checkOnOpen(project)
+    expect(state.checking.value).toBe(true)
+    release()
+    await running
+    expect(state.checking.value).toBe(false)
+
+    backend.sidecarSupported = async () => { throw new Error('つながらない') }
+    await state.checkOnOpen(project)
+    expect(state.checking.value).toBe(false)
+  })
+})
+
+describe('R9: 組み立てに渡した行と自分で読んだ行で、書く catalog.json が 1 バイトも違わない', () => {
+  /** 写真の行の読み出しを数える（同じ行を何度読んだか）。 */
+  function counted(backend) {
+    const read = backend.getCoreInputs
+    backend.coreReads = 0
+    backend.getCoreInputs = async (...args) => { backend.coreReads += 1; return read(...args) }
+    return backend
+  }
+
+  /**
+   * JSON の中身を、オブジェクトの鍵の順だけそろえた文字列にする。core の `sidecarToJson` は写真の鍵などの
+   * 並びを呼ぶたびに変える（Rust の HashMap。同じ入力を 2 回書いても並びが違う。R9 の前から）ので、
+   * 並び以外の 1 バイトを比べる。配列（履歴・手直し・残りの順）の並びはそのまま比べる。
+   */
+  const canonical = json => JSON.stringify(JSON.parse(json), (_key, value) =>
+    value && typeof value === 'object' && !Array.isArray(value)
+      ? Object.fromEntries(Object.keys(value).sort().map(key => [key, value[key]]))
+      : value)
+
+  /**
+   * いまの端末で、書く版（フォルダ形式の鍵・印つき）を 2 通りに組んで、JSON の中身が同じことを確かめる。
+   * 1 つは直前に読んだ行を渡し、もう 1 つは渡さない（今どおり自分で読む）。
+   */
+  async function expectSameBytes(backend, sync, at = 4242) {
+    const rows = await backend.getCoreInputs(project.id)
+    const nas = backend.files.get('catalog.json')
+    const remote = nas ? core.sidecarFromJson(nas) : null
+    const write = sidecar =>
+      canonical(core.sidecarToJson(core.sidecarStamp(core.sidecarKeysToFolder(sidecar, ''), 'w-r9', remote)))
+    const given = write(await sync.buildSidecar(project, at, rows))
+    const own = write(await sync.buildSidecar(project, at))
+    expect(given).toBe(own)
+    // 組んだまま（端末の鍵）も同じ。
+    expect(canonical(core.sidecarToJson(await sync.buildSidecar(project, at, rows))))
+      .toBe(canonical(core.sidecarToJson(await sync.buildSidecar(project, at))))
+    return own
+  }
+
+  /** NAS に書かれた版を、同じ時刻・同じ印で組み直したものと比べる（書いた版がそのまま組み立ての結果か）。 */
+  async function expectWrittenFrom(backend, sync, before, rows) {
+    const written = nasCatalog(backend)
+    const remote = before ? core.sidecarFromJson(before) : null
+    const rebuilt = core.sidecarStamp(
+      core.sidecarKeysToFolder(await sync.buildSidecar(project, written.updatedAt, rows), ''), written.writeId, remote)
+    expect(canonical(core.sidecarToJson(rebuilt))).toBe(canonical(backend.files.get('catalog.json')))
+  }
+
+  it('初回の書き込み: 書いた catalog.json は、渡した行でも自分で読んだ行でも同じ組み立てになる', async () => {
+    const pc = fakeBackend()
+    const sync = createSidecarSync(pc, nextClock)
+    play(pc, [['IMG_0.JPG'], ['IMG_3.JPG']])
+    expect((await sync.checkOnOpen(project)).kind).toBe('pushed')
+    await expectWrittenFrom(pc, sync, null, await pc.getCoreInputs(project.id))
+    await expectWrittenFrom(pc, sync, null)
+    await expectSameBytes(pc, sync)
+  })
+
+  it('★の更新・手直し・学習した距離: どの段でも 2 通りの組み立てが同じ', async () => {
+    const pc = fakeBackend()
+    const sync = createSidecarSync(pc, nextClock)
+    play(pc, [['IMG_0.JPG']])
+    await sync.pushIfChanged(project)
+    // ★の更新（選別を進めた）。
+    let before = pc.files.get('catalog.json')
+    const next = core.advance(pc.session.core, ['IMG_2.JPG'])
+    pc.session = envelope(next)
+    for (const row of pc.rows) row.rating = next.ratings[row.relativePath] ?? 0
+    await expectSameBytes(pc, sync)
+    expect(await sync.pushIfChanged(project)).toBe(true)
+    await expectWrittenFrom(pc, sync, before, await pc.getCoreInputs(project.id))
+    // 手直し（連写のまとまり）と学習した距離。
+    before = pc.files.get('catalog.json')
+    pc.overrides = [{ left: 'IMG_0.JPG', right: 'IMG_1.JPG', decision: 'split' }]
+    pc.distance = 13
+    await expectSameBytes(pc, sync)
+    expect(await sync.pushIfChanged(project)).toBe(true)
+    await expectWrittenFrom(pc, sync, before, await pc.getCoreInputs(project.id))
+    await expectWrittenFrom(pc, sync, before)
+  })
+
+  it('U58: 非対応の形式の行も、欠損の行の★も、2 通りで同じく photos に残る', async () => {
+    const pc = fakeBackend()
+    const sync = createSidecarSync(pc, nextClock)
+    pc.rows[1].analysisErrorKind = 'unsupported'
+    pc.rows[1].rating = 2
+    pc.rows[4].isMissing = true
+    pc.rows[4].rating = 3
+    const json = await expectSameBytes(pc, sync)
+    const photos = JSON.parse(json).photos
+    expect(photos['IMG_1.JPG']).toEqual({ rating: 2 })
+    expect(photos['IMG_4.JPG']).toEqual({ rating: 3 })
+    expect(Object.keys(photos)).toHaveLength(6)
+  })
+
+  for (const choice of ['intersection', 'union']) {
+    it(`混ぜる（${choice === 'intersection' ? 'D 積集合' : 'E 和集合'}）: 混ぜる前と後で 2 通りが同じ。混ぜたあとの未判定は飛ばさない（U45）`, async () => {
+      const nas = sharedNas()
+      const pc = fakeBackend({ nas, identity: PC })
+      const android = fakeBackend({ nas, identity: ANDROID })
+      const pcSync = createSidecarSync(pc, nextClock)
+      play(android, [['IMG_0.JPG'], ['IMG_2.JPG']])
+      await createSidecarSync(android, nextClock).pushIfChanged(project)
+      play(pc, [['IMG_1.JPG'], ['IMG_2.JPG']])
+      const outcome = await pcSync.checkOnOpen(project)
+      expect(outcome.kind).toBe('clash')
+      await expectSameBytes(pc, pcSync)
+      expect((await pcSync.resolveClash(project, outcome.clash, choice)).kind).toBe('done')
+      await expectSameBytes(pc, pcSync)
+      expect([...pc.session.core.current, ...pc.session.core.queue]).toEqual(['IMG_4.JPG', 'IMG_5.JPG'])
+      // 混ぜたあとの控えは、取り込んだあとに読み直した行の比較キー（古い行で組んでいない）→ 落ち着いている。
+      expect((await pcSync.checkOnOpen(project)).kind).toBe('settled')
+    })
+  }
+
+  it('取り込み（adopt）: snapshot が読んだ行を渡すので行の読み出しが 1 回減り、結果は今までどおり', async () => {
+    const pc = counted(fakeBackend())
+    play(pc, [['IMG_0.JPG']])
+    const sync = createSidecarSync(pc, nextClock)
+    await sync.pushIfChanged(project)
+    pc.coreReads = 0
+    await sync.adopt(project, remoteSidecar())
+    // snapshot 1・applyLocal 1・取り込んだあとの比較キー 1（以前は adopt の組み立てでもう 1 回）。
+    expect(pc.coreReads).toBe(3)
+    expect(ratingsOf(pc)).toEqual([0, 1, 1, 0, 0, 0])
+    expect(pc.overrides).toEqual([{ left: 'IMG_1.JPG', right: 'IMG_2.JPG', decision: 'split' }])
+    // 控えの比較キーは、取り込んだあとの行で組んだもの（取り込む前の行を使い回していない）。
+    const after = core.judgementKey(core.sidecarJudgement(core.sidecarKeysToFolder(await sync.buildSidecar(project), '')))
+    expect(pc.state.seenKey).toBe(after)
+    await expectSameBytes(pc, sync)
+  })
+
+  it('古い行を渡すと★の最新が欠ける（だから渡すのは組む直前に同じ処理の中で読んだ行だけ）', async () => {
+    const pc = fakeBackend()
+    const sync = createSidecarSync(pc, nextClock)
+    const stale = await pc.getCoreInputs(project.id)
+    pc.rows[2].rating = 1 // 選別中に★が変わった
+    const fromStale = await sync.buildSidecar(project, 1, stale)
+    const fresh = await sync.buildSidecar(project, 1)
+    expect(fromStale.photos['IMG_2.JPG']).toEqual({ rating: 0 })
+    expect(fresh.photos['IMG_2.JPG']).toEqual({ rating: 1 })
+    // 開いたときの確認（snapshot）は呼び出し側の行を受け取らず、毎回その場で読む。
+    expect((await sync.checkOnOpen(project)).kind).toBe('pushed')
+    expect(nasCatalog(pc).photos['IMG_2.JPG']).toEqual({ rating: 1 })
   })
 })

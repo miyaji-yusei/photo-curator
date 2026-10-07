@@ -20,6 +20,35 @@ export interface Photo {
    * ネットワーク越しでは重すぎる。その中間がこれ。
    */
   displayPath: string | null
+  /**
+   * 解析できなかった理由の種類（U58）。`unsupported`＝読めたのに復号できない非対応の形式（選別の対象から外す。
+   * 行そのものは残る）、`transient`＝一時的、省略・null＝失敗なし。
+   */
+  analysisErrorKind?: AnalysisErrorKind | null
+}
+
+export type AnalysisErrorKind = 'unsupported' | 'transient'
+
+/** 準備の状態を 1 回で返す口の値（R4）。 */
+export interface PrepareState {
+  /** まだ解析が要る写真の枚数。 */
+  analysisBacklog: number
+  /** まだ表示用画像が要る枚数。 */
+  displayBacklog: number
+  /** 解析できなかった枚数（非対応を含む）。 */
+  failed: number
+  /** うち、対応していない形式の枚数。 */
+  unsupported: number
+}
+
+/** 解析できなかった写真 1 枚（U58）。警告の「一覧を見る」に出す。 */
+export interface AnalysisFailure {
+  relativePath: string
+  name: string
+  kind: AnalysisErrorKind
+  reason: string
+  /** 失敗した時刻（ms）。 */
+  at: number | null
 }
 
 /** 星の上限。1ラウンド通過ごとに +1 で頭打ち。 */

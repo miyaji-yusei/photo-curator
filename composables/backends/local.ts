@@ -15,7 +15,7 @@
  * - **写真ライブラリは書き換えない。** 反映は共有シートや ZIP 書き出しなど、利用者の操作を経由する。
  */
 import type {
-  AmazonExport, AmazonPreview, ExportReport, Photo, PhotoPage, PhotoSort, Project,
+  AmazonExport, AmazonPreview, AnalysisFailure, ExportReport, Photo, PhotoPage, PhotoSort, PrepareState, Project,
   ProjectProgress, ProjectTask, SelectionResult, SelectionSummary
 } from '~/types/photo'
 import { init as initCore } from '~/lib/core'
@@ -33,7 +33,8 @@ import type { AnalysisJob } from '~/utils/analysisPool'
 import { DISPLAY_EDGE_DEFAULT, hashThumbnail } from '~/utils/analyzePhoto'
 import { DISPLAY_EDGE_CHOICES, nearestDisplayEdge } from '~/utils/displayEdge'
 import { capabilitiesFor, hasDirectoryPicker } from '~/utils/capabilities'
-import { requestPersistence, toPhoto } from '~/utils/browserStore'
+import { publicErrorKind, requestPersistence, toPhoto } from '~/utils/browserStore'
+import { isSettledUnsupported, needsAnalysis, selectableCount } from '~/utils/analysisFailures'
 import type { StoredPhoto, StoredProject, StoredSource } from '~/utils/browserStore'
 import { scanFolder } from '~/utils/folderScan'
 import {
@@ -289,15 +290,23 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
     const total = jobs.length
     const displayEdge = await displayEdgeOf(projectId)
     let processed = 0
-    let failed = 0
-    emit(progressOf(projectId, 'background', 'hashing', 0, total, '写真を解析しています'))
+    // 警告の件数は、この回の数ではなく行から数え直す（PC と同じ意味。U58）。
+    // この回で解析し直さない失敗（非対応のまま据え置いたもの）を土台にして、この回の失敗を足す。
+    const rerun = new Set(jobs.map(job => job.id))
+    let failed = (await store.photosOfProject(projectId))
+      .filter(row => !row.isMissing && !rerun.has(row.id) && publicErrorKind(row) !== null).length
+    emit(progressOf(projectId, 'background', 'hashing', 0, total, '写真を解析しています', failed))
     await analyzeAll(jobs, {
       workers,
       isCancelled: () => cancelled.has(projectId),
       displayEdge,
-      onResult: async (id, analyzed) => {
+      onResult: async (id, analyzed, file) => {
         processed += 1
-        if (analyzed.error) failed += 1
+        // ハッシュ値だけ作れなかった写真（絵はある）は失敗に数えない。
+        if (analyzed.error && analyzed.errorKind !== 'unhashable') failed += 1
+        const kind = analyzed.error ? (analyzed.errorKind ?? 'transient') : null
+        // 非対応のときは、そのときの原本の大きさ・更新時刻を控える（変われば再試行する）。
+        const unsupported = kind === 'unsupported' && file !== null
         // 画像を先に書く。行にハッシュ値があるなら、画像もあるようにするため。
         await blobStore.put(id, { thumbnail: analyzed.thumbnail, display: analyzed.display })
         await store.patchPhoto(id, {
@@ -305,6 +314,9 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
           timestampSource: analyzed.timestampSource,
           dHash: analyzed.dHash,
           analysisError: analyzed.error,
+          analysisErrorKind: kind,
+          analysisFailedSize: unsupported ? file.size : null,
+          analysisFailedModified: unsupported ? file.lastModified : null,
           displayEdge: analyzed.display ? displayEdge : null
         })
         emit(progressOf(projectId, 'background', 'hashing', processed, total, '写真を解析しています', failed))
@@ -312,17 +324,28 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
     })
     const phase = cancelled.has(projectId) ? 'cancelled' : 'complete'
     emit(progressOf(projectId, 'background', phase, processed, total, '解析が終わりました', failed))
-    await store.patchProject(projectId, {})
+    // ホームの「◯枚」は選別の対象の数。非対応の形式は含めない。
+    await store.patchProject(projectId, { photoCount: selectableCount(await store.photosOfProject(projectId)) })
   }
 
-  /** ハッシュ値がまだ無い（かつ失敗もしていない）写真の解析を、出所から読んで回す。 */
+  /**
+   * 解析がまだ要る写真（ハッシュ値が無く、失敗していないか一時的な失敗）の解析を、出所から読んで回す。
+   * 非対応の形式は、原本（大きさ・更新時刻）が変わっていなければ試さない（U58）。
+   */
   async function analyzeBacklog(projectId: string, io: SourceIO): Promise<void> {
     const rows = await store.photosOfProject(projectId)
+    const targets: { row: StoredPhoto, file?: File }[] = rows.filter(needsAnalysis).map(row => ({ row }))
+    for (const row of rows) {
+      if (row.isMissing || row.dHash !== null || publicErrorKind(row) !== 'unsupported') continue
+      // 非対応の行だけ、ファイルを 1 回開いて大きさ・更新時刻を見る（少数なので速さの問題は無い）。
+      const file = await io.readFile(subPathOf(row), row.name).catch(() => null)
+      if (file && !isSettledUnsupported(row, file)) targets.push({ row, file })
+    }
     // 撮影時刻の昇順（選別の順）。分からないものは最後に取り込み順（`orderForAnalysis`）。
-    const jobs: AnalysisJob[] = orderForAnalysis(
-      rows.filter(row => !row.isMissing && row.dHash === null && row.analysisError === null),
-      row => row
-    ).map(row => ({ id: row.id, load: () => io.readFile(subPathOf(row), row.name) }))
+    const jobs: AnalysisJob[] = orderForAnalysis(targets, target => target.row)
+      .map(({ row, file }) => file
+        ? { id: row.id, file }
+        : { id: row.id, load: () => io.readFile(subPathOf(row), row.name) })
     if (!jobs.length) return
     await analyze(projectId, jobs)
   }
@@ -376,7 +399,7 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
         if (!seen.has(item.relativePath) && !item.isMissing) changed.push({ ...item, isMissing: true })
       }
       await store.putPhotos(changed)
-      await store.patchProject(projectId, { photoCount: files.length, status: 'ready' })
+      await store.patchProject(projectId, { photoCount: selectableCount(await store.photosOfProject(projectId)), status: 'ready' })
       scanned = true
       emit(progressOf(projectId, 'scan', 'complete', files.length, files.length, '読み込みが終わりました'))
 
@@ -469,7 +492,7 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
       await store.writeAmazonLinks(projectId, links)
       linkCache.set(projectId, links)
       await store.putPhotos(changed)
-      await store.patchProject(projectId, { photoCount: seen.size, status: 'ready' })
+      await store.patchProject(projectId, { photoCount: selectableCount(await store.photosOfProject(projectId)), status: 'ready' })
       scanned = true
       emit(progressOf(projectId, 'scan', 'complete', seen.size, seen.size, '読み込みが終わりました'))
 
@@ -497,7 +520,7 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
     if (!links) return
     const rows = orderForAnalysis(
       (await store.photosOfProject(projectId))
-        .filter(row => !row.isMissing && row.dHash === null && row.analysisError === null && links[row.relativePath]),
+        .filter(row => needsAnalysis(row) && links[row.relativePath]),
       row => row
     )
     if (!rows.length) return
@@ -523,10 +546,14 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
         if (blob) {
           const hash = await hashThumbnail(blob).catch(() => null)
           if (hash) await blobStore.put(row.id, { thumbnail: blob })
-          if (!hash) failed += 1
+          // 作れなかった写真は、絵はあるので選別できる。数えず・再試行せず・一覧にも出さない（U58）。
           pending.push({
             id: row.id,
-            patch: { dHash: hash, analysisError: hash ? null : 'ハッシュ値を作れませんでした。' }
+            patch: {
+              dHash: hash,
+              analysisError: hash ? null : 'ハッシュ値を作れませんでした。',
+              analysisErrorKind: hash ? null : 'unhashable'
+            }
           })
         } else {
           failed += 1
@@ -536,6 +563,7 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
       }
     })
     await flush()
+    await store.patchProject(projectId, { photoCount: selectableCount(await store.photosOfProject(projectId)) })
     if (report.gaveUp) {
       noRelay.add(projectId)
       emit({
@@ -547,7 +575,6 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
       const phase = cancelled.has(projectId) ? 'cancelled' : 'complete'
       emit(progressOf(projectId, 'background', phase, processed, total, '解析が終わりました', failed))
     }
-    await store.patchProject(projectId, {})
   }
 
   /** Amazon の結果を ZIP にする。原本は中継で取る（CSV は全部の出所が `saveCsv`）。 */
@@ -574,6 +601,25 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
       name: row.name, rating: row.rating, blob: got.get(row.id)!, modifiedAt: row.capturedAt ?? undefined
     }))))
     return { blob: zip, fileName: `photo-curator-${stamp}.zip`, count: taken.length, skipped: rows.length - taken.length }
+  }
+
+  async function analysisBacklogOf(projectId: string): Promise<number> {
+    if (noRelay.has(projectId)) return 0
+    const rows = await store.photosOfProject(projectId)
+    return rows.filter(needsAnalysis).length
+  }
+
+  async function analysisFailuresOf(projectId: string): Promise<AnalysisFailure[]> {
+    return (await store.photosOfProject(projectId))
+      .filter(row => !row.isMissing && publicErrorKind(row) !== null)
+      .sort((left, right) => (left.relativePath < right.relativePath ? -1 : left.relativePath > right.relativePath ? 1 : 0))
+      .map(row => ({
+        relativePath: row.relativePath,
+        name: row.name,
+        kind: publicErrorKind(row)!,
+        reason: row.analysisError ?? '',
+        at: null
+      }))
   }
 
   return {
@@ -794,11 +840,20 @@ export function createLocalBackend(parts: Partial<LocalBackendParts> = {}): Phot
       }
     },
 
-    getAnalysisBacklog: async (projectId: string) => {
-      if (noRelay.has(projectId)) return 0
-      const rows = await store.photosOfProject(projectId)
-      return rows.filter(row => !row.isMissing && row.dHash === null && row.analysisError === null).length
+    getAnalysisBacklog: analysisBacklogOf,
+
+    // 準備と同時に作っているので、表示用画像の残りは常に 0（`getDisplayBacklog` と同じ）。
+    getPrepareState: async (projectId: string): Promise<PrepareState> => {
+      const [analysisBacklog, failures] = await Promise.all([analysisBacklogOf(projectId), analysisFailuresOf(projectId)])
+      return {
+        analysisBacklog,
+        displayBacklog: 0,
+        failed: failures.length,
+        unsupported: failures.filter(failure => failure.kind === 'unsupported').length
+      }
     },
+
+    getAnalysisFailures: analysisFailuresOf,
 
     cancelProjectTask: (projectId: string) => {
       cancelled.add(projectId)

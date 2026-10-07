@@ -25,24 +25,64 @@ object Analyse {
     private const val TAG = "Analyse"
 
     /**
-     * 1 枚ぶんの dHash。作れなければ null。
+     * 1 枚ぶんのハッシュ値の結果。**「作れた」「一時的に作れなかった」「非対応」を分ける。**
      *
-     * **null と「値が 0」は違う。** 読めなかったものを 0 にすると、
-     * 読めない写真どうしが同一に見えて誤ってまとまる。
+     * 分け方（迷ったら一時的。非対応にすると、原本が変わるまで二度と試さず、選別の対象からも外れる）:
+     * - 一時的: ファイルを開けない・読めない（許可・NAS の切断・Wi-Fi）、取得の失敗。次に開いたときにもう一度試す
+     * - 非対応: **全部読めたのに復号できない**（壊れた画像・この端末で扱えない形式）、
+     *   RAW で埋め込みのプレビューが無い。原本が変わらない限り、何度やっても同じ
      */
-    fun hash(context: Context, photo: Photo): String? {
+    sealed interface HashResult {
+        data class Made(val print: Fingerprint) : HashResult
+        data class Transient(val reason: String) : HashResult
+        data class Unsupported(val reason: String) : HashResult
+    }
+
+    /**
+     * 1 枚ぶんの dHash。
+     *
+     * **作れなかったことと「値が 0」は違う。** 読めなかったものを 0 にすると、
+     * 読めない写真どうしが同一に見えて誤ってまとまる。
+     * 絵は読めたのにハッシュ値だけ作れなかったとき（小さすぎるなど）は、**失敗にせず**
+     * 空のハッシュ値で「作れなかった」の印を控える（選別には出る。連写のまとめに入らないだけ）。
+     */
+    fun hash(context: Context, photo: Photo): HashResult {
         // U49: RAW は OS が縮小画像を作れないことがある。**そのときは中のプレビューから作る。**
         val source = Photos.thumbnail(context, photo, edge = 64)
             ?: (if (photo.isRaw) RawImages.localThumbBitmap(context, photo.uri, 64) else null)
-            ?: return null
+            ?: return localFailure(context, photo)
         return try {
-            hashOf(source)
+            HashResult.Made(Fingerprint(VERSION, photo.size, hashOf(source) ?: ""))
         } catch (error: Exception) {
             Log.w(TAG, "dHash を作れなかった: ${photo.name}", error)
-            null
+            HashResult.Transient("ハッシュ値を作れませんでした")
         } finally {
             source.recycle()
         }
+    }
+
+    /**
+     * 端末の写真の縮小画像が取れなかったとき、**開けなかったのか・読めたのに復号できないのか**を分ける。
+     * 開けない（許可・SD の取り外しなど）は一時的。開けて、画像として読めない／RAW にプレビューが無い
+     * なら非対応。縮小だけ失敗して、画像としては読めるなら一時的（安全側）。
+     */
+    private fun localFailure(context: Context, photo: Photo): HashResult = try {
+        val opened = context.contentResolver.openInputStream(photo.uri)?.use { it.read(); true } ?: false
+        when {
+            !opened -> HashResult.Transient("ファイルを開けませんでした（移動・削除・権限）")
+            photo.isRaw -> HashResult.Unsupported("RAW に埋め込みのプレビューがありません")
+            else -> {
+                val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                context.contentResolver.openInputStream(photo.uri)?.use {
+                    android.graphics.BitmapFactory.decodeStream(it, null, bounds)
+                }
+                if (bounds.outWidth > 0) HashResult.Transient("縮小画像を作れませんでした")
+                else HashResult.Unsupported("画像を読み取れませんでした（破損または非対応の形式）")
+            }
+        }
+    } catch (error: Exception) {
+        Log.w(TAG, "読めない理由を調べられなかった: ${photo.name}", error)
+        HashResult.Transient("ファイルを開けませんでした")
     }
 
     /**
@@ -50,23 +90,26 @@ object Analyse {
      *
      * 原本 6MB を網越しに引くと 2,000 枚で 12GB になる。EXIF は先頭にあり、
      * その中の縮小画像（160x120 程度）でハッシュ値は十分に作れる。
+     * 読めなかったら一時的（次に開いたときにもう一度）。
      */
     fun hashOverNetwork(
         context: Context,
         reader: Smb.Reader,
         photo: Photo,
         fallbackAt: Long
-    ): Fingerprint? {
-        val path = photo.smb?.path ?: return null
+    ): HashResult {
+        val path = photo.smb?.path ?: return HashResult.Transient("NAS の道筋が分かりません")
         if (photo.isRaw) return hashRawOverNetwork(context, reader, photo, path, fallbackAt)
-        val head = reader.head(path, SmbExifReader.HEAD_BYTES) ?: return null
+        val head = reader.head(path, SmbExifReader.HEAD_BYTES)
+            ?: return HashResult.Transient("NAS から読めませんでした")
         val exif = SmbExifReader.parse(head, fallbackAt)
         // 縮小画像が無い写真はハッシュ値を作らない。**原本を引きに行かない。**
         // 連写のまとめに入らないだけで、選別には出る。
-        val bytes = exif.thumbnail ?: return Fingerprint(VERSION, photo.size, "", exif.takenAt)
+        val bytes = exif.thumbnail
+            ?: return HashResult.Made(Fingerprint(VERSION, photo.size, "", exif.takenAt))
         return try {
             val decoded = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                ?: return Fingerprint(VERSION, photo.size, "", exif.takenAt)
+                ?: return HashResult.Made(Fingerprint(VERSION, photo.size, "", exif.takenAt))
             // **向きを当ててからハッシュ値を作る。** 回ったままだと、同じ連写でも
             // 縦横が混ざって距離が開き、まとまらなくなる。
             val bitmap = SmbExifReader.applyOrientation(decoded, exif.orientation)
@@ -74,16 +117,19 @@ object Analyse {
             photo.smb?.let { ThumbCache.write(context, it.nasId, it.path, bitmap) }
             val made = hashOf(bitmap)
             bitmap.recycle()
-            Fingerprint(VERSION, photo.size, made ?: "", exif.takenAt)
+            HashResult.Made(Fingerprint(VERSION, photo.size, made ?: "", exif.takenAt))
         } catch (error: Exception) {
             Log.w(TAG, "NAS のハッシュ値を作れなかった: ${photo.name}", error)
-            Fingerprint(VERSION, photo.size, "", exif.takenAt)
+            HashResult.Made(Fingerprint(VERSION, photo.size, "", exif.takenAt))
         }
     }
 
     /**
      * NAS の RAW（U49）。**IFD をたどって、小さいプレビューと撮影時刻だけを読む。**
-     * 25MB の原本は引かない。プレビューが無ければハッシュ値は空（連写のまとめに入らないだけ）。
+     * 25MB の原本は引かない。
+     *
+     * - 読み取りが失敗した（接続・I/O）なら一時的
+     * - **最後まで読めたのにプレビューが無い・復号できない**なら非対応（表示用画像も作れないので）
      */
     private fun hashRawOverNetwork(
         context: Context,
@@ -91,22 +137,40 @@ object Analyse {
         photo: Photo,
         path: String,
         fallbackAt: Long
-    ): Fingerprint? {
-        val got = reader.ranged(path) { RawImages.extract(it, thumb = true) }
-            ?: return Fingerprint(VERSION, photo.size, "", fallbackAt)
+    ): HashResult {
+        // ranged は、読み取りで例外が出ても「プレビューが無い」ときも null を返し、さらに
+        // 抽出の中（RawPreview.inspect）が読み取りの例外を飲み込む。**そのまま null を非対応にすると、
+        // NAS の瞬断が「非対応」に化けて二度と試されない。** 読み取りの例外は自分で見張って覚える。
+        var ioFailed = false
+        var ran = false
+        val got = reader.ranged(path) { source ->
+            val watched = ByteSource { offset, length ->
+                try {
+                    source.read(offset, length)
+                } catch (error: Exception) {
+                    ioFailed = true
+                    throw error
+                }
+            }
+            RawImages.extract(watched, thumb = true).also { ran = true }
+        }
+        if (got == null) {
+            return if (ran && !ioFailed) HashResult.Unsupported("RAW に埋め込みのプレビューがありません")
+            else HashResult.Transient("NAS から読めませんでした")
+        }
         val takenAt = got.takenAt ?: fallbackAt
         return try {
             val bitmap = RawImages.decode(got.jpeg, got.orientation, 256)
-                ?: return Fingerprint(VERSION, photo.size, "", takenAt)
+                ?: return HashResult.Unsupported("RAW のプレビューを復号できませんでした")
             val small = RawImages.shrink(bitmap, RawImages.THUMB_STORE)
             if (small !== bitmap) bitmap.recycle()
             photo.smb?.let { ThumbCache.write(context, it.nasId, it.path, small) }
             val made = hashOf(small)
             small.recycle()
-            Fingerprint(VERSION, photo.size, made ?: "", takenAt)
+            HashResult.Made(Fingerprint(VERSION, photo.size, made ?: "", takenAt))
         } catch (error: Exception) {
             Log.w(TAG, "NAS の RAW のハッシュ値を作れなかった: ${photo.name}", error)
-            Fingerprint(VERSION, photo.size, "", takenAt)
+            HashResult.Transient("RAW のプレビューを読めませんでした")
         }
     }
 
@@ -115,25 +179,27 @@ object Analyse {
      * 撮影時刻は一覧に入っていたものをそのまま控える（EXIF を読まない）。
      *
      * リンクが消えていたら**準備ごと止める**（つまずきとして出すため）。
-     * それ以外で取れなければ null（次に開いたときにもう一度試す）。
+     * それ以外で取れなければ一時的（次に開いたときにもう一度試す）。
+     * 取れたのに復号できないときは**失敗にしない**（空のハッシュ値。Amazon が作った縮小画像で、
+     * 選別には出る。非対応にも一時的にもすると、終わらない準備になる。U58 の仮置きとの違い）。
      */
-    suspend fun hashOverAmazon(context: Context, photo: Photo): Fingerprint? {
-        val ref = photo.amazon ?: return null
+    suspend fun hashOverAmazon(context: Context, photo: Photo): HashResult {
+        val ref = photo.amazon ?: return HashResult.Transient("Amazon の指し先が分かりません")
         val cacheId = Amazon.linkOf(ref.shareKey).cacheId
         val bytes = ThumbCache.read(context, cacheId, ref.nodeId) ?: run {
             when (val got = Amazon.image(ref, Amazon.THUMB)) {
                 is SmbResult.Failed -> {
                     if (got.reason == Amazon.GONE) throw IllegalStateException(Amazon.GONE)
-                    return null
+                    return HashResult.Transient("Amazon から取得できませんでした")
                 }
                 is SmbResult.Ok -> got.value.also { ThumbCache.put(context, cacheId, ref.nodeId, it) }
             }
         }
         val bitmap = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-            ?: return Fingerprint(VERSION, photo.size, "", photo.takenAt)
+            ?: return HashResult.Made(Fingerprint(VERSION, photo.size, "", photo.takenAt))
         val made = hashOf(bitmap)
         bitmap.recycle()
-        return Fingerprint(VERSION, photo.size, made ?: "", photo.takenAt)
+        return HashResult.Made(Fingerprint(VERSION, photo.size, made ?: "", photo.takenAt))
     }
 
     /** 絵からハッシュ値を作る。**元の Bitmap は片付けない**（呼んだ側の持ち物）。 */
@@ -207,9 +273,22 @@ object Analyse {
     fun upToDate(known: Fingerprint?, photo: Photo): Boolean =
         known != null && known.version == VERSION && known.size == photo.size
 
-    /** 全部の写真に、いまのハッシュ値（または「作れなかった」の印）があるか。 */
-    fun allUpToDate(photos: List<Photo>, prints: Map<String, Fingerprint>): Boolean =
-        photos.all { upToDate(prints[it.relativePath], it) }
+    /**
+     * 全部の写真が**片付いているか**（いまのハッシュ値がある。または**非対応と確定していて原本が
+     * 変わっていない**。非対応はもう試さないので、待っても増えない）。
+     */
+    fun allUpToDate(
+        photos: List<Photo>,
+        prints: Map<String, Fingerprint>,
+        failures: Map<String, Failure> = emptyMap()
+    ): Boolean = photos.all { settled(it, prints, failures) }
+
+    /** この写真はもう試さなくてよいか（ハッシュ値が最新、または非対応で原本が同じ）。 */
+    fun settled(photo: Photo, prints: Map<String, Fingerprint>, failures: Map<String, Failure>): Boolean =
+        upToDate(prints[photo.relativePath], photo) || Failures.isUnsupported(photo, failures[photo.relativePath])
+
+    /** [fingerprints] の結果。ハッシュ値と、試して駄目だったものの控え。 */
+    data class Prints(val prints: Map<String, Fingerprint>, val failures: Map<String, Failure>)
 
     /**
      * まとめて作る。**すでにある分は作り直さない。**
@@ -221,46 +300,24 @@ object Analyse {
      * 開くたびに全部やり直すと、何が起きているのか誰にも分からなくなる。
      * 進み具合は「試した枚数」で返す。**失敗も進捗のうち。**
      * 成功だけ数えると、読めない写真がある限り終わらないように見える。
+     *
+     * **非対応と確定した写真（原本が同じ）は試さず、分母にも入れない。**
+     * 一時的に作れなかった写真は控えに理由を残し、次に開いたときにもう一度試す。
      */
     suspend fun fingerprints(
         context: Context,
         photos: List<Photo>,
         cached: Map<String, Fingerprint>,
         onProgress: (done: Int, total: Int) -> Unit,
-        onPartial: suspend (Map<String, Fingerprint>) -> Unit = {},
+        onPartial: suspend (Prints) -> Unit = {},
         // NAS のときだけ要る。**端末の写真には触らせない。**
-        nasAccess: Pair<Nas, String>? = null
-    ): Map<String, Fingerprint> = withContext(Dispatchers.IO) {
-        // **既に分かっている分から始める。** 途中で止まったときにここを空から
-        // 始めていると、まだ見ていない写真のハッシュ値まで消してしまう。
-        val out = HashMap(cached)
-
-        fun needsWork(photo: Photo): Boolean = !upToDate(cached[photo.relativePath], photo)
-
-        var done = 0
-        // **新しく作った（変わった）分だけを数える。** 準備済みの写真を通るだけで
-        // 50 回ごとにファイルを書き直さない（A4）。
-        val unsaved = PartialCounter(50)
-        suspend fun record(photo: Photo, made: Fingerprint?) {
-            val changed = needsWork(photo)
-            if (made != null) out[photo.relativePath] = made
-            // 作れなかったものは控えない。**次に開いたときにもう一度試す。**
-            // 古い（大きさの違う）値が残っていたら消す。
-            else out.remove(photo.relativePath)
-            done += 1
-            if (done % 10 == 0 || done == photos.size) onProgress(done, photos.size)
-            // **途中でやめても、作った分は残す。**
-            if (unsaved.add(changed)) onPartial(HashMap(out))
-        }
-
-        suspend fun sweepLocal() {
-            for (photo in photos) {
-                val made = if (needsWork(photo)) {
-                    hash(context, photo)?.let { Fingerprint(VERSION, photo.size, it) }
-                } else cached[photo.relativePath]
-                record(photo, made)
-            }
-        }
+        nasAccess: Pair<Nas, String>? = null,
+        // 試して駄目だったものの控え。
+        known: Map<String, Failure> = emptyMap(),
+        // 端末の写真を 1 枚読む（試験で差し替える）。
+        local: (Photo) -> HashResult = { hash(context, it) }
+    ): Prints = withContext(Dispatchers.IO) {
+        val sweep = Sweep(photos, cached, known, onProgress, onPartial)
 
         /**
          * NAS はまとめて並べて読む。**待ち時間が支配的**なので、
@@ -268,15 +325,15 @@ object Analyse {
          * 詰まるので、少なめに抑える。
          */
         suspend fun sweepNetwork(reader: Smb.Reader) = coroutineScope {
-            for (chunk in photos.chunked(8)) {
+            for (chunk in sweep.active.chunked(8)) {
                 val results = chunk.map { photo ->
                     async {
-                        photo to if (needsWork(photo)) {
+                        photo to if (sweep.needsWork(photo)) {
                             hashOverNetwork(context, reader, photo, photo.takenAt)
-                        } else cached[photo.relativePath]
+                        } else null
                     }
                 }.map { it.await() }
-                for ((photo, made) in results) record(photo, made)
+                for ((photo, made) in results) sweep.record(photo, made)
             }
         }
 
@@ -285,41 +342,119 @@ object Analyse {
          * 取ったサムネは一覧でも使うので置いておく（二度取らない）。
          */
         suspend fun sweepAmazon() = coroutineScope {
-            for (chunk in photos.chunked(Amazon.PARALLEL)) {
+            for (chunk in sweep.active.chunked(Amazon.PARALLEL)) {
                 val results = chunk.map { photo ->
                     async {
-                        photo to if (needsWork(photo)) hashOverAmazon(context, photo)
-                        else cached[photo.relativePath]
+                        photo to if (sweep.needsWork(photo)) hashOverAmazon(context, photo) else null
                     }
                 }.map { it.await() }
-                for ((photo, made) in results) record(photo, made)
+                for ((photo, made) in results) sweep.record(photo, made)
             }
         }
 
-        if (nasAccess != null && photos.any(::needsWork)) {
+        if (nasAccess != null && sweep.active.any(sweep::needsWork)) {
             // **1 本の接続で全部読む。** 1 枚ごとに張り直すと、網の往復が
             // そのまま待ち時間になる（実測 50 枚で 40 秒）。
             val (nas, password) = nasAccess
             val result = Smb.reading(nas, password) { reader -> sweepNetwork(reader) }
             if (result is SmbResult.Failed) {
                 // **失敗を握りつぶさない。** ここまでに作った分は残してから、準備を失敗にする。
-                onPartial(HashMap(out))
+                onPartial(sweep.snapshot())
                 throw IllegalStateException(result.reason)
             }
         } else if (photos.any { it.amazon != null }) {
             sweepAmazon()
         } else {
-            sweepLocal()
+            sweepLocal(sweep, local)
         }
 
-        // 最後まで来たときだけ、無くなったものを片付ける。
-        // 途中で刈ると、まだ見ていない写真を「消えた」と誤解する。
-        // **顔ぶれが空なら刈らない。** 取れなかっただけかもしれず、全部消えてしまう。
-        if (photos.isNotEmpty()) {
-            val living = photos.mapTo(HashSet()) { it.relativePath }
-            out.keys.retainAll(living)
+        sweep.finish()
+    }
+
+    /** 端末の写真を 1 枚ずつ読む。**非対応と確定した写真は `active` に入らないので読まない。** */
+    internal suspend fun sweepLocal(sweep: Sweep, read: (Photo) -> HashResult) {
+        for (photo in sweep.active) {
+            sweep.record(photo, if (sweep.needsWork(photo)) read(photo) else null)
         }
-        out
+    }
+
+    /**
+     * [fingerprints] の 1 回ぶんの状態。**結果の書き込みと進みの数え方だけを持つ**
+     * （読む処理は持たない。試験でそのまま動かせる）。
+     */
+    internal class Sweep(
+        private val photos: List<Photo>,
+        private val cached: Map<String, Fingerprint>,
+        private val known: Map<String, Failure>,
+        private val onProgress: (done: Int, total: Int) -> Unit,
+        private val onPartial: suspend (Prints) -> Unit,
+        private val now: () -> Long = System::currentTimeMillis
+    ) {
+        // **既に分かっている分から始める。** 途中で止まったときにここを空から
+        // 始めていると、まだ見ていない写真のハッシュ値まで消してしまう。
+        private val out = HashMap(cached)
+        private val failures = HashMap(known)
+
+        /**
+         * 今回見る写真。**非対応と確定していて原本が同じものは外す**（読まない・分母に入れない）。
+         * 外した写真の控えはそのまま残る。
+         */
+        val active: List<Photo> = photos.filter {
+            upToDate(cached[it.relativePath], it) || !Failures.isUnsupported(it, known[it.relativePath])
+        }
+
+        private var total = active.size
+        private var done = 0
+
+        // **新しく作った（変わった）分だけを数える。** 準備済みの写真を通るだけで
+        // 50 回ごとにファイルを書き直さない（A4）。
+        private val unsaved = PartialCounter(50)
+
+        fun needsWork(photo: Photo): Boolean = !upToDate(cached[photo.relativePath], photo)
+
+        fun snapshot() = Prints(HashMap(out), HashMap(failures))
+
+        /** [result] が null なら、読む必要が無かった（準備済み）。 */
+        suspend fun record(photo: Photo, result: HashResult?) {
+            val path = photo.relativePath
+            when (result) {
+                null -> Unit
+                is HashResult.Made -> {
+                    out[path] = result.print
+                    failures.remove(path)
+                }
+                // 作れなかったものはハッシュ値を控えない。**次に開いたときにもう一度試す。**
+                // 古い（大きさの違う）値が残っていたら消す。理由は一覧に出すために控える。
+                is HashResult.Transient -> {
+                    out.remove(path)
+                    failures[path] = Failure(FailureKind.Transient, result.reason, photo.size, VERSION, now())
+                }
+                is HashResult.Unsupported -> {
+                    out.remove(path)
+                    failures[path] = Failure(FailureKind.Unsupported, result.reason, photo.size, VERSION, now())
+                    // **分母から外す。** 選別に出さない写真を「あと何枚」に数えない。
+                    total -= 1
+                }
+            }
+            if (result !is HashResult.Unsupported) done += 1
+            if (done % 10 == 0 || done == total || result is HashResult.Unsupported) onProgress(done, total)
+            // **途中でやめても、作った分は残す。**
+            if (unsaved.add(result != null)) onPartial(snapshot())
+        }
+
+        /**
+         * 最後まで来たときだけ、無くなったものを片付ける。
+         * 途中で刈ると、まだ見ていない写真を「消えた」と誤解する。
+         * **顔ぶれが空なら刈らない。** 取れなかっただけかもしれず、全部消えてしまう。
+         */
+        fun finish(): Prints {
+            if (photos.isNotEmpty()) {
+                val living = photos.mapTo(HashSet()) { it.relativePath }
+                out.keys.retainAll(living)
+                failures.keys.retainAll(living)
+            }
+            return Prints(out, failures)
+        }
     }
 }
 
@@ -393,9 +528,15 @@ object Prepare {
         return fresh
     }
 
-    /** ハッシュ値を作り直す写真があるか。**無ければ NAS へつながない**（U43）。 */
-    fun needsNetwork(photos: List<Photo>, cached: Map<String, Fingerprint>): Boolean =
-        photos.any { !Analyse.upToDate(cached[it.relativePath], it) }
+    /**
+     * ハッシュ値を作り直す写真があるか。**無ければ NAS へつながない**（U43）。
+     * 非対応と確定した写真（原本が同じ）は数えない（もう試さないので、つなぐ理由にならない）。
+     */
+    fun needsNetwork(
+        photos: List<Photo>,
+        cached: Map<String, Fingerprint>,
+        failures: Map<String, Failure> = emptyMap()
+    ): Boolean = photos.any { !Analyse.settled(it, cached, failures) }
 
     suspend fun run(
         context: android.content.Context,
@@ -415,26 +556,40 @@ object Prepare {
         }
         val photos = inShootingOrder(listed)
         val cached = Fingerprints.load(context, project.source.key)
+        val known = Failures.load(context, project.source.key)
 
         // NAS のときだけ、つなぎ先とパスワードを渡す。**作るものが無ければつながない**（U43）。
         // 準備済みのプロジェクトを開くたびに NAS へつないでいると、Wi-Fi・NAS が起きる前に
         // 開いただけで「止まっています」になる（A1 で接続の失敗を出すようにしたため）。
-        val nasAccess = if (project.source.kind == SourceKind.Nas && needsNetwork(photos, cached)) {
+        val nasAccess = if (project.source.kind == SourceKind.Nas && needsNetwork(photos, cached, known)) {
             val nasId = project.source.key.substringBefore("|")
             NasStore.all(context).firstOrNull { it.id == nasId }?.let { nas ->
                 NasPasswords.password(context, nas)?.let { nas to it }
             } ?: throw IllegalStateException("NAS につなぐ情報（登録かパスワード）がありません")
         } else null
 
-        val prints = Analyse.fingerprints(
+        val made = Analyse.fingerprints(
             context, photos, cached,
             onProgress = onProgress,
-            onPartial = { Fingerprints.save(context, project.source.key, it) },
-            nasAccess = nasAccess
+            onPartial = { saveBoth(context, project.source.key, it, cached, known) },
+            nasAccess = nasAccess,
+            known = known
         )
-        if (prints != cached) Fingerprints.save(context, project.source.key, prints)
+        saveBoth(context, project.source.key, made, cached, known)
 
-        return assemble(context, project, photos, prints)
+        return assemble(context, project, photos, made.prints, made.failures)
+    }
+
+    /** 変わったほうだけ書く（ハッシュ値と、解析できなかったものの控え）。 */
+    private suspend fun saveBoth(
+        context: android.content.Context,
+        key: String,
+        made: Analyse.Prints,
+        cached: Map<String, Fingerprint>,
+        known: Map<String, Failure>
+    ) {
+        if (made.prints != cached) Fingerprints.save(context, key, made.prints)
+        if (made.failures != known) Failures.save(context, key, made.failures)
     }
 
     /**
@@ -474,16 +629,18 @@ object Prepare {
         val listing = Listing.load(context, project.source.key)
         if (listing.isNullOrEmpty()) return null
         val prints = Fingerprints.load(context, project.source.key)
+        val failures = Failures.load(context, project.source.key)
         val photos = inShootingOrder(listing)
-        if (!Analyse.allUpToDate(photos, prints)) return null
-        return assemble(context, project, photos, prints)
+        if (!Analyse.allUpToDate(photos, prints, failures)) return null
+        return assemble(context, project, photos, prints, failures)
     }
 
     private suspend fun assemble(
         context: android.content.Context,
         project: Project,
         photos: List<Photo>,
-        prints: Map<String, Fingerprint>
+        prints: Map<String, Fingerprint>,
+        failures: Map<String, Failure> = emptyMap()
     ): Pair<List<Photo>, List<uniffi.photo_curator_core.PhotoRef>> {
         // **撮影時刻は EXIF のものを使う。**
         // NAS の更新時刻はコピーしたときに変わるので、撮影順にならない。
@@ -500,7 +657,9 @@ object Prepare {
         // 撮影時刻を当てたものを控え直す。**次に開いたときはここから始まる。**
         if (dated != photos) Listing.save(context, project.source.key, dated)
 
-        val refs = dated.map {
+        // **選別に渡す refs だけ、非対応を外す。** 返す写真の一覧（対応表）には残す
+        // （途中のセッションの写真・★を引けるように。サイドカーの顔ぶれも変えない）。
+        val refs = selectable(dated, failures).map {
             uniffi.photo_curator_core.PhotoRef(
                 relativePath = it.relativePath,
                 capturedAt = it.takenAt,
@@ -513,6 +672,11 @@ object Prepare {
         }
         return dated to refs
     }
+
+    /** 選別の対象にする写真。**非対応と確定していて原本が同じものを除く。** */
+    fun selectable(photos: List<Photo>, failures: Map<String, Failure>): List<Photo> =
+        if (failures.isEmpty()) photos
+        else photos.filterNot { Failures.isUnsupported(it, failures[it.relativePath]) }
 
     /**
      * 表示用画像を作る。**準備の 3 段目。原本を読むのはここだけ。**

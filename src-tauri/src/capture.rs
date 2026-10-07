@@ -63,6 +63,18 @@ pub trait PhotoSource {
     fn head(&self, want: usize) -> Option<Vec<u8>>;
     /// 全体。EXIF サムネイルが無い写真だけがここへ落ちる。
     fn all(&self) -> Option<Vec<u8>>;
+    /// `offset` から最大 `length` バイト（RAW の埋め込みプレビューだけを読むため。U57）。
+    /// ファイルの外なら None、終わりにかかれば短く返す。
+    /// 既定は全体を読んで切り出す（遅い。範囲読みができる実装は上書きする）。
+    fn read_range(&self, offset: u64, length: usize) -> Option<Vec<u8>> {
+        let all = self.all()?;
+        let start = usize::try_from(offset).ok()?;
+        if start >= all.len() {
+            return None;
+        }
+        let end = start.saturating_add(length).min(all.len());
+        Some(all[start..end].to_vec())
+    }
     /// mtime と size。**既存のキャッシュ無効化がそのまま効く。**
     fn fingerprint(&self) -> Option<(i64, i64)>;
     /// ファイル名。EXIF が無いときの撮影時刻の手がかりになる。
@@ -92,6 +104,18 @@ impl PhotoSource for LocalPhoto<'_> {
 
     fn all(&self) -> Option<Vec<u8>> {
         fs::read(self.0).ok()
+    }
+
+    fn read_range(&self, offset: u64, length: usize) -> Option<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = File::open(self.0).ok()?;
+        if offset >= file.metadata().ok()?.len() {
+            return None;
+        }
+        file.seek(SeekFrom::Start(offset)).ok()?;
+        let mut buffer = Vec::new();
+        file.take(length as u64).read_to_end(&mut buffer).ok()?;
+        Some(buffer)
     }
 
     fn fingerprint(&self) -> Option<(i64, i64)> {

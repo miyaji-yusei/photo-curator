@@ -77,16 +77,20 @@ object HomeCards {
     private suspend fun cardOf(
         context: Context,
         project: Project,
-        tally: suspend () -> Map<Pair<String, Int>, Int>
+        tally: suspend () -> Map<Pair<String, Int>, Set<String>>
     ): Card {
         val key = project.source.key
         val edge = Prefs.projectEdge(context, project.id)
+        // 古い名前の控えの引き継ぎを先に済ませる（B2）。済ませずに印を作ると、初回だけ「控え無し」で数える。
+        SourceFiles.adopt(context, key)
         // 状態を決める材料のファイルと設定。**どれかが変われば作り直す。**
         val signature = buildList {
             addAll(stamp(Store.file(context, project.id)))
             addAll(stamp(Trouble.file(context, key)))
             addAll(stamp(Listing.file(context, key)))
             addAll(stamp(Fingerprints.file(context, key)))
+            // 非対応の数が変わると「準備中」の分母が変わる（足さないと数が古いまま）。
+            addAll(stamp(Failures.file(context, key)))
             // 絵の置き場は、中身が増減するとフォルダの更新時刻が動く。
             addAll(stamp(Renders.dirOf(context)))
             addAll(stamp(ThumbCache.dirOf(context)))

@@ -170,6 +170,19 @@ namespace photo_curator_core {
     // 読んだ直後に通す。keyBase が無い古い版は、頭のフォルダが folder_hint の末尾と合えば外す。
     Sidecar sidecar_normalize_keys(Sidecar sidecar, string folder_hint);
     KeyCoverage sidecar_key_coverage(Sidecar sidecar, sequence<string> photo_keys);
+
+    // ---- 写真のファイル名（R10） ----
+    // 3 台で同じでなければ困る規則だけ。どの名前を候補にするか（拡張子の一覧）は各環境が持つ（B8）。
+    // 道筋の区切りは `/` でも `\` でもよい。先頭の点は拡張子にしない。
+    // 拡張子が RAW か（大文字小文字は問わない。HEIC・HEIF は RAW ではない）。
+    boolean is_raw_name([ByRef] string name);
+    // RAW の拡張子の一覧（小文字）。
+    sequence<string> raw_extensions();
+    // 道筋ごとに「同じフォルダに同名（大文字小文字を無視）の JPEG がある RAW なので除く」なら true。
+    // 並びは入力と同じ。呼ぶ側が自分の一覧を並びを保って絞るための形。
+    sequence<boolean> paired_raw_mask(sequence<string> paths);
+    // 組の RAW を除いた道筋の一覧（並びは保つ）。enabled が false なら何も除かない。
+    sequence<string> skip_paired_raw(sequence<string> paths, boolean enabled);
 };
 
 // 選別に出す 1 枚。**端末ごとの指し先は持たない。**
