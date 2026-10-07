@@ -307,7 +307,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     const total = done + remainingGroups.value
     return total ? (done / total) * 100 : 100
   })
-  const selectedCount = computed(() => coreSession.value?.survivors.length ?? 0)
   // 連写の学習。質問と答えは封筒（`learning`）に持つので、リロードしても続きから。
   const askedCount = computed(() => session.value?.learning?.answers.length ?? 0)
   const learningPosition = computed(() => (session.value?.learning?.index ?? 0) + 1)
@@ -1064,7 +1063,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     currentGroup,
     remainingGroups,
     remainingPhotos,
-    selectedCount,
     askedCount,
     learningPosition,
     learningTotal,
@@ -1181,7 +1179,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     openGroupSizeDialog,
     cancelTask,
     cancelAnalysis,
-    onKeydown,
     mount,
     unmount
   }
