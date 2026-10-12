@@ -1,11 +1,13 @@
 import type { Photo } from '~/types/photo'
 import type { PhotoBackend } from '~/composables/photoBackend'
+import { useFocusPeaking } from '~/composables/curator/useFocusPeaking'
 
 /**
  * 拡大表示（U53 で `useCurator.ts` から切り出した。中身は変えていない）。
  * 拡大中のキー（`onZoomKeydown`）もここ。選別画面のキー（`useCurator` の `onKeydown`）が、拡大中はこちらへ渡す。
  */
 export function useZoom(desktop: PhotoBackend) {
+  const { toggleFocus } = useFocusPeaking()
   const zoomPhoto = ref<Photo | null>(null)
   /** 拡大中に ← → で辿れる一覧。開いた場所に並んでいた写真をそのまま入れる。 */
   const zoomList = ref<Photo[]>([])
@@ -67,6 +69,7 @@ export function useZoom(desktop: PhotoBackend) {
 
   /**
    * 拡大表示のキー。← → は前後送り、Esc・Enter・Space は閉じる。
+   * F はピントの位置の表示の切り替え（閉じない）。
    * Ctrl・Shift・Alt・Meta の単独の押下や、ほかのキーでは閉じない（Ctrl+ホイールの前に Ctrl を押すだけで閉じない）。
    * どのキーでも、選別画面の操作には流さない。
    */
@@ -75,6 +78,12 @@ export function useZoom(desktop: PhotoBackend) {
     event.stopPropagation()
     if (event.key === 'ArrowLeft') { event.preventDefault(); stepZoom(-1); return }
     if (event.key === 'ArrowRight') { event.preventDefault(); stepZoom(1); return }
+    // F: ピントの位置を出す・消す。Ctrl+F など修飾キー付きは触らない。
+    if (event.key.toLowerCase() === 'f' && !event.ctrlKey && !event.metaKey && !event.altKey) {
+      event.preventDefault()
+      toggleFocus()
+      return
+    }
     if (event.key === 'Escape' || event.key === 'Enter' || event.key === ' ') {
       event.preventDefault()
       zoomPhoto.value = null

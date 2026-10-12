@@ -68,7 +68,9 @@ internal fun SlideshowStage(
     onDecide: (SlideDecision) -> Unit,
     onZoom: () -> Unit,
     onOpenBurst: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    /** ピントの位置の印を重ねるか（U60）。 */
+    focus: Boolean = false
 ) {
     val density = LocalDensity.current.density
     val scope = rememberCoroutineScope()
@@ -142,15 +144,44 @@ internal fun SlideshowStage(
                     val startY = down.position.y
                     var moved = false
                     val widthNow = size.width / density
+                    // 長押しで拡大。**指がほとんど動いていなければ**、タップの領域
+                    // （落とす・残す・★5）でも中央でも拡大する。少し揺れてドラッグが
+                    // 始まっていても、LONG_PRESS_SLOP の内側なら長押しとみなす。
+                    var farthest = 0f
+                    var lastMs = down.uptimeMillis
+                    var longOpen = true
                     while (true) {
-                        val change = awaitPointerEvent().changes.firstOrNull { it.id == down.id }
+                        val event = if (longOpen) {
+                            val left = SlideshowGesture.LONG_PRESS_MS - (lastMs - down.uptimeMillis)
+                            if (left <= 0) null else withTimeoutOrNull(left) { awaitPointerEvent() }
+                        } else awaitPointerEvent()
+                        if (event == null) {
+                            longOpen = false
+                            if (farthest < SlideshowGesture.LONG_PRESS_SLOP) {
+                                if (moved) snapBack()
+                                lastCenterTap = null
+                                zoomNow()
+                                // 指を離すまでの残りは捨てる（離した所で「選ぶ」にしない）。
+                                while (true) {
+                                    val rest = awaitPointerEvent().changes
+                                    rest.forEach { it.consume() }
+                                    if (rest.none { it.pressed }) break
+                                }
+                                break
+                            }
+                            continue
+                        }
+                        val change = event.changes.firstOrNull { it.id == down.id }
                             ?: break
                         val dx = (change.position.x - startX) / density
                         val dy = (change.position.y - startY) / density
+                        lastMs = change.uptimeMillis
+                        farthest = maxOf(farthest, kotlin.math.hypot(dx, dy))
+                        if (farthest >= SlideshowGesture.LONG_PRESS_SLOP) longOpen = false
                         if (!change.pressed) {
                             if (!moved) {
                                 // タップ。上のほうは★5、左のほうは落とす、右のほうは残す、
-                                // 中央の縦帯は何もしない（二度タップで拡大。長押しの拡大はしない）。
+                                // 中央の縦帯は何もしない（二度タップで拡大。長押しでも拡大）。
                                 val result = SlideshowGesture.tapDecision(
                                     change.position.x, change.position.y, 0f, 0f,
                                     size.width.toFloat(), size.height.toFloat()
@@ -219,6 +250,8 @@ internal fun SlideshowStage(
                     onSize = { w, h -> natural = w to h },
                     modifier = Modifier.fillMaxSize()
                 )
+                // ピントの印。写真と一緒に動く（同じ箱の中）。押しても反応しない。
+                if (focus) FocusTileOverlay(photo, displayEdge, Modifier.fillMaxSize())
             }
 
             // ドラッグ中だけ、色の膜＋アイコン＋文字がドラッグ量に応じて濃くなる。

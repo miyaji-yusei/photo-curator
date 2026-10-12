@@ -2,6 +2,7 @@ import type { ComputedRef, Ref } from 'vue'
 import type { Photo } from '~/types/photo'
 import type { SavedSelection } from '~/utils/selectionFlow'
 import type { View } from './types'
+import { useFocusPeaking } from './useFocusPeaking'
 
 /** 選別画面のキー操作が `useCurator` から受け取るもの（状態と、キーで呼ぶ操作）。 */
 export interface KeyboardDeps {
@@ -34,6 +35,7 @@ export interface KeyboardDeps {
  * `window` への登録・解除は `useCurator` の `mount`／`unmount`（同じ関数を渡す）。
  */
 export function useKeyboard(deps: KeyboardDeps) {
+  const { toggleFocus } = useFocusPeaking()
   const {
     view, session, helpDialog, zoomPhoto, tournamentPhotos, burstReviewPhotos, burstReviewKept, currentPair,
     isSlideshow, onZoomKeydown, openZoom, openBurst, applyBurstReview, toggleBurstReviewKeep, skipCurrentPair,
@@ -82,6 +84,12 @@ export function useKeyboard(deps: KeyboardDeps) {
 
     if (view.value !== 'tournament') return
 
+    // F: ピントの位置を出す・消す（スライドショーは 1 枚ずつで重ねないので対象外）。Ctrl+F などは触らない。
+    if (event.key.toLowerCase() === 'f' && !isSlideshow.value && !event.ctrlKey && !event.metaKey && !event.altKey) {
+      event.preventDefault()
+      toggleFocus()
+      return
+    }
     // 選び間違えたときに1手戻す。
     if (event.key === 'Backspace') {
       event.preventDefault()

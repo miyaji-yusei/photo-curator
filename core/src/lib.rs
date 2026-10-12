@@ -15,6 +15,9 @@ pub use sidecar_sync::*;
 pub mod photo_files;
 pub use photo_files::*;
 
+pub mod focus;
+pub use focus::*;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PhotoRef {
     pub relative_path: String,

@@ -66,6 +66,13 @@ pub fn d_hash_from_gray(gray: Vec<u8>, width: u32, height: u32) -> Option<String
     core::d_hash_from_gray(gray, width, height)
 }
 
+/// くっきりした領域の四角（core の `FocusRegions`）。`{ regions: [{ x, y, w, h, strength }] }`（0〜1）。
+/// 読めない入力・くっきりした所なしでは `regions` が空。
+#[wasm_bindgen(js_name = focusRegions)]
+pub fn focus_regions(gray: Vec<u8>, width: u32, height: u32) -> Result<JsValue, JsValue> {
+    ser(&core::focus_regions(gray, width, height))
+}
+
 #[wasm_bindgen(js_name = learnDistance)]
 pub fn learn_distance(answers: JsValue, fallback: u32) -> Result<u32, JsValue> {
     let answers: Vec<core::BurstAnswer> = de(answers)?;

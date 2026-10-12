@@ -1,6 +1,10 @@
 package app.photocurator.next
 
+import android.graphics.Bitmap
+import android.graphics.drawable.BitmapDrawable
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -11,6 +15,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ChevronLeft
 import androidx.compose.material.icons.filled.ChevronRight
+import androidx.compose.material.icons.filled.CenterFocusStrong
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -23,7 +28,6 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
@@ -47,8 +51,6 @@ fun ZoomView(
     photos: List<Photo>,
     startAt: Int,
     displayEdge: Int,
-    /** 「残す」を出すか。**選別から来たときだけ**。見るだけの場所では出さない。 */
-    onKeep: ((Photo) -> Unit)? = null,
     onClose: () -> Unit
 ) {
     if (photos.isEmpty()) {
@@ -92,19 +94,58 @@ fun ZoomView(
     val context = LocalContext.current
     // 原本。**届くまで state は Loading のまま**なので、それを文にして出す。
     val full = rememberAsyncImagePainter(
-        model = ImageRequest.Builder(context).data(photo.fullModel).size(2048).build(),
+        // 印の計算で画素を読むので、ハードウェアビットマップにしない。
+        model = ImageRequest.Builder(context).data(photo.fullModel).size(2048)
+            .allowHardware(false).build(),
         imageLoader = Images.loader(context)
     )
     val ready = full.state is AsyncImagePainter.State.Success
     val broken = full.state is AsyncImagePainter.State.Error
+
+    // ---- ピントの位置（U60） ----
+    // **写真ごとに作り直す**（photo.id がキー）。別の写真のマスクが一瞬でも重ならない。
+    val focusOn by FocusPeaking.enabled
+    var displayMask by remember(photo.id, photo.relativePath) { mutableStateOf<FocusFound?>(null) }
+    var originalMask by remember(photo.id, photo.relativePath) { mutableStateOf<FocusFound?>(null) }
+    var displayBitmap by remember(photo.id, photo.relativePath) { mutableStateOf<Bitmap?>(null) }
+    // 長押ししているあいだは印を消して、素の写真を見られるようにする。
+    var held by remember { mutableStateOf(false) }
+
+    // まず表示用画像で計算してすぐ出す。**すでに画面が読んだ絵を使う**（読み直さない）。
+    LaunchedEffect(photo.id, photo.relativePath, focusOn, displayBitmap) {
+        val bitmap = displayBitmap
+        if (focusOn && bitmap != null && displayMask == null) {
+            displayMask = FocusPeaking.maskFor(photo, FocusKind.Display, bitmap)
+        }
+    }
+    // 原本が届いたら計算し直す（届いた原本のビットマップをそのまま使う）。
+    val fullBitmap = (full.state as? AsyncImagePainter.State.Success)
+        ?.result?.drawable?.let { (it as? BitmapDrawable)?.bitmap }
+    LaunchedEffect(photo.id, photo.relativePath, focusOn, fullBitmap) {
+        if (focusOn && fullBitmap != null && originalMask == null) {
+            originalMask = FocusPeaking.maskFor(photo, FocusKind.Original, fullBitmap)
+        }
+    }
+    val mask = originalMask ?: displayMask
 
     Box(
         Modifier
             .fillMaxSize()
             .background(Color.Black)
             .transformable(transform)
-            .pointerInput(photo.id) {
+            .pointerInput(photo.id, focusOn) {
                 detectTapGestures(
+                    // 長押しのあいだ印を消し、離したら戻す。**印が出ているときだけ**
+                    // 長押しを拾う（拾うと、長押しのあと離しても「閉じる」にならない。
+                    // 印を消して見比べて指を離したら画面が閉じる、を避ける）。
+                    onPress = {
+                        try {
+                            tryAwaitRelease()
+                        } finally {
+                            held = false
+                        }
+                    },
+                    onLongPress = if (focusOn) ({ held = true }) else null,
                     // 等倍なら閉じる。広げているなら等倍に戻す。
                     // **「閉じる」と「戻す」を 1 つの動作に混ぜない。**
                     onTap = { if (scale > 1.01f) reset() else onClose() },
@@ -128,10 +169,15 @@ fun ZoomView(
         // ---- 下: 表示用画像。**必ず出る絵。** ----
         AsyncImage(
             model = ImageRequest.Builder(context)
-                .data(photo.displayModel(displayEdge)).size(displayEdge).build(),
+                .data(photo.displayModel(displayEdge)).size(displayEdge)
+                // 印の計算で画素を読むので、ハードウェアビットマップにしない。
+                .allowHardware(false).build(),
             contentDescription = photo.name,
             imageLoader = Images.loader(context),
             contentScale = ContentScale.Fit,
+            onSuccess = { state ->
+                displayBitmap = (state.result.drawable as? BitmapDrawable)?.bitmap
+            },
             modifier = Modifier
                 .fillMaxSize()
                 .graphicsLayer(
@@ -153,6 +199,19 @@ fun ZoomView(
                         translationX = offsetX, translationY = offsetY
                     )
             )
+        }
+
+        // ---- ピントの位置: 写真と同じ Fit・同じ拡大と移動で重ねる。押しても反応しない。 ----
+        if (focusOn && !held) {
+            mask?.let {
+                FocusOverlay(
+                    it,
+                    Modifier.graphicsLayer(
+                        scaleX = scale, scaleY = scale,
+                        translationX = offsetX, translationY = offsetY
+                    )
+                )
+            }
         }
 
         // ---- 中央: まだ来ていないことを出す ----
@@ -213,6 +272,21 @@ fun ZoomView(
                     modifier = Modifier.padding(end = 12.dp)
                 )
             }
+            // 右端: ピントの位置。**オンは Lime で塗って**状態が分かるようにする。
+            // 写真を送ってもオンのまま（状態は写真に紐づけない）。
+            Box(
+                Modifier
+                    .size(44.dp)
+                    .clip(CircleShape)
+                    .background(if (focusOn) Lime else Color.Transparent)
+                    .clickable { FocusPeaking.toggle() },
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    Icons.Filled.CenterFocusStrong, "ピントの位置",
+                    tint = if (focusOn) Color.Black else Color.White
+                )
+            }
         }
 
         // ---- 左右: 前後へ。**指が滑らない人のために押せる場所も置く。** ----
@@ -222,22 +296,6 @@ fun ZoomView(
             }
             if (at < photos.lastIndex) {
                 Arrow(Icons.Filled.ChevronRight, "次の写真", Alignment.CenterEnd) { move(1) }
-            }
-        }
-
-        // ---- 下端: 残す ----
-        // **見るだけの場所からは出さない。** 詳細と結果ではここに何も出ない。
-        if (onKeep != null) {
-            Row(
-                Modifier
-                    .align(Alignment.BottomCenter)
-                    .windowInsetsPadding(WindowInsets.safeDrawing)
-                    .padding(bottom = 20.dp)
-            ) {
-                Button(
-                    onClick = { onKeep(photo) },
-                    shape = RoundedCornerShape(50)
-                ) { Text("この 1 枚を残す", fontWeight = FontWeight.Bold) }
             }
         }
     }

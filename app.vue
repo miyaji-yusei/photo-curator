@@ -26,8 +26,11 @@ import AnalysisFailuresDialog from '~/components/dialogs/AnalysisFailuresDialog.
 import DeleteDialog from '~/components/dialogs/DeleteDialog.vue'
 import SidecarConflictDialog from '~/components/dialogs/SidecarConflictDialog.vue'
 import AppNav from '~/components/AppNav.vue'
+import FocusLayer from '~/components/FocusLayer.vue'
+import { useFocusPeaking } from '~/composables/curator/useFocusPeaking'
 import { panBy, wheelFactor, ZOOM_RESET, zoomAt, zoomLabel, type ZoomView } from '~/utils/zoomPan'
 
+const { focusOn, toggleFocus } = useFocusPeaking()
 const c = useCurator()
 onMounted(c.mount)
 onBeforeUnmount(c.unmount)
@@ -104,8 +107,23 @@ watch(() => !!zoomPhoto.value, (open) => {
 })
 onBeforeUnmount(() => window.removeEventListener('wheel', onZoomWheel))
 
+// 写真を押しているあいだ（pointerdown〜up）は、ピントの印を消す。拡大中のドラッグ移動と同じ操作なので、
+// 動かす手元で印が邪魔にならないように。離したら戻る（枠の外で離しても window で受ける）。
+const zoomPressing = ref(false)
+function releaseZoomPress() {
+  zoomPressing.value = false
+  window.removeEventListener('pointerup', releaseZoomPress)
+  window.removeEventListener('pointercancel', releaseZoomPress)
+}
+onBeforeUnmount(releaseZoomPress)
+
 let dragFrom: { x: number, y: number, id: number } | null = null
 function onZoomPointerDown(event: PointerEvent) {
+  if (event.button === 0) {
+    zoomPressing.value = true
+    window.addEventListener('pointerup', releaseZoomPress)
+    window.addEventListener('pointercancel', releaseZoomPress)
+  }
   if (zoomView.value.scale <= 1 || event.button !== 0) return
   dragFrom = { x: event.clientX, y: event.clientY, id: event.pointerId }
   ;(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId)
@@ -246,7 +264,11 @@ function onZoomReset() {
             @pointerdown="onZoomPointerDown" @pointermove="onZoomPointerMove"
             @pointerup="onZoomPointerUp" @pointercancel="onZoomPointerUp"
           >
-            <img ref="zoomImage" :src="zoomSrc" :alt="zoomPhoto.name" :style="zoomTransform" draggable="false">
+            <!-- 倍率と移動は枠ごとに掛ける。ピントの印は写真と同じ枠に重ねて、拡大・移動にそのまま追従させる。 -->
+            <div class="zoom-overlay__frame" :style="zoomTransform">
+              <img ref="zoomImage" :src="zoomSrc" :alt="zoomPhoto.name" draggable="false">
+              <FocusLayer :photo-id="zoomPhoto.id" :src="zoomSrc" :kind="zoomLoading ? 'display' : 'original'" :hidden="zoomPressing" />
+            </div>
             <!-- 原本に替わるまで、表示用画像の上にぐるぐるを重ねる。 -->
             <v-progress-circular v-if="zoomLoading" class="zoom-overlay__spinner" indeterminate color="white" size="48" width="4" aria-label="原本を読み込み中" />
           </div>
@@ -263,7 +285,11 @@ function onZoomReset() {
           <span v-if="zoomError" class="text-error"> ・ {{ zoomError }}</span>
           <span v-if="zoomScaleLabel" class="zoom-overlay__scale"> ・ {{ zoomScaleLabel }}</span>
           <template v-if="zoomList.length > 1"> ・ ← → で前後</template>
-          ・ Esc かクリックで閉じる ・ Ctrl+スクロールで拡大・縮小
+          ・ Esc かクリックで閉じる ・ Ctrl+スクロールで拡大・縮小 ・ F でピントの位置
+          <v-btn
+            class="zoom-overlay__focus" :class="{ 'is-on': focusOn }" icon="mdi-image-filter-center-focus" size="x-small" variant="text"
+            :aria-pressed="focusOn" aria-label="ピントの位置" title="ピントの位置（F）" @click.stop="toggleFocus"
+          />
         </div>
       </div>
     </v-overlay>

@@ -105,6 +105,17 @@ object SlideshowGesture {
         return hypot(now.x - prev.x, now.y - prev.y) <= DOUBLE_TAP_DISTANCE
     }
 
+    /** 長押しとみなす時間（ms）と、その間に動いてよい距離（dp。これ未満）。 */
+    const val LONG_PRESS_MS = 1000L
+    const val LONG_PRESS_SLOP = 16f
+
+    /**
+     * 長押しか。**押してから 1 秒たっても、いちばん離れた所が 16dp 未満**なら長押し
+     * （拡大する）。タップの判定（8dp）より広いので、指が少し揺れても長押しになる。
+     */
+    fun isLongPress(heldMs: Long, farthest: Float): Boolean =
+        heldMs >= LONG_PRESS_MS && farthest < LONG_PRESS_SLOP
+
     /** 決定したとき、写真が飛んでいく先。 */
     data class Fly(val x: Float, val y: Float, val rotation: Float)
 
