@@ -13,6 +13,7 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.CenterFocusStrong
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.MoreHoriz
 import androidx.compose.material.icons.filled.SelectAll
@@ -87,12 +88,14 @@ fun CullScreen(
     var multi by remember { mutableStateOf(false) }
     // 長押しの動き。**既定は「選ぶ」**（設定で拡大に戻せる）。
     var holdZooms by remember { mutableStateOf(false) }
+    // ピントの位置（U60）。拡大画面と同じ状態を見る。
+    val focusOn by FocusPeaking.enabled
     var note by remember { mutableStateOf("読み込み中…") }
     var stageSize by remember { mutableStateOf(0 to 0) }
     // 連写のまとめに使うハッシュ値。**出来た分だけで始められる。**
     var prepared by remember { mutableStateOf(0 to 0) }
     // 大きく見ている並びと、その何枚目か。**左右で前後に送れる**ので
-    // 1 枚ではなく並びで持つ。拡大からは「残す」だけができる。
+    // 1 枚ではなく並びで持つ。拡大は見るだけ（決めるのは閉じてから）。
     var zooming by remember { mutableStateOf<Pair<List<Photo>, Int>?>(null) }
     // 開いている連写のまとまり（代表の相対パス）。
     var editingBurst by remember { mutableStateOf<String?>(null) }
@@ -464,26 +467,6 @@ fun CullScreen(
             photos = line,
             startAt = index,
             displayEdge = displayEdge,
-            // **拡大したまま決められる。** 迷って開いた 1 枚を、
-            // 閉じてから探し直させない。
-            onKeep = { picked ->
-                zooming = null
-                val path = picked.relativePath
-                // 連写の中の 1 枚を見ていたなら、**その組をこの 1 枚で残す。**
-                // いま並んでいるのは代表なので、代表を移してから確定する。
-                val head = live.current.firstOrNull { it == path }
-                    ?: live.current.firstOrNull { live.members[it]?.contains(path) == true }
-                if (head != null) {
-                    // **代表の付け替えと確定は 1 回で書く。** state に入れてから
-                    // 同じ組で読み直すと、まだ再構成されていない古い方を掴む。
-                    val base =
-                        if (head != path) setRepresentative(live, head, path) ?: live else live
-                    val next = advance(base, listOf(head))
-                    session = next
-                    selected = emptySet()
-                    Store.queue(context, project.id, next)
-                }
-            },
             onClose = { zooming = null }
         )
         return
@@ -504,6 +487,8 @@ fun CullScreen(
             onOptions = { options = true },
             onHelp = { help = true },
             onCommit = { commit(selected) },
+            focusOn = focusOn,
+            onToggleFocus = { FocusPeaking.toggle() },
             slideshow = slideshow
         )
 
@@ -613,6 +598,7 @@ fun CullScreen(
                                     alwaysZoom = !holdZooms,
                                     onOpenBurst = { editingBurst = path },
                                     onTop = { keepTop(path) },
+                                    focus = focusOn,
                                     onTap = {
                                         if (multi) {
                                             selected = if (path in selected) selected - path
@@ -649,6 +635,9 @@ private fun CullBar(
     /** 「？」。操作のヘルプを開く。トーナメントとスライドショーで同じ位置・同じ部品。 */
     onHelp: () -> Unit,
     onCommit: () -> Unit,
+    /** ピントの位置（U60）を重ねているか。拡大画面と同じ状態。 */
+    focusOn: Boolean = false,
+    onToggleFocus: () -> Unit = {},
     /** スライドショー。**複数選択・まとめる・確定のボタンは出さない。** */
     slideshow: Boolean = false
 ) {
@@ -721,6 +710,25 @@ private fun CullBar(
             IconButton(onClick = onHelp) {
                 Icon(Icons.Outlined.HelpOutline, "操作のヘルプ", Modifier.size(20.dp))
             }
+            // ピントの位置。**「？」の隣**（操作の道具が並ぶ列）。オンは Lime で塗る。
+            // 選別ではタップが「選ぶ」で長押しも使い済みなので、長押しで消す動作は付けない。
+            // 2 枚並びの画面だけ（スライドショーは 1 枚ずつで、この印は使わない）。
+            if (!slideshow) {
+                Box(
+                    Modifier
+                        .size(40.dp)
+                        .clip(androidx.compose.foundation.shape.CircleShape)
+                        .background(if (focusOn) Lime else Color.Transparent)
+                        .clickable(onClick = onToggleFocus),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        Icons.Filled.CenterFocusStrong, "ピントの位置",
+                        Modifier.size(22.dp),
+                        tint = if (focusOn) Color.Black else LocalContentColor.current
+                    )
+                }
+            }
             if (!slideshow) Spacer(Modifier.width(4.dp))
             if (!slideshow) Button(
                 onClick = onCommit,
@@ -768,7 +776,9 @@ internal fun Tile(
     alwaysZoom: Boolean = false,
     onOpenBurst: () -> Unit,
     /** ★5 で確定する。連写の中身選別のように**使えない場所では null**。 */
-    onTop: (() -> Unit)? = null
+    onTop: (() -> Unit)? = null,
+    /** ピントの位置（U60）を重ねるか。 */
+    focus: Boolean = false
 ) {
     // 小さい枠にボタンを重ねると写真が見えなくなる。**120dp 未満では出さない。**
     // その場合は長押しから同じことができる。
@@ -806,6 +816,8 @@ internal fun Tile(
                 px = Prefetch.TILE_PX,
                 modifier = Modifier.fillMaxSize()
             )
+            // 輪郭に色をのせる。写真と同じ Fit の枠なので合う。押しは通す。
+            if (focus) FocusTileOverlay(photo, displayEdge, Modifier.fillMaxSize())
         }
         Box(
             Modifier
