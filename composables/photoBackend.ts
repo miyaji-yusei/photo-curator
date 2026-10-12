@@ -14,7 +14,7 @@ export interface DisplaySettings {
   projectEdge?: number
 }
 import type {
-  AmazonExport, AmazonPreview, ExportReport, Photo, PhotoPage, PhotoSort, Project,
+  AmazonExport, AmazonPreview, AnalysisFailure, ExportReport, Photo, PhotoPage, PhotoSort, PrepareState, Project,
   ProjectProgress, ProjectTask, SelectionResult, SelectionSummary
 } from '~/types/photo'
 import type { PairOverride } from '~/lib/core'
@@ -118,6 +118,10 @@ export interface PhotoBackend {
   startBurstAnalysis: (projectId: string) => Promise<void>
   /** まだ解析が要る写真の枚数。0 なら事前生成を起動しない。 */
   getAnalysisBacklog: (projectId: string) => Promise<number>
+  /** 準備の状態（解析の残り・表示用画像の残り・失敗の枚数）を 1 回で返す（R4）。 */
+  getPrepareState: (projectId: string) => Promise<PrepareState>
+  /** 解析できなかった写真の一覧（名前・理由・種類。U58）。相対パス順。 */
+  getAnalysisFailures: (projectId: string) => Promise<AnalysisFailure[]>
   /** scan 完了後の事前生成。既に走っていても失敗しない。 */
   startBackgroundAnalysis: (projectId: string) => Promise<void>
   cancelProjectTask: (projectId: string, task: ProjectTask) => Promise<void>

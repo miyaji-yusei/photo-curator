@@ -3,9 +3,14 @@
  * W10: フォルダ（handle）の走査は、写真ごとに getFile() を呼ばない（呼ぶたびにブラウザとファイル
  * システムの往復が入る）。読み込み（readFile）の階層の辿りは、同じ階層なら 1 回だけ。
  */
-import { describe, expect, it } from 'vitest'
+import { beforeAll, describe, expect, it } from 'vitest'
 import { HandleFolderIO } from '~/composables/backends/web/sourceIO'
 import { scanFolder } from '~/utils/folderScan'
+import { initWithBytes } from '~/lib/core'
+import { wasmBytes } from './helpers/wasmBytes.mjs'
+
+// 走査の最後の「組の RAW を除く」は core（wasm）が持つ（R10）。
+beforeAll(() => initWithBytes(wasmBytes()))
 
 interface Counts { getFile: number, getDirectoryHandle: number }
 

@@ -125,30 +125,35 @@ object Fingerprints {
     private const val TAG = "Fingerprints"
 
     /**
-     * 出所の鍵をそのままファイル名にしない。
-     * NAS の鍵は "nasId|フォルダ道筋" の形で、区切り記号がそのまま入ると
-     * **扱いにくい名前のファイル**ができる。英数字以外は _ に潰す。
+     * 出所の鍵をそのままファイル名にしない。名前は鍵の SHA-256（[SourceFiles]。B2）。
+     * 以前の「英数字以外を _ に潰す」名前は、同じ長さの日本語のフォルダ 2 つで同じになっていた。
      */
     internal fun file(context: Context, sourceKey: String) =
-        File(context.filesDir, "fingerprints-${sourceKey.replace(Regex("[^A-Za-z0-9_-]"), "_")}.json")
+        SourceFiles.current(context.filesDir, SourceFiles.Kind.Fingerprints, sourceKey)
+
+    /** 中身を読む。**形が合わなければ例外**（部分的に読まない）。 */
+    internal fun parse(text: String): Map<String, Fingerprint> {
+        val root = org.json.JSONObject(text)
+        val out = HashMap<String, Fingerprint>(root.length())
+        for (path in root.keys()) {
+            val entry = root.getJSONObject(path)
+            out[path] = Fingerprint(
+                version = entry.getInt("v"),
+                size = entry.getLong("size"),
+                hash = entry.getString("h"),
+                takenAt = if (entry.has("t")) entry.getLong("t") else null
+            )
+        }
+        return out
+    }
 
     suspend fun load(context: Context, sourceKey: String): Map<String, Fingerprint> =
         withContext(Dispatchers.IO) {
+            SourceFiles.adopt(context, sourceKey)
             val target = file(context, sourceKey)
             if (!target.exists()) return@withContext emptyMap()
             try {
-                val root = org.json.JSONObject(target.readText())
-                val out = HashMap<String, Fingerprint>(root.length())
-                for (path in root.keys()) {
-                    val entry = root.getJSONObject(path)
-                    out[path] = Fingerprint(
-                        version = entry.getInt("v"),
-                        size = entry.getLong("size"),
-                        hash = entry.getString("h"),
-                        takenAt = if (entry.has("t")) entry.getLong("t") else null
-                    )
-                }
-                out
+                parse(target.readText())
             } catch (error: Exception) {
                 // 読めないものは無かったことにして作り直す。**部分的に読まない。**
                 Log.w(TAG, "ハッシュ値を読めなかった: $sourceKey", error)
@@ -156,7 +161,8 @@ object Fingerprints {
             }
         }
 
-    suspend fun save(context: Context, sourceKey: String, prints: Map<String, Fingerprint>) =
+    suspend fun save(context: Context, sourceKey: String, prints: Map<String, Fingerprint>) {
+        SourceFiles.adopt(context, sourceKey, writing = SourceFiles.Kind.Fingerprints)
         Persist.latest("fingerprints:$sourceKey") {
             try {
                 val root = org.json.JSONObject()
@@ -175,6 +181,7 @@ object Fingerprints {
                 Log.w(TAG, "ハッシュ値を保存できなかった: $sourceKey", error)
             }
         }
+    }
 }
 
 /**
@@ -473,36 +480,44 @@ object Overrides {
 object Listing {
     private const val TAG = "Listing"
 
+    /** 名前は出所の鍵の SHA-256（[SourceFiles]。B2）。 */
     internal fun file(context: Context, sourceKey: String) =
-        File(context.filesDir, "listing-${sourceKey.replace(Regex("[^A-Za-z0-9_-]"), "_")}.json")
+        SourceFiles.current(context.filesDir, SourceFiles.Kind.Listing, sourceKey)
+
+    /** 中身を読む。**形が合わなければ例外**（部分的に読まない）。 */
+    internal fun parse(text: String): List<Photo> {
+        val array = org.json.JSONArray(text)
+        return (0 until array.length()).map { at ->
+            val entry = array.getJSONObject(at)
+            Photo(
+                id = entry.getLong("id"),
+                name = entry.getString("name"),
+                relativePath = entry.getString("rel"),
+                size = entry.getLong("size"),
+                takenAt = entry.getLong("at"),
+                remote = when {
+                    entry.has("nas") -> SmbRef(entry.getString("nas"), entry.getString("path"))
+                    entry.has("amz") -> AmazonRef(entry.getString("amz"), entry.getString("node"), entry.optString("tl"))
+                    else -> null
+                }
+            )
+        }
+    }
 
     suspend fun load(context: Context, sourceKey: String): List<Photo>? = withContext(Dispatchers.IO) {
+        SourceFiles.adopt(context, sourceKey)
         val target = file(context, sourceKey)
         if (!target.exists()) return@withContext null
         try {
-            val array = org.json.JSONArray(target.readText())
-            (0 until array.length()).map { at ->
-                val entry = array.getJSONObject(at)
-                Photo(
-                    id = entry.getLong("id"),
-                    name = entry.getString("name"),
-                    relativePath = entry.getString("rel"),
-                    size = entry.getLong("size"),
-                    takenAt = entry.getLong("at"),
-                    remote = when {
-                        entry.has("nas") -> SmbRef(entry.getString("nas"), entry.getString("path"))
-                        entry.has("amz") -> AmazonRef(entry.getString("amz"), entry.getString("node"), entry.optString("tl"))
-                        else -> null
-                    }
-                )
-            }
+            parse(target.readText())
         } catch (error: Exception) {
             Log.w(TAG, "顔ぶれを読めなかった: $sourceKey", error)
             null
         }
     }
 
-    suspend fun save(context: Context, sourceKey: String, photos: List<Photo>) =
+    suspend fun save(context: Context, sourceKey: String, photos: List<Photo>) {
+        SourceFiles.adopt(context, sourceKey, writing = SourceFiles.Kind.Listing)
         Persist.latest("listing:$sourceKey") {
             try {
                 val array = org.json.JSONArray()
@@ -527,8 +542,10 @@ object Listing {
                 Log.w(TAG, "顔ぶれを保存できなかった: $sourceKey", error)
             }
         }
+    }
 
     suspend fun clear(context: Context, sourceKey: String) {
+        SourceFiles.adopt(context, sourceKey, writing = SourceFiles.Kind.Listing)
         Persist.latest("listing:$sourceKey") { file(context, sourceKey).delete() }
     }
 }
@@ -543,11 +560,13 @@ object Listing {
 object Trouble {
     private const val TAG = "Trouble"
 
+    /** 名前は出所の鍵の SHA-256（[SourceFiles]。B2）。 */
     internal fun file(context: Context, sourceKey: String) =
-        File(context.filesDir, "trouble-${sourceKey.replace(Regex("[^A-Za-z0-9_-]"), "_")}.txt")
+        SourceFiles.current(context.filesDir, SourceFiles.Kind.Trouble, sourceKey)
 
     suspend fun note(context: Context, sourceKey: String, message: String) =
         withContext(Dispatchers.IO) {
+            SourceFiles.adopt(context, sourceKey, writing = SourceFiles.Kind.Trouble)
             try {
                 file(context, sourceKey).writeText(message)
             } catch (error: Exception) {
@@ -556,6 +575,7 @@ object Trouble {
         }
 
     suspend fun load(context: Context, sourceKey: String): String? = withContext(Dispatchers.IO) {
+        SourceFiles.adopt(context, sourceKey)
         val target = file(context, sourceKey)
         if (!target.exists()) return@withContext null
         try {
@@ -566,6 +586,7 @@ object Trouble {
     }
 
     suspend fun clear(context: Context, sourceKey: String) = withContext(Dispatchers.IO) {
+        SourceFiles.adopt(context, sourceKey, writing = SourceFiles.Kind.Trouble)
         try {
             file(context, sourceKey).delete()
         } catch (error: Exception) {

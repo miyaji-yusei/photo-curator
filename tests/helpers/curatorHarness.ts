@@ -86,6 +86,13 @@ export function fakeDesktop(overrides: Partial<Record<keyof PhotoBackend, unknow
     startDisplayGeneration: async () => undefined,
     ...overrides
   }
+  // 準備の状態は、個別の口（上書きされたものを含む）から組む。
+  base.getPrepareState ??= async (projectId: string) => ({
+    analysisBacklog: await (base.getAnalysisBacklog as (id: string) => Promise<number>)(projectId),
+    displayBacklog: await (base.getDisplayBacklog as (id: string) => Promise<number>)(projectId),
+    failed: 0,
+    unsupported: 0
+  })
   const desktop = new Proxy(base, {
     get(target, key: string) {
       if (key === 'then') return undefined

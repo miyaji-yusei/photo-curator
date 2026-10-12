@@ -63,6 +63,24 @@
 | U38 | core のレビュー R15〜R17（次のラウンドで仲間の星が追従する・`advance` の検証・手直しの重複は先勝ち） | S〜M | `core/src/lib.rs` | 済（#46） |
 | U39 | 「指紋」を「ハッシュ値」に言い換える（docs・文言。識別子は変えない） | S | docs・画面の文言 | 済（#47） |
 | U40 | Android のホームのカードが「…」のまま固まる件 | S | `app-android/` | 済（#48） |
+| U57 | PC の RAW（CR2 など）を解析・選別できるようにする。RAW に埋め込まれたプレビュー JPEG を取り出してサムネイル・dHash・表示用画像の元にする（Android の U49 と同じ規則） | M | `src-tauri/src/raw_preview.rs`・`image_pipeline.rs`・`capture.rs` | 済（PC。Web 版は未対応） |
+| U58-A | Android: 解析できなかったファイルの一覧・非対応は再試行しない・準備の分母と選別の対象に含めない（`11-ユーザーフロー.md` §5.3） | M | `app-android/`（`Analyse.kt`・`Failures.kt`・`FailuresDialog.kt`・`Album.kt`・`Home.kt`） | 済（`feat/mb-u58-unsupported-android`。実機・NAS は未確認。PC・Web は別ブランチ） |
+| R8 | 選別中の操作を `composables/curator/useTournamentActions.ts` へ（挙動不変。`11-ユーザーフロー.md` §2.5） | M | `composables/` | 済（`refactor/mb-r8-tournament-actions`。10 章 §7 の R8 の行） |
+| U58 | 解析できなかった写真の一覧・非対応形式は再試行しない・準備の分母と選別の対象から外す（PC・Web。Android は別担当）。`photos.analysis_error_kind` を 1 列追加 | M | `src-tauri/`（`analysis.rs`・`image_pipeline.rs`・`display.rs`・`lib.rs`）・`composables/`・`utils/analysisFailures.ts`・`AnalysisFailuresDialog.vue` | 済（PC・Web。Android は未着手。詳細は 10 章 §7 の U58 の行） |
+| B2 | Android: 出所ごとの控え（顔ぶれ・ハッシュ値・つまずき）のファイル名が同じ文字数の日本語のフォルダで衝突する件を、SHA-256 の名前にする。古い名前の控えは中身で確かめられたときだけ引き継ぎ、消さない（`11-ユーザーフロー.md` §4 B2・DB-3） | S〜M | `app-android/`（`SourceFiles.kt`・`Store.kt`・`HomeCards.kt`） | 済（`fix/mb-b2-android-cache-names`。実機・NAS は未確認。古い名前のファイルの片付けは後の版） |
+| R3・R5 | 「選別を始められるか」を `utils/selectionGate.ts` の純関数に・選別の開始を `composables/curator/useSelectionStart.ts` へ（挙動不変。`11-ユーザーフロー.md` §2.5） | S | `utils/`・`composables/`・`components/views/ProjectView.vue`・`tests/` | 済（`refactor/mb-r3-r5-selection-start`。10 章 §7 の R3・R5 の行） |
+| R6 | 開く・カード・準備の数・削除を `composables/curator/useProjectOpen.ts`、進みのイベントを `useProgressEvents.ts` へ（挙動不変。`11-ユーザーフロー.md` §2.5） | M | `composables/` | 済（`refactor/mb-r6-project-open`。10 章 §7 の R6 の行） |
+| R7 | 連写の学習・確認を `composables/curator/useBurstLearning.ts` へ（挙動不変。`11-ユーザーフロー.md` §2.5） | S | `composables/` | 済（`refactor/mb-r7-burst-learning`。10 章 §7 の R7 の行） |
+| U58 | 解析できなかった写真の一覧・非対応形式は再試行しない・準備の分母と選別の対象から外す（PC・Web。Android は別担当）。`photos.analysis_error_kind` を 1 列追加 | M | `src-tauri/`（`analysis.rs`・`image_pipeline.rs`・`display.rs`・`lib.rs`）・`composables/`・`utils/analysisFailures.ts`・`PhotoFailuresDialog.vue` | 済（PC・Web。Android は未着手。詳細は 10 章 §7 の U58 の行） |
+| R2 | 解析の失敗の理由を `PhotoFailure`（`message()`・`kind()`）に集約（PC。挙動・文言は不変） | S | `src-tauri/src/parallel.rs`・`analysis.rs`・`display.rs` | 済（`refactor/mb-r2-analysis-failure`） |
+| R1 | 写真の候補にする名前・組の RAW の規則を共通のフィクスチャで試験に縛る（`11-ユーザーフロー.md` §2.5） | S | `core/tests/fixtures/photo-names.json`・`tests/`・Android の `test/` | 済（`test/mb-r1-photo-name-fixture`。10 章 §7 の R1 の行。既知の差は表の `known_differences`） |
+| R4 | 準備の状態を 1 回で返す口 `get_prepare_state`（`getPrepareState`。解析の残り・表示用画像の残り・失敗・非対応の枚数。カードと `refreshPrepareCounts` を置き換え。挙動不変） | S | `src-tauri/src/lib.rs`・`composables/`・`types/photo.ts` | 済（`refactor/mb-r4-prepare-state`） |
+| B3 | PC: フォルダの再走査で原本が変わっても表示用画像が残り、差し替え前の絵が選別画面に出る件を、Amazon 版と同じく作り直しの対象に戻す（`11-ユーザーフロー.md` §4 B3） | S | `src-tauri/src/scan.rs`（`upsert_photo`）・`tests.rs` | 済（`fix/mb-b3-b9`。実アプリでは未確認） |
+| B9 | PC・Web: 「写真を再読み込み」の走査中は「選別を開始／再開」を押せなくする（設計書 01 章。Android と同じ。`11-ユーザーフロー.md` §4 B9） | S | `utils/selectionGate.ts`・`useSelectionStart.ts`・`ProjectView.vue` | 済（`fix/mb-b3-b9`。実アプリでは未確認） |
+| R9 | サイドカーの組み立て（`buildWith`・`buildSidecar`）に写真の行を渡せるように（渡さなければ今どおり読む。渡すのは `adopt` の 2 回目の組み立てだけ。挙動不変。`11-ユーザーフロー.md` §2.5） | S | `composables/useSidecarSync.ts`・`tests/sidecarSync.test.mjs` | 済（`refactor/mb-r9-sidecar-rows`。10 章 §7 の R9 の行） |
+| R3 続き | PC Rust: 書き込み・設定の同期コマンド 25 本を `async` ＋ `spawn_blocking` に（挙動不変。順序は `ratingsQueue`・`serialized` で保証済みを確認） | S | `src-tauri/src/lib.rs` | 済（`refactor/mb-rust-r3-async-writes`。10 章 §7 の R3 続きの行） |
+| W17 | `useCurator()` の戻り値の未使用キーを外す（`selectedCount`・`onKeydown`） | S | `composables/useCurator.ts` | 済（push 済み） |
+| R10 | 組の RAW を除く規則と RAW の判定を core（`photo_files.rs`）へ移し、wasm・UniFFI で公開。3 実装は呼ぶだけ（候補の拡張子の一覧＝B8 は移さない。`11-ユーザーフロー.md` §2.5） | M | `core/`・`core-wasm/`・`lib/core.ts`・`scan.rs`・`utils/folderScan.ts`・`RawFiles.kt` | 済（`refactor/mb-r10-photo-files-core`。10 章 §7 の R10 の行） |
 
 ---
 
@@ -262,6 +280,7 @@
 | U33 | core: 正規化・比較キー・未着手・`sidecar_plan`・混ぜ方（D・E）・鍵の変換・catalog.json v2 の項目。UDL と core-wasm に公開 | `fix/mb-u33-core-sidecar` | 済（#45 に含む。10章 §7 の U33） |
 | U34 | PC・Web: `useSidecarSync` を `sidecar_plan` と楽観ロック（lock → 読む → 確かめる → 一時ファイル → rename → 読み戻し）に切り替える。`sidecar_state` に `seen_token`・`seen_key`・`seen_epoch`・`detached`（移行: 古い seen_at/seen_by から `legacy:` の token、localChanged=true なら key を空に）。5 択のダイアログ・B の帯と「NAS に書き込む」・取り込みの「元に戻す」。`lib/core.ts` に新しい関数の型を足す。鍵は書くとき `sidecarKeysToFolder(…, '')`、読んだ直後に `sidecarNormalizeKeys(…, 選んだフォルダ)`、取り込むとき `sidecarKeysFromFolder(…, '', '\\')`（Windows） | `fix/mb-u34-pcweb-sidecar` | 済（#45 に含む。10章 §7 の U34・下の「U34」） |
 | U35 | Android: `Sidecar.kt` の判断を core の `sidecarPlan` に置き換える（`SyncState` を token・key・epoch・detached に）。鍵は prefix＝共有の根からのフォルダで変換。プロジェクトごとに 1 本の列・一時ファイル → rename・ON_STOP は開いているプロジェクトだけ・最初の確認が終わるまで「選別を開始」を押せない・5 択のダイアログ。**先に `node scripts/build-core.mjs` で `.so` と Kotlin の束ねを作り直す（ユーザー）** | `fix/mb-u35-android-sidecar` | 済（#45 に含む。下の「U35」の節。実機は未確認） |
+| B4・B7 | Web: 走査を拡張子で絞る（B4）／Android: ホームの表示用画像の数をプロジェクトの顔ぶれで数える（B7） | `fix/mb-b4-b7` | 実装済み（2026-10-07）。B8（rw2・pef・srw・HEIC の扱い）は未着手 |
 
 ### U33 で足した core の公開 API（`core/src/sidecar_sync.rs`。UDL・core-wasm にも同名／camelCase）
 - 正規化・比較: `normalize_key`・`canonical_judgement`・`sidecar_judgement`・`judgement_equivalent`・`judgement_key`

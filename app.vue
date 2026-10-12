@@ -22,6 +22,7 @@ import RestartDialog from '~/components/dialogs/RestartDialog.vue'
 import DisplayEdgeDialog from '~/components/dialogs/DisplayEdgeDialog.vue'
 import ExportDialog from '~/components/dialogs/ExportDialog.vue'
 import MetadataDialog from '~/components/dialogs/MetadataDialog.vue'
+import AnalysisFailuresDialog from '~/components/dialogs/AnalysisFailuresDialog.vue'
 import DeleteDialog from '~/components/dialogs/DeleteDialog.vue'
 import SidecarConflictDialog from '~/components/dialogs/SidecarConflictDialog.vue'
 import AppNav from '~/components/AppNav.vue'
@@ -42,6 +43,7 @@ const {
   activeProject,
   analysisFailures,
   analysisProgress,
+  openAnalysisFailures,
   analysisRunning,
   analysisValue,
   cancelAnalysis,
@@ -159,6 +161,7 @@ function onZoomReset() {
         <!-- 1枚も解析できなくても選別は続けられる。件数だけ伝えて先へ進ませる。 -->
         <v-alert v-if="analysisFailures" type="warning" variant="tonal" density="compact" closable class="mb-5" @click:close="analysisFailures = 0">
           {{ analysisFailures.toLocaleString() }} 件を解析できませんでした。該当の写真は連写のまとめ対象から外れますが、選別はこのまま続けられます。
+          <v-btn variant="text" size="small" class="ml-2" @click="openAnalysisFailures">一覧を見る</v-btn>
         </v-alert>
 
         <template v-if="view === 'home'">
@@ -276,6 +279,7 @@ function onZoomReset() {
     <DisplayEdgeDialog />
     <ExportDialog />
     <MetadataDialog />
+    <AnalysisFailuresDialog />
     <DeleteDialog />
     <SidecarConflictDialog />
 

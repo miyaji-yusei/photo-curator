@@ -44,9 +44,20 @@ export interface StoredPhoto {
   isMissing: boolean
   /** 解析できなかった理由。成功したら null に戻す。 */
   analysisError: string | null
+  /**
+   * 解析できなかった理由の種類（U58）。省略（U58 より前の失敗）は `transient` と同じ＝一度やり直す。
+   * `unsupported` は読めたのに復号できない形式で、原本（大きさ・更新時刻）が変わるまで再試行しない。
+   * `unhashable` は絵はあるがハッシュ値だけ作れない（小さすぎる）。再試行せず、数えず、一覧にも出さない。
+   */
+  analysisErrorKind?: StoredErrorKind | null
+  /** `unsupported` にしたときの原本の大きさと更新時刻。これが変われば再試行する。 */
+  analysisFailedSize?: number | null
+  analysisFailedModified?: number | null
   /** 表示用画像を作ったときの長辺。設定を変えたときの作り直し判定に使う。 */
   displayEdge?: number | null
 }
+
+export type StoredErrorKind = 'transient' | 'unsupported' | 'unhashable'
 
 /** 写真の出所。行に持つので、リロード後も同じ出所から読み直せる。 */
 export type StoredSource
@@ -213,6 +224,13 @@ export async function requestPersistence(): Promise<boolean> {
   }
 }
 
+/** 画面・core に見せる種類。`unhashable`（絵はある）は失敗として見せない。 */
+export function publicErrorKind(row: Pick<StoredPhoto, 'analysisError' | 'analysisErrorKind'>): 'unsupported' | 'transient' | null {
+  if (row.analysisError === null) return null
+  const kind = row.analysisErrorKind ?? 'transient'
+  return kind === 'unhashable' ? null : kind
+}
+
 /** 保存済みの行を画面が使う `Photo` に直す。URL は呼び出し側が埋める。 */
 export function toPhoto(
   row: StoredPhoto,
@@ -232,6 +250,7 @@ export function toPhoto(
     dHash: row.dHash,
     rating: row.rating,
     thumbnailPath: thumbnailUrl,
-    displayPath: displayUrl ?? originalUrl ?? thumbnailUrl
+    displayPath: displayUrl ?? originalUrl ?? thumbnailUrl,
+    analysisErrorKind: publicErrorKind(row)
   }
 }

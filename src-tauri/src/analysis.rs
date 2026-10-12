@@ -22,7 +22,7 @@ pub(crate) fn metadata_one(index: usize, job: &MetadataJob) -> PhotoWork {
             result.timestamp_source = Some(capture.source);
         }
         None => {
-            result.error = Some("撮影時刻を読み取れませんでした。".into());
+            result.fail(PhotoFailure::NoCaptureTime);
         }
     }
     result
@@ -34,7 +34,7 @@ pub(crate) fn apply_metadata(tx: &Connection, item: &PhotoWork) -> Result<(), St
     if item.not_image {
         tx.execute(
             "UPDATE photos SET is_missing=1,captured_at=NULL,timestamp_source=NULL,
-               analysis_error=NULL,analysis_error_at=NULL
+               analysis_error=NULL,analysis_error_at=NULL,analysis_error_kind=NULL
              WHERE id=?1",
             params![item.photo_id],
         )
@@ -43,8 +43,8 @@ pub(crate) fn apply_metadata(tx: &Connection, item: &PhotoWork) -> Result<(), St
     }
     tx.execute(
         "UPDATE photos SET captured_at=?1,timestamp_source=?2,
-           analysis_error=?3,analysis_error_at=?4
-         WHERE id=?5",
+           analysis_error=?3,analysis_error_at=?4,analysis_error_kind=?5
+         WHERE id=?6",
         params![
             item.captured_at,
             item.timestamp_source
@@ -52,6 +52,7 @@ pub(crate) fn apply_metadata(tx: &Connection, item: &PhotoWork) -> Result<(), St
                 .as_str(),
             item.error,
             item.error.as_ref().map(|_| now()),
+            item.error_kind(),
             item.photo_id
         ],
     )
@@ -59,11 +60,14 @@ pub(crate) fn apply_metadata(tx: &Connection, item: &PhotoWork) -> Result<(), St
     Ok(())
 }
 
-/// プロジェクトの写真の数を、欠損を除いて数え直す。
+/// プロジェクトの写真の数を、欠損を除き、非対応の形式（U58）も除いて数え直す。
+/// 選別の対象になる枚数＝ホームの「◯枚」。
 pub(crate) fn recount_photos(conn: &Connection, project_id: &str) -> Result<i64, String> {
     let count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM photos WHERE project_id=?1 AND is_missing=0",
+            "SELECT COUNT(*) FROM photos
+             WHERE project_id=?1 AND is_missing=0
+               AND COALESCE(analysis_error_kind,'')<>'unsupported'",
             params![project_id],
             |row| row.get(0),
         )
@@ -89,11 +93,9 @@ pub(crate) fn hash_one(thumbnails: &Path, index: usize, record: &HashRecord) -> 
     result.thumbnail_source = analysed.thumbnail_state.decode_source();
     result.hash_reused = analysed.hash_reused;
     if result.d_hash.is_none() {
-        result.error = Some(match current {
-            // ファイルは在るのに読めない = 壊れている / 非対応形式。
-            Some(_) => "画像を読み取れませんでした（破損または非対応の形式）。".into(),
-            None => "ファイルを開けませんでした（移動・削除・権限）。".into(),
-        });
+        // 非対応にするのは「全部読めたのに復号できない」ときだけ（U58）。
+        // 読めない・サムネイルを作れない・理由が分からないは一時的（安全側）。
+        result.fail(PhotoFailure::from_decode(analysed.failure, current.is_some()));
     }
     result
 }
@@ -129,16 +131,16 @@ pub(crate) fn hash_one_amazon(
     let bytes = match book.fetch(&record.path, Some(AMAZON_THUMBNAIL_EDGE)) {
         Ok(bytes) => bytes,
         Err(message) => {
-            result.error = Some(message);
+            result.fail(PhotoFailure::Fetch(message));
             return result;
         }
     };
     let Some(image) = image::load_from_memory(&bytes).ok() else {
-        result.error = Some("画像を読み取れませんでした（破損または非対応の形式）。".into());
+        result.fail(PhotoFailure::RemoteUndecodable);
         return result;
     };
     let Some(thumbnail) = encode_thumbnail(&scale_for_thumbnail(&image)) else {
-        result.error = Some("画像を読み取れませんでした（破損または非対応の形式）。".into());
+        result.fail(PhotoFailure::RemoteUndecodable);
         return result;
     };
     result.d_hash = hash_thumbnail_bytes(&thumbnail);
@@ -147,13 +149,185 @@ pub(crate) fn hash_one_amazon(
         result.thumbnail_source = Some("amazon");
     }
     if result.d_hash.is_none() {
-        result.error = Some("画像を読み取れませんでした（破損または非対応の形式）。".into());
+        result.fail(PhotoFailure::RemoteUndecodable);
     }
     result
 }
 
 /// Amazon に縮小させるときの長辺（サムネイルとハッシュ値のもと）。
 pub(crate) const AMAZON_THUMBNAIL_EDGE: u32 = 160;
+
+/// ハッシュの段の結果を 1 枚ぶん書く。失敗の種類（`analysis_error_kind`）もここで書く（U58）。
+pub(crate) fn apply_hash(tx: &Connection, item: &PhotoWork, is_amazon: bool) -> Result<(), String> {
+    // 据え置きで済んだ1枚は、書き込む理由が無い。
+    if item.hash_reused {
+        return Ok(());
+    }
+    if is_amazon {
+        // 原本の mtime は無い。走査が入れた大きさ（fingerprint_size）は触らない。
+        tx.execute(
+            "UPDATE photos SET d_hash=?1,d_hash_version=?2,thumbnail_path=?3,
+               thumbnail_source=COALESCE(?4,thumbnail_source),
+               thumbnail_version=?5,
+               analysis_error=?6,analysis_error_at=?7,analysis_error_kind=?8
+             WHERE id=?9",
+            params![
+                item.d_hash,
+                item.d_hash.as_ref().map(|_| D_HASH_VERSION),
+                item.thumbnail_path,
+                item.thumbnail_source,
+                item.thumbnail_path.as_ref().map(|_| THUMBNAIL_VERSION),
+                item.error,
+                item.error.as_ref().map(|_| now()),
+                item.error_kind(),
+                item.photo_id
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    // metadata が読めない場合は fingerprint を NULL のままにする。(0,0) を
+    // 入れると、読めないファイル同士が同じ fingerprint に見えてキャッシュが
+    // 誤ヒットする。
+    let (mtime, size) = match item.fingerprint {
+        Some((mtime, size)) => (Some(mtime), Some(size)),
+        None => (None, None),
+    };
+    // サムネイルを保存できたときだけ、それを作った時点の fingerprint を
+    // 控える。次回の無効化判定はこの一致で行う。
+    let (thumb_mtime, thumb_size) = match item.thumbnail_path {
+        Some(_) => (mtime, size),
+        None => (None, None),
+    };
+    tx.execute(
+        "UPDATE photos SET d_hash=?1,d_hash_version=?2,thumbnail_path=?3,
+           thumbnail_mtime=?4,thumbnail_size=?5,
+           thumbnail_source=COALESCE(?6,thumbnail_source),
+           thumbnail_version=?7,
+           fingerprint_mtime=?8,fingerprint_size=?9,
+           analysis_error=?10,analysis_error_at=?11,analysis_error_kind=?12
+         WHERE id=?13",
+        params![
+            item.d_hash,
+            item.d_hash.as_ref().map(|_| D_HASH_VERSION),
+            item.thumbnail_path,
+            thumb_mtime,
+            thumb_size,
+            item.thumbnail_source,
+            // 版はサムネイルを保存できたときだけ立てる。パスが NULL のまま
+            // 版だけ残ると、次回「使える」と誤判定する。
+            item.thumbnail_path.as_ref().map(|_| THUMBNAIL_VERSION),
+            mtime,
+            size,
+            item.error,
+            item.error.as_ref().map(|_| now()),
+            item.error_kind(),
+            item.photo_id
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// 非対応の印が付いていて、原本がそのままか（U58）。そのままなら何度やっても同じなので、再試行しない。
+/// 原本が変わっていたら（大きさ・更新時刻が控えと違う）、stat できなかったときも、false＝もう一度試す。
+fn is_settled_unsupported(
+    kind: Option<&str>,
+    path: &str,
+    stored: (Option<i64>, Option<i64>),
+) -> bool {
+    kind == Some(ERROR_KIND_UNSUPPORTED)
+        && fingerprint(Path::new(path))
+            .is_some_and(|(mtime, size)| stored == (Some(mtime), Some(size)))
+}
+
+/// 撮影時刻の段の対象。非対応で原本が変わっていない行は含めない。
+pub(crate) fn load_metadata_records(
+    conn: &Connection,
+    project_id: &str,
+) -> Result<Vec<MetadataRecord>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT id,path,captured_at,timestamp_source,analysis_error_kind,fingerprint_mtime,fingerprint_size
+             FROM photos WHERE project_id=?1 AND is_missing=0 ORDER BY path",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params![project_id], |row| {
+            let kind: Option<String> = row.get(4)?;
+            let path: String = row.get(1)?;
+            let settled =
+                is_settled_unsupported(kind.as_deref(), &path, (row.get(5)?, row.get(6)?));
+            Ok((settled, (row.get(0)?, path, row.get(2)?, row.get(3)?)))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut records = Vec::new();
+    for row in rows {
+        let (settled, record) = row.map_err(|error| error.to_string())?;
+        if !settled {
+            records.push(record);
+        }
+    }
+    Ok(records)
+}
+
+/// ハッシュの段の候補。非対応で原本が変わっていない行は含めない（U58）。
+/// `dated_only` は撮影時刻のある行だけ（Amazon 以外）。
+pub(crate) fn load_hash_records(
+    conn: &Connection,
+    project_id: &str,
+    dated_only: bool,
+) -> Result<Vec<HashRecord>, String> {
+    let dated_only = if dated_only {
+        "AND captured_at IS NOT NULL"
+    } else {
+        ""
+    };
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT id,path,captured_at,timestamp_source,d_hash,d_hash_version,
+                    thumbnail_path,thumbnail_mtime,thumbnail_size,thumbnail_version,
+                    analysis_error_kind,fingerprint_mtime,fingerprint_size
+             FROM photos
+             WHERE project_id=?1 AND is_missing=0 {dated_only}
+             ORDER BY captured_at IS NULL, captured_at, path"
+        ))
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params![project_id], |row| {
+            let source: Option<String> = row.get(3)?;
+            let kind: Option<String> = row.get(10)?;
+            let path: String = row.get(1)?;
+            let settled =
+                is_settled_unsupported(kind.as_deref(), &path, (row.get(11)?, row.get(12)?));
+            Ok((
+                settled,
+                HashRecord {
+                    id: row.get(0)?,
+                    path,
+                    captured_at: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    source: TimestampSource::parse(source.as_deref()),
+                    cached: CachedAnalysis {
+                        d_hash: row.get(4)?,
+                        d_hash_version: row.get(5)?,
+                        thumbnail_path: row.get(6)?,
+                        thumbnail_mtime: row.get(7)?,
+                        thumbnail_size: row.get(8)?,
+                        thumbnail_version: row.get(9)?,
+                    },
+                },
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut records = Vec::new();
+    for row in rows {
+        let (settled, record) = row.map_err(|error| error.to_string())?;
+        if !settled {
+            records.push(record);
+        }
+    }
+    Ok(records)
+}
 
 /// 解析できなかった写真の件数。UI へそのまま渡す。
 pub(crate) fn failed_photo_count(conn: &Connection, project_id: &str) -> Result<usize, String> {
@@ -195,18 +369,7 @@ pub(crate) fn run_burst_analysis(
         mode.workers(Path::new(&folder))
     };
     let conn = connection(&app)?;
-    let records: Vec<MetadataRecord> = {
-        let mut statement = conn
-            .prepare("SELECT id,path,captured_at,timestamp_source FROM photos WHERE project_id=?1 AND is_missing=0 ORDER BY path")
-            .map_err(|error| error.to_string())?;
-        let rows = statement
-            .query_map(params![project_id], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })
-            .map_err(|error| error.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?
-    };
+    let records: Vec<MetadataRecord> = load_metadata_records(&conn, &project_id)?;
     // 旧ビルドの行は captured_at はあっても timestamp_source が無い。経路が
     // 分からないままだと連写判定で信用度を測れないので、その場合も読み直す
     // （EXIF 読取は 0.14 ms/枚）。既に両方ある行は仕事そのものを作らない。
@@ -246,12 +409,10 @@ pub(crate) fn run_burst_analysis(
             // worker はファイルを読むだけ。DB には触れない。
             |index, job: &MetadataJob| metadata_one(index, job),
             &mut |item| {
-                if item.error.is_some() {
-                    failed += 1;
-                }
                 pending.push(item);
                 if pending.len() >= ANALYSIS_CHUNK_SIZE {
                     committed += flush_results(&conn, &mut pending, &apply)?;
+                    failed = failed_photo_count(&conn, &project_id)?;
                     progress_note(
                         &app,
                         &project_id,
@@ -288,6 +449,7 @@ pub(crate) fn run_burst_analysis(
         )?;
         // キャンセルされていても、読み終わっているぶんは書いてから抜ける。
         committed += flush_results(&conn, &mut pending, &apply)?;
+        failed = failed_photo_count(&conn, &project_id)?;
         // 中身が画像ではなかった写真は数から外れているので、件数を数え直す。
         recount_photos(&conn, &project_id)?;
         if outcome.cancelled {
@@ -316,36 +478,7 @@ pub(crate) fn run_burst_analysis(
         } else {
             "AND captured_at IS NOT NULL"
         };
-        let mut statement = conn
-            .prepare(&format!(
-                "SELECT id,path,captured_at,timestamp_source,d_hash,d_hash_version,
-                        thumbnail_path,thumbnail_mtime,thumbnail_size,thumbnail_version
-                 FROM photos
-                 WHERE project_id=?1 AND is_missing=0 {dated_only}
-                 ORDER BY captured_at IS NULL, captured_at, path"
-            ))
-            .map_err(|error| error.to_string())?;
-        let rows = statement
-            .query_map(params![project_id], |row| {
-                let source: Option<String> = row.get(3)?;
-                Ok(HashRecord {
-                    id: row.get(0)?,
-                    path: row.get(1)?,
-                    captured_at: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
-                    source: TimestampSource::parse(source.as_deref()),
-                    cached: CachedAnalysis {
-                        d_hash: row.get(4)?,
-                        d_hash_version: row.get(5)?,
-                        thumbnail_path: row.get(6)?,
-                        thumbnail_mtime: row.get(7)?,
-                        thumbnail_size: row.get(8)?,
-                        thumbnail_version: row.get(9)?,
-                    },
-                })
-            })
-            .map_err(|error| error.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?
+        load_hash_records(&conn, &project_id, !dated_only.is_empty())?
     };
 
     // 時間が近いものだけがハッシュを必要とする。ただし mtime しか根拠が無い
@@ -395,74 +528,7 @@ pub(crate) fn run_burst_analysis(
     let mut pending: Vec<PhotoWork> = Vec::with_capacity(ANALYSIS_CHUNK_SIZE);
     let mut committed = 0usize;
     let is_amazon = amazon_book.is_some();
-    let apply = |tx: &Connection, item: &PhotoWork| -> Result<(), String> {
-        // 据え置きで済んだ1枚は、書き込む理由が無い。
-        if item.hash_reused {
-            return Ok(());
-        }
-        if is_amazon {
-            // 原本の mtime は無い。走査が入れた大きさ（fingerprint_size）は触らない。
-            tx.execute(
-                "UPDATE photos SET d_hash=?1,d_hash_version=?2,thumbnail_path=?3,
-                   thumbnail_source=COALESCE(?4,thumbnail_source),
-                   thumbnail_version=?5,
-                   analysis_error=?6,analysis_error_at=?7
-                 WHERE id=?8",
-                params![
-                    item.d_hash,
-                    item.d_hash.as_ref().map(|_| D_HASH_VERSION),
-                    item.thumbnail_path,
-                    item.thumbnail_source,
-                    item.thumbnail_path.as_ref().map(|_| THUMBNAIL_VERSION),
-                    item.error,
-                    item.error.as_ref().map(|_| now()),
-                    item.photo_id
-                ],
-            )
-            .map_err(|error| error.to_string())?;
-            return Ok(());
-        }
-        // metadata が読めない場合は fingerprint を NULL のままにする。(0,0) を
-        // 入れると、読めないファイル同士が同じ fingerprint に見えてキャッシュが
-        // 誤ヒットする。
-        let (mtime, size) = match item.fingerprint {
-            Some((mtime, size)) => (Some(mtime), Some(size)),
-            None => (None, None),
-        };
-        // サムネイルを保存できたときだけ、それを作った時点の fingerprint を
-        // 控える。次回の無効化判定はこの一致で行う。
-        let (thumb_mtime, thumb_size) = match item.thumbnail_path {
-            Some(_) => (mtime, size),
-            None => (None, None),
-        };
-        tx.execute(
-            "UPDATE photos SET d_hash=?1,d_hash_version=?2,thumbnail_path=?3,
-               thumbnail_mtime=?4,thumbnail_size=?5,
-               thumbnail_source=COALESCE(?6,thumbnail_source),
-               thumbnail_version=?7,
-               fingerprint_mtime=?8,fingerprint_size=?9,
-               analysis_error=?10,analysis_error_at=?11
-             WHERE id=?12",
-            params![
-                item.d_hash,
-                item.d_hash.as_ref().map(|_| D_HASH_VERSION),
-                item.thumbnail_path,
-                thumb_mtime,
-                thumb_size,
-                item.thumbnail_source,
-                // 版はサムネイルを保存できたときだけ立てる。パスが NULL のまま
-                // 版だけ残ると、次回「使える」と誤判定する。
-                item.thumbnail_path.as_ref().map(|_| THUMBNAIL_VERSION),
-                mtime,
-                size,
-                item.error,
-                item.error.as_ref().map(|_| now()),
-                item.photo_id
-            ],
-        )
-        .map_err(|error| error.to_string())?;
-        Ok(())
-    };
+    let apply = |tx: &Connection, item: &PhotoWork| apply_hash(tx, item, is_amazon);
     let thumbnails_for_workers = thumbnails.clone();
     let book_for_workers = amazon_book.clone();
     let outcome = run_in_parallel(
@@ -476,12 +542,10 @@ pub(crate) fn run_burst_analysis(
             None => hash_one(&thumbnails_for_workers, index, record),
         },
         &mut |item| {
-            if item.error.is_some() {
-                failed += 1;
-            }
             pending.push(item);
             if pending.len() >= ANALYSIS_CHUNK_SIZE {
                 committed += flush_results(&conn, &mut pending, &apply)?;
+                failed = failed_photo_count(&conn, &project_id)?;
                 progress_note(
                     &app,
                     &project_id,
@@ -517,6 +581,7 @@ pub(crate) fn run_burst_analysis(
         },
     )?;
     committed += flush_results(&conn, &mut pending, &apply)?;
+    failed = failed_photo_count(&conn, &project_id)?;
     // リンクが消えていたら、ここで止めて理由を伝える。開いたときに自動では続けない。
     if amazon_book.as_ref().is_some_and(|book| book.is_gone()) {
         mark_amazon_gone(&conn, &project_id);

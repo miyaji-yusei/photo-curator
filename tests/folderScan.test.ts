@@ -1,7 +1,12 @@
-import { describe, expect, it } from 'vitest'
+import { beforeAll, describe, expect, it } from 'vitest'
 import type { SourceEntry, SourceIO } from '~/composables/backends/web/sourceIO'
 import { PickerIO, joinPath } from '~/composables/backends/web/sourceIO'
-import { isVideoName, scanFolder, skipPairedRaw } from '~/utils/folderScan'
+import { isPhotoName, isVideoName, scanFolder, skipPairedRaw } from '~/utils/folderScan'
+import { initWithBytes } from '~/lib/core'
+import { wasmBytes } from './helpers/wasmBytes.mjs'
+
+// 組の RAW を除く規則は core（wasm）が持つ（R10）。
+beforeAll(() => initWithBytes(wasmBytes()))
 
 /** サイドカーは走査に関係しない。 */
 const noSidecar = {
@@ -28,6 +33,19 @@ function fakeFolder(tree: Record<string, string[]>): SourceIO {
     ...noSidecar
   }
 }
+
+describe('isPhotoName（B4）', () => {
+  it('画像・RAW の拡張子と、拡張子の無い名前は候補。大文字小文字は問わない', () => {
+    for (const name of ['a.jpg', 'A.JPEG', 'a.png', 'a.webp', 'a.HEIC', 'a.heif', 'a.CR3', 'a.rw2', 'IMG_0001']) {
+      expect(isPhotoName(name), name).toBe(true)
+    }
+  })
+  it('.xmp・.txt・Thumbs.db・.AAE・動画などは候補にしない', () => {
+    for (const name of ['a.xmp', 'a.jpg.xmp', 'notes.txt', 'Thumbs.db', 'desktop.ini', 'IMG_1.AAE', 'a.gif', 'a.mp4']) {
+      expect(isPhotoName(name), name).toBe(false)
+    }
+  })
+})
 
 describe('isVideoName', () => {
   it('動画の拡張子を、大文字小文字を問わず見分ける', () => {

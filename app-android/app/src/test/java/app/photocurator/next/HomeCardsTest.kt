@@ -75,4 +75,34 @@ class HomeCardsTest {
             dir.deleteRecursively()
         }
     }
+
+    // B7: 置き場の id は NAS ごと。同じ NAS の別プロジェクトの絵を足さない。
+    private fun nasPhoto(path: String) = Photo(
+        id = 1, name = path.substringAfterLast('/'), relativePath = path, size = 1, takenAt = 1,
+        remote = SmbRef("nas1", path)
+    )
+
+    @Test fun 表示用画像の名前から道筋の名前も取り出す() {
+        val hash = CacheName.of("a/b.jpg")
+        assertEquals(Triple("nas1", hash, 1536), CacheName.parseRenderParts("nas1_${hash}_1536.jpg"))
+        assertEquals(Triple("a_b", hash, 768), CacheName.parseRenderParts("a_b_${hash}_768.jpg"))
+        assertNull(CacheName.parseRenderParts("nas1_1a2b3c4d_1536.jpg"))
+        assertNull(CacheName.parseRenderParts("nas1_${hash}_1536.jpg.1.writing"))
+    }
+
+    @Test fun 表示用画像の数はプロジェクトの写真の顔ぶれで数える() {
+        // 同じ NAS の 2 プロジェクト。置き場には両方の絵が入っている。
+        val mine = listOf(nasPhoto("a/1.jpg"), nasPhoto("a/2.jpg"), nasPhoto("a/3.jpg"))
+        val others = listOf("b/1.jpg", "b/2.jpg", "b/3.jpg", "b/4.jpg").map(CacheName::of)
+        val onDisk = (listOf(CacheName.of("a/1.jpg")) + others).toSet()
+        assertEquals(1, Renders.madeCount(mine, onDisk))
+        assertEquals(0, Renders.madeCount(mine, emptySet()))
+        assertEquals(3, Renders.madeCount(mine, mine.map { CacheName.of(it.relativePath) }.toSet() + others))
+    }
+
+    @Test fun 端末の写真は表示用画像の道筋を持たないので数えない() {
+        val local = Photo(id = 1, name = "x.jpg", relativePath = "x.jpg", size = 1, takenAt = 1)
+        assertNull(Renders.pathOf(local))
+        assertEquals(0, Renders.madeCount(listOf(local), setOf(CacheName.of("x.jpg"))))
+    }
 }

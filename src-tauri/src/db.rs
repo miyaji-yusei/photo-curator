@@ -246,6 +246,10 @@ pub(crate) fn open_database(path: &Path) -> Result<Connection, String> {
     // 「◯件を解析できませんでした」と伝え、**解析自体は続行する**。
     add_column_if_missing(&conn, "photos", "analysis_error", "TEXT")?;
     add_column_if_missing(&conn, "photos", "analysis_error_at", "INTEGER")?;
+    // 解析できなかった理由の種類（U58）。'unsupported'＝読めたのに復号できない（原本が変わるまで
+    // 再試行しない）／'transient'＝読めない・打ち切り・網の失敗（次に開いたとき再試行）。
+    // NULL は「失敗なし」か「U58 より前の失敗」（後者は一時的として 1 回やり直す）。
+    add_column_if_missing(&conn, "photos", "analysis_error_kind", "TEXT")?;
 
     // 手で直したまとめ。**グループ単位では持てない。** まとめは dHash と閾値から
     // そのつど導出していて実体が無く、閾値が変われば別物になって紐づかないため。

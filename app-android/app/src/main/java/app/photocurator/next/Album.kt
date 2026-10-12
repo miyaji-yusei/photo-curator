@@ -32,6 +32,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
@@ -60,6 +61,12 @@ fun ProjectScreen(
     var session by remember { mutableStateOf<Session?>(null) }
     var scanned by remember { mutableStateOf(false) }
     var prints by remember { mutableStateOf<Map<String, Fingerprint>>(emptyMap()) }
+    // 解析できなかった写真の控え（U58）。一覧と、非対応を引いた分母に使う。
+    var failures by remember { mutableStateOf<Map<String, Failure>>(emptyMap()) }
+    var showFailures by remember { mutableStateOf(false) }
+    val failureRows = remember(photos, failures) { Failures.rows(photos, failures) }
+    // 選別の対象の枚数（非対応を除く）。準備の分母。
+    val workable = remember(photos, failures) { Failures.workableCount(photos, failures) }
     var filter by remember { mutableStateOf("all") }
     var menu by remember { mutableStateOf(false) }
     var confirmRestart by remember { mutableStateOf(false) }
@@ -155,6 +162,7 @@ fun ProjectScreen(
         if (!mine.running) {
             photos = Listing.load(context, project.source.key) ?: photos
             prints = Fingerprints.load(context, project.source.key)
+            failures = Failures.load(context, project.source.key)
         }
     }
 
@@ -163,6 +171,7 @@ fun ProjectScreen(
         trouble = null
         session = Store.load(context, project.id)
         prints = Fingerprints.load(context, project.source.key)
+        failures = Failures.load(context, project.source.key)
         // **転んだままなら、まずそれを出す。** 準備をやり直すのは押されたとき。
         val noted = Trouble.load(context, project.source.key)
         photos = Listing.load(context, project.source.key)
@@ -177,6 +186,7 @@ fun ProjectScreen(
                 scope.launch {
                     photos = Listing.load(context, project.source.key) ?: photos
                     prints = Fingerprints.load(context, project.source.key)
+                    failures = Failures.load(context, project.source.key)
                     // 出せない大きさだったら準備の側で直している（設計 08 章 8.5）。
                     displayEdge = Prefs.projectEdge(context, project.id)
                 }
@@ -253,8 +263,12 @@ fun ProjectScreen(
             verticalAlignment = Alignment.CenterVertically
         ) {
             IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, "ホームへ") }
-            Text(project.name, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
-            Spacer(Modifier.weight(1f))
+            // **名前は残りの幅で省略する。** 閉じた幅だと名前がボタンを押しつぶし、文字が縦に折れた。
+            Text(
+                project.name, fontSize = 18.sp, fontWeight = FontWeight.SemiBold,
+                maxLines = 1, overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
+            )
             IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, "その他") }
             Spacer(Modifier.width(8.dp))
             Button(
@@ -283,7 +297,8 @@ fun ProjectScreen(
                         live.finished -> "結果を見る"
                         else -> "選別を続ける"
                     },
-                    fontWeight = FontWeight.Bold, fontSize = 14.sp
+                    fontWeight = FontWeight.Bold, fontSize = 14.sp,
+                    maxLines = 1, softWrap = false
                 )
             }
         }
@@ -302,7 +317,7 @@ fun ProjectScreen(
                     Text(
                         // **いつ撮ったものかを 1 行で。** 同じ名前のフォルダが
                         // 並んだとき、枚数だけでは見分けがつかない。
-                        "${photos.size} 枚" + photoSpan?.let { " · $it" }.orEmpty(),
+                        "$workable 枚" + photoSpan?.let { " · $it" }.orEmpty(),
                         fontSize = 12.sp, color = Faint,
                         modifier = Modifier.padding(top = 6.dp)
                     )
@@ -344,7 +359,7 @@ fun ProjectScreen(
                         Text(
                             when {
                                 trouble != null -> "止まっています"
-                                scanned && prints.size >= photos.size &&
+                                scanned && prints.size >= workable &&
                                     (!project.source.remote ||
                                         (rendering.second > 0 && rendering.first >= rendering.second))
                                 -> "完了"
@@ -396,22 +411,37 @@ fun ProjectScreen(
                     }
                     Spacer(Modifier.height(10.dp))
                     PrepRow("写真の走査", if (scanned) photos.size else 0, photos.size, scanned)
+                    // **非対応は分母に入れない**（U58）。以降の 2 行は選別の対象の枚数で数える。
                     // Tauri 版の「表示用画像」に当たる段。ネイティブでは OS の縮小画像を
                     // そのまま使うので、実際に作るのは連写のまとめに使うハッシュ値だけ。
                     // ハッシュ値は撮影時刻と同じ 1 回の読みで取れるので、同じ行に畳む。
                     PrepRow(
                         "撮影時刻・サムネイル",
                         maxOf(prints.size, preparing.first),
-                        photos.size,
-                        prints.size >= photos.size && photos.isNotEmpty()
+                        workable,
+                        prints.size >= workable && photos.isNotEmpty()
                     )
                     // **網越しのときだけ。** 端末の写真は手元でデコードすれば足りる。
                     if (project.source.remote) {
                         PrepRow(
                             "表示用画像（${displayEdge}px）",
                             rendering.first,
-                            photos.size,
+                            workable,
                             rendering.second > 0 && rendering.first >= rendering.second
+                        )
+                    }
+                    // 解析できなかったファイル。**押すと名前と理由の一覧。**
+                    if (failureRows.isNotEmpty()) {
+                        val unsupportedRows = failureRows.count { it.kind == FailureKind.Unsupported }
+                        Text(
+                            "${failureRows.size} 件を解析できませんでした" +
+                                if (unsupportedRows > 0) "（うち ${unsupportedRows} 件は対応していない形式）" else "",
+                            fontSize = 12.sp, color = Warn,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable { showFailures = true }
+                                .padding(top = 8.dp, bottom = 4.dp)
                         )
                     }
                     Text(
@@ -606,8 +636,8 @@ fun ProjectScreen(
     if (starting) {
         StartSheet(
             project = project,
-            photoCount = photos.size,
-            readyCount = if (project.source.remote) rendering.first else photos.size,
+            photoCount = workable,
+            readyCount = if (project.source.remote) rendering.first else workable,
             onStart = {
                 starting = false
                 // 連写をまとめる設定で、まだ基準を決めていなければ学習へ。
@@ -756,6 +786,10 @@ fun ProjectScreen(
         )
     }
 
+    if (showFailures) {
+        FailuresDialog(failureRows) { showFailures = false }
+    }
+
     if (renaming) {
         var text by remember { mutableStateOf(project.name) }
         AlertDialog(
@@ -794,7 +828,7 @@ fun ProjectScreen(
                     """
                         ID: ${project.id}
                         出所: ${project.source.technical}
-                        写真: ${photos.size} 枚 / ハッシュ値 ${prints.size} 枚
+                        写真: ${photos.size} 枚（非対応 ${photos.size - workable} 枚）/ ハッシュ値 ${prints.size} 枚
                         表示用画像: ${rendering.first} / ${rendering.second}（${displayEdge}px）
                     """.trimIndent(),
                     fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,

@@ -1,26 +1,23 @@
 import type {
-  BurstGroup, Photo, Project, ProjectProgress,
+  AnalysisFailure, BurstGroup, Photo, Project, ProjectProgress,
   SelectionResult, TournamentSettings
 } from '~/types/photo'
 import { MAX_RATING } from '~/types/photo'
 import type { PhotoBackend } from '~/composables/photoBackend'
 import * as core from '~/lib/core'
 import type { BurstThreshold, PairOverride, PhotoRef, Session } from '~/lib/core'
-import { buildBurstQuestions } from '~/utils/burstQuestions'
-import { joinSpanOverrides } from '~/utils/burstShape'
 import { createSaveQueue } from '~/utils/saveQueue'
 import { createSerialQueue } from '~/utils/serialQueue'
 import {
   BURST_WINDOW_MS, D_HASH_VERSION, DEFAULT_BURST_DISTANCE,
-  buildCoreInputs, maxNeighborDistance
+  buildCoreInputs
 } from '~/utils/coreInputs'
 import type { CoreInputs } from '~/utils/coreInputs'
 import { applyChanges } from '~/utils/ratingEdit'
 import { healRatings, syncRatings } from '~/utils/selectionFlow'
-import { prepareProgress, projectStatus } from '~/utils/projectStatus'
-import type { CardState, CardStatus, PrepareLine } from '~/utils/projectStatus'
+import type { CardStatus } from '~/utils/projectStatus'
 import type { RatingChange, SavedSelection } from '~/utils/selectionFlow'
-import { SLIDESHOW_GROUP_SIZE, clampGroupSize, groupSizeLimits, isSlideshowSize, tournamentGroupSize } from '~/utils/groupSize'
+import { clampGroupSize, groupSizeLimits, isSlideshowSize, tournamentGroupSize } from '~/utils/groupSize'
 import { registerAutoPush, useSidecarSync } from '~/composables/useSidecarSync'
 import type { View } from '~/composables/curator/types'
 import { useExport } from '~/composables/curator/useExport'
@@ -34,6 +31,11 @@ import { useBurstEdit } from '~/composables/curator/useBurstEdit'
 import { usePreviewGrid } from '~/composables/curator/usePreviewGrid'
 import { useSidecarActions } from '~/composables/curator/useSidecarActions'
 import { useKeyboard } from '~/composables/curator/useKeyboard'
+import { useSelectionStart } from '~/composables/curator/useSelectionStart'
+import { useBurstLearning } from '~/composables/curator/useBurstLearning'
+import { useProjectOpen } from '~/composables/curator/useProjectOpen'
+import { useTournamentActions } from '~/composables/curator/useTournamentActions'
+import { useProgressEvents } from '~/composables/curator/useProgressEvents'
 
 /**
  * 行の星を**読む・消す・動かす**メソッド。選別の 1 タップは行の星の書き込みを待たずに次の組を出す（W1）ので、
@@ -94,7 +96,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     }
   })
   const {
-    access: sidecarAccess, clash: sidecarClash, busy: sidecarBusy,
+    access: sidecarAccess, clash: sidecarClash, busy: sidecarBusy, checking: sidecarChecking,
     message: sidecarMessage, notice: sidecarNotice, detached: sidecarDetached, savedAt: sidecarSavedAt
   } = sidecar
   /** 写真の行がまだ無いまま開いたプロジェクト。走査が済んでから確かめる。 */
@@ -148,6 +150,29 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   // 連写解析は前面をブロックしない。ダイアログではなく帯で知らせるだけにする。
   const analysisProgress = ref<ProjectProgress | null>(null)
   const analysisFailures = ref(0)
+  /** 解析できなかった写真の一覧（名前・理由・種類）。警告の「一覧を見る」で出す（U58）。 */
+  const analysisFailureList = ref<AnalysisFailure[]>([])
+  const analysisFailuresDialog = ref(false)
+
+  /**
+   * 解析できなかった写真を DB から読み直す。**件数はここで決める**（進みのイベントだけに頼ると、
+   * プロジェクトを替えても前の件数が残った。B6）。
+   */
+  async function refreshAnalysisFailures(projectId = activeProject.value?.id) {
+    if (!projectId) return
+    try {
+      const list = (await desktop.getAnalysisFailures(projectId)) ?? []
+      if (activeProject.value?.id !== projectId) return
+      analysisFailureList.value = list
+      analysisFailures.value = list.length
+    } catch {
+      // 一覧が読めなくても、選別も解析も止めない。
+    }
+  }
+  async function openAnalysisFailures() {
+    await refreshAnalysisFailures()
+    analysisFailuresDialog.value = true
+  }
   // 選別画面に出す表示用画像の設定（`composables/curator/useDisplayImages.ts`）。
   // 先読みの表は下で作るので、捨てる関数として渡す（呼ばれるのは作ったあと）。
   const {
@@ -282,7 +307,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     const total = done + remainingGroups.value
     return total ? (done / total) * 100 : 100
   })
-  const selectedCount = computed(() => coreSession.value?.survivors.length ?? 0)
   // 連写の学習。質問と答えは封筒（`learning`）に持つので、リロードしても続きから。
   const askedCount = computed(() => session.value?.learning?.answers.length ?? 0)
   const learningPosition = computed(() => (session.value?.learning?.index ?? 0) + 1)
@@ -334,83 +358,31 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
   /** いま開いているプロジェクトは Amazon Photos の共有リンクか。 */
   const isAmazon = computed(() => activeProject.value?.sourceKind === 'amazon')
 
-  async function refreshProjects() {
-    // デスクトップは PC の DB、ブラウザは端末内の DB。どちらも一覧を返す。
-    projects.value = await desktop.listProjects()
-    void refreshProjectCards()
-  }
-
-  /** 開いたときの準備（解析・表示用画像）が始められなかったとき。黙らず、通知に出す。 */
-  function warnPrepareNotStarted(what: string, cause: unknown) {
-    console.warn(`${what}を始められませんでした`, cause)
-    taskWarning.value = `${what}を始められませんでした。${cause instanceof Error ? cause.message : ''}`.trim()
-  }
-
-  let cardsToken = 0
-  /** 各プロジェクトの状態と見本を読み直す（網へは行かない）。新しい呼び出しがあれば古い結果は捨てる。 */
-  async function refreshProjectCards() {
-    const token = ++cardsToken
-    // 書き途中の選別を先に書き終える（行の状態は保存したものから読む）。
-    await saveQueue.flush()
-    const list = projects.value
-    const entries = await Promise.all(list.map(async (project) => {
-      try {
-        // 状態を決める 4 つのどれかが読めなかったら、状態を作らない（0・null にして
-        // 「準備完了」「選別なし」と誤表示しない）。見本だけは読めなくても状態に関係しない。
-        const [analysis, display, saved, summary, first] = await Promise.all([
-          desktop.getAnalysisBacklog(project.id),
-          desktop.getDisplayBacklog(project.id),
-          desktop.loadSession(project.id),
-          desktop.getSelectionSummary(project.id),
-          desktop.getProjectPhotoPage(project.id, 0, 1).catch(() => null)
-        ])
-        const status = projectStatus({
-          project, analysisBacklog: analysis, displayBacklog: display,
-          session: saved?.core ?? null,
-          keptCount: summary ? summary.counts.slice(1).reduce((sum, count) => sum + count, 0) : 0
-        })
-        const photo = first?.photos[0]
-        return [project.id, { status, thumbnailUrl: photo ? desktop.photoThumbnailUrl(photo) : null }] as const
-      } catch (cause) {
-        // 前に読めた値があればそのまま残す（無ければ状態の行を出さない）。
-        console.warn('プロジェクトの状態を読めませんでした', project.id, cause)
-        const previous = projectCards.value[project.id]
-        return previous ? [project.id, previous] as const : null
-      }
-    }))
-    if (token !== cardsToken) return
-    projectCards.value = Object.fromEntries(entries.filter(entry => entry !== null))
-  }
-
-  /** 準備の進み 3 行。開いているプロジェクトの、走査の途中は走査の進みを使う。 */
-  const prepareLines = computed<PrepareLine[]>(() => {
-    const project = activeProject.value
-    if (!project) return []
-    const progress = taskProgress.value
-    const scanning = scanRunning.value && progress?.projectId === project.id
-    return prepareProgress({
-      project: scanning ? { ...project, status: 'scanning', photoCount: progress!.processed } : project,
-      analysisBacklog: analysisBacklog.value,
-      displayBacklog: displayBacklog.value,
-      session: null,
-      keptCount: 0
-    })
+  // ---- 開く・カード・準備の数・削除（`composables/curator/useProjectOpen.ts`） ----
+  // 再代入される `let`（`openToken`・`sidecarCheckPending`・`deletingProjectId`・`pairOverrides`）は関数で渡す。
+  // あとで作られるもの（`loadSummary`・`runSidecarCheck`・`enterMethod` など）は呼ぶ関数として渡す（呼ばれるのは作ったあと）。
+  /** 開く処理の世代。新しい呼び出しが来たら古い呼び出しは、以降の結果を捨てて終わる（W6）。 */
+  let openToken = 0
+  const {
+    refreshProjects, refreshProjectCards, prepareLines, refreshPrepareCounts, openProject, openProjectAction,
+    askDeleteProject, confirmDeleteProject
+  } = useProjectOpen({
+    desktop, projects, projectCards, activeProject, session, view, loading, error, coreInputs, previewPhotos,
+    previewTotal, tournamentPhotos, taskProgress, taskWarning, scanRunning, analysisBacklog, displayBacklog,
+    analysisFailures, analysisFailureList, analysisFailuresDialog, analysisProgress, deleteTarget, deleteDialog,
+    deleteBusy, saveQueue, sidecar,
+    nextOpenToken: () => ++openToken,
+    currentOpenToken: () => openToken,
+    setSidecarCheckPending: (projectId) => { sidecarCheckPending = projectId },
+    setDeletingProjectId: (projectId) => { deletingProjectId = projectId },
+    setPairOverrides: (overrides) => { pairOverrides = overrides },
+    clearPrefetched: () => prefetched.clear(),
+    importsByPicker: () => importsByPicker.value,
+    loadPreview, loadSummary: () => loadSummary(), refreshDisplayState, refreshAnalysisFailures,
+    runSidecarCheck: (project) => runSidecarCheck(project), healRowRatings,
+    startScan: () => startScan(), enterMethod: () => enterMethod(), resumeSession: () => resumeSession(),
+    openResults: () => openResults()
   })
-
-  /** 準備の未処理の数を読み直す（進捗のイベントごとには 1 秒に 1 回まで）。 */
-  let prepareCountsAt = 0
-  async function refreshPrepareCounts(projectId: string, force = false) {
-    const now = Date.now()
-    if (!force && now - prepareCountsAt < 1000) return
-    prepareCountsAt = now
-    const [analysis, display] = await Promise.all([
-      desktop.getAnalysisBacklog(projectId).catch(() => 0),
-      desktop.getDisplayBacklog(projectId).catch(() => 0)
-    ])
-    if (activeProject.value?.id !== projectId) return
-    analysisBacklog.value = analysis
-    displayBacklog.value = display
-  }
 
   async function loadCurrentPhotos(ids = currentGroup.value) {
     if (!activeProject.value || !ids.length) {
@@ -598,93 +570,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     refreshProjects, loadPreview, loadSummary: () => loadSummary()
   })
 
-  /** 開く処理の世代。新しい呼び出しが来たら古い呼び出しは、以降の結果を捨てて終わる（W6）。 */
-  let openToken = 0
-  async function openProject(project: Project) {
-    const token = ++openToken
-    const stale = () => token !== openToken
-    activeProject.value = project
-    previewPhotos.value = []
-    previewTotal.value = 0
-    analysisBacklog.value = 0
-    prefetched.clear()
-    coreInputs.value = null
-    pairOverrides = []
-    view.value = 'project'
-    loading.value = true
-    sidecarCheckPending = null
-    try {
-      // 前に開いていたプロジェクトの書き途中を、読む前に書き終える。
-      await saveQueue.flush()
-      if (stale()) return
-      // プレビュー格子は星を出さないのでサイドカーの結果に依存しない。確認と並べて読み始める（W9）。
-      // サイドカーが取り込んだときは reloadAfterSidecar がもう一度読むので、最後は新しい値になる。
-      const preview = loadPreview(project.id)
-      preview.catch(() => undefined) // 待つのは下。ここでは未処理の拒否にしない
-      // 記録の取り込みは、選別の途中を読み込む前に済ませる（取り込んだ分が画面に出るように）。
-      // 写真の行がまだ無いときは、走査のあとで確かめる（星を写す行が要る）。
-      if (project.photoCount > 0) await runSidecarCheck(project)
-      else {
-        sidecarCheckPending = project.id
-        await sidecar.refreshAccess(project.id)
-      }
-      if (stale()) return
-      await Promise.all([
-        preview,
-        desktop.loadSession(project.id).then(value => {
-          // 遅れて届いた前のプロジェクトの封筒で、今のプロジェクトの session を上書きしない。
-          if (stale()) return
-          if (value) value.core = markRaw(value.core)
-          session.value = value
-        })
-      ])
-      if (stale()) return
-      await healRowRatings(project.id)
-      if (stale()) return
-      // 開いた時点から少しずつ解析を進めておく。「選別を開始」で待たされないように。
-      // ただし**やることが無いなら起動しない**。以前は無条件に呼んでいたため、
-      // 解析済みのプロジェクトを開くたびに進捗イベントだけが飛び、解析中の帯が
-      // 一瞬表示されていた。
-      // まだ一枚も読み込んでいないプロジェクトは、開いた時点で読み込みを始める。
-      // 利用者がボタンを押すのを待つ理由が無い。
-      //
-      // **フォルダを走査できる環境だけ。** ブラウザには走査するフォルダが無く、
-      // `startProjectScan` は何もしないので、進捗イベントも来ない。それを待つ
-      // ダイアログが閉じられなくなり、リロードしないと戻れなくなっていた。
-      // フォルダの許可が切れているときは、ここで求めても通らない（許可は利用者の操作の中でだけ）。
-      // プロジェクトの画面の「フォルダへのアクセスを許可」を押してもらう。
-      // リンクが消えた Amazon のプロジェクトは、開くたびに読みにいかない（「写真を再読み込み」で試す）。
-      const linkGone = project.sourceKind === 'amazon' && project.status === 'missing'
-      if (!project.photoCount && !importsByPicker.value && !scanRunning.value && project.folderAccess !== 'needs-permission' && !linkGone) {
-        await startScan()
-        return
-      }
-      if (linkGone) {
-        await loadSummary()
-        return
-      }
-      // 未解析数・表示用の状態・集計は互いに依存しないので、並べて読む（W9）。
-      const [backlog] = await Promise.all([
-        desktop.getAnalysisBacklog(project.id).catch(() => 0),
-        refreshDisplayState(),
-        loadSummary()
-      ])
-      if (stale()) return
-      analysisBacklog.value = backlog
-      if (backlog > 0) desktop.startBackgroundAnalysis(project.id).catch(cause => warnPrepareNotStarted('解析', cause))
-      // 表示用画像は走査とは別に溜める。**走査に混ぜると解析が桁で遅くなる**
-      // （EXIF サムネイル経路 1.72ms/枚 に対しフルデコード 132ms/枚）。
-      if (displayBacklog.value > 0) {
-        desktop.startDisplayGeneration(project.id).catch(cause => warnPrepareNotStarted('表示用画像の作成', cause))
-      }
-    } catch (cause) {
-      if (!stale()) error.value = cause instanceof Error ? cause.message : 'プロジェクトを開けませんでした。'
-    } finally {
-      // 古い呼び出しが、新しい呼び出しの「読み込み中」を落とさない。
-      if (!stale()) loading.value = false
-    }
-  }
-
   /**
    * 写真ライブラリから取り込める環境か。ブラウザはフォルダを走査できないので、
    * 代わりに写真ピッカーから受け取る。
@@ -777,50 +662,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     }
   }
 
-  function enterMethod() {
-    if (!activeProject.value?.photoCount || sidecarClash.value) return
-    view.value = 'method'
-  }
-
-  /** 方法の選択の「スライドショー」。設定の画面は同じで、枚数の設定は出さず 1 枚ずつにする。 */
-  function openSlideshowSettings() {
-    openSettings()
-    settings.groupSize = SLIDESHOW_GROUP_SIZE
-  }
-
-  function openSettings() {
-    const prior = session.value?.settings
-    settings.groupSize = tournamentGroupSize(prior?.groupSize ?? groupLimits.default, groupLimits)
-    settings.groupBursts = prior?.groupBursts ?? false
-    view.value = 'settings'
-  }
-
-  // 解析の完了を待たない。scan 後の事前生成で出来ているぶんをそのまま使い、
-  // 未解析が残っていても選別画面へ進む。残りはバックグラウンドで進み続ける。
-  async function beginTournament() {
-    if (!activeProject.value || taskDialog.value || sidecarClash.value) return
-    // 始める前にサイドカーを確かめる（設計書 §4.5）。この端末が未着手で、別の端末が進めていれば、
-    // ここで確認なしに取り込む。取り込んだら始めずにプロジェクトの画面へ戻し、続きから再開してもらう
-    // （このまま始めると、取り込んだ星を全部 0 にしてしまう）。食い違えばダイアログを出して止める。
-    if (await syncAtBreak(activeProject.value)) {
-      view.value = 'project'
-      return
-    }
-    if (sidecarClash.value) {
-      view.value = 'project'
-      return
-    }
-    // 星が 1 つでも付いている（取り込んだ星を含む）と、開始は星を全部 0 にする。
-    // 「最初からやり直す」と同じ確認を先に出す。「キャンセル」なら何もしない。
-    await loadSummary()
-    if (hasSelectionData.value) {
-      restartForStart.value = true
-      restartDialog.value = true
-      return
-    }
-    await startTournament()
-  }
-
   /** 確認の「星を全部消してやり直す」。開始の確認から開いていたら、閉じて開始へ進む。 */
   async function confirmRestartDialog() {
     if (!restartForStart.value) return restartFromScratch()
@@ -830,364 +671,35 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     await startTournament()
   }
 
-  async function startTournament() {
-    if (!activeProject.value || taskDialog.value || sidecarClash.value) return
-    pendingTournamentSettings.value = { ...settings }
-    if (settings.groupBursts) {
-      taskWarning.value = null
-      // 起動できなくても選別自体は始められる。ここで止めない。
-      desktop.startBurstAnalysis(activeProject.value.id).catch(() => undefined)
-    }
-    await finishTournamentStart()
-  }
+  // ---- 選別中の操作（`composables/curator/useTournamentActions.ts`） ----
+  // あとで作られるもの（`enterTournamentAfterRebuild`・`openSelection`・`enterStage`）は呼ぶ関数として渡す（呼ばれるのは作ったあと）。
+  // 再代入される `let`（`deletingProjectId`・`pairOverrides`）は関数で渡す。
+  const {
+    saveSession, toggleChoice, confirmChoices, decideSlide, confirmPhoto, undoChoice, applyGroupSize,
+    applyGroupBursts, groupSelectedAsBurst, openNextRoundDialog, startRatingSelection
+  } = useTournamentActions({
+    desktop, activeProject, session, view, loading, error, settings, groupLimits, groupSizeDialog,
+    nextRoundDialog, nextRoundGroupSize, nextRoundRating, saveQueue, ratingsQueue, pathOf,
+    getDeletingProjectId: () => deletingProjectId,
+    getPairOverrides: () => pairOverrides,
+    setPairOverrides: (overrides) => { pairOverrides = overrides },
+    applyCore, setCore, loadCurrentPhotos, loadCoreInputs, ensureCoreInputs, loadPairOverrides,
+    sessionWithRowRatings, thresholdFor, currentDistance, noteJudgementChanged, flushThenPush,
+    enterTournamentAfterRebuild: () => enterTournamentAfterRebuild(),
+    openSelection: (initial, chosen, inputs) => openSelection(initial, chosen, inputs),
+    enterStage: () => enterStage()
+  })
 
-  async function finishTournamentStart() {
-    const project = activeProject.value
-    const chosen = pendingTournamentSettings.value
-    if (!project || !chosen) return
-    loading.value = true
-    try {
-      // 最初から選び直すので、前回の星と落選は消す。数字を膨らませない。
-      await desktop.resetSelectionResults(project.id).catch(() => undefined)
-      noteJudgementChanged(project.id)
-      const inputs = await loadCoreInputs(project.id)
-      if (!inputs?.refs.length) throw new Error('選別できる写真がありません。')
-      await loadPairOverrides()
-      const learned = project.burstThreshold
-      const initial = core.startRound(
-        inputs.refs, chosen.groupSize, 0, chosen.groupBursts,
-        thresholdFor(learned ?? DEFAULT_BURST_DISTANCE), pairOverrides
-      )
-      openSelection(initial, chosen, inputs)
-      await enterStage()
-      await saveSession()
-    } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : '選別を準備できませんでした。'
-    } finally {
-      pendingTournamentSettings.value = null
-      loading.value = false
-    }
-  }
-
-  /**
-   * 始めた選別を封筒に入れる。開始時の行き先を決める。
-   * - 連写をまとめない設定 / 候補ペアが無い → そのまま選別
-   * - 学習済みの距離がある → 質問を飛ばして確認画面へ
-   * - それ以外 → 連写の学習から
-   * 学習・確認の間の Session は既定か学習済みの距離で組んだ仮のもので、
-   * 「この設定で選別を始める」で `regroup` して確定する。
-   */
-  function openSelection(initial: Session, chosen: TournamentSettings, inputs: CoreInputs) {
-    const learned = activeProject.value?.burstThreshold ?? null
-    const questions = chosen.groupBursts ? buildBurstQuestions(inputs.refs) : []
-    const stage = !chosen.groupBursts || !questions.length
-      ? 'tournament'
-      : learned === null ? 'burst-threshold' : 'burst-preview'
-    session.value = {
-      v: 2,
-      core: markRaw(initial),
-      stage,
-      settings: { ...chosen },
-      multiSelect: false,
-      selectedInGroup: [],
-      learning: stage === 'burst-threshold' ? { questions, index: 0, answers: [] } : null,
-      burstDistance: chosen.groupBursts ? learned : null,
-      updatedAt: Date.now()
-    }
-  }
-
-  /** セッションの stage に合わせて画面と必要なデータを揃える。 */
-  async function enterStage() {
-    const current = session.value
-    if (!current) return
-    await ensureCoreInputs()
-    if (current.stage === 'burst-threshold') {
-      view.value = 'burst-threshold'
-      await showNextPair()
-      return
-    }
-    if (current.stage === 'burst-preview') {
-      view.value = 'burst-preview'
-      await loadPairOverrides()
-      await refreshBurstPreview(currentDistance())
-      return
-    }
-    if (current.stage === 'result' || current.core.finished) {
-      current.stage = 'result'
-      view.value = 'result'
-      return
-    }
-    current.stage = 'tournament'
-    view.value = 'tournament'
-    await loadCurrentPhotos()
-  }
-
-  /** 次の出題を用意する。出し尽くしたら確認画面へ進む。 */
-  async function showNextPair() {
-    const current = session.value
-    const learning = current?.learning
-    if (!current || !learning) return
-    while (learning.index < learning.questions.length) {
-      const question = learning.questions[learning.index]!
-      const ids = idsOf([question.left.relative_path, question.right.relative_path])
-      const photos = activeProject.value && ids.length === 2
-        ? await desktop.getPhotosByIds(activeProject.value.id, ids)
-        : []
-      if (photos.length === 2) {
-        pairPhotos.value = photos
-        return
-      }
-      // 行が見つからない（消えた・欠損）問いは飛ばす。
-      learning.index += 1
-    }
-    await finishThresholdLearning()
-  }
-
-  async function answerPair(grouped: boolean) {
-    const learning = session.value?.learning
-    const question = currentQuestion.value
-    if (!learning || !question) return
-    learning.answers = [...learning.answers, { distance: question.distance, same: grouped }]
-    learning.index += 1
-    await showNextPair()
-    await saveSession()
-  }
-
-  /** 判断できない問いは学習に使わない。答えに入れず次を出す。 */
-  async function skipCurrentPair() {
-    const learning = session.value?.learning
-    if (!learning || !currentQuestion.value) return
-    learning.index += 1
-    await showNextPair()
-    await saveSession()
-  }
-
-  async function finishThresholdLearning() {
-    const current = session.value
-    if (!current) return
-    const answers = (current.learning?.answers ?? []).map(answer => ({ ...answer }))
-    // 答えから距離を決めるのは core。答えが無ければ既定値のまま。
-    const distance = core.learnDistance(answers, DEFAULT_BURST_DISTANCE)
-    pairPhotos.value = []
-    current.stage = 'burst-preview'
-    view.value = 'burst-preview'
-    await loadPairOverrides()
-    await refreshBurstPreview(distance)
-    await saveSession()
-  }
-
-  let previewMaxFor: CoreInputs | null = null
-
-  /** 距離を当てた結果を取り直す。スライダー操作からも呼ぶ（core は同期で速い）。 */
-  async function refreshBurstPreview(distance: number) {
-    const current = session.value
-    if (!current || !activeProject.value) return
-    previewThreshold.value = distance
-    previewBusy.value = true
-    try {
-      const inputs = await ensureCoreInputs()
-      if (previewMaxFor !== inputs) {
-        previewMaxDistance.value = maxNeighborDistance(inputs.refs, BURST_WINDOW_MS, core.hashDistance)
-        previewMaxFor = inputs
-      }
-      const groups = core.groupBursts(inputs.refs, thresholdFor(distance), pairOverrides)
-      burstPreviewGroups.value = groups
-        .filter(group => group.members.length > 1)
-        .map(group => toViewGroup(group, inputs))
-      current.burstDistance = distance
-    } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : '連写のまとめ結果を取得できませんでした。'
-    } finally {
-      previewBusy.value = false
-    }
-  }
-
-  /** core のまとまりを、画面が使う `BurstGroup`（写真の id）に写す。 */
-  function toViewGroup(group: core.BurstGroup, inputs: CoreInputs): BurstGroup {
-    const times = group.members
-      .map(path => inputs.byPath.get(path)?.capturedAt)
-      .filter((at): at is number => typeof at === 'number')
-    return {
-      id: group.representative,
-      photoIds: idsOf(group.members),
-      capturedSpanMs: times.length ? Math.max(...times) - Math.min(...times) : 0,
-      similarity: 0,
-      accepted: null
-    }
-  }
-
-  /** さらに質問して距離を詰める。 */
-  async function askMorePairs() {
-    const current = session.value
-    if (!current) return
-    const inputs = await ensureCoreInputs()
-    current.learning = {
-      questions: current.learning?.questions ?? buildBurstQuestions(inputs.refs),
-      index: 0,
-      answers: []
-    }
-    current.stage = 'burst-threshold'
-    view.value = 'burst-threshold'
-    await showNextPair()
-    await saveSession()
-  }
-
-  /** 確認した距離を保存し、選別へ進む。 */
-  async function acceptBurstThreshold() {
-    const current = session.value
-    if (!current || !activeProject.value) return
-    const distance = previewThreshold.value
-    try {
-      await desktop.saveBurstThreshold(activeProject.value.id, distance)
-      noteJudgementChanged()
-      activeProject.value.burstThreshold = distance
-      await refreshProjects()
-    } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : '閾値を保存できませんでした。'
-    }
-    const inputs = await ensureCoreInputs()
-    // まとめた連写は代表 1 枚に畳む。まだ何も決めていないので、組み直しで足りる。
-    setCore(core.regroup(current.core, inputs.refs, true, thresholdFor(distance), pairOverrides))
-    current.burstDistance = distance
-    current.learning = null
-    current.selectedInGroup = []
-    current.multiSelect = false
-    await enterTournamentAfterRebuild()
-  }
-
-  /** core の組が変わったあと、画面を今の組に合わせる。 */
-  async function enterTournamentAfterRebuild() {
-    const current = session.value
-    if (!current) return
-    if (current.core.finished) {
-      current.stage = 'result'
-      view.value = 'result'
-    } else {
-      current.stage = 'tournament'
-      view.value = 'tournament'
-      await loadCurrentPhotos()
-    }
-    await saveSession()
-    if (current.core.finished) void flushThenPush()
-  }
-
-  /** 設定画面から学習をやり直す。 */
-  async function relearnThreshold() {
-    if (!activeProject.value) return
-    try {
-      await desktop.clearBurstThreshold(activeProject.value.id)
-      noteJudgementChanged()
-      activeProject.value.burstThreshold = null
-      await refreshProjects()
-    } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : '閾値を消去できませんでした。'
-    }
-  }
-
-  /**
-   * 選別の途中を保存する。**待たない**（待ち行列に入れて戻る）。入れる時点の写しを渡すので、
-   * 書くまでの間に画面が封筒を書き換えても、この時点の状態が書かれる（core の Session は丸ごと置き換える決め）。
-   */
-  function saveSession() {
-    const current = session.value
-    const project = activeProject.value
-    if (!current || !project || project.id === deletingProjectId) return
-    current.updatedAt = Date.now()
-    saveQueue.enqueue(project.id, {
-      ...current,
-      settings: { ...current.settings },
-      selectedInGroup: [...current.selectedInGroup],
-      learning: current.learning
-        ? { ...current.learning, answers: [...current.learning.answers] }
-        : null
-    })
-  }
-
-  async function toggleChoice(photoId: string) {
-    const current = session.value
-    const path = pathOf(photoId)
-    // 今の組に無い写真（組が進んだあとに届いた古い操作）は無視する。core の `advance` は組に無い
-    // 写真を黙って捨てるので、通すと新しい組が「選ばず」で丸ごと落ちる（W5）。
-    if (!current || !path || !current.core.current.includes(path)) return
-    if (!current.multiSelect) {
-      current.selectedInGroup = [path]
-      await confirmChoices()
-      return
-    }
-    const index = current.selectedInGroup.indexOf(path)
-    if (index >= 0) current.selectedInGroup.splice(index, 1)
-    else current.selectedInGroup.push(path)
-    await saveSession()
-  }
-
-  /**
-   * このグループの判断を確定して次へ進む。**判断は core の `advance`。**
-   * 選んだ写真が空でも進める。良い写真が 1 枚も無いグループはあるので、
-   * その場合は「1 枚も通さない」という判断として記録される。
-   */
-  async function confirmChoices() {
-    const current = session.value
-    if (!current) return
-    await advanceWith(core.advance(current.core, [...current.selectedInGroup]))
-  }
-
-  /** core が返した次の Session を受け取り、星を行に写して次の組へ。 */
-  async function advanceWith(next: Session) {
-    const current = session.value
-    if (!current) return
-    // 封筒に写る画面の状態は、Session を差し替える前に整える（applyCore が先に封筒を待ち行列へ入れる）。
-    current.selectedInGroup = []
-    current.multiSelect = false
-    if (next.finished) current.stage = 'result'
-    // 行の星の書き込み・集計は待たずに次の組を出す（W1）。終わったときだけ、結果の数字のために待つ。
-    await applyCore(next, false)
-    if (next.finished) {
-      await ratingsQueue.flush()
-      view.value = 'result'
-    } else {
-      await loadCurrentPhotos()
-    }
-    await saveSession()
-    // ラウンドが終わったら書く（変更があるときだけ）。待たない。
-    if (next.finished) void flushThenPush()
-  }
-
-  /**
-   * スライドショーで 1 枚ぶんを決める。**判断は既存の処理をそのまま通す**
-   * （残す＝`advance`、落とす＝選ばずに `advance`、★5＝`keepAndTop`）。
-   * 複数選択が残っていると単なる選択のトグルになるので、先に切る。
-   */
-  async function decideSlide(kind: 'keep' | 'drop' | 'top', photoId: string) {
-    const current = session.value
-    if (!current) return
-    // 飛ばしている間に組が進んだ・戻された（Backspace）とき、古い写真への判断は捨てる（W5）。
-    const path = pathOf(photoId)
-    if (!path || !current.core.current.includes(path)) return
-    current.multiSelect = false
-    if (kind === 'keep') await toggleChoice(photoId)
-    else if (kind === 'top') await confirmPhoto(photoId)
-    else await skipGroup()
-  }
-
-  /** このグループからは 1 枚も通さない。 */
-  async function skipGroup() {
-    if (!session.value) return
-    session.value.selectedInGroup = []
-    await confirmChoices()
-  }
-
-  /**
-   * 迷う必要のない 1 枚を ★5 で確定する。**判断は core の `keepAndTop`**。
-   * 複数枚選択中は、選んでいた写真も残したままその組を確定する。
-   * 以降のラウンドには出ない。「1 つ戻す」で元の星に返る。
-   */
-  async function confirmPhoto(photoId: string) {
-    const current = session.value
-    const path = pathOf(photoId)
-    if (!current || !path || !current.core.current.includes(path)) return
-    const selected = current.multiSelect ? [...current.selectedInGroup] : []
-    await advanceWith(core.keepAndTop(current.core, selected, path))
-  }
+  // ---- 連写の学習・確認（`composables/curator/useBurstLearning.ts`） ----
+  const {
+    showNextPair, answerPair, skipCurrentPair, finishThresholdLearning, refreshBurstPreview, toViewGroup,
+    askMorePairs, acceptBurstThreshold, enterTournamentAfterRebuild, relearnThreshold
+  } = useBurstLearning({
+    desktop, activeProject, session, view, error, pairPhotos, previewThreshold, previewBusy, previewMaxDistance,
+    burstPreviewGroups, currentQuestion, idsOf, thresholdFor, ensureCoreInputs, loadPairOverrides,
+    getPairOverrides: () => pairOverrides,
+    noteJudgementChanged, refreshProjects, flushThenPush, setCore, saveSession, loadCurrentPhotos
+  })
 
   // ---- まとめの中身を直す画面（`composables/curator/useBurstEdit.ts`） ----
   const {
@@ -1199,133 +711,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     ensureCoreInputs, loadPairOverrides, setPairOverrides: (overrides) => { pairOverrides = overrides },
     setCore, applyCore, saveSession, noteJudgementChanged, enterTournamentAfterRebuild
   })
-
-  /** 直前の 1 グループぶんの判断を取り消してやり直す。**判断は core の `undo`。** */
-  async function undoChoice() {
-    const current = session.value
-    if (!current || !current.core.history.length) return
-    // 戻した星（仲間の分も）は、前後の差で行にも戻る。
-    await applyCore(core.undo(current.core), false)
-    current.selectedInGroup = []
-    current.multiSelect = false
-    current.stage = 'tournament'
-    view.value = 'tournament'
-    await loadCurrentPhotos()
-    await saveSession()
-  }
-
-  /** 選別の途中で 1 グループの表示枚数を変える。済んだぶんはそのまま。 */
-  async function applyGroupSize(size: number) {
-    const current = session.value
-    if (!current) return
-    setCore(core.resize(current.core, size))
-    current.settings = { ...current.settings, groupSize: size }
-    current.selectedInGroup = []
-    current.multiSelect = false
-    groupSizeDialog.value = false
-    await enterTournamentAfterRebuild()
-  }
-
-  /**
-   * 選別中の設定の「連写をまとめる」。**その場で今の組に効かせる**（core の `regroup` は
-   * まだ判断していない写真だけを組み直すので、済んだ組はそのまま）。
-   */
-  async function applyGroupBursts(on: boolean) {
-    const current = session.value
-    const project = activeProject.value
-    if (!current || !project || current.settings.groupBursts === on) return
-    try {
-      current.settings = { ...current.settings, groupBursts: on }
-      if (on) {
-        // 距離が決まっていなければ、学習済み（無ければ既定）を使う。ハッシュ値は裏で作っておく。
-        current.burstDistance ??= project.burstThreshold ?? DEFAULT_BURST_DISTANCE
-        desktop.startBurstAnalysis(project.id).catch(() => undefined)
-      }
-      const inputs = await loadCoreInputs(project.id) ?? await ensureCoreInputs()
-      await loadPairOverrides()
-      setCore(core.regroup(current.core, inputs.refs, on, thresholdFor(currentDistance()), pairOverrides))
-      noteJudgementChanged(project.id)
-      current.selectedInGroup = []
-      current.multiSelect = false
-      await enterTournamentAfterRebuild()
-    } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : '連写のまとめを切り替えられませんでした。'
-    }
-  }
-
-  /**
-   * 複数選択中の「この写真をまとめる」。選んだ代表（とその仲間）の撮影順で最初から最後までの
-   * 隣どうしを全部 `join` の手直しにして保存し、`core.regroup` で今のラウンドに反映する。
-   * あいだに挟まる選んでいない写真も同じまとまりに入る（仕様）。
-   */
-  async function groupSelectedAsBurst() {
-    const current = session.value
-    const project = activeProject.value
-    if (!current || !project || current.selectedInGroup.length < 2) return
-    try {
-      const inputs = await ensureCoreInputs()
-      const existing = await loadPairOverrides()
-      const merged = joinSpanOverrides(
-        inputs.refs.map(ref => ref.relative_path), current.selectedInGroup, current.core.members, existing
-      )
-      if (!merged) return
-      await desktop.savePairOverrides(project.id, merged)
-      noteJudgementChanged(project.id)
-      pairOverrides = merged
-      setCore(core.regroup(current.core, inputs.refs, current.settings.groupBursts, thresholdFor(currentDistance()), merged))
-      current.selectedInGroup = []
-      current.multiSelect = false
-      await enterTournamentAfterRebuild()
-    } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : '写真をまとめられませんでした。'
-    }
-  }
-
-  function openNextRoundDialog(rating: number) {
-    nextRoundGroupSize.value = tournamentGroupSize(session.value?.settings.groupSize ?? groupLimits.default, groupLimits)
-    nextRoundRating.value = rating
-    nextRoundDialog.value = true
-  }
-
-  /**
-   * 指定した星の写真を選別する。
-   *
-   * 対象は星だけで決まるので、**どんな経路でその星に辿り着いた写真も同じ回に
-   * 合流する**。以前は「通過した写真」「落選した写真」という別々の集合を持って
-   * いたため、一度分かれると二度と一緒に選別できなかった。
-   */
-  async function startRatingSelection(rating: number) {
-    const project = activeProject.value
-    if (!project) return
-    nextRoundDialog.value = false
-    loading.value = true
-    try {
-      const chosen: TournamentSettings = { ...(session.value?.settings ?? settings) }
-      // スライドショーのセッションは方式を保つ（次のラウンドも 1 枚ずつ）。
-      if (!isSlideshowSize(chosen.groupSize) && nextRoundGroupSize.value >= 2) chosen.groupSize = nextRoundGroupSize.value
-
-      // 星は行が持ち主。行の星を入れた土台から、その星ちょうどの写真で始める。
-      const { base, inputs } = await sessionWithRowRatings()
-      await loadPairOverrides()
-      const count = inputs.photos.filter(photo => base.ratings[photo.relativePath] === rating).length
-      const distance = session.value?.burstDistance ?? project.burstThreshold ?? DEFAULT_BURST_DISTANCE
-      const started = core.roundFor(
-        core.resize(base, chosen.groupSize), inputs.refs, rating,
-        chosen.groupBursts, thresholdFor(distance), pairOverrides
-      )
-      if (!started) {
-        error.value = `★${rating} の写真が ${count} 枚しかないため、選別できません。`
-        return
-      }
-      openSelection(started, chosen, inputs)
-      await enterStage()
-      await saveSession()
-    } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : '選別を準備できませんでした。'
-    } finally {
-      loading.value = false
-    }
-  }
 
   /**
    * 星を全部 0 に戻して最初からやり直す。解析結果（ハッシュ値・サムネイル）は消えない。
@@ -1398,59 +783,19 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     noteJudgementChanged, loadSummary, loadResultsPage
   })
 
-  async function resumeSession() {
-    // 別の端末の記録との食い違いを選ぶまで、選別は始めさせない。
-    if (sidecarClash.value) return
-    if (!session.value) return openSettings()
-    // 別の環境で作られたセッションは、この端末の上限を超える枚数を持ちうる。
-    const clamped = clampGroupSize(session.value.settings.groupSize, groupLimits)
-    session.value.settings.groupSize = clamped
-    if (session.value.core.group_size !== clamped) setCore(core.resize(session.value.core, clamped))
-    await enterStage()
-  }
-
-  /** ホームの行の「次の一手」。プロジェクトを開いてから、状態に合う画面へ進む。 */
-  async function openProjectAction(project: Project, state: CardState) {
-    await openProject(project)
-    if (error.value || activeProject.value?.id !== project.id) return
-    if (state === 'error') await startScan()
-    else if (state === 'culling') await resumeSession()
-    else if (state === 'done') await openResults()
-    else enterMethod()
-  }
-
-  function askDeleteProject(project: Project) {
-    deleteTarget.value = project
-    deleteDialog.value = true
-  }
-
-  async function confirmDeleteProject() {
-    const target = deleteTarget.value
-    if (!target) return
-    deleteBusy.value = true
-    deletingProjectId = target.id
-    try {
-      // 消す前に、そのプロジェクトの未書き込みの封筒を捨てる（消したあとに書かれないように）。
-      await saveQueue.drop(target.id)
-      await desktop.deleteProject(target.id)
-      if (activeProject.value?.id === target.id) {
-        activeProject.value = null
-        coreInputs.value = null
-        session.value = null
-        previewPhotos.value = []
-        tournamentPhotos.value = []
-        view.value = 'home'
-      }
-      await refreshProjects()
-      deleteDialog.value = false
-      deleteTarget.value = null
-    } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : 'プロジェクトを削除できませんでした。'
-    } finally {
-      deletingProjectId = null
-      deleteBusy.value = false
-    }
-  }
+  // ---- 選別の開始（`composables/curator/useSelectionStart.ts`） ----
+  // `sidecarClash` などは上で作った状態、`loadSummary`・`hasSelectionData` は useResults が作る。
+  const {
+    enterMethod, openSlideshowSettings, openSettings, beginTournament, startTournament,
+    finishTournamentStart, openSelection, enterStage, resumeSession
+  } = useSelectionStart({
+    desktop, activeProject, session, view, loading, error, settings, groupLimits, taskDialog, scanRunning, taskWarning,
+    restartDialog, restartForStart, pendingTournamentSettings, sidecarClash, sidecarChecking, hasSelectionData,
+    syncAtBreak, loadSummary, loadCoreInputs, ensureCoreInputs, loadPairOverrides,
+    getPairOverrides: () => pairOverrides,
+    thresholdFor, currentDistance, noteJudgementChanged, setCore, saveSession, loadCurrentPhotos,
+    showNextPair, refreshBurstPreview
+  })
 
   function openGroupSizeDialog() {
     const size = clampGroupSize(session.value?.settings.groupSize ?? groupLimits.default, groupLimits)
@@ -1491,20 +836,16 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     answerPair, undoChoice, confirmChoices, confirmPhoto, toggleChoice, saveSession
   })
 
-  /** 準備の途中で、格子のサムネイルを少しずつ埋める（ブラウザだけ。PC は元から原本が見える）。 */
-  let previewRefreshedAt = 0
-  async function refreshDuringPreparation(progress: ProjectProgress) {
-    if (desktop.kind !== 'local' || view.value !== 'project') return
-    const finished = progress.phase === 'complete' || progress.phase === 'cancelled'
-    const now = Date.now()
-    if (!finished && now - previewRefreshedAt < 3000) return
-    previewRefreshedAt = now
-    await (finished ? loadPreview(progress.projectId) : refreshPreviewThumbnails(progress.projectId))
-      .catch(() => undefined)
-    if (!finished) return
-    await refreshProjects().catch(() => undefined)
-    await loadCoreInputs(progress.projectId).catch(() => undefined)
-  }
+  // ---- 進みのイベントの受け取り（`composables/curator/useProgressEvents.ts`） ----
+  // `sidecarCheckPending` は開く処理（useProjectOpen）と共有するので、ここ（useCurator）に置いて関数で渡す。
+  const { listenProgress } = useProgressEvents({
+    desktop, projects, activeProject, view, error, taskProgress, taskWarning, taskDialog, analysisProgress,
+    analysisFailures, sidecar,
+    getSidecarCheckPending: () => sidecarCheckPending,
+    setSidecarCheckPending: (projectId) => { sidecarCheckPending = projectId },
+    refreshProjects, refreshAnalysisFailures, refreshPrepareCounts, loadPreview, refreshPreviewThumbnails,
+    loadCoreInputs, startDisplayAfterScan, runSidecarCheck, reloadAfterSidecar
+  })
 
   // プロジェクトを閉じる（ホームへ戻る）とき、変更があれば書く。
   watch(view, (next, previous) => {
@@ -1538,53 +879,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
       error.value = cause instanceof Error ? cause.message : 'プロジェクトを読み込めませんでした。'
     }
     try {
-      stopProgressListener = await desktop.onProjectProgress(async (progress) => {
-        if (!activeProject.value || progress.projectId !== activeProject.value.id) return
-        // 連写解析（前面・事前生成とも）は待たせない。帯で状況だけ伝える。
-        if (progress.task !== 'scan') {
-          analysisProgress.value = progress
-          analysisFailures.value = progress.failed
-          // 警告は解析中の1イベントにしか乗らないので、別に保持して出し続ける。
-          if (progress.warning) taskWarning.value = progress.warning
-          if (progress.phase === 'error') {
-            error.value = progress.message
-            void refreshProjects().then(() => {
-              activeProject.value = projects.value.find(project => project.id === activeProject.value?.id) ?? activeProject.value
-            })
-          }
-          void refreshPrepareCounts(progress.projectId, progress.phase === 'complete')
-          if (progress.task === 'background') void refreshDuringPreparation(progress)
-          return
-        }
-        taskProgress.value = progress
-        if (progress.warning) taskWarning.value = progress.warning
-        if (progress.phase === 'complete') {
-          taskDialog.value = false
-          await refreshProjects()
-          activeProject.value = projects.value.find(project => project.id === activeProject.value?.id) ?? activeProject.value
-          await loadPreview(progress.projectId)
-          void refreshPrepareCounts(progress.projectId, true)
-          await loadCoreInputs(progress.projectId).catch(() => undefined)
-          // 表示用画像は走査のあとに溜める（開き直さないと始まらなかった）。
-          await startDisplayAfterScan(progress.projectId)
-          await sidecar.refreshAccess(progress.projectId)
-          if (sidecarCheckPending === progress.projectId && activeProject.value) {
-            // 写真の行ができたので、開いたときの確認をここで行う（取り込んだ星を行へ写せる）。
-            sidecarCheckPending = null
-            const outcome = await runSidecarCheck(activeProject.value)
-            if (outcome?.kind === 'pulled') await reloadAfterSidecar(progress.projectId)
-          }
-        }
-        if (progress.phase === 'cancelled' || progress.phase === 'error') {
-          taskDialog.value = false
-          if (progress.phase === 'error') {
-            error.value = progress.message
-            // リンクが消えたときなど、状態が変わっているので取り直す。
-            await refreshProjects()
-            activeProject.value = projects.value.find(project => project.id === activeProject.value?.id) ?? activeProject.value
-          }
-        }
-      })
+      stopProgressListener = await listenProgress()
     } catch (cause) {
       error.value = cause instanceof Error ? cause.message : '進み具合を受け取れませんでした。'
     }
@@ -1664,6 +959,9 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     taskDialog,
     analysisProgress,
     analysisFailures,
+    analysisFailureList,
+    analysisFailuresDialog,
+    openAnalysisFailures,
     displaySettings,
     displayEdge,
     displayBacklog,
@@ -1765,7 +1063,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     currentGroup,
     remainingGroups,
     remainingPhotos,
-    selectedCount,
     askedCount,
     learningPosition,
     learningTotal,
@@ -1869,6 +1166,7 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     sidecarAccess,
     sidecarClash,
     sidecarBusy,
+    sidecarChecking,
     sidecarMessage,
     sidecarSavedAt,
     sidecarNotice,
@@ -1881,7 +1179,6 @@ export function createCurator(backend: PhotoBackend = useDesktop()) {
     openGroupSizeDialog,
     cancelTask,
     cancelAnalysis,
-    onKeydown,
     mount,
     unmount
   }

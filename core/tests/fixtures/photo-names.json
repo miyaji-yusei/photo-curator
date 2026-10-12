@@ -1,0 +1,124 @@
+{
+  "description": "どの名前を写真の候補にするか／同名の JPEG と組の RAW をどう除くか（R1）。files は走査する出所の中の相対パス（区切りは /）。pair_on は設定 pair_raw_jpeg がオンのとき、pair_off はオフのときに候補になる名前の集合（並びは問わない）。known_differences は、3 実装（pc=src-tauri/src/scan.rs・web=utils/folderScan.ts・android=Smb.kt の isPhoto と RawFiles.kt）のうち、pair_on／pair_off と今の挙動が違うものの、その実装の期待。**今の挙動を縛る表で、正しさの宣言ではない**。差を直すときは、直した実装の known_differences を消す。",
+  "cases": [
+    {
+      "id": "jpeg_raw_pair",
+      "note": "同名の JPEG がある RAW だけが除かれる。組の JPEG が無い RAW（IMG_2.CR2）は残る。",
+      "files": ["d/IMG_1.JPG", "d/IMG_1.CR2", "d/IMG_2.CR2", "d/IMG_3.jpeg", "d/IMG_3.NEF"],
+      "pair_on": ["d/IMG_1.JPG", "d/IMG_2.CR2", "d/IMG_3.jpeg"],
+      "pair_off": ["d/IMG_1.JPG", "d/IMG_1.CR2", "d/IMG_2.CR2", "d/IMG_3.jpeg", "d/IMG_3.NEF"]
+    },
+    {
+      "id": "case_insensitive_stem_and_ext",
+      "note": "拡張子を除いた名前は大文字小文字を無視して比べ、拡張子も大文字小文字を問わない。",
+      "files": ["d/Img_9.jPg", "d/IMG_9.ARW", "d/Photo.JPEG", "d/PHOTO.Dng"],
+      "pair_on": ["d/Img_9.jPg", "d/Photo.JPEG"],
+      "pair_off": ["d/Img_9.jPg", "d/IMG_9.ARW", "d/Photo.JPEG", "d/PHOTO.Dng"]
+    },
+    {
+      "id": "numbered_raw_is_not_a_pair",
+      "note": "実データにあった例。IMG_6377 (2).CR2 の名前は IMG_6377.JPG と一致しないので組にならず、両方残る。",
+      "files": ["d/IMG_6377 (2).CR2", "d/IMG_6377.JPG"],
+      "pair_on": ["d/IMG_6377 (2).CR2", "d/IMG_6377.JPG"],
+      "pair_off": ["d/IMG_6377 (2).CR2", "d/IMG_6377.JPG"]
+    },
+    {
+      "id": "double_extension_is_not_a_pair",
+      "note": "a.jpg.cr2 の名前（拡張子を除く）は a.jpg で、a.jpg の a とは違う。b.cr2.jpg も同じ。",
+      "files": ["d/a.jpg", "d/a.jpg.cr2", "d/b.cr2", "d/b.cr2.jpg"],
+      "pair_on": ["d/a.jpg", "d/a.jpg.cr2", "d/b.cr2", "d/b.cr2.jpg"],
+      "pair_off": ["d/a.jpg", "d/a.jpg.cr2", "d/b.cr2", "d/b.cr2.jpg"]
+    },
+    {
+      "id": "other_folder_same_name",
+      "note": "別フォルダの同名は組にしない。同じフォルダの組だけ除く。",
+      "files": ["raw/a.cr2", "jpg/a.jpg", "2024/05/a.jpg", "2024/05/a.cr2", "2024/06/a.cr2"],
+      "pair_on": ["raw/a.cr2", "jpg/a.jpg", "2024/05/a.jpg", "2024/06/a.cr2"],
+      "pair_off": ["raw/a.cr2", "jpg/a.jpg", "2024/05/a.jpg", "2024/05/a.cr2", "2024/06/a.cr2"]
+    },
+    {
+      "id": "raw_pairs_only_with_jpeg",
+      "note": "PNG・WebP・RAW 同士との組は除かない。JPEG が PNG と RAW の両方と並んでいても、RAW だけが除かれる。",
+      "files": ["d/b.png", "d/b.arw", "d/c.webp", "d/c.raf", "d/e.cr2", "d/e.dng", "d/f.jpg", "d/f.png", "d/f.cr2"],
+      "pair_on": ["d/b.png", "d/b.arw", "d/c.webp", "d/c.raf", "d/e.cr2", "d/e.dng", "d/f.jpg", "d/f.png"],
+      "pair_off": ["d/b.png", "d/b.arw", "d/c.webp", "d/c.raf", "d/e.cr2", "d/e.dng", "d/f.jpg", "d/f.png", "d/f.cr2"]
+    },
+    {
+      "id": "unicode_and_spaces",
+      "note": "日本語・空白の名前でも同じ規則。",
+      "files": ["写真/旅行 1.jpg", "写真/旅行 1.NEF", "写真/旅行 2.NEF"],
+      "pair_on": ["写真/旅行 1.jpg", "写真/旅行 2.NEF"],
+      "pair_off": ["写真/旅行 1.jpg", "写真/旅行 1.NEF", "写真/旅行 2.NEF"]
+    },
+    {
+      "id": "plain_image_extensions",
+      "note": "jpg・jpeg・png・webp は大文字小文字を問わず 3 実装とも候補。",
+      "files": ["d/A.JPEG", "d/B.JPG", "d/C.Png", "d/D.WEBP", "d/e.jpeg"],
+      "pair_on": ["d/A.JPEG", "d/B.JPG", "d/C.Png", "d/D.WEBP", "d/e.jpeg"],
+      "pair_off": ["d/A.JPEG", "d/B.JPG", "d/C.Png", "d/D.WEBP", "d/e.jpeg"]
+    },
+    {
+      "id": "heic_heif",
+      "note": "HEIC・HEIF は RAW ではないので、JPEG と並んでも除かれない。候補にするかが実装で違う（B8）。",
+      "files": ["d/h.HEIC", "d/h.jpg", "d/g.heif"],
+      "pair_on": ["d/h.HEIC", "d/h.jpg", "d/g.heif"],
+      "pair_off": ["d/h.HEIC", "d/h.jpg", "d/g.heif"],
+      "known_differences": {
+        "android": {
+          "reason": "B8: Smb.kt の EXTENSIONS は jpg・jpeg・png・webp＋RAW 10 種。HEIC・HEIF は対象外",
+          "pair_on": ["d/h.jpg"],
+          "pair_off": ["d/h.jpg"]
+        }
+      }
+    },
+    {
+      "id": "rw2_pef_srw",
+      "note": "rw2・pef・srw は PC の走査の候補に入らない（RAW_EXTENSIONS には有る）。Web・Android は候補で、組なら除く（B8）。",
+      "files": ["d/a.jpg", "d/a.rw2", "d/b.pef", "d/c.srw"],
+      "pair_on": ["d/a.jpg", "d/b.pef", "d/c.srw"],
+      "pair_off": ["d/a.jpg", "d/a.rw2", "d/b.pef", "d/c.srw"],
+      "known_differences": {
+        "pc": {
+          "reason": "B8: scan.rs の IMAGE_EXTENSIONS に rw2・pef・srw が無い",
+          "pair_on": ["d/a.jpg"],
+          "pair_off": ["d/a.jpg"]
+        }
+      }
+    },
+    {
+      "id": "videos",
+      "note": "動画の拡張子は常に除く（mkv は Web だけが動画として除き、PC・Android は画像の拡張子でないので除く。結果は同じ）。",
+      "files": ["d/v.mp4", "d/v.MOV", "d/v.m4v", "d/v.avi", "d/v.mts", "d/v.m2ts", "d/v.3gp", "d/v.mkv", "d/v.jpg"],
+      "pair_on": ["d/v.jpg"],
+      "pair_off": ["d/v.jpg"]
+    },
+    {
+      "id": "not_photo_names",
+      "note": "写真でない名前（B4）。3 実装とも拡張子で絞り、画像・RAW 以外は候補にしない（Web は B4 で PC に揃えた）。",
+      "files": ["d/Thumbs.db", "d/a.xmp", "d/a.jpg.xmp", "d/notes.txt", "d/a.gif", "d/a.tif", "d/a.jpg"],
+      "pair_on": ["d/a.jpg"],
+      "pair_off": ["d/a.jpg"]
+    },
+    {
+      "id": "no_extension",
+      "note": "拡張子が無い名前（B4）。PC・Web は候補にして中身で決める。Android は拡張子で絞るので候補にしない。",
+      "files": ["d/README", "d/IMG_0001", "d/a.jpg"],
+      "pair_on": ["d/README", "d/IMG_0001", "d/a.jpg"],
+      "pair_off": ["d/README", "d/IMG_0001", "d/a.jpg"],
+      "known_differences": {
+        "android": {
+          "reason": "B4: Smb.kt の isPhoto は拡張子が EXTENSIONS に有るものだけ",
+          "pair_on": ["d/a.jpg"],
+          "pair_off": ["d/a.jpg"]
+        }
+      }
+    },
+    {
+      "id": "hidden_names",
+      "note": "名前が . で始まるファイル・フォルダ（NAS の .webaxs・サイドカーの .photo-curator など）は、中身に関わらず除く。",
+      "files": [".hidden.jpg", ".webaxs/thumb.jpg", ".photo-curator/catalog.json", "d/.DS_Store", "d/._a.jpg", "d/.a.cr2", "d/.a.jpg", "d/ok.jpg"],
+      "pair_on": ["d/ok.jpg"],
+      "pair_off": ["d/ok.jpg"]
+    }
+  ]
+}

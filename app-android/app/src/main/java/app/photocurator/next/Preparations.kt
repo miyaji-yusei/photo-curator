@@ -88,14 +88,18 @@ object Preparations {
                     val ready = Prepare.run(app, project, rescan) { done, total ->
                         put(project.id) { it.copy(meta = done to total) }
                     }
+                    // **非対応と確定した写真には表示用画像を作らない**（読んでも復号できない原本を
+                    // 毎回丸ごと引かない。分母にも入れない）。選別に渡す顔ぶれ（refs）と同じ範囲。
+                    val selectable = ready.second.mapTo(HashSet()) { it.relativePath }
+                    val workable = ready.first.filter { it.relativePath in selectable }
                     if (project.source.remote) {
-                        Prepare.renders(app, project, ready.first, displayEdge) { done, total ->
+                        Prepare.renders(app, project, workable, displayEdge) { done, total ->
                             put(project.id) { it.copy(display = done to total) }
                         }
                         // EXIF に縮小画像が無かった写真を、落とした表示用画像から
                         // 埋める。**網へは行かない。**
                         // Amazon は縮小画像からハッシュ値を作るので要らない。
-                        if (kind == SourceKind.Nas) Prepare.fillFromRenders(app, project, ready.first, displayEdge)
+                        if (kind == SourceKind.Nas) Prepare.fillFromRenders(app, project, workable, displayEdge)
                     }
                     Trouble.clear(app, project.source.key)
                 }

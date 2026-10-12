@@ -551,6 +551,7 @@ fn run_pipeline(
 fn decode_source_name(source: DecodeSource) -> &'static str {
     match source {
         DecodeSource::ExifThumbnail => "exif_thumbnail",
+        DecodeSource::RawPreview => "raw_preview",
         DecodeSource::JpegScaled => "jpeg_scaled",
         DecodeSource::FullDecode => "full_decode",
     }

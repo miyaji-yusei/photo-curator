@@ -379,7 +379,7 @@ internal suspend fun standingOf(
     known: List<Photo>?,
     edge: Int,
     // 表示用画像の枚数（置き場の id, 大きさ）→ 枚数。全プロジェクトで 1 回の列挙を共有する。
-    renderTally: suspend () -> Map<Pair<String, Int>, Int>
+    renderTally: suspend () -> Map<Pair<String, Int>, Set<String>>
 ): Standing {
     val session = Store.load(context, project.id)
 
@@ -397,24 +397,30 @@ internal suspend fun standingOf(
             return Standing("準備中 · 写真の走査", "", null, Sky, "開く")
         }
         val prints = Fingerprints.load(context, project.source.key).size
-        if (prints < known.size) {
+        // **非対応の写真は分母にも枚数にも入れない**（U58。選別の対象でないので）。
+        val failures = Failures.load(context, project.source.key)
+        val total = Failures.workableCount(known, failures)
+        if (prints < total) {
             return Standing(
                 "準備中 · 撮影時刻・サムネイル",
-                "$prints / ${known.size} 枚", ratio(prints, known.size), Sky, "開始"
+                "$prints / $total 枚", ratio(prints, total), Sky, "開始"
             )
         }
         val cacheId = project.source.cacheId
         if (project.source.remote && cacheId != null) {
-            val made = renderTally()[cacheId to edge] ?: 0
-            if (made < known.size) {
+            // **プロジェクトの写真の顔ぶれで数える**（B7）。置き場の id は NAS ごとなので、
+            // 枚数をそのまま使うと同じ NAS の別プロジェクトの絵まで足される。
+            val workable = known.filterNot { Failures.isUnsupported(it, failures[it.relativePath]) }
+            val made = Renders.madeCount(workable, renderTally()[cacheId to edge] ?: emptySet())
+            if (made < total) {
                 return Standing(
                     "準備中 · 表示用画像を作成",
-                    "$made / ${known.size} 枚", ratio(made, known.size), Sky, "開始"
+                    "$made / $total 枚", ratio(made, total), Sky, "開始"
                 )
             }
         }
         // ---- 未開始 ----
-        return Standing("準備完了", "${known.size} 枚", null, Faint, "開始")
+        return Standing("準備完了", "$total 枚", null, Faint, "開始")
     }
 
     val total = session.ratings.size

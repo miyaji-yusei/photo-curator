@@ -520,3 +520,34 @@ export function sidecarKeyCoverage(sidecar: Sidecar, photoKeys: string[]): KeyCo
   ensureReady()
   return wasm.sidecarKeyCoverage(sidecar, photoKeys)
 }
+
+// ---------------------------------------------------------------------------
+// 写真のファイル名（R10。どの名前を候補にするかは各環境が持つ）
+// ---------------------------------------------------------------------------
+
+/** 道筋（またはファイル名）の拡張子が RAW か。大文字小文字は問わない。先頭の点は拡張子にしない。 */
+export function isRawName(name: string): boolean {
+  ensureReady()
+  return wasm.isRawName(name)
+}
+
+/** RAW の拡張子の一覧（小文字）。 */
+export function rawExtensions(): string[] {
+  ensureReady()
+  return wasm.rawExtensions()
+}
+
+/**
+ * 道筋ごとに「同じフォルダに同名（大文字小文字を無視）の JPEG がある RAW なので除く」なら true。
+ * 並びは入力と同じ。区切りは `/` でも `\` でもよい。
+ */
+export function pairedRawMask(paths: string[]): boolean[] {
+  ensureReady()
+  return wasm.pairedRawMask(paths) as boolean[]
+}
+
+/** 組の RAW を除いた道筋の一覧（並びは保つ）。`enabled` が false なら何も除かない。 */
+export function skipPairedRaw(paths: string[], enabled: boolean): string[] {
+  ensureReady()
+  return wasm.skipPairedRaw(paths, enabled)
+}

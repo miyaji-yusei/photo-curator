@@ -397,3 +397,28 @@ pub fn sidecar_normalize_keys(sidecar: JsValue, folder_hint: String) -> Result<J
 pub fn sidecar_key_coverage(sidecar: JsValue, photo_keys: Vec<String>) -> Result<JsValue, JsValue> {
     ser(&core::sidecar_key_coverage(de(sidecar)?, photo_keys))
 }
+
+// ---------------------------------------------------------------------------
+// 写真のファイル名（R10）
+// ---------------------------------------------------------------------------
+
+#[wasm_bindgen(js_name = isRawName)]
+pub fn is_raw_name(name: String) -> bool {
+    core::is_raw_name(&name)
+}
+
+#[wasm_bindgen(js_name = rawExtensions)]
+pub fn raw_extensions() -> Vec<String> {
+    core::raw_extensions()
+}
+
+/// 道筋ごとの「組の RAW なので除く」（boolean の配列）。
+#[wasm_bindgen(js_name = pairedRawMask)]
+pub fn paired_raw_mask(paths: Vec<String>) -> Result<JsValue, JsValue> {
+    ser(&core::paired_raw_mask(paths))
+}
+
+#[wasm_bindgen(js_name = skipPairedRaw)]
+pub fn skip_paired_raw(paths: Vec<String>, enabled: bool) -> Vec<String> {
+    core::skip_paired_raw(paths, enabled)
+}

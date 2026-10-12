@@ -536,6 +536,46 @@ fn rescanning_a_photo_without_readable_metadata_keeps_its_analysis() {
     fs::remove_dir_all(&directory).expect("remove test directory");
 }
 
+// 原本が変わった（大きさ・更新時刻が違う）再走査では、表示用画像も作り直しの対象に戻す（B3）。
+// 変わらなければ消さない。
+#[test]
+fn rescanning_a_changed_original_resets_its_display_image() {
+    let directory = test_directory("rescan-display");
+    let conn = open_database(&directory.join("scan.sqlite3")).expect("open database");
+    let absolute = "C:/photos/a.jpg";
+    let scan = |mtime: i64, size: i64| {
+        upsert_photo(&conn, "project-1", absolute, "a.jpg", "a.jpg", Some(mtime), Some(size)).expect("scan");
+    };
+    let display = || -> (Option<String>, Option<i64>) {
+        conn.query_row(
+            "SELECT display_path,display_edge FROM photos WHERE path=?1",
+            params![absolute],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read display")
+    };
+
+    scan(10, 100);
+    conn.execute(
+        "UPDATE photos SET display_path='old.jpg', display_edge=1024 WHERE path=?1",
+        params![absolute],
+    )
+    .expect("record display");
+
+    scan(10, 100);
+    assert_eq!(display(), (Some("old.jpg".to_string()), Some(1024)), "変わらなければ消さない");
+    scan(11, 100);
+    assert_eq!(display(), (None, None), "更新時刻が違えば作り直し");
+
+    conn.execute("UPDATE photos SET display_path='old.jpg', display_edge=1024 WHERE path=?1", params![absolute])
+        .expect("record display");
+    scan(11, 101);
+    assert_eq!(display(), (None, None), "大きさが違えば作り直し");
+
+    drop(conn);
+    fs::remove_dir_all(&directory).expect("remove test directory");
+}
+
 // 解析全体をひとつのトランザクションで囲んでいた頃は、キャンセルすると
 // すべて rollback され、何度やり直しても d_hash が1件も残らなかった。
 #[test]
@@ -993,6 +1033,7 @@ struct CountingSource {
     name: String,
     served: std::cell::Cell<usize>,
     all_calls: std::cell::Cell<usize>,
+    range_calls: std::cell::Cell<usize>,
 }
 
 impl CountingSource {
@@ -1002,6 +1043,7 @@ impl CountingSource {
             name: name.to_owned(),
             served: std::cell::Cell::new(0),
             all_calls: std::cell::Cell::new(0),
+            range_calls: std::cell::Cell::new(0),
         }
     }
 }
@@ -1016,6 +1058,16 @@ impl PhotoSource for CountingSource {
         self.all_calls.set(self.all_calls.get() + 1);
         self.served.set(self.served.get() + self.bytes.len());
         Some(self.bytes.clone())
+    }
+    fn read_range(&self, offset: u64, length: usize) -> Option<Vec<u8>> {
+        let start = usize::try_from(offset).ok()?;
+        if start >= self.bytes.len() {
+            return None;
+        }
+        let end = start.saturating_add(length).min(self.bytes.len());
+        self.range_calls.set(self.range_calls.get() + 1);
+        self.served.set(self.served.get() + (end - start));
+        Some(self.bytes[start..end].to_vec())
     }
     fn fingerprint(&self) -> Option<(i64, i64)> {
         Some((1_700_000_000_000, self.bytes.len() as i64))
@@ -3311,6 +3363,43 @@ fn moving_one_photo_marks_only_that_photo_missing() {
 }
 
 #[test]
+fn prepare_state_bundles_the_backlogs_and_failure_counts() {
+    let directory = test_directory("prepare-state");
+    let conn = open_database(&directory.join("ps.sqlite3")).expect("open database");
+    conn.execute(
+        "INSERT INTO projects (id,name,folder_path,photo_count,status,created_at,updated_at)
+             VALUES ('p1','p1','C:/photos',3,'ready',1,1)",
+        [],
+    )
+    .expect("insert project");
+    for (id, at) in [("a1", 1_000_000_i64), ("a2", 1_001_000), ("a3", 1_002_000)] {
+        conn.execute(
+            "INSERT INTO photos (id,project_id,path,relative_path,name,captured_at,timestamp_source,is_missing)
+                 VALUES (?1,'p1',?2,?1,?1,?3,'exif_original',0)",
+            params![id, format!("C:/photos/{id}.jpg"), at],
+        )
+        .expect("insert photo");
+    }
+    conn.execute(
+        "UPDATE photos SET analysis_error='x',analysis_error_kind='unsupported',analysis_error_at=1 WHERE id='a3'",
+        [],
+    )
+    .expect("unsupported");
+    conn.execute(
+        "UPDATE photos SET analysis_error='y',analysis_error_kind='transient',analysis_error_at=1 WHERE id='a2'",
+        [],
+    )
+    .expect("transient");
+    let edge = 2048;
+    let state = prepare_state(&conn, "p1", false, edge).expect("state");
+    assert_eq!(state.analysis_backlog, analysis_backlog(&conn, "p1", false).unwrap());
+    assert_eq!(state.display_backlog, display_backlog_count(&conn, "p1", edge).unwrap());
+    assert_eq!((state.failed, state.unsupported), (2, 1), "失敗 2 枚のうち非対応は 1 枚");
+    drop(conn);
+    fs::remove_dir_all(&directory).expect("remove test directory");
+}
+
+#[test]
 fn analysis_backlog_counts_only_photos_the_analysis_targets() {
     let directory = test_directory("backlog");
     let conn = open_database(&directory.join("b.sqlite3")).expect("open database");
@@ -3867,4 +3956,888 @@ fn a_failing_xmp_is_reported_while_the_jpeg_write_still_counts() {
     assert_eq!((report.processed, report.paired_raw_processed, report.failed), (1, 0, 1));
     assert_eq!(fs::read_to_string(&xmp).unwrap(), "<broken><x></broken>");
     fs::remove_dir_all(&directory).ok();
+}
+
+/// RAW（`image` で開けない）は、EXIF のサムネイルが取れなかったら、本体を丸ごと読まずに諦める。
+#[test]
+fn a_raw_without_a_thumbnail_gives_up_without_reading_the_whole_file() {
+    let source = CountingSource::new(vec![0u8; 4 * 1024 * 1024], "IMG_0001.CR2");
+    assert!(decode_hash_source_with(&source, false).is_none());
+    assert_eq!(source.all_calls.get(), 0, "RAW の本体を丸ごと読んでいる");
+    assert!(source.served.get() <= EXIF_HEAD_PROBE);
+}
+
+/// 解析できなかった件数は、DB の行を数える。前回までの失敗を、今回の失敗として二重に足さない。
+#[test]
+fn failed_photo_count_counts_rows_once() {
+    let conn = Connection::open_in_memory().expect("open");
+    conn.execute_batch(
+        "CREATE TABLE photos (project_id TEXT, is_missing INTEGER, analysis_error TEXT);
+         INSERT INTO photos VALUES ('p',0,'x'),('p',0,NULL),('p',1,'x'),('q',0,'x');",
+    )
+    .expect("seed");
+    assert_eq!(failed_photo_count(&conn, "p").expect("count"), 1);
+}
+
+// -----------------------------------------------------------------------
+// U57: RAW に埋め込まれたプレビュー JPEG
+// -----------------------------------------------------------------------
+
+/// 小さな TIFF を手で組む入れ物。
+struct TiffBuf {
+    d: Vec<u8>,
+    little: bool,
+}
+
+impl TiffBuf {
+    fn new(size: usize, little: bool) -> Self {
+        let mut t = Self { d: vec![0; size], little };
+        t.d[0..2].copy_from_slice(if little { b"II" } else { b"MM" });
+        t.u16(2, 42);
+        t
+    }
+    fn u16(&mut self, at: usize, v: u16) {
+        let b = if self.little { v.to_le_bytes() } else { v.to_be_bytes() };
+        self.d[at..at + 2].copy_from_slice(&b);
+    }
+    fn u32(&mut self, at: usize, v: u32) {
+        let b = if self.little { v.to_le_bytes() } else { v.to_be_bytes() };
+        self.d[at..at + 4].copy_from_slice(&b);
+    }
+    fn put(&mut self, at: usize, bytes: &[u8]) {
+        self.d[at..at + bytes.len()].copy_from_slice(bytes);
+    }
+    /// (tag, type, count, value)。type 3（SHORT）の値は先頭 2 バイトに置く。
+    fn ifd(&mut self, at: usize, entries: &[(u16, u16, u32, u32)], next: u32) {
+        self.u16(at, entries.len() as u16);
+        for (i, (tag, ty, n, value)) in entries.iter().enumerate() {
+            let e = at + 2 + i * 12;
+            self.u16(e, *tag);
+            self.u16(e + 2, *ty);
+            self.u32(e + 4, *n);
+            if *ty == 3 {
+                self.u16(e + 8, *value as u16);
+            } else {
+                self.u32(e + 8, *value);
+            }
+        }
+        self.u32(at + 2 + entries.len() * 12, next);
+    }
+    fn first_ifd(&mut self, at: u32) {
+        self.u32(4, at);
+    }
+}
+
+/// SOF だけが正しい、デコードはできない JPEG 風のバイト列。
+fn fake_jpeg(width: u16, height: u16, len: usize, sof: u8) -> Vec<u8> {
+    let mut v = vec![0u8; len];
+    v[0..2].copy_from_slice(&[0xFF, 0xD8]);
+    v[2..6].copy_from_slice(&[0xFF, 0xE0, 0x00, 0x10]); // APP0 16 バイト
+    v[6 + 14..6 + 14 + 4].copy_from_slice(&[0xFF, sof, 0x00, 0x11]);
+    let s = 6 + 14 + 4; // SOF の中身
+    v[s] = 8;
+    v[s + 1..s + 3].copy_from_slice(&height.to_be_bytes());
+    v[s + 3..s + 5].copy_from_slice(&width.to_be_bytes());
+    v[s + 5] = 3;
+    v[len - 2..].copy_from_slice(&[0xFF, 0xD9]);
+    v
+}
+
+/// 実際にデコードできる JPEG。
+fn real_jpeg(width: u32, height: u32) -> Vec<u8> {
+    let img = image::RgbImage::from_fn(width, height, |x, y| {
+        image::Rgb([(x * 255 / width) as u8, (y * 255 / height) as u8, ((x ^ y) & 0xFF) as u8])
+    });
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85)
+        .encode(img.as_raw(), width, height, image::ExtendedColorType::Rgb8)
+        .expect("encode");
+    out
+}
+
+/// CR2 風: IFD0（向き・JPEG 圧縮 1 本の strip）→ IFD1（JPEGInterchangeFormat のサムネイル）。
+/// `big` を IFD0 の strip（大きいプレビュー）、`small` を IFD1 のサムネイルとして `total` バイトの中に置く。
+fn cr2_like(big: &[u8], small: &[u8], big_at: usize, small_at: usize, total: usize, orientation: u16) -> Vec<u8> {
+    let mut t = TiffBuf::new(total, true);
+    t.first_ifd(8);
+    t.ifd(
+        8,
+        &[
+            (0x0103, 3, 1, 6),
+            (0x0111, 4, 1, big_at as u32),
+            (0x0112, 3, 1, orientation as u32),
+            (0x0117, 4, 1, big.len() as u32),
+        ],
+        100,
+    );
+    t.ifd(
+        100,
+        &[(0x0201, 4, 1, small_at as u32), (0x0202, 4, 1, small.len() as u32)],
+        0,
+    );
+    t.put(big_at, big);
+    t.put(small_at, small);
+    t.d
+}
+
+fn raw_info_of(bytes: &[u8]) -> RawInfo {
+    inspect(&SliceSource(bytes))
+}
+
+#[test]
+fn raw_preview_picks_the_largest_jpeg_in_a_cr2_like_file() {
+    let big = fake_jpeg(1620, 1080, 3000, 0xC0);
+    let small = fake_jpeg(160, 120, 800, 0xC0);
+    let bytes = cr2_like(&big, &small, 1000, 5000, 8000, 6);
+    let info = raw_info_of(&bytes);
+    assert_eq!(info.previews.len(), 2);
+    assert_eq!(info.orientation, Some(6));
+    let top = largest(&info).expect("largest");
+    assert_eq!((top.width, top.height, top.offset, top.length), (1620, 1080, 1000, 3000));
+    // サムネイル用: 長辺 256 以上で最小 → 大きい方。100 以上なら小さい方。
+    assert_eq!(for_thumb(&info, 256).unwrap().width, 1620);
+    assert_eq!(for_thumb(&info, 100).unwrap().width, 160);
+    // 足りるものが無ければ一番大きいもの。
+    assert_eq!(for_thumb(&info, 5000).unwrap().width, 1620);
+    assert_eq!(bytes_of(&SliceSource(&bytes), &top).unwrap(), big);
+}
+
+#[test]
+fn raw_preview_follows_sub_ifds_in_a_big_endian_file() {
+    // NEF 風: IFD0 に SubIFD（0x014A）が 2 つ。片方に大きい JPEG、もう片方に可逆（C3）の本体。
+    let mut t = TiffBuf::new(9000, false);
+    t.first_ifd(8);
+    t.ifd(8, &[(0x0112, 3, 1, 1), (0x014A, 4, 2, 200)], 0);
+    t.u32(200, 300);
+    t.u32(204, 400);
+    t.ifd(300, &[(0x0201, 4, 1, 1000), (0x0202, 4, 1, 4000)], 0);
+    t.ifd(400, &[(0x0201, 4, 1, 6000), (0x0202, 4, 1, 2000)], 0);
+    t.put(1000, &fake_jpeg(4000, 3000, 4000, 0xC2)); // プログレッシブ
+    t.put(6000, &fake_jpeg(6000, 4000, 2000, 0xC3)); // 可逆 = RAW 本体
+    let info = raw_info_of(&t.d);
+    assert_eq!(info.previews.len(), 1, "可逆 JPEG（RAW 本体）は数えない");
+    assert_eq!(largest(&info).unwrap().width, 4000);
+    assert_eq!(info.orientation, Some(1));
+}
+
+#[test]
+fn raw_preview_is_empty_without_a_jpeg() {
+    let mut t = TiffBuf::new(2000, true);
+    t.first_ifd(8);
+    t.ifd(8, &[(0x0103, 3, 1, 7), (0x0111, 4, 1, 500), (0x0112, 3, 1, 1), (0x0117, 4, 1, 800)], 0);
+    t.put(500, &fake_jpeg(6000, 4000, 800, 0xC3));
+    let info = raw_info_of(&t.d);
+    assert!(info.previews.is_empty());
+    assert!(largest(&info).is_none());
+    // 見出しが違う・短い・空。
+    assert!(raw_info_of(b"not a raw file at all, just text").previews.is_empty());
+    assert!(raw_info_of(&[]).previews.is_empty());
+    assert!(raw_info_of(&[0x49, 0x49]).previews.is_empty());
+}
+
+#[test]
+fn raw_preview_survives_broken_offsets_and_loops() {
+    let big = fake_jpeg(1620, 1080, 3000, 0xC0);
+    let mut bytes = cr2_like(&big, &fake_jpeg(160, 120, 800, 0xC0), 1000, 5000, 8000, 1);
+    // 範囲外のオフセット・長さ（IFD1 の JPEG）。IFD0 の方だけが残る。
+    let mut t = TiffBuf { d: bytes.clone(), little: true };
+    t.ifd(100, &[(0x0201, 4, 1, 7_900), (0x0202, 4, 1, 4_000_000_000)], 0);
+    assert_eq!(raw_info_of(&t.d).previews.len(), 1, "範囲外の方だけ捨てる");
+    // IFD の鎖がループ（自分自身を指す）。
+    let mut t = TiffBuf { d: bytes.clone(), little: true };
+    t.ifd(100, &[(0x0201, 4, 1, 5000), (0x0202, 4, 1, 800)], 100);
+    t.ifd(8, &[(0x0112, 3, 1, 1)], 100);
+    assert!(raw_info_of(&t.d).previews.len() <= 1);
+    // SubIFD が自分を指す・IFD0 の次が IFD0。
+    let mut t = TiffBuf { d: bytes.clone(), little: true };
+    t.ifd(8, &[(0x014A, 4, 1, 8)], 8);
+    let _ = raw_info_of(&t.d);
+    // 最初の IFD が範囲外（u32 の上限）。
+    t.first_ifd(0xFFFF_FFFF);
+    assert!(raw_info_of(&t.d).previews.is_empty());
+    // どの 1 バイトを壊しても、途中で切っても panic しない。
+    for i in 0..bytes.len().min(400) {
+        let saved = bytes[i];
+        for value in [0u8, 0xFF, 0x7F] {
+            bytes[i] = value;
+            let _ = raw_info_of(&bytes);
+        }
+        bytes[i] = saved;
+    }
+    for cut in [0, 1, 7, 8, 9, 50, 99, 101, 130, 1500, 4000, 7999] {
+        let _ = raw_info_of(&bytes[..cut]);
+    }
+}
+
+#[test]
+fn raw_preview_reads_the_raf_header() {
+    let jpeg = fake_jpeg(1920, 1280, 5000, 0xC0);
+    let mut bytes = vec![0u8; 12000];
+    bytes[..15].copy_from_slice(b"FUJIFILMCCD-RAW");
+    bytes[84..88].copy_from_slice(&2000u32.to_be_bytes());
+    bytes[88..92].copy_from_slice(&5000u32.to_be_bytes());
+    bytes[2000..7000].copy_from_slice(&jpeg);
+    let info = raw_info_of(&bytes);
+    assert_eq!(info.previews.len(), 1);
+    assert_eq!(info.orientation, None);
+    assert_eq!(largest(&info).unwrap().length, 5000);
+    // 見出しが範囲外を指すなら空。
+    bytes[84..88].copy_from_slice(&900_000u32.to_be_bytes());
+    assert!(raw_info_of(&bytes).previews.is_empty());
+}
+
+fn hex16(text: &str) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).unwrap();
+    }
+    out
+}
+
+fn iso_box(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut b = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+    b.extend_from_slice(kind);
+    b.extend_from_slice(body);
+    b
+}
+
+/// CR3 風: ftyp → moov（uuid(CMT) → CMT1 の TIFF）→ uuid(PRVW) → mdat。
+fn cr3_like(jpeg: &[u8], orientation: u16) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend(iso_box(b"ftyp", b"crx \0\0\0\x01crx isom"));
+    let mut t = TiffBuf::new(40, true);
+    t.first_ifd(8);
+    t.ifd(8, &[(0x0112, 3, 1, orientation as u32)], 0);
+    let mut uuid_cmt = hex16("85c0b687820f11e08111f4ce462b6a48").to_vec();
+    uuid_cmt.extend(iso_box(b"CMT1", &t.d));
+    out.extend(iso_box(b"moov", &iso_box(b"uuid", &uuid_cmt)));
+    // PRVW: uuid(16) + 詰め物 8 + 箱（サイズ 4・PRVW 4・詰め物 12・JPEG の長さ 4・JPEG）
+    let mut body = hex16("eaf42b5e1c984b88b9fbb7dc406e4d16").to_vec();
+    body.extend_from_slice(&[0u8; 8]);
+    body.extend_from_slice(&((24 + jpeg.len()) as u32).to_be_bytes());
+    body.extend_from_slice(b"PRVW");
+    body.extend_from_slice(&[0u8; 12]);
+    body.extend_from_slice(&(jpeg.len() as u32).to_be_bytes());
+    body.extend_from_slice(jpeg);
+    out.extend(iso_box(b"uuid", &body));
+    out.extend(iso_box(b"mdat", &[0u8; 64]));
+    out
+}
+
+#[test]
+fn raw_preview_reads_the_cr3_prvw_box_and_orientation() {
+    let jpeg = fake_jpeg(1620, 1080, 3000, 0xC0);
+    let bytes = cr3_like(&jpeg, 8);
+    let info = raw_info_of(&bytes);
+    assert_eq!(info.previews.len(), 1, "PRVW の JPEG を見つける");
+    assert_eq!(info.orientation, Some(8), "向きは moov の CMT1 から");
+    let region = largest(&info).unwrap();
+    assert_eq!((region.width, region.height), (1620, 1080));
+    assert_eq!(bytes_of(&SliceSource(&bytes), &region).unwrap(), jpeg);
+    // 途中で切れていたら（JPEG が全部読めない）使わない。
+    assert!(raw_info_of(&bytes[..bytes.len() - 100]).previews.is_empty());
+    for cut in (0..bytes.len()).step_by(37) {
+        let _ = raw_info_of(&bytes[..cut]);
+    }
+}
+
+#[test]
+fn raw_preview_does_not_hand_back_a_truncated_jpeg() {
+    let big = fake_jpeg(1620, 1080, 3000, 0xC0);
+    let bytes = cr2_like(&big, &fake_jpeg(160, 120, 800, 0xC0), 1000, 5000, 8000, 1);
+    let region = largest(&raw_info_of(&bytes)).unwrap();
+    // 実際のファイルが JPEG の途中までしか無い。
+    assert!(bytes_of(&SliceSource(&bytes[..2000]), &region).is_none());
+}
+
+#[test]
+fn a_raw_preview_reads_only_the_head_and_the_jpeg_range() {
+    // 8MB の「RAW」。大きいプレビューは 5MB 付近、サムネイル用は 6MB 付近に置く。
+    let big = real_jpeg(1200, 800);
+    let small = real_jpeg(320, 240);
+    let total = 8 * 1024 * 1024;
+    let bytes = cr2_like(&big, &small, 5 * 1024 * 1024, 6 * 1024 * 1024, total, 1);
+    let source = CountingSource::new(bytes, "IMG_0001.CR2");
+    let (image, how) = decode_hash_source_with(&source, false).expect("raw preview");
+    assert_eq!(how, DecodeSource::RawPreview);
+    assert_eq!((image.width(), image.height()), (320, 240), "長辺 256 以上で一番小さいもの");
+    assert_eq!(source.all_calls.get(), 0, "RAW の本体を丸ごと読んでいる");
+    assert!(source.range_calls.get() >= 1);
+    // 先頭 64KB ＋ 各 JPEG の確認の区画（64KB ずつ）＋ JPEG 本体。本体の丸読み（8MB）には遠い。
+    let budget = EXIF_HEAD_PROBE + 4 * 64 * 1024 + big.len() + small.len();
+    assert!(source.served.get() <= budget, "読んだ量 {} > {}", source.served.get(), budget);
+    assert!(source.served.get() < total / 4);
+}
+
+#[test]
+fn a_raw_preview_gets_the_raw_orientation() {
+    let big = real_jpeg(600, 400);
+    let bytes = cr2_like(&big, &real_jpeg(160, 120), 3000, 70_000, 80_000, 6);
+    let source = CountingSource::new(bytes, "IMG_0002.CR2");
+    let (image, _) = decode_hash_source_with(&source, false).expect("raw preview");
+    // 向き 6（時計回りに 90 度）→ 縦長になる。
+    assert_eq!((image.width(), image.height()), (400, 600));
+}
+
+#[test]
+fn a_raw_without_a_usable_preview_still_fails() {
+    let mut t = TiffBuf::new(5000, true);
+    t.first_ifd(8);
+    t.ifd(8, &[(0x0112, 3, 1, 1)], 0);
+    let source = CountingSource::new(t.d, "IMG_0003.CR2");
+    assert!(decode_hash_source_with(&source, false).is_none());
+    assert_eq!(source.all_calls.get(), 0);
+    // 壊れた JPEG（SOF は正しいが中身がデコードできない）。
+    let bytes = cr2_like(&fake_jpeg(1620, 1080, 3000, 0xC0), &fake_jpeg(160, 120, 800, 0xC0), 1000, 5000, 8000, 1);
+    let source = CountingSource::new(bytes, "IMG_0004.CR2");
+    assert!(decode_hash_source_with(&source, false).is_none());
+}
+
+#[test]
+fn display_of_a_raw_comes_from_the_largest_preview() {
+    let big = real_jpeg(1600, 1000);
+    let bytes = cr2_like(&big, &real_jpeg(320, 240), 3000, 200_000, 300_000, 1);
+    let source = CountingSource::new(bytes, "IMG_0005.CR2");
+    let built = build_display(&source, 1024, None).expect("display");
+    let image = image::load_from_memory(&built).expect("decode");
+    assert_eq!((image.width(), image.height()), (1024, 640));
+    assert_eq!(source.all_calls.get(), 0);
+    // 取り出せない RAW は None（表示用を作れない）。
+    let broken = CountingSource::new(vec![0u8; 4096], "IMG_0006.NEF");
+    assert!(build_display(&broken, 1024, None).is_none());
+}
+
+#[test]
+fn a_local_file_serves_ranges() {
+    let directory = test_directory("read-range");
+    let path = directory.join("IMG_0007.CR2");
+    let bytes: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+    fs::write(&path, &bytes).unwrap();
+    let local = LocalPhoto(&path);
+    assert_eq!(local.read_range(10, 5).unwrap(), bytes[10..15]);
+    assert_eq!(local.read_range(990, 100).unwrap(), bytes[990..], "終わりにかかれば短く返す");
+    assert!(local.read_range(1000, 1).is_none(), "ファイルの外");
+    assert!(local.read_range(5000, 1).is_none());
+    fs::remove_dir_all(&directory).ok();
+}
+
+#[test]
+fn analysing_a_raw_makes_a_thumbnail_and_a_hash() {
+    let directory = test_directory("raw-analyse");
+    let path = directory.join("IMG_0008.CR2");
+    let bytes = cr2_like(&real_jpeg(1200, 800), &real_jpeg(320, 240), 3000, 90_000, 100_000, 1);
+    fs::write(&path, &bytes).unwrap();
+    let outcome = analyse_photo(
+        &directory.join("thumbs"),
+        "p1",
+        &path,
+        fingerprint(&path),
+        &CachedAnalysis::default(),
+    );
+    assert_eq!(outcome.thumbnail_state, ThumbnailState::Generated(DecodeSource::RawPreview));
+    assert!(outcome.d_hash.is_some());
+    assert!(outcome.thumbnail_path.is_some());
+    fs::remove_dir_all(&directory).ok();
+}
+
+// -----------------------------------------------------------------------
+// U58: 非対応の形式は、原本が変わるまで再試行しない・数に含めない・選別の対象から外す
+// -----------------------------------------------------------------------
+
+/// 読めない `PhotoSource`（先頭が読めない／先頭は読めるが全体が読めない）。
+struct FlakySource {
+    bytes: Vec<u8>,
+    head_ok: bool,
+}
+
+impl PhotoSource for FlakySource {
+    fn head(&self, want: usize) -> Option<Vec<u8>> {
+        self.head_ok
+            .then(|| self.bytes[..want.min(self.bytes.len())].to_vec())
+    }
+    fn all(&self) -> Option<Vec<u8>> {
+        None
+    }
+    fn read_range(&self, _offset: u64, _length: usize) -> Option<Vec<u8>> {
+        None
+    }
+    fn fingerprint(&self) -> Option<(i64, i64)> {
+        None
+    }
+    fn name(&self) -> Option<String> {
+        Some("photo.jpg".into())
+    }
+}
+
+#[test]
+fn decode_failures_tell_unreadable_from_undecodable() {
+    // 読めたのに復号できない（中身が JPEG でない .jpg）。
+    let garbage = CountingSource::new(vec![7u8; 5000], "garbage.jpg");
+    assert_eq!(
+        try_decode_hash_source_with(&garbage, true).err(),
+        Some(DecodeFailure::Undecodable)
+    );
+    // RAW でプレビューが取れない。
+    let raw = CountingSource::new(vec![0u8; 4096], "IMG_0001.CR2");
+    assert_eq!(
+        try_decode_hash_source_with(&raw, false).err(),
+        Some(DecodeFailure::Undecodable)
+    );
+    // 先頭が読めない。
+    let closed = FlakySource { bytes: vec![0; 10], head_ok: false };
+    assert_eq!(
+        try_decode_hash_source_with(&closed, true).err(),
+        Some(DecodeFailure::Unreadable)
+    );
+    // 先頭は読めたが全体を読む途中で切れた（NAS の瞬断）。
+    let cut = FlakySource { bytes: vec![7; 5000], head_ok: true };
+    assert_eq!(
+        try_decode_hash_source_with(&cut, true).err(),
+        Some(DecodeFailure::Unreadable)
+    );
+}
+
+fn hash_record_of(conn: &Connection, id: &str) -> HashRecord {
+    load_hash_records(conn, "project-1", false)
+        .expect("records")
+        .into_iter()
+        .find(|record| record.id == id)
+        .expect("record")
+}
+
+/// 1 枚を解析して、本番と同じ書き方（`apply_hash`）で DB に書く。
+fn analyse_and_store(conn: &Connection, thumbnails: &Path, id: &str) -> PhotoWork {
+    let record = hash_record_of(conn, id);
+    let work = hash_one(thumbnails, 0, &record);
+    apply_hash(conn, &work, false).expect("apply");
+    work
+}
+
+fn put_photo(conn: &Connection, id: &str, path: &Path, captured_at: i64) {
+    conn.execute(
+        "INSERT INTO photos (id,project_id,path,relative_path,name,captured_at,timestamp_source,d_hash,rating,is_missing)
+         VALUES (?1,'project-1',?2,?3,?3,?4,'exif',NULL,0,0)",
+        params![
+            id,
+            path.to_string_lossy().to_string(),
+            path.file_name().unwrap().to_string_lossy().to_string(),
+            captured_at
+        ],
+    )
+    .expect("insert");
+}
+
+fn kind_of(conn: &Connection, id: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT analysis_error_kind FROM photos WHERE id=?1",
+        params![id],
+        |row| row.get(0),
+    )
+    .expect("kind")
+}
+
+#[test]
+fn an_unsupported_original_is_not_read_again_until_it_changes() {
+    let directory = test_directory("u58-retry");
+    let conn = database_with_photos(&directory, 0);
+    let thumbnails = directory.join("thumbs");
+    let broken = directory.join("broken.jpg"); // 中身が JPEG でない
+    let good = directory.join("good.jpg");
+    let raw = directory.join("IMG_0001.CR2"); // プレビューの無い RAW
+    let missing = directory.join("gone.jpg"); // 開けない
+    fs::write(&broken, vec![9u8; 6000]).unwrap();
+    fs::write(&good, real_jpeg(320, 240)).unwrap();
+    fs::write(&raw, vec![0u8; 8192]).unwrap();
+    for (index, (id, path)) in [("broken", &broken), ("good", &good), ("raw", &raw), ("gone", &missing)]
+        .into_iter()
+        .enumerate()
+    {
+        put_photo(&conn, id, path, 1_000 + index as i64);
+    }
+
+    // 1 回目: 全部読まれる。
+    assert_eq!(load_hash_records(&conn, "project-1", true).unwrap().len(), 4);
+    for id in ["broken", "good", "raw", "gone"] {
+        analyse_and_store(&conn, &thumbnails, id);
+    }
+    assert_eq!(kind_of(&conn, "broken").as_deref(), Some("unsupported"));
+    assert_eq!(kind_of(&conn, "raw").as_deref(), Some("unsupported"));
+    assert_eq!(kind_of(&conn, "gone").as_deref(), Some("transient"), "開けないのは一時的");
+    assert_eq!(kind_of(&conn, "good"), None);
+
+    // 2 回目: 非対応の 2 枚は対象に入らない（読まない）。一時的な失敗と成功済みは入る。
+    let second: Vec<String> = load_hash_records(&conn, "project-1", true)
+        .unwrap()
+        .into_iter()
+        .map(|record| record.id)
+        .collect();
+    assert!(!second.contains(&"broken".to_string()));
+    assert!(!second.contains(&"raw".to_string()));
+    assert!(second.contains(&"gone".to_string()), "一時的な失敗は再試行する");
+    assert!(second.contains(&"good".to_string()));
+    // 撮影時刻の段も同じ。
+    conn.execute("UPDATE photos SET captured_at=NULL", []).unwrap();
+    let metadata: Vec<String> = load_metadata_records(&conn, "project-1")
+        .unwrap()
+        .into_iter()
+        .map(|record| record.0)
+        .collect();
+    assert!(!metadata.contains(&"broken".to_string()));
+    assert!(metadata.contains(&"gone".to_string()));
+
+    // 原本が変わったら（大きさが違う）もう一度試す。
+    fs::write(&broken, vec![9u8; 6001]).unwrap();
+    let third: Vec<String> = load_hash_records(&conn, "project-1", false)
+        .unwrap()
+        .into_iter()
+        .map(|record| record.id)
+        .collect();
+    assert!(third.contains(&"broken".to_string()), "原本が変わったら再試行する");
+    assert!(!third.contains(&"raw".to_string()), "変わっていない方は読まない");
+
+    // 直った（本物の JPEG に差し替わった）ら成功して種類が消える。
+    fs::write(&broken, real_jpeg(200, 100)).unwrap();
+    analyse_and_store(&conn, &thumbnails, "broken");
+    assert_eq!(kind_of(&conn, "broken"), None);
+    assert!(conn
+        .query_row("SELECT d_hash FROM photos WHERE id='broken'", [], |row| row.get::<_, Option<String>>(0))
+        .unwrap()
+        .is_some());
+    drop(conn);
+    fs::remove_dir_all(&directory).ok();
+}
+
+#[test]
+fn a_legacy_failure_without_a_kind_is_retried_once_then_classified() {
+    let directory = test_directory("u58-legacy");
+    let conn = database_with_photos(&directory, 0);
+    let thumbnails = directory.join("thumbs");
+    let broken = directory.join("old.jpg");
+    fs::write(&broken, vec![1u8; 3000]).unwrap();
+    put_photo(&conn, "old", &broken, 5);
+    // U58 より前の失敗（理由はあるが種類が無い）。
+    conn.execute(
+        "UPDATE photos SET analysis_error='画像を読み取れませんでした（破損または非対応の形式）。',analysis_error_at=1,
+           fingerprint_mtime=1,fingerprint_size=3000 WHERE id='old'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(load_hash_records(&conn, "project-1", true).unwrap().len(), 1, "1 回は試す");
+    analyse_and_store(&conn, &thumbnails, "old");
+    assert_eq!(kind_of(&conn, "old").as_deref(), Some("unsupported"));
+    assert!(load_hash_records(&conn, "project-1", true).unwrap().is_empty(), "分類されたら読まない");
+    drop(conn);
+    fs::remove_dir_all(&directory).ok();
+}
+
+#[test]
+fn unsupported_rows_stay_in_the_table_but_leave_the_counts() {
+    let directory = test_directory("u58-counts");
+    let conn = database_with_photos(&directory, 0);
+    for (id, index) in [("a", 1_000_000i64), ("b", 1_000_500), ("c", 1_001_000)] {
+        conn.execute(
+            "INSERT INTO photos (id,project_id,path,relative_path,name,captured_at,timestamp_source,rating,is_missing)
+             VALUES (?1,'project-1',?2,?1,?1,?3,'exif_original',0,0)",
+            params![id, format!("C:/p/{id}.jpg"), index],
+        )
+        .unwrap();
+    }
+    conn.execute("INSERT INTO projects (id,name,folder_path,photo_count,status,created_at,updated_at) VALUES ('project-1','n','C:/p',3,'ready',0,0)", []).unwrap();
+    conn.execute("UPDATE photos SET rating=3 WHERE id='b'", []).unwrap();
+
+    // 3 枚とも未処理（連写の候補になる近さ）。
+    let before = analysis_backlog(&conn, "project-1", false).unwrap();
+    assert_eq!(before, 3);
+    let edge = 1536u32;
+    assert_eq!(display_backlog_count(&conn, "project-1", edge).unwrap(), 3);
+
+    // b を非対応にする。
+    conn.execute(
+        "UPDATE photos SET analysis_error='x',analysis_error_at=1,analysis_error_kind='unsupported' WHERE id='b'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(analysis_backlog(&conn, "project-1", false).unwrap(), 2, "準備の分母から外れる");
+    assert_eq!(display_backlog_count(&conn, "project-1", edge).unwrap(), 2, "表示用画像も作りに行かない");
+    assert_eq!(recount_photos(&conn, "project-1").unwrap(), 2, "枚数から外れる");
+
+    // 行は消えず、★も残る。core に渡す行（get_core_inputs の SELECT）には印付きで載る。
+    let rows: Vec<Photo> = conn
+        .prepare(&format!(
+            "SELECT {PHOTO_COLUMNS} FROM photos WHERE project_id=?1 AND is_missing=0 ORDER BY id"
+        ))
+        .unwrap()
+        .query_map(params!["project-1"], photo_from_row)
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    let b = rows.iter().find(|photo| photo.id == "b").unwrap();
+    assert_eq!(b.rating, 3);
+    assert_eq!(b.analysis_error_kind.as_deref(), Some("unsupported"));
+    assert_eq!(rows.iter().find(|photo| photo.id == "a").unwrap().analysis_error_kind, None);
+    drop(conn);
+    fs::remove_dir_all(&directory).ok();
+}
+
+#[test]
+fn the_failure_list_has_names_reasons_and_kinds() {
+    let directory = test_directory("u58-list");
+    let conn = database_with_photos(&directory, 3);
+    conn.execute(
+        "UPDATE photos SET analysis_error='壊れている',analysis_error_at=5,analysis_error_kind='unsupported' WHERE id='photo-1'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE photos SET analysis_error='開けない',analysis_error_at=6,analysis_error_kind='transient' WHERE id='photo-0'",
+        [],
+    )
+    .unwrap();
+    // 種類が無い古い失敗は一時的として出す。
+    conn.execute(
+        "UPDATE photos SET analysis_error='古い失敗',analysis_error_at=7 WHERE id='photo-2'",
+        [],
+    )
+    .unwrap();
+    // 欠損の行は出さない。
+    conn.execute("UPDATE photos SET is_missing=1 WHERE id='photo-2'", []).unwrap();
+    let list = analysis_failures(&conn, "project-1").unwrap();
+    assert_eq!(
+        list,
+        vec![
+            AnalysisFailure {
+                relative_path: "0.jpg".into(),
+                name: "0.jpg".into(),
+                kind: "transient".into(),
+                reason: "開けない".into(),
+                at: Some(6),
+            },
+            AnalysisFailure {
+                relative_path: "1.jpg".into(),
+                name: "1.jpg".into(),
+                kind: "unsupported".into(),
+                reason: "壊れている".into(),
+                at: Some(5),
+            },
+        ]
+    );
+    conn.execute("UPDATE photos SET is_missing=0 WHERE id='photo-2'", []).unwrap();
+    let list = analysis_failures(&conn, "project-1").unwrap();
+    assert_eq!(list.len(), 3);
+    assert_eq!(list[2].kind, "transient", "種類の無い古い失敗は一時的");
+    drop(conn);
+    fs::remove_dir_all(&directory).ok();
+}
+
+#[test]
+fn a_rescan_clears_the_kind_only_when_the_original_changed() {
+    let directory = test_directory("u58-rescan");
+    let conn = database_with_photos(&directory, 0);
+    conn.execute(
+        "INSERT INTO photos (id,project_id,path,relative_path,name,captured_at,rating,fingerprint_mtime,fingerprint_size,is_missing,analysis_error,analysis_error_at,analysis_error_kind)
+         VALUES ('p','project-1','C:/p/a.jpg','a.jpg','a.jpg',1,0,10,20,0,'x',1,'unsupported')",
+        [],
+    )
+    .unwrap();
+    upsert_photo(&conn, "project-1", "C:/p/a.jpg", "a.jpg", "a.jpg", Some(10), Some(20)).unwrap();
+    assert_eq!(kind_of(&conn, "p").as_deref(), Some("unsupported"), "変わっていなければ残る");
+    upsert_photo(&conn, "project-1", "C:/p/a.jpg", "a.jpg", "a.jpg", Some(11), Some(20)).unwrap();
+    assert_eq!(kind_of(&conn, "p"), None, "更新時刻が変わったら消えて再試行になる");
+    let error: Option<String> = conn
+        .query_row("SELECT analysis_error FROM photos WHERE id='p'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(error, None);
+    drop(conn);
+    fs::remove_dir_all(&directory).ok();
+}
+
+#[test]
+fn timeouts_and_unresponsive_workers_are_transient() {
+    let mut work = PhotoWork::new(0, "p");
+    work.error = Some("解析が 15 秒以内に終わりませんでした。".into());
+    assert_eq!(work.error_kind(), Some("transient"), "既定は一時的（迷ったら安全側）");
+    work.error_unsupported = true;
+    assert_eq!(work.error_kind(), Some("unsupported"));
+    assert_eq!(PhotoWork::new(1, "q").error_kind(), None, "失敗が無ければ種類も無い");
+}
+
+/// 範囲読みだけ壊せる `PhotoSource`（NAS の瞬断の代わり）。
+struct FlakyRange {
+    inner: CountingSource,
+    mode: u8, // 0=正常 1=読めない 2=半分で切れる
+}
+
+impl PhotoSource for FlakyRange {
+    fn head(&self, want: usize) -> Option<Vec<u8>> {
+        self.inner.head(want)
+    }
+    fn all(&self) -> Option<Vec<u8>> {
+        self.inner.all()
+    }
+    fn read_range(&self, offset: u64, length: usize) -> Option<Vec<u8>> {
+        match self.mode {
+            1 => None,
+            2 => self
+                .inner
+                .read_range(offset, length)
+                .map(|bytes| bytes[..bytes.len() / 2].to_vec()),
+            _ => self.inner.read_range(offset, length),
+        }
+    }
+    fn fingerprint(&self) -> Option<(i64, i64)> {
+        self.inner.fingerprint()
+    }
+    fn name(&self) -> Option<String> {
+        self.inner.name()
+    }
+}
+
+#[test]
+fn a_raw_range_read_that_fails_midway_is_transient_not_unsupported() {
+    let bytes = cr2_like(&real_jpeg(1200, 800), &real_jpeg(320, 240), 3000, 90_000, 100_000, 1);
+    let make = |mode| FlakyRange { inner: CountingSource::new(bytes.clone(), "IMG_0100.CR2"), mode };
+    // 正常に読めればプレビューが取れる。
+    assert!(try_decode_hash_source_with(&make(0), false).is_ok());
+    // 範囲読みが途中で読めない・短く返る＝一時的。
+    assert_eq!(
+        try_decode_hash_source_with(&make(1), false).err(),
+        Some(DecodeFailure::Unreadable)
+    );
+    assert_eq!(
+        try_decode_hash_source_with(&make(2), false).err(),
+        Some(DecodeFailure::Unreadable)
+    );
+    // 最後まで正常に読めたのにプレビューが無い＝非対応のまま。
+    let none = FlakyRange { inner: CountingSource::new(vec![0u8; 100_000], "IMG_0101.CR2"), mode: 0 };
+    assert_eq!(
+        try_decode_hash_source_with(&none, false).err(),
+        Some(DecodeFailure::Undecodable)
+    );
+}
+
+/// R2: 失敗の理由 → 画面の文言・DB の種類の表。ここを変えると利用者に見える文言が変わる。
+#[test]
+fn analysis_failure_messages_and_kinds_are_fixed() {
+    let table: Vec<(PhotoFailure, String, &str)> = vec![
+        (PhotoFailure::NoCaptureTime, "撮影時刻を読み取れませんでした。".into(), "transient"),
+        (PhotoFailure::Unreadable, "ファイルを開けませんでした（移動・削除・権限）。".into(), "transient"),
+        (PhotoFailure::Undecodable, "画像を読み取れませんでした（破損または非対応の形式）。".into(), "unsupported"),
+        (PhotoFailure::RemoteUndecodable, "画像を読み取れませんでした（破損または非対応の形式）。".into(), "transient"),
+        (PhotoFailure::Fetch("取得に失敗".into()), "取得に失敗".into(), "transient"),
+        (PhotoFailure::Timeout(15), "解析が 15 秒以内に終わりませんでした。".into(), "transient"),
+        (PhotoFailure::Stalled, "読み込みが応答しないため、解析できませんでした。".into(), "transient"),
+        (PhotoFailure::DisplayFailed, "表示用の画像を作れませんでした。".into(), "transient"),
+    ];
+    for (failure, message, kind) in table {
+        assert_eq!(failure.message(), message, "{failure:?}");
+        assert_eq!(failure.kind(), kind, "{failure:?}");
+        let mut work = PhotoWork::new(0, "x");
+        work.fail(failure.clone());
+        assert_eq!(work.error.as_deref(), Some(message.as_str()));
+        assert_eq!(work.error_kind(), Some(kind));
+    }
+    // 復号の失敗 → 解析の失敗（U58 と同じ決め方）
+    assert_eq!(PhotoFailure::from_decode(Some(DecodeFailure::Undecodable), true), PhotoFailure::Undecodable);
+    assert_eq!(PhotoFailure::from_decode(Some(DecodeFailure::Undecodable), false), PhotoFailure::Unreadable);
+    assert_eq!(PhotoFailure::from_decode(Some(DecodeFailure::Unreadable), true), PhotoFailure::Unreadable);
+    assert_eq!(PhotoFailure::from_decode(None, true), PhotoFailure::Unreadable);
+}
+
+// -----------------------------------------------------------------------
+// R1: どの名前を写真の候補にするか・組の RAW をどう除くかの共通の表
+//
+// `core/tests/fixtures/photo-names.json` を、Web（`tests/photoNames.test.ts`）・Android
+// （`PhotoNamesFixtureTest`）も読む。実際にフォルダを作って `list_photo_files`（隠し・拡張子・
+// 組の RAW の 3 つの規則が通る入口）に通し、今の挙動を縛る。食い違いは表の `known_differences.pc`。
+// -----------------------------------------------------------------------
+
+fn photo_names_expected(case: &serde_json::Value, implementation: &str, key: &str) -> Vec<String> {
+    let value = case["known_differences"][implementation]
+        .get(key)
+        .unwrap_or(&case[key]);
+    let mut names: Vec<String> = value
+        .as_array()
+        .expect("expected is an array")
+        .iter()
+        .map(|name| name.as_str().expect("name").to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn photo_names_fixture_matches_the_scan_of_this_implementation() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../core/tests/fixtures/photo-names.json"))
+            .expect("fixture parses");
+    let cases = fixture["cases"].as_array().expect("cases");
+    assert!(cases.len() >= 10);
+    for case in cases {
+        let id = case["id"].as_str().expect("id");
+        let root = test_directory(&format!("photo-names-{id}"));
+        for name in case["files"].as_array().expect("files") {
+            let path = root.join(name.as_str().expect("name"));
+            fs::create_dir_all(path.parent().expect("parent")).expect("create folder");
+            fs::write(&path, b"x").expect("create file");
+        }
+        for (pair_raw, key) in [(true, "pair_on"), (false, "pair_off")] {
+            let listing = list_photo_files(root.to_str().expect("utf-8 path"), pair_raw)
+                .expect("list the fixture folder");
+            let mut actual: Vec<String> = listing
+                .files
+                .iter()
+                .map(|file| {
+                    file.path
+                        .strip_prefix(&root)
+                        .expect("under the root")
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                })
+                .collect();
+            actual.sort();
+            assert_eq!(
+                actual,
+                photo_names_expected(case, "pc", key),
+                "case {id} / {key}"
+            );
+        }
+        fs::remove_dir_all(&root).expect("remove fixture folder");
+    }
+}
+
+#[test]
+fn photo_names_known_differences_are_real_differences() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../core/tests/fixtures/photo-names.json"))
+            .expect("fixture parses");
+    for case in fixture["cases"].as_array().expect("cases") {
+        let Some(differences) = case["known_differences"].as_object() else {
+            continue;
+        };
+        for (implementation, difference) in differences {
+            assert!(
+                ["pc", "web", "android"].contains(&implementation.as_str()),
+                "unknown implementation {implementation}"
+            );
+            assert!(difference["reason"].is_string(), "reason is required");
+            for key in ["pair_on", "pair_off"] {
+                if difference.get(key).is_some() {
+                    let mut default: Vec<String> = case[key]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|name| name.as_str().unwrap().to_string())
+                        .collect();
+                    default.sort();
+                    assert_ne!(
+                        photo_names_expected(case, implementation, key),
+                        default,
+                        "stale known difference: {} {implementation} {key}",
+                        case["id"]
+                    );
+                }
+            }
+        }
+    }
 }

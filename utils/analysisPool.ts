@@ -28,7 +28,7 @@ export interface AnalysisJob {
 
 export interface AnalysisPoolOptions {
   /** 1 枚終わるたびに呼ばれる。進捗表示と保存に使う。 */
-  onResult: (id: string, analyzed: AnalyzedPhoto) => Promise<void> | void
+  onResult: (id: string, analyzed: AnalyzedPhoto, file: File | null) => Promise<void> | void
   /** true を返すと以降を打ち切る。 */
   isCancelled?: () => boolean
   /** 同時に走らせる本数の上限。 */
@@ -67,7 +67,9 @@ function runOnWorker(worker: Worker, job: AnalysisJob, file: File, displayEdge?:
 }
 
 const failed = (error: string): AnalyzedPhoto => ({
-  thumbnail: null, display: null, dHash: null, capturedAt: null, timestampSource: 'unknown', error
+  thumbnail: null, display: null, dHash: null, capturedAt: null, timestampSource: 'unknown', error,
+  // 読めない・ワーカーの異常は一時的（U58）。
+  errorKind: 'transient'
 })
 
 /** 1 枚を読む。読めなかったときは理由を返す（例外は投げない）。 */
@@ -111,8 +113,9 @@ export async function analyzeAll(jobs: AnalysisJob[], options: AnalysisPoolOptio
     let current = take()
     while (current) {
       const upcoming = take()
-      const analyzed = await analyzeOne(worker, current.job, await current.file, options.displayEdge)
-      await options.onResult(current.job.id, analyzed)
+      const loaded = await current.file
+      const analyzed = await analyzeOne(worker, current.job, loaded, options.displayEdge)
+      await options.onResult(current.job.id, analyzed, typeof loaded === 'string' ? null : loaded)
       current = options.isCancelled?.() ? null : upcoming
     }
   }
