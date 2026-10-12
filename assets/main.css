@@ -281,3 +281,15 @@ body { margin: 0; }
 .zoom-overlay__scale { color: #c6ff00; font-weight: 700; }
 .zoom-overlay__photo .zoom-overlay__spinner { position: absolute; top: 50%; left: 50%; margin: -24px 0 0 -24px; filter: drop-shadow(0 0 4px rgba(0,0,0,.6)); pointer-events: none; }
 .project-actions .v-btn.v-btn.v-btn { height: 40px; min-height: 40px; min-width: 40px; }
+
+/* ピントの位置（U60）。写真と同じ枠に重ねる。押しても反応しない。 */
+.focus-layer {
+  position: absolute; inset: 0; z-index: 1;
+  width: 100%; height: 100%; object-fit: contain;
+  pointer-events: none;
+  filter: drop-shadow(0 0 1px rgba(0,0,0,.55));
+}
+.zoom-overlay__frame { position: relative; transform-origin: center; }
+.zoom-overlay__frame img { display: block; }
+.zoom-overlay__focus { color: #cfd3da; margin-left: 4px; }
+.zoom-overlay__focus.is-on { color: #d6ff73; }

@@ -24,6 +24,10 @@ namespace photo_curator_core {
     // 各環境の縮小器に任せると値が揃わない（実測で距離 5 の差が出た）。
     string? d_hash_from_gray(sequence<u8> gray, u32 width, u32 height);
 
+    // ピントが合っている所のマスク（フォーカスピーキング）。入力は輝度で長辺 2048 まで。
+    // 返すのは長辺 512 以下の強さ（0〜255、アルファにそのまま使える）。読めない入力は 0x0 の空。
+    FocusMask focus_mask(sequence<u8> gray, u32 width, u32 height);
+
     // 学習の答えから「見た目が近い」の境目を決める。答えが無ければ既定値。
     // 食い違ったときは切る側に倒す（間違えて繋ぐ方が高くつくため）。
     u32 learn_distance(sequence<BurstAnswer> answers, u32 fallback);
@@ -434,4 +438,11 @@ interface SidecarPlan {
         ClashReason reason,
         MergePreview preview
     );
+};
+
+// ピントの位置のマスク。data は width * height 個で、0 は「合っていない」。
+dictionary FocusMask {
+    u32 width;
+    u32 height;
+    sequence<u8> data;
 };

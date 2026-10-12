@@ -3,6 +3,8 @@ import type { Ref } from 'vue'
 import SelectionHelpButton from '~/components/dialogs/SelectionHelpButton.vue'
 import type { SavedSelection } from '~/utils/selectionFlow'
 import { gridFor, type GridShape } from '~/utils/gridFor'
+import FocusLayer from '~/components/FocusLayer.vue'
+import { useFocusPeaking } from '~/composables/curator/useFocusPeaking'
 
 const {
   MAX_RATING,
@@ -29,6 +31,7 @@ const {
   undoChoice,
   view
 } = useCurator()
+const { focusOn, toggleFocus } = useFocusPeaking()
 // 親の `v-if` で null を除いているので、ここでは non-null として扱う。
 const session = nullableSession as Ref<SavedSelection>
 
@@ -114,6 +117,10 @@ function clearSelection() {
           @click="groupSelectedAsBurst"
         >この写真をまとめる</v-btn>
         <v-btn icon="mdi-dots-horizontal" variant="text" aria-label="選別中の設定（表示枚数）" title="選別中の設定（表示枚数）" @click="openGroupSizeDialog" />
+        <v-btn
+          icon="mdi-image-filter-center-focus" variant="text" :color="focusOn ? 'primary' : undefined"
+          :aria-pressed="focusOn" aria-label="ピントの位置（F）" title="ピントの位置（F）" @click="toggleFocus"
+        />
         <SelectionHelpButton />
         <v-btn color="primary" @click="confirmChoices">
           {{ session.selectedInGroup.length ? `${session.selectedInGroup.length} 枚を選択` : '選択なしで次へ' }}<span v-if="!isTouchOnly" class="ms-1 text-caption">（Enter）</span>
@@ -180,6 +187,7 @@ function clearSelection() {
         <span v-if="isConfirmed(photo.id)" class="tournament-card__confirmed">確定</span>
 
         <img :src="desktop.photoDisplayUrl(photo)" :alt="photo.name">
+        <FocusLayer :photo-id="photo.id" :src="desktop.photoDisplayUrl(photo)" kind="display" />
       </v-card>
     </div>
     </div>
