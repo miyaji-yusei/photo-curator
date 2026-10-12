@@ -535,6 +535,7 @@ fun CullScreen(
                     photo = photo,
                     stands = live.members[path]?.size ?: 1,
                     displayEdge = displayEdge,
+                    focus = focusOn,
                     // 落とす＝1 枚も通さず確定、残す＝通して確定、上＝★5 で確定。
                     // どれも core（advance・keepAndTop）が判断する。
                     onDecide = { decision ->
@@ -712,8 +713,8 @@ private fun CullBar(
             }
             // ピントの位置。**「？」の隣**（操作の道具が並ぶ列）。オンは Lime で塗る。
             // 選別ではタップが「選ぶ」で長押しも使い済みなので、長押しで消す動作は付けない。
-            // 2 枚並びの画面だけ（スライドショーは 1 枚ずつで、この印は使わない）。
-            if (!slideshow) {
+            // スライドショーでも出す（1 枚ずつ見るときこそ、ピントを確かめたい）。
+            run {
                 Box(
                     Modifier
                         .size(40.dp)

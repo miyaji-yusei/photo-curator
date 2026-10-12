@@ -243,4 +243,13 @@ class SlideshowGestureTest {
         assertEquals(Keep, tapDecision(w * 0.7f + 0.01f, h / 2, 0f, 0f, w, h))
         assertNull(tapDecision(w / 2, h - 1f, 0f, 0f, w, h))
     }
+
+    @Test fun 長押しは400ms以上で16dp未満の動きのとき() {
+        assertTrue(SlideshowGesture.isLongPress(400, 0f))
+        assertTrue(SlideshowGesture.isLongPress(900, 15.9f))
+        assertTrue(!SlideshowGesture.isLongPress(399, 0f))
+        assertTrue(!SlideshowGesture.isLongPress(400, 16f))
+        // タップの揺れ（8dp）を超えていても、16dp 未満なら長押しになる。
+        assertTrue(SlideshowGesture.isLongPress(500, 12f))
+    }
 }
