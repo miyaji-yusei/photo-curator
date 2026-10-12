@@ -106,11 +106,11 @@ object SlideshowGesture {
     }
 
     /** 長押しとみなす時間（ms）と、その間に動いてよい距離（dp。これ未満）。 */
-    const val LONG_PRESS_MS = 400L
+    const val LONG_PRESS_MS = 1000L
     const val LONG_PRESS_SLOP = 16f
 
     /**
-     * 長押しか。**押してから 400ms たっても、いちばん離れた所が 16dp 未満**なら長押し
+     * 長押しか。**押してから 1 秒たっても、いちばん離れた所が 16dp 未満**なら長押し
      * （拡大する）。タップの判定（8dp）より広いので、指が少し揺れても長押しになる。
      */
     fun isLongPress(heldMs: Long, farthest: Float): Boolean =
