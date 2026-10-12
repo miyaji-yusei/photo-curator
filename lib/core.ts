@@ -293,22 +293,24 @@ export function dHashFromGray(gray: Uint8Array | number[], width: number, height
   return wasm.dHashFromGray(gray instanceof Uint8Array ? gray : Uint8Array.from(gray), width, height) ?? null
 }
 
-/** ピントの位置のマスク。`data` は width*height 個の強さ（0〜255）。読めない入力では 0x0 の空。 */
-export interface FocusMask {
-  width: number
-  height: number
-  data: Uint8Array
+/** くっきりした領域の四角 1 個。座標と大きさは 0〜1（写真全体に対する割合）、strength も 0〜1。 */
+export interface FocusRegion {
+  x: number
+  y: number
+  w: number
+  h: number
+  strength: number
 }
 
-/** 輝度（長辺 2048 まで）から、ピントが合っている所のマスク（長辺 512 以下）を作る。 */
-export function focusMask(gray: Uint8Array, width: number, height: number): FocusMask {
+export interface FocusRegions {
+  /** 強い順で最大 3 個。空なら「くっきりした所なし」。 */
+  regions: FocusRegion[]
+}
+
+/** 輝度（長辺 2048 まで）から、くっきりした領域の四角を最大 3 個返す。読めない入力では空。 */
+export function focusRegions(gray: Uint8Array, width: number, height: number): FocusRegions {
   ensureReady()
-  const raw = wasm.focusMask(gray, width, height)
-  try {
-    return { width: raw.width, height: raw.height, data: raw.data }
-  } finally {
-    raw.free()
-  }
+  return wasm.focusRegions(gray, width, height) as FocusRegions
 }
 
 export function learnDistance(answers: BurstAnswer[], fallback: number): number {

@@ -7,6 +7,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import uniffi.photo_curator_core.FocusRegion
 
 /** U60: ピントの位置。画面に触らない部分（輝度・色付け・キャッシュ・状態）。 */
 class FocusPeakingTest {
@@ -36,21 +37,75 @@ class FocusPeakingTest {
         assertEquals(0 to 0, FocusPeaking.fitWithin(-1, -1, 1024))
     }
 
+    private fun region(x: Float, y: Float, w: Float, h: Float) = FocusRegion(x, y, w, h, 0.8f)
+
     @Test
-    fun alphaOfRejectsEmptyAndMismatched() {
-        assertNull(FocusPeaking.alphaOf(0u, 0u, emptyList()))
-        assertNull(FocusPeaking.alphaOf(2u, 2u, listOf(1u.toUByte())))
-        assertNull(FocusPeaking.alphaOf(0u, 3u, emptyList()))
+    fun foundOfKeepsEmptyAsNoneButRejectsUnreadableSize() {
+        // 四角が 0 個は「くっきりした所なし」。失敗（null）ではない。
+        val none = FocusPeaking.foundOf(1024, 683, emptyList())!!
+        assertTrue(none.regions.isEmpty())
+        assertEquals(1024, none.width)
+        assertNull(FocusPeaking.foundOf(0, 683, emptyList()))
+        assertNull(FocusPeaking.foundOf(1024, 0, listOf(region(0f, 0f, 0.5f, 0.5f))))
     }
 
     @Test
-    fun argbCarriesStrengthAsAlphaInLime() {
-        val alpha = FocusPeaking.alphaOf(2u, 1u, listOf(0u.toUByte(), 200u.toUByte()))!!
-        val px = alpha.toArgb()
-        assertEquals(2, alpha.width)
-        assertEquals(1, alpha.height)
-        assertEquals(0x00D6FF73, px[0])
-        assertEquals((200 shl 24) or 0xD6FF73, px[1])
+    fun foundOfDropsOutOfRangeAndLimitsToThree() {
+        val good = region(0.1f, 0.1f, 0.2f, 0.2f)
+        val found = FocusPeaking.foundOf(
+            100, 100,
+            listOf(good, region(0.9f, 0.9f, 0.5f, 0.5f), region(-0.1f, 0f, 0.2f, 0.2f), region(0f, 0f, 0f, 0.2f), good, good, good)
+        )!!
+        assertEquals(3, found.regions.size)
+        assertTrue(found.regions.all { it == good })
+    }
+
+    @Test
+    fun fitRectLetterboxesLikeContentScaleFit() {
+        // 横長の写真（2:1）を 100x100 の箱に: 幅いっぱい、上下に余白。
+        val wide = FocusPeaking.fitRect(100f, 100f, 200, 100)
+        assertEquals(listOf(0f, 25f, 100f, 50f), wide.toList())
+        // 縦長（1:2）: 高さいっぱい、左右に余白。
+        val tall = FocusPeaking.fitRect(100f, 100f, 100, 200)
+        assertEquals(listOf(25f, 0f, 50f, 100f), tall.toList())
+        // 拡大はしない（箱が小さい前提の縮小のみ。ここでは箱に合わせて拡縮する Fit と同じ計算）。
+        assertEquals(listOf(0f, 0f, 0f, 0f), FocusPeaking.fitRect(0f, 100f, 200, 100).toList())
+        assertEquals(listOf(0f, 0f, 0f, 0f), FocusPeaking.fitRect(100f, 100f, 0, 100).toList())
+    }
+
+    @Test
+    fun bracketSegmentsDrawOnlyTheFourCorners() {
+        // 箱 200x100 に 2:1 の写真 → 範囲は (0,0,200,100)。四角 (0.1,0.2)-(0.6,0.8) = (20,20)-(120,80)、短辺 60 の 30 % = 腕 18。
+        val fit = FocusPeaking.fitRect(200f, 100f, 200, 100)
+        val segments = FocusPeaking.bracketSegments(region(0.1f, 0.2f, 0.5f, 0.6f), fit)
+        assertEquals(8, segments.size)
+        fun near(s: BracketSegment, x1: Float, y1: Float, x2: Float, y2: Float) {
+            assertEquals(x1, s.x1, 0.01f); assertEquals(y1, s.y1, 0.01f)
+            assertEquals(x2, s.x2, 0.01f); assertEquals(y2, s.y2, 0.01f)
+        }
+        near(segments[0], 20f, 20f, 38f, 20f)
+        near(segments[1], 20f, 20f, 20f, 38f)
+        near(segments[7], 120f, 80f, 120f, 62f)
+        // 辺の真ん中は描かない: どの線も端点が四角の角にある。
+        for (s in segments) {
+            assertTrue(Math.abs(s.x1 - 20f) < 0.01f || Math.abs(s.x1 - 120f) < 0.01f)
+            assertTrue(Math.abs(s.y1 - 20f) < 0.01f || Math.abs(s.y1 - 80f) < 0.01f)
+        }
+    }
+
+    @Test
+    fun bracketStyleMakesFirstBoldAndOthersThinAndFaint() {
+        val first = FocusPeaking.bracketStyle(0)
+        val second = FocusPeaking.bracketStyle(1)
+        assertTrue(first.widthDp > second.widthDp)
+        assertTrue(first.alpha > second.alpha)
+        assertEquals(second, FocusPeaking.bracketStyle(2))
+    }
+
+    @Test
+    fun noneLabelsMatchWebAndCompactIsShorter() {
+        assertEquals("くっきりした所が見つかりません", FocusPeaking.NONE_LABEL)
+        assertEquals("ピント甘め？", FocusPeaking.NONE_LABEL_COMPACT)
     }
 
     @Test
@@ -66,7 +121,7 @@ class FocusPeakingTest {
         assertEquals(2, cache.size)
     }
 
-    private val alpha = FocusAlpha(1, 1, byteArrayOf(9))
+    private val alpha = FocusFound(1, 1, emptyList())
 
     @Test
     fun storeComputesOncePerKey() = runBlocking {

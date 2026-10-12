@@ -26,7 +26,7 @@ namespace photo_curator_core {
 
     // ピントが合っている所のマスク（フォーカスピーキング）。入力は輝度で長辺 2048 まで。
     // 返すのは長辺 512 以下の強さ（0〜255、アルファにそのまま使える）。読めない入力は 0x0 の空。
-    FocusMask focus_mask(sequence<u8> gray, u32 width, u32 height);
+    FocusRegions focus_regions(sequence<u8> gray, u32 width, u32 height);
 
     // 学習の答えから「見た目が近い」の境目を決める。答えが無ければ既定値。
     // 食い違ったときは切る側に倒す（間違えて繋ぐ方が高くつくため）。
@@ -440,9 +440,16 @@ interface SidecarPlan {
     );
 };
 
-// ピントの位置のマスク。data は width * height 個で、0 は「合っていない」。
-dictionary FocusMask {
-    u32 width;
-    u32 height;
-    sequence<u8> data;
+// くっきりした領域の四角（0〜1 に正規化）。strength は 0〜1。
+dictionary FocusRegion {
+    f32 x;
+    f32 y;
+    f32 w;
+    f32 h;
+    f32 strength;
+};
+
+// 強い順で最大 3 個。空なら「くっきりした所なし」。
+dictionary FocusRegions {
+    sequence<FocusRegion> regions;
 };

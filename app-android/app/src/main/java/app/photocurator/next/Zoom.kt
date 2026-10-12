@@ -105,8 +105,8 @@ fun ZoomView(
     // ---- ピントの位置（U60） ----
     // **写真ごとに作り直す**（photo.id がキー）。別の写真のマスクが一瞬でも重ならない。
     val focusOn by FocusPeaking.enabled
-    var displayMask by remember(photo.id, photo.relativePath) { mutableStateOf<FocusAlpha?>(null) }
-    var originalMask by remember(photo.id, photo.relativePath) { mutableStateOf<FocusAlpha?>(null) }
+    var displayMask by remember(photo.id, photo.relativePath) { mutableStateOf<FocusFound?>(null) }
+    var originalMask by remember(photo.id, photo.relativePath) { mutableStateOf<FocusFound?>(null) }
     var displayBitmap by remember(photo.id, photo.relativePath) { mutableStateOf<Bitmap?>(null) }
     // 長押ししているあいだは印を消して、素の写真を見られるようにする。
     var held by remember { mutableStateOf(false) }

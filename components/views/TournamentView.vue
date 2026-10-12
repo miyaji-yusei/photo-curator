@@ -187,7 +187,7 @@ function clearSelection() {
         <span v-if="isConfirmed(photo.id)" class="tournament-card__confirmed">確定</span>
 
         <img :src="desktop.photoDisplayUrl(photo)" :alt="photo.name">
-        <FocusLayer :photo-id="photo.id" :src="desktop.photoDisplayUrl(photo)" kind="display" />
+        <FocusLayer :photo-id="photo.id" :src="desktop.photoDisplayUrl(photo)" kind="display" compact />
       </v-card>
     </div>
     </div>

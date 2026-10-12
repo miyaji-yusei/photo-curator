@@ -1,13 +1,17 @@
 <script setup lang="ts">
-import type { FocusMask } from '~/lib/core'
-import { useFocusPeaking, focusMaskLoader } from '~/composables/curator/useFocusPeaking'
-import { maskToRgba, type FocusKind } from '~/utils/focusPeaking'
+import { useFocusPeaking, focusLoader } from '~/composables/curator/useFocusPeaking'
+import {
+  bracketPath, bracketStyle, FOCUS_COLOR, FOCUS_NONE_LABEL, FOCUS_NONE_LABEL_COMPACT, FOCUS_OUTLINE_COLOR,
+  type FocusKind, type FocusResult
+} from '~/utils/focusPeaking'
 
 /**
- * ピントが合っている所の輪郭に色を重ねる層（U60）。写真と同じ枠に `object-fit: contain` で重ね、
+ * くっきりした所を囲む枠の層（U60）。カメラの AF 枠のように、四角の**四隅だけ**のかぎ括弧を重ねる。
+ * 写真と同じ枠に重ね（SVG は `meet` で写真の `object-fit: contain` と同じ置き方）、
  * 押しても反応しない（pointer-events: none）。オンのときだけ計算する。
+ * 四角が 0 個のときは写真の下端に札を出す（計算中は何も出さない）。
  *
- * **別の写真のマスクは出さない**: 出すのは「いま `photoId` の写真」のマスクだけ。
+ * **別の写真の枠は出さない**: 出すのは「いま `photoId` の写真」の結果だけ。
  * 同じ写真で画像が替わったとき（表示用 → 原本）は、新しいのが届くまで前のを残す（位置は同じ）。
  */
 const props = defineProps<{
@@ -17,14 +21,15 @@ const props = defineProps<{
   kind: FocusKind
   /** 写真を押している間などに一時的に隠す。 */
   hidden?: boolean
+  /** 札を短い文言にする（選別のタイルなど狭い所）。 */
+  compact?: boolean
 }>()
 
 const { focusOn } = useFocusPeaking()
-const current = shallowRef<{ photoId: string, mask: FocusMask } | null>(null)
-const canvas = ref<HTMLCanvasElement | null>(null)
+const current = shallowRef<{ photoId: string, result: FocusResult } | null>(null)
 const shown = computed(() => {
   const value = current.value
-  return focusOn.value && value && value.photoId === props.photoId ? value.mask : null
+  return focusOn.value && value && value.photoId === props.photoId ? value.result : null
 })
 
 let token = 0
@@ -33,30 +38,36 @@ async function refresh() {
   if (!focusOn.value || !props.src) return
   const { photoId, kind, src } = props
   const wanted = () => run === token
-  const mask = await focusMaskLoader().load({ photoId, kind, src, wanted })
-  if (run === token && mask) current.value = { photoId, mask }
+  const result = await focusLoader().load({ photoId, kind, src, wanted })
+  if (run === token && result) current.value = { photoId, result }
 }
 watch(() => [focusOn.value, props.photoId, props.src, props.kind] as const, refresh, { immediate: true })
 onBeforeUnmount(() => { token += 1 })
 
-function draw() {
-  const el = canvas.value
-  const mask = shown.value
-  if (!el || !mask) return
-  el.width = mask.width
-  el.height = mask.height
-  el.getContext('2d')?.putImageData(new ImageData(maskToRgba(mask), mask.width, mask.height), 0, 0)
-}
-watch(shown, () => nextTick(draw), { flush: 'post' })
-onMounted(draw)
+const brackets = computed(() => {
+  const result = shown.value
+  if (!result) return []
+  return result.regions.map((region, rank) => ({
+    d: bracketPath(region, result.width, result.height),
+    ...bracketStyle(rank)
+  }))
+})
 </script>
 
 <template>
-  <canvas
-    v-if="shown"
-    v-show="!hidden"
-    ref="canvas"
-    class="focus-layer"
-    aria-hidden="true"
-  />
+  <div v-if="shown" v-show="!hidden" class="focus-layer" aria-hidden="true">
+    <svg
+      v-if="shown.regions.length"
+      class="focus-layer__svg"
+      :viewBox="`0 0 ${shown.width} ${shown.height}`"
+      preserveAspectRatio="xMidYMid meet"
+    >
+      <!-- 暗い縁取りを先に太く敷いてから、黄緑を重ねる。 -->
+      <g v-for="(bracket, index) in [...brackets].reverse()" :key="index" fill="none" stroke-linecap="square" stroke-linejoin="miter" :opacity="bracket.opacity">
+        <path :d="bracket.d" :stroke="FOCUS_OUTLINE_COLOR" :stroke-width="bracket.width + 2" vector-effect="non-scaling-stroke" />
+        <path :d="bracket.d" :stroke="FOCUS_COLOR" :stroke-width="bracket.width" vector-effect="non-scaling-stroke" />
+      </g>
+    </svg>
+    <span v-else class="focus-layer__none">{{ compact ? FOCUS_NONE_LABEL_COMPACT : FOCUS_NONE_LABEL }}</span>
+  </div>
 </template>

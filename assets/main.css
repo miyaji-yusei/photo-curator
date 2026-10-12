@@ -285,9 +285,16 @@ body { margin: 0; }
 /* ピントの位置（U60）。写真と同じ枠に重ねる。押しても反応しない。 */
 .focus-layer {
   position: absolute; inset: 0; z-index: 1;
-  width: 100%; height: 100%; object-fit: contain;
+  width: 100%; height: 100%;
   pointer-events: none;
-  filter: drop-shadow(0 0 1px rgba(0,0,0,.55));
+}
+.focus-layer__svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+/* 「くっきりした所なし」の札。写真の下端に小さく。 */
+.focus-layer__none {
+  position: absolute; left: 50%; bottom: 8px; transform: translateX(-50%);
+  max-width: calc(100% - 16px); padding: 3px 10px; border-radius: 999px;
+  background: rgba(0,0,0,.6); color: #fff; font-size: 12px; line-height: 1.4; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
 }
 .zoom-overlay__frame { position: relative; transform-origin: center; }
 .zoom-overlay__frame img { display: block; }

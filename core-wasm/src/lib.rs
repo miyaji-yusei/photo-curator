@@ -66,35 +66,11 @@ pub fn d_hash_from_gray(gray: Vec<u8>, width: u32, height: u32) -> Option<String
     core::d_hash_from_gray(gray, width, height)
 }
 
-/// ピントの位置のマスク（core の `FocusMask`）。`data` は `Uint8Array`。
-/// 使い終わったら `free()`（`lib/core.ts` の `focusMask` が値を写して解放する）。
-#[wasm_bindgen]
-pub struct FocusMask {
-    width: u32,
-    height: u32,
-    data: Vec<u8>,
-}
-
-#[wasm_bindgen]
-impl FocusMask {
-    #[wasm_bindgen(getter)]
-    pub fn width(&self) -> u32 {
-        self.width
-    }
-    #[wasm_bindgen(getter)]
-    pub fn height(&self) -> u32 {
-        self.height
-    }
-    #[wasm_bindgen(getter)]
-    pub fn data(&self) -> Vec<u8> {
-        self.data.clone()
-    }
-}
-
-#[wasm_bindgen(js_name = focusMask)]
-pub fn focus_mask(gray: Vec<u8>, width: u32, height: u32) -> FocusMask {
-    let mask = core::focus_mask(gray, width, height);
-    FocusMask { width: mask.width, height: mask.height, data: mask.data }
+/// くっきりした領域の四角（core の `FocusRegions`）。`{ regions: [{ x, y, w, h, strength }] }`（0〜1）。
+/// 読めない入力・くっきりした所なしでは `regions` が空。
+#[wasm_bindgen(js_name = focusRegions)]
+pub fn focus_regions(gray: Vec<u8>, width: u32, height: u32) -> Result<JsValue, JsValue> {
+    ser(&core::focus_regions(gray, width, height))
 }
 
 #[wasm_bindgen(js_name = learnDistance)]

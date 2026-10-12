@@ -1,12 +1,12 @@
 import { beforeAll, describe, expect, it } from 'vitest'
-import { focusMask, initWithBytes, type FocusMask } from '~/lib/core'
+import { focusRegions, initWithBytes, type FocusRegions } from '~/lib/core'
 import {
-  createFocusMaskLoader, createMaskCache, fitWithin, maskKey, maskToRgba, type GrayPixels
+  bracketPath, bracketStyle, createFocusLoader, createMaskCache, fitWithin, maskKey, type GrayPixels
 } from '~/utils/focusPeaking'
 import { wasmBytes } from './helpers/wasmBytes.mjs'
 
-function mask(value: number, width = 2, height = 2): FocusMask {
-  return { width, height, data: new Uint8Array(width * height).fill(value) }
+function found(count = 1): FocusRegions {
+  return { regions: Array.from({ length: count }, () => ({ x: 0.1, y: 0.1, w: 0.3, h: 0.3, strength: 0.8 })) }
 }
 
 describe('fitWithin', () => {
@@ -18,10 +18,22 @@ describe('fitWithin', () => {
   })
 })
 
-describe('maskToRgba', () => {
-  it('強さをアルファにして色を塗る', () => {
-    const rgba = maskToRgba({ width: 2, height: 1, data: Uint8Array.from([0, 200]) }, [1, 2, 3])
-    expect(Array.from(rgba)).toEqual([1, 2, 3, 0, 1, 2, 3, 200])
+describe('bracketPath', () => {
+  it('四隅だけのかぎ括弧を、解析した画像の画素の座標で描く', () => {
+    // 200x100 の画像の (0.1, 0.2)-(0.6, 0.8) = 画素 (20,20)-(120,80)。短辺 60 の 30 % = 腕 18。
+    const d = bracketPath({ x: 0.1, y: 0.2, w: 0.5, h: 0.6, strength: 1 }, 200, 100)
+    expect(d).toBe('M20 38V20H38M102 20H120V38M120 62V80H102M38 80H20V62')
+    expect(d.match(/M/g)).toHaveLength(4)
+  })
+})
+
+describe('bracketStyle', () => {
+  it('いちばん強い 1 個は太く、2・3 個目は細く薄い', () => {
+    const first = bracketStyle(0)
+    const second = bracketStyle(1)
+    expect(first.width).toBeGreaterThan(second.width)
+    expect(first.opacity).toBeGreaterThan(second.opacity)
+    expect(bracketStyle(2)).toEqual(second)
   })
 })
 
@@ -39,11 +51,11 @@ describe('createMaskCache', () => {
   })
 })
 
-describe('createFocusMaskLoader', () => {
+describe('createFocusLoader', () => {
   const pixels: GrayPixels = { gray: new Uint8Array(4), width: 2, height: 2 }
-  function make(compute = () => mask(255)) {
+  function make(compute = () => found()) {
     const calls: Array<{ src: string, side: number }> = []
-    const loader = createFocusMaskLoader({
+    const loader = createFocusLoader({
       read: async (src, side) => { calls.push({ src, side }); return pixels },
       compute,
       yieldToUi: async () => undefined,
@@ -57,6 +69,8 @@ describe('createFocusMaskLoader', () => {
     const first = await loader.load({ photoId: 'p', kind: 'display', src: 'u1' })
     const second = await loader.load({ photoId: 'p', kind: 'display', src: 'u1' })
     expect(second).toBe(first)
+    expect(first).toMatchObject({ width: 2, height: 2 })
+    expect(first!.regions).toHaveLength(1)
     expect(calls).toHaveLength(1)
     expect(calls[0]!.side).toBe(1024)
   })
@@ -85,21 +99,24 @@ describe('createFocusMaskLoader', () => {
   it('同時に 2 枚は計算しない（1 枚ずつ）', async () => {
     let running = 0
     let peak = 0
-    const loader = createFocusMaskLoader({
+    const loader = createFocusLoader({
       read: async () => { running += 1; peak = Math.max(peak, running); await Promise.resolve(); running -= 1; return pixels },
-      compute: () => mask(255),
+      compute: () => found(),
       yieldToUi: async () => undefined
     })
     await Promise.all(['a', 'b', 'c'].map(id => loader.load({ photoId: id, kind: 'display', src: id })))
     expect(peak).toBe(1)
   })
 
-  it('読めない・空のマスクは null で、キャッシュに入れない', async () => {
-    const failing = createFocusMaskLoader({ read: async () => { throw new Error('tainted') }, compute: () => mask(1), yieldToUi: async () => undefined })
+  it('読めないものは null でキャッシュに入れない。四角が 0 個なのは失敗ではなく、空の結果をキャッシュする', async () => {
+    const failing = createFocusLoader({ read: async () => { throw new Error('tainted') }, compute: () => found(), yieldToUi: async () => undefined })
     expect(await failing.load({ photoId: 'x', kind: 'display', src: 'u' })).toBeNull()
-    const empty = createFocusMaskLoader({ read: async () => pixels, compute: () => ({ width: 0, height: 0, data: new Uint8Array() }), yieldToUi: async () => undefined })
-    expect(await empty.load({ photoId: 'x', kind: 'display', src: 'u' })).toBeNull()
-    expect(empty.cacheSize).toBe(0)
+    const unreadable = createFocusLoader({ read: async () => null, compute: () => found(), yieldToUi: async () => undefined })
+    expect(await unreadable.load({ photoId: 'x', kind: 'display', src: 'u' })).toBeNull()
+    expect(unreadable.cacheSize).toBe(0)
+    const none = createFocusLoader({ read: async () => pixels, compute: () => ({ regions: [] }), yieldToUi: async () => undefined })
+    expect(await none.load({ photoId: 'x', kind: 'display', src: 'u' })).toEqual({ width: 2, height: 2, regions: [] })
+    expect(none.cacheSize).toBe(1)
   })
 
   it('キャッシュは上限つき', async () => {
@@ -110,48 +127,48 @@ describe('createFocusMaskLoader', () => {
   })
 })
 
-describe('core の focusMask（wasm 越し）', () => {
+describe('core の focusRegions（wasm 越し）', () => {
   beforeAll(() => initWithBytes(wasmBytes()))
 
-  it('左がくっきり・右がのっぺりなら、印は左だけに出る', () => {
-    const width = 128
-    const height = 64
-    const gray = new Uint8Array(width * height)
+  function checker(width: number, height: number, period: number, inside: (x: number) => boolean): Uint8Array {
+    const gray = new Uint8Array(width * height).fill(128)
     for (let y = 0; y < height; y += 1) {
       for (let x = 0; x < width; x += 1) {
-        gray[y * width + x] = x < width / 2 ? (((x >> 2) + (y >> 2)) % 2 === 0 ? 20 : 235) : 128
+        if (inside(x)) gray[y * width + x] = (Math.floor(x / period) + Math.floor(y / period)) % 2 === 0 ? 20 : 235
       }
     }
-    const result = focusMask(gray, width, height)
-    expect([result.width, result.height]).toEqual([128, 64])
-    let left = 0
-    let right = 0
-    for (let y = 0; y < result.height; y += 1) {
-      for (let x = 0; x < result.width; x += 1) {
-        const value = result.data[y * result.width + x]!
-        if (x < result.width / 2) left += value
-        else right += value
-      }
+    return gray
+  }
+
+  it('左がくっきり・右がのっぺりなら、四角は左だけ（0〜1 の割合で返る）', () => {
+    const width = 256
+    const height = 128
+    const result = focusRegions(checker(width, height, 8, x => x < width / 2), width, height)
+    expect(result.regions.length).toBeGreaterThan(0)
+    expect(result.regions.length).toBeLessThanOrEqual(3)
+    for (const region of result.regions) {
+      expect(region.x).toBeGreaterThanOrEqual(0)
+      expect(region.x + region.w).toBeLessThanOrEqual(0.55)
+      expect(region.y + region.h).toBeLessThanOrEqual(1.0001)
+      expect(region.strength).toBeGreaterThan(0)
     }
-    expect(left).toBeGreaterThan(0)
-    expect(right).toBe(0)
   })
 
-  it('読めない入力では空のマスク', () => {
-    const result = focusMask(new Uint8Array(5), 3, 3)
-    expect([result.width, result.height, result.data.length]).toEqual([0, 0, 0])
+  it('のっぺりした画像・読めない入力では四角が 0 個', () => {
+    expect(focusRegions(new Uint8Array(128 * 128).fill(100), 128, 128)).toEqual({ regions: [] })
+    expect(focusRegions(new Uint8Array(5), 3, 3)).toEqual({ regions: [] })
   })
 
-  it('長辺 2048 の入力を 1 枚あたり 50ms 前後で処理する（目安。遅い環境では緩める）', () => {
+  it('長辺 2048 の入力を 1 枚あたり 100ms 前後で処理する（目安。遅い環境では緩める）', () => {
     const width = 1536
     const height = 1024
     const gray = new Uint8Array(width * height)
     for (let i = 0; i < gray.length; i += 1) gray[i] = (i * 31) & 255
-    focusMask(gray, width, height) // 暖機
+    focusRegions(gray, width, height) // 暖機
     const started = performance.now()
-    focusMask(gray, width, height)
+    focusRegions(gray, width, height)
     const elapsed = performance.now() - started
-    console.log(`focusMask 1536x1024: ${elapsed.toFixed(1)}ms`)
-    expect(elapsed).toBeLessThan(250)
+    console.log(`focusRegions 1536x1024: ${elapsed.toFixed(1)}ms`)
+    expect(elapsed).toBeLessThan(400)
   })
 })
